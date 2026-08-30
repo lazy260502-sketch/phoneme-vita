@@ -1,0 +1,111 @@
+#!/bin/bash
+# Step 1.5: Generate ROM image (includes CLDC + MIDP system classes)
+# This embeds midp_system.jar content into ROM so all classes load from ROM,
+# eliminating need for midp_system.jar on filesystem.
+
+source "$(dirname "${BASH_SOURCE[0]}")/build_midp_vita.common"
+
+build_section "[Step 1.5] Generating ROM image..."
+
+# Combined ROM jar (CLDC + MIDP classes)
+ROM_JAR="$CLDC_DIR/build/vita_arm/dist/lib/min_rom.jar"
+ROM_OUTPUT="$CLDC_DIR/build/vita_arm/romgen/generated/ROMImage.cpp"
+
+# Reset external trigger
+export ROM_FORCE_REBUILD=0
+
+# Build ROM jar if needed
+if [ ! -f "$ROM_JAR" ] || file_changed "$ROM_JAR" "$BUILD_DIR/.rom_jar.md5"; then
+    build_info "Building combined ROM classes jar (includes midp_system.jar)..."
+    
+    ROM_BUILD_DIR="$CLDC_DIR/build/vita_arm/_rom_temp"
+    rm -rf "$ROM_BUILD_DIR"
+    mkdir -p "$ROM_BUILD_DIR"
+    cd "$ROM_BUILD_DIR"
+
+    # Extract CLDC base classes
+    jar xf "$CLDC_DIR/build/vita_arm/dist/lib/cldc_classes.zip"
+
+    # Add all MIDP compiled classes (com, java, javax)
+    MIDP_CLASSES_DIR="$MIDP_DIR/build/vita_arm/classes"
+    if [ -d "$MIDP_CLASSES_DIR" ]; then
+        [ -d "$MIDP_CLASSES_DIR/com" ] && cp -r "$MIDP_CLASSES_DIR/com" .
+        [ -d "$MIDP_CLASSES_DIR/java" ] && cp -r "$MIDP_CLASSES_DIR/java" .
+        [ -d "$MIDP_CLASSES_DIR/javax" ] && cp -r "$MIDP_CLASSES_DIR/javax" .
+    fi
+
+    # Add CLDC i18n classes (not in base zip)
+    cp -r "$CLDC_DIR/build/classes/com/sun/cldc/i18n" "com/sun/cldc/" 2>/dev/null || true
+
+    # Embed midp_system.jar content (user JAR classes that need to be in ROM)
+    # This ensures MIDP system classes are in ROM, not filesystem
+    MIDP_SYSTEM_JAR="$PROJECT_DIR/build/midp_system.jar"
+    if [ -f "$MIDP_SYSTEM_JAR" ]; then
+        build_info "Embedding midp_system.jar into ROM..."
+        # Extract midp_system.jar content
+        jar xf "$MIDP_SYSTEM_JAR"
+        build_success "midp_system.jar embedded"
+    fi
+
+    # Also embed Hello.jar for user MIDlet
+    HELLO_JAR="$PROJECT_DIR/build/Hello.jar"
+    if [ -f "$HELLO_JAR" ]; then
+        build_info "Embedding Hello.jar into ROM..."
+        jar xf "$HELLO_JAR"
+        build_success "Hello.jar embedded"
+    fi
+
+    # Clean duplicate paths
+    rm -rf com/com 2>/dev/null || true
+
+    # Create combined jar
+    jar cf "$ROM_JAR" *
+    rm -rf "$ROM_BUILD_DIR"
+    md5sum "$ROM_JAR" | cut -d' ' -f1 > "$BUILD_DIR/.rom_jar.md5"
+    
+    JAR_SIZE=$(du -h "$ROM_JAR" | cut -f1)
+    build_success "ROM jar built: $JAR_SIZE (includes midp_system.jar)"
+fi
+
+# Generate ROM if needed
+if [ ! -f "$ROM_OUTPUT" ] || file_changed "$ROM_JAR" "$BUILD_DIR/.rom_image.md5"; then
+    build_info "Running romgen..."
+    cd "$CLDC_DIR/build/vita_arm"
+
+    # Run romgen (suppress debug output)
+    ROMGEN_OUTPUT=$(./dist/bin/romgen \
+        -cp "$ROM_JAR" \
+        -romconfig "$CLDC_DIR/build/vita_arm/dist/lib/cldc_rom.cfg" \
+        +GenerateGNUCode +RewriteROMConstantPool +EnableAllROMOptimizations \
+        -romincludepath "$CLDC_DIR/src/vm" \
+        -romize =HeapCapacity80M 2>&1 | grep -vE "^(PRE_NATIVES|POST_NATIVES)")
+    
+    # Check for errors
+    if echo "$ROMGEN_OUTPUT" | grep -q "NoClassDefFoundError"; then
+        build_error "romgen failed: $(echo "$ROMGEN_OUTPUT" | grep -o 'NoClassDefFoundError.*' | head -1)"
+    elif echo "$ROMGEN_OUTPUT" | grep -q "ROM image generated"; then
+        # Copy generated files
+        cp ROMImage*.cpp romgen/generated/ 2>/dev/null
+        md5sum "$ROM_JAR" | cut -d' ' -f1 > "$BUILD_DIR/.rom_image.md5"
+        touch "$ROM_MARKER"
+        export ROM_FORCE_REBUILD=1
+        
+        # Show stats
+        echo "$ROMGEN_OUTPUT" | grep -E "objects|bytes" | head -5
+        build_success "ROM image generated"
+    else
+        build_error "romgen failed"
+        echo "$ROMGEN_OUTPUT" | tail -10
+    fi
+
+    # Also regenerate OopMaps.cpp for consistency
+    build_info "Regenerating OopMaps.cpp..."
+    ./dist/bin/romgen -cp "$CLDC_DIR/build/vita_arm/dist/lib/cldc_classes.zip" +GenerateOopMaps >/dev/null 2>&1
+    cp romgen/generated/OopMaps.cpp OopMaps.cpp 2>/dev/null
+    build_success "OopMaps.cpp regenerated"
+else
+    build_info "ROM image up to date"
+fi
+
+# Export for other modules
+export ROM_FORCE_REBUILD

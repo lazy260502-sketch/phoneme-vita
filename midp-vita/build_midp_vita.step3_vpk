@@ -1,0 +1,26 @@
+#!/bin/bash
+# Step 3: Build VPK
+
+source "$(dirname "${BASH_SOURCE[0]}")/build_midp_vita.common"
+
+build_section "[Step 3] Building VPK..."
+
+cd "$BUILD_DIR"
+cmake .. >/dev/null 2>&1
+
+# Build with output
+make 2>&1 | tee /tmp/midp_vita_make.log | grep -E "^\[|Error|error" | tail -15
+MAKE_RESULT=${PIPESTATUS[0]}
+
+if [ -f "$VPK_OUTPUT" ] && [ "$MAKE_RESULT" = "0" ]; then
+    SIZE=$(du -h "$VPK_OUTPUT" | cut -f1)
+    touch "$CLDC_MARKER"
+    echo -e "\n${BLD_GREEN}========================================${BLD_NC}"
+    echo -e "${BLD_GREEN}  Build successful!${BLD_NC}"
+    echo -e "${BLD_GREEN}  Output: $VPK_OUTPUT ($SIZE)${BLD_NC}"
+    echo -e "${BLD_GREEN}========================================${BLD_NC}"
+else
+    build_error "Build failed!"
+    cat /tmp/midp_vita_make.log | tail -20
+    exit 1
+fi

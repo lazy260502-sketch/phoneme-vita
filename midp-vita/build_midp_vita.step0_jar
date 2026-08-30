@@ -1,0 +1,17 @@
+#!/bin/bash
+# Build Hello.jar (MIDlet test JAR)
+
+source "$(dirname "${BASH_SOURCE[0]}")/build_midp_vita.common"
+
+build_section "[Step 0] Building Hello.jar..."
+
+MIDLET_JAR="$BUILD_DIR/midlet/jar/Hello.jar"
+JAR_MARKER="$BUILD_DIR/.hello_jar.md5"
+
+if [ ! -f "$MIDLET_JAR" ] || file_changed "$SCRIPT_DIR/src/HelloMIDlet.java" "$JAR_MARKER"; then
+    bash "$SCRIPT_DIR/build_jar.sh"
+    md5sum "$SCRIPT_DIR/src/HelloMIDlet.java" | cut -d' ' -f1 > "$JAR_MARKER"
+    build_success "Hello.jar built"
+else
+    build_info "Hello.jar up to date"
+fi

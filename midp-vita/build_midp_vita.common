@@ -1,0 +1,69 @@
+# Common build utilities for J2ME/MIDP Vita
+
+# Colors
+export BLD_RED='\033[0;31m'
+export BLD_GREEN='\033[0;32m'
+export BLD_YELLOW='\033[1;33m'
+export BLD_BLUE='\033[0;34m'
+export BLD_NC='\033[0m'
+
+# Helper: Print section header
+build_section() {
+    echo -e "\n${BLD_YELLOW}$1${BLD_NC}"
+}
+
+# Helper: Print success
+build_success() {
+    echo -e "  ${BLD_GREEN}✓ $1${BLD_NC}"
+}
+
+# Helper: Print info
+build_info() {
+    echo -e "  ${BLD_BLUE}$1${BLD_NC}"
+}
+
+# Helper: Print warning
+build_warn() {
+    echo -e "  ${BLD_YELLOW}⚠ $1${BLD_NC}"
+}
+
+# Helper: Print error
+build_error() {
+    echo -e "  ${BLD_RED}✗ $1${BLD_NC}"
+}
+
+# Helper: Compare checksums
+file_changed() {
+    local file="$1"
+    local marker="$2"
+    [ ! -f "$marker" ] && return 0
+    [ ! -f "$file" ] && return 0
+    local old_sum=$(cat "$marker" 2>/dev/null)
+    local new_sum=$(md5sum "$file" 2>/dev/null | cut -d' ' -f1)
+    [ "$old_sum" != "$new_sum" ]
+}
+
+# Helper: Print section header
+build_section() {
+    echo -e "\n${BLD_YELLOW}$1${BLD_NC}"
+}
+
+# Helper: Print success
+build_success() {
+    echo -e "  ${BLD_GREEN}✓ $1${BLD_NC}"
+}
+
+# Helper: Print info
+build_info() {
+    echo -e "  ${BLD_BLUE}$1${BLD_NC}"
+}
+
+# Helper: Print warning
+build_warn() {
+    echo -e "  ${BLD_YELLOW}⚠ $1${BLD_NC}"
+}
+
+# Helper: Print error
+build_error() {
+    echo -e "  ${BLD_RED}✗ $1${BLD_NC}"
+}
