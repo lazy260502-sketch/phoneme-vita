@@ -101,8 +101,6 @@ set(MIDP_INCLUDE_DIRS
     ${MIDP_DIR}/src/security/crypto/include
     ${MIDP_DIR}/src/security/file_digest/include
     ${MIDP_DIR}/src/security/secure_random_port/include
-    ${MIDP_DIR}/src/core/jarutil/include
-    ${MIDP_DIR}/src/core/memory/include
     ${MIDP_BUILD}/generated
     ${MIDP_BUILD}/pcsl/vita_arm/inc
     ${CLDC_DIST}/include
@@ -168,6 +166,7 @@ target_link_libraries(${PROJECT_NAME}
     pcsl_network
     pcsl_print
     pcsl_escfilenames
+    z
     SceDisplay_stub
     SceCtrl_stub
     SceLibKernel_stub

@@ -31,9 +31,7 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
 
-#include <pcsl_string.h>
-#include <midpJar.h>
-#include <midpMalloc.h>
+#include <zlib.h>
 
 #include "vita_menu.h"
 
@@ -205,93 +203,166 @@ typedef struct {
 static GameEntry games[MAX_GAMES];
 static int game_count = 0;
 
-/* pcsl_string.data is a jchar array: expand each byte into one jchar
- * (wrapping a byte pointer directly makes readers stride 2 bytes and
- * garble the path). */
-static void make_pcsl_string(const char *utf8, pcsl_string *ps) {
-    size_t n = strlen(utf8);
-    jchar *w = (jchar *)malloc(n * sizeof(jchar));
-    size_t i;
-    for (i = 0; i < n; i++) {
-        w[i] = (jchar)(unsigned char)utf8[i];
-    }
-    ps->data = w;
-    ps->length = (jsize)n;
-    ps->flags = 0;
+/* ------------------------------------------------------------------
+ * Mini zip reader: parse the jar directly with sceIo + zlib.
+ * Rationale: the phoneME jar API matches entry names by exact length
+ * using pcsl_string_utf8_length(), which the baseline pcsl implements
+ * as a 3x upper bound (length*3) - so EVERY lookup fails with
+ * "no MIDlet class in jar". Parsing the zip ourselves avoids that
+ * whole chain and touches nothing global.
+ * ------------------------------------------------------------------ */
+
+static unsigned int rd16(const unsigned char *p) {
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
 }
 
-static void free_pcsl_string(pcsl_string *ps) {
-    free(ps->data);
-    ps->data = NULL;
-    ps->length = 0;
+static unsigned int rd32(const unsigned char *p) {
+    return rd16(p) | (rd16(p + 2) << 16);
 }
 
-static char g_manifest_entry[160];
-
-static jboolean manifest_filter(const pcsl_string *name) {
-    char tmp[160];
-    int i, n = name->length;
-    if (n < 20 || n >= (int)sizeof(tmp)) {
-        return 0;
+/* raw-deflate (zip method 8) into dst; returns bytes produced or -1 */
+static long inflate_raw(unsigned char *dst, unsigned long dst_cap,
+                        const unsigned char *src, unsigned long src_len) {
+    z_stream zs;
+    int r;
+    memset(&zs, 0, sizeof(zs));
+    if (inflateInit2(&zs, -15) != Z_OK) {
+        return -1;
     }
-    for (i = 0; i < n; i++) {
-        char ch = (char)(name->data[i] & 0xFF);
-        tmp[i] = (ch >= 'a' && ch <= 'z') ? (char)(ch - 32) : ch;
-    }
-    tmp[n] = '\0';
-    if (strncmp(tmp, "META-INF/", 9) != 0) {
-        return 0;
-    }
-    if (strcmp(tmp + n - 11, "MANIFEST.MF") != 0) {
-        return 0;
-    }
-    memcpy(g_manifest_entry, tmp, n);
-    g_manifest_entry[n] = '\0';
-    return 1;
+    zs.next_in = (Bytef *)src;
+    zs.avail_in = (uInt)src_len;
+    zs.next_out = dst;
+    zs.avail_out = (uInt)dst_cap;
+    r = inflate(&zs, Z_FINISH);
+    inflateEnd(&zs);
+    return (r == Z_STREAM_END) ? (long)zs.total_out : -1;
 }
 
-static jboolean manifest_action(const pcsl_string *name) {
-    (void)name;
-    return 0;
+/* Read one entry (case-insensitive ASCII match) into a malloc'd buffer.
+ * Returns NULL when not found / malformed. */
+static unsigned char *zip_read_entry(const char *jarpath, const char *want,
+                                     long *out_size) {
+    SceUID fd;
+    unsigned int size;
+    unsigned char *data = NULL;
+    unsigned char *result = NULL;
+    long i, eocd = -1, p;
+    unsigned int cd_count, e;
+    long scan;
+
+    *out_size = 0;
+    fd = sceIoOpen(jarpath, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return NULL;
+    }
+    size = (unsigned int)sceIoLseek(fd, 0, SCE_SEEK_END);
+    sceIoLseek(fd, 0, SCE_SEEK_SET);
+    data = (unsigned char *)malloc(size ? size : 1);
+    if (data == NULL ||
+        sceIoRead(fd, data, size) != (int)size) {
+        goto done;
+    }
+
+    /* find End Of Central Directory from the tail */
+    scan = (long)size - 22;
+    for (i = scan; i >= 0 && i >= scan - 65536; i--) {
+        if (rd32(data + i) == 0x06054b50u) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd < 0) {
+        goto done;
+    }
+    cd_count = rd16(data + eocd + 10);
+    p = (long)rd32(data + eocd + 16);
+
+    for (e = 0; e < cd_count; e++) {
+        unsigned int name_len, extra_len, comment_len, method;
+        unsigned int comp_len, decomp_len, lho;
+        const unsigned char *nm;
+        int match = 1;
+        unsigned int k;
+
+        if (p + 46 > (long)size || rd32(data + p) != 0x02014b50u) {
+            break;
+        }
+        name_len = rd16(data + p + 28);
+        extra_len = rd16(data + p + 30);
+        comment_len = rd16(data + p + 32);
+        method = rd16(data + p + 10);
+        comp_len = rd32(data + p + 20);
+        decomp_len = rd32(data + p + 24);
+        lho = rd32(data + p + 42);
+        nm = data + p + 46;
+
+        if (name_len != strlen(want)) {
+            match = 0;
+        } else {
+            for (k = 0; k < name_len; k++) {
+                char a = (char)nm[k];
+                if (a >= 'a' && a <= 'z') {
+                    a = (char)(a - 32);
+                }
+                if (a != want[k]) {
+                    match = 0;
+                    break;
+                }
+            }
+        }
+
+        if (match) {
+            if (lho + 30 <= size && rd32(data + lho) == 0x04034b50u) {
+                unsigned int ln = rd16(data + lho + 26);
+                unsigned int le = rd16(data + lho + 28);
+                long doff = (long)lho + 30 + ln + le;
+                if (doff + (long)comp_len <= (long)size) {
+                    result = (unsigned char *)malloc(decomp_len ? decomp_len : 1);
+                    if (result != NULL) {
+                        if (method == 0) { /* stored */
+                            memcpy(result, data + doff, decomp_len);
+                            *out_size = (long)decomp_len;
+                        } else if (method == 8) { /* deflated */
+                            long n = inflate_raw(result, decomp_len,
+                                                 data + doff, comp_len);
+                            if (n < 0) {
+                                free(result);
+                                result = NULL;
+                            } else {
+                                *out_size = n;
+                            }
+                        } else {
+                            free(result);
+                            result = NULL;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        p += 46 + name_len + extra_len + comment_len;
+    }
+
+done:
+    free(data);
+    if (fd >= 0) {
+        sceIoClose(fd);
+    }
+    return result;
 }
 
 /* The class is the text after the LAST comma on the "MIDlet-1:" line;
  * non-printable characters are dropped (a stray CR makes Class.forName
  * fail with an invisible suffix). */
 static void parse_manifest_class(const char *jarpath, char *out, size_t outsz) {
-    pcsl_string jar_ps, entry_ps;
-    void *handle;
-    int jar_err;
-    unsigned char *buf = NULL;
-    long n = 0, i;
-    const char *entry = "META-INF/MANIFEST.MF";
+    long n = 0;
+    unsigned char *buf;
+    long i;
     out[0] = '\0';
 
-    make_pcsl_string(jarpath, &jar_ps);
-    handle = midpOpenJar(&jar_err, &jar_ps);
-    free_pcsl_string(&jar_ps);
-    if (handle == NULL) {
-        return;
-    }
-
-    make_pcsl_string(entry, &entry_ps);
-    n = midpGetJarEntry(handle, &entry_ps, &buf);
-    free_pcsl_string(&entry_ps);
-
-    if (n <= 0 || buf == NULL) {
-        g_manifest_entry[0] = '\0';
-        midpIterateJarEntries(handle, manifest_filter, manifest_action);
-        if (g_manifest_entry[0] != '\0') {
-            make_pcsl_string(g_manifest_entry, &entry_ps);
-            n = midpGetJarEntry(handle, &entry_ps, &buf);
-            free_pcsl_string(&entry_ps);
-        }
-    }
-    midpCloseJar(handle);
-    if (n <= 0 || buf == NULL) {
-        if (buf != NULL) {
-            midpFree(buf);
-        }
+    buf = zip_read_entry(jarpath, "META-INF/MANIFEST.MF", &n);
+    if (buf == NULL || n <= 0) {
+        free(buf);
         return;
     }
 
@@ -300,24 +371,24 @@ static void parse_manifest_class(const char *jarpath, char *out, size_t outsz) {
             buf[i + 3] == 'l' && buf[i + 4] == 'e' && buf[i + 5] == 't' &&
             buf[i + 6] == '-' && buf[i + 7] == '1' && buf[i + 8] == ':') {
             long p = i + 9;
-            long lineEnd = p;
-            long lastComma = -1;
+            long line_end = p;
+            long last_comma = -1;
             int len = 0;
             char tmp[128];
-            while (lineEnd < n && buf[lineEnd] != '\n' && buf[lineEnd] != '\r') {
-                lineEnd++;
+            while (line_end < n && buf[line_end] != '\n' && buf[line_end] != '\r') {
+                line_end++;
             }
-            for (p = i + 9; p < lineEnd; p++) {
+            for (p = i + 9; p < line_end; p++) {
                 if (buf[p] == ',') {
-                    lastComma = p;
+                    last_comma = p;
                 }
             }
-            if (lastComma < 0) {
+            if (last_comma < 0) {
                 break;
             }
-            p = lastComma + 1;
-            while (p < lineEnd && buf[p] == ' ') p++;
-            while (p < lineEnd && len < (int)sizeof(tmp) - 1) {
+            p = last_comma + 1;
+            while (p < line_end && buf[p] == ' ') p++;
+            while (p < line_end && len < (int)sizeof(tmp) - 1) {
                 char ch = (char)buf[p++];
                 if (ch >= 0x20) {
                     tmp[len++] = ch;
@@ -332,7 +403,7 @@ static void parse_manifest_class(const char *jarpath, char *out, size_t outsz) {
             break;
         }
     }
-    midpFree(buf);
+    free(buf);
 }
 
 static void save_cfg(const GameEntry *g) {
