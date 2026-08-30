@@ -253,15 +253,25 @@ static unsigned char *zip_read_entry(const char *jarpath, const char *want,
     *out_size = 0;
     fd = sceIoOpen(jarpath, SCE_O_RDONLY, 0);
     if (fd < 0) {
+        fprintf(stderr, "[zip] open FAILED %s\n", jarpath);
+        fflush(stderr);
         return NULL;
     }
     size = (unsigned int)sceIoLseek(fd, 0, SCE_SEEK_END);
     sceIoLseek(fd, 0, SCE_SEEK_SET);
     data = (unsigned char *)malloc(size ? size : 1);
-    if (data == NULL ||
-        sceIoRead(fd, data, size) != (int)size) {
+    if (data == NULL) {
+        fprintf(stderr, "[zip] malloc(%u) failed\n", size);
+        fflush(stderr);
         goto done;
     }
+    if (sceIoRead(fd, data, size) != (int)size) {
+        fprintf(stderr, "[zip] short read (%u)\n", size);
+        fflush(stderr);
+        goto done;
+    }
+    fprintf(stderr, "[zip] jar %s size=%u\n", jarpath, size);
+    fflush(stderr);
 
     /* find End Of Central Directory from the tail */
     scan = (long)size - 22;
@@ -272,10 +282,15 @@ static unsigned char *zip_read_entry(const char *jarpath, const char *want,
         }
     }
     if (eocd < 0) {
+        fprintf(stderr, "[zip] no EOCD\n");
+        fflush(stderr);
         goto done;
     }
     cd_count = rd16(data + eocd + 10);
     p = (long)rd32(data + eocd + 16);
+    fprintf(stderr, "[zip] eocd=%ld entries=%u cd_off=%ld\n",
+            eocd, cd_count, p);
+    fflush(stderr);
 
     for (e = 0; e < cd_count; e++) {
         unsigned int name_len, extra_len, comment_len, method;
@@ -296,9 +311,8 @@ static unsigned char *zip_read_entry(const char *jarpath, const char *want,
         lho = rd32(data + p + 42);
         nm = data + p + 46;
 
-        if (name_len != strlen(want)) {
-            match = 0;
-        } else {
+        if (name_len == strlen(want)) {
+            match = 1;
             for (k = 0; k < name_len; k++) {
                 char a = (char)nm[k];
                 if (a >= 'a' && a <= 'z') {
@@ -309,9 +323,19 @@ static unsigned char *zip_read_entry(const char *jarpath, const char *want,
                     break;
                 }
             }
+        } else {
+            match = 0;
+        }
+        if (e < 4 || match) {
+            fprintf(stderr, "[zip] entry[%u] len=%u '%.*s' match=%d\n",
+                    e, name_len, (int)name_len, nm, match);
+            fflush(stderr);
         }
 
         if (match) {
+            fprintf(stderr, "[zip] MANIFEST matched, method=%u comp=%u decomp=%u\n",
+                    method, comp_len, decomp_len);
+            fflush(stderr);
             if (lho + 30 <= size && rd32(data + lho) == 0x04034b50u) {
                 unsigned int ln = rd16(data + lho + 26);
                 unsigned int le = rd16(data + lho + 28);

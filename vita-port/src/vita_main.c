@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <unistd.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -151,10 +152,20 @@ int main(int argc, char *argv[]) {
     sceIoMkdir(DATA_DIR "/appdb", 0777);
     sceIoMkdir(DATA_DIR "/lib", 0777);
 
+    /* CRITICAL: run from the data dir and keep ALL VM classpath entries
+     * RELATIVE. The CLDC classpath splits on ':' - an entry like
+     * "ux0:/data/..." gets cut at the colon into "ux0" + "/data/..."
+     * (system classes only loaded by luck: the second fragment happened
+     * to resolve inside app0:). With chdir, "midp_system.jar",
+     * "games/x/game.jar" etc. contain no colon at all. */
+    if (chdir(DATA_DIR) < 0) {
+        dlog("WARNING: sceIoChdir to data dir failed\n");
+    }
+
     /* Default game = bundled Hello.jar; launch.cfg overrides.
      * launch.cfg lines: <jar path> / <class> / [portrait|landscape] */
     copy_file("app0:/data/J2ME00001/Hello.jar", DATA_DIR "/Hello.jar");
-    snprintf(jar_path, sizeof(jar_path), DATA_DIR "/Hello.jar");
+    snprintf(jar_path, sizeof(jar_path), "Hello.jar");
     snprintf(class_name, sizeof(class_name), "HelloMIDlet");
     snprintf(orient, sizeof(orient), "portrait");
     /* Native game menu: pick an installed game (see vita_menu.c for the
@@ -211,7 +222,7 @@ int main(int argc, char *argv[]) {
      *   "internal"                 -> INTERNAL_SUITE_ID (no AMS install)
      *   <classname>                -> MIDlet to launch                       */
     snprintf(classpath, sizeof(classpath),
-             DATA_DIR "/midp_system.jar:%s", jar_path);
+             "midp_system.jar:%s", jar_path);
 
     char *run_argv[] = {
         "runMidlet",
