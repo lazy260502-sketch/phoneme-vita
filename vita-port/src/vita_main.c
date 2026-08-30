@@ -179,6 +179,14 @@ int main(int argc, char *argv[]) {
             snprintf(jar_path, sizeof(jar_path), "%s", sel.jar);
             snprintf(class_name, sizeof(class_name), "%s", sel.cls);
             snprintf(orient, sizeof(orient), "%s", sel.orient);
+            /* VM classpath splits on ':' - strip "ux0:/data/J2ME00001/"
+             * so the entry is RELATIVE (see chdir above) */
+            {
+                size_t plen = strlen(DATA_DIR "/");
+                if (strncmp(jar_path, DATA_DIR "/", plen) == 0) {
+                    memmove(jar_path, jar_path + plen, strlen(jar_path) - plen + 1);
+                }
+            }
             dlog_str("menu jar: ", jar_path);
             dlog_str("menu class: ", class_name);
             dlog_str("menu orientation: ", orient);
