@@ -28,6 +28,8 @@
 
 extern int runMidlet(int argc, char **argv);
 
+#include "vita_menu.h"
+
 /* from vita_display.c: must run before the VM starts */
 extern void vita_display_set_orientation(int landscape);
 
@@ -155,14 +157,29 @@ int main(int argc, char *argv[]) {
     snprintf(jar_path, sizeof(jar_path), DATA_DIR "/Hello.jar");
     snprintf(class_name, sizeof(class_name), "HelloMIDlet");
     snprintf(orient, sizeof(orient), "portrait");
-    if (read_launch_cfg(jar_path, sizeof(jar_path),
-                        class_name, sizeof(class_name),
-                        orient, sizeof(orient)) == 0) {
+    /* Native game menu: pick an installed game (see vita_menu.c for the
+     * games/ + inbox/ layout). Falls through to launch.cfg / Hello when
+     * the user quits the menu without a selection. */
+    {
+        VitaGameSel sel;
+        sceIoMkdir(DATA_DIR "/games", 0777);
+        sceIoMkdir(DATA_DIR "/inbox", 0777);
+        if (vita_menu_run(&sel)) {
+            snprintf(jar_path, sizeof(jar_path), "%s", sel.jar);
+            snprintf(class_name, sizeof(class_name), "%s", sel.cls);
+            snprintf(orient, sizeof(orient), "%s", sel.orient);
+            dlog_str("menu jar: ", jar_path);
+            dlog_str("menu class: ", class_name);
+            dlog_str("menu orientation: ", orient);
+        } else if (read_launch_cfg(jar_path, sizeof(jar_path),
+                                   class_name, sizeof(class_name),
+                                   orient, sizeof(orient)) == 0) {
         dlog_str("launch.cfg jar: ", jar_path);
         dlog_str("launch.cfg class: ", class_name);
         dlog_str("launch.cfg orientation: ", orient);
     } else {
-        dlog("launch.cfg not found, defaults in use");
+            dlog("launch.cfg not found, defaults in use");
+        }
     }
 
     {

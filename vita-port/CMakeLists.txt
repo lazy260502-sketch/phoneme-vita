@@ -101,6 +101,8 @@ set(MIDP_INCLUDE_DIRS
     ${MIDP_DIR}/src/security/crypto/include
     ${MIDP_DIR}/src/security/file_digest/include
     ${MIDP_DIR}/src/security/secure_random_port/include
+    ${MIDP_DIR}/src/core/jarutil/include
+    ${MIDP_DIR}/src/core/memory/include
     ${MIDP_BUILD}/generated
     ${MIDP_BUILD}/pcsl/vita_arm/inc
     ${CLDC_DIST}/include
@@ -136,6 +138,7 @@ add_custom_target(libobj_target DEPENDS ${LIBOBJ_NO_MAIN})
 #==============================================================================
 add_executable(${PROJECT_NAME}
     src/vita_main.c
+    src/vita_menu.c
     src/vita_display.c
     src/vita_input.c
     src/vita_pcsl.c
