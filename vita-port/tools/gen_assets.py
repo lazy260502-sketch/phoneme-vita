@@ -8,6 +8,7 @@ layout:
     sce_sys/livearea/contents/bg.png           840x500  LiveArea background
     sce_sys/livearea/contents/startup.png      280x158  start button image
 """
+import math
 import os
 from PIL import Image, ImageDraw, ImageFont
 
@@ -40,21 +41,42 @@ def centered(d, xy_wh, text, font, fill):
 
 
 def icon0():
-    """128x128 bubble icon: dark tile, green phone screen with J2ME."""
+    """128x128 bubble icon: the classic Java steaming coffee cup."""
     img = vgrad(128, 128, BG_TOP, BG_BOT)
     d = ImageDraw.Draw(img)
-    # retro phone outline: body + screen + keypad dots
-    d.rounded_rectangle([34, 14, 94, 114], radius=12, outline=ACCENT, width=3)
-    d.rounded_rectangle([42, 24, 86, 62], radius=4, fill=(6, 10, 22),
-                        outline=ACCENT2, width=2)
-    f_big = ImageFont.truetype(FONT, 15)
-    centered(d, (42, 24, 44, 38), "J2ME", f_big, ACCENT)
-    # keypad
-    for r in range(3):
-        for c in range(3):
-            cx, cy = 54 + c * 12, 74 + r * 11
-            d.ellipse([cx - 3, cy - 3, cx + 3, cy + 3], fill=ACCENT2)
-    d.rounded_rectangle([42, 100, 86, 108], radius=3, outline=WHITE, width=1)
+    java_orange = (231, 111, 0)    # Java brand orange
+    java_orange_dk = (180, 84, 0)
+    java_orange_lt = (247, 148, 52)
+    java_blue = (83, 130, 161)     # Java brand blue
+
+    # steam: two wavy strands above the cup
+    for cx, phase in ((54, 0.0), (74, 2.1)):
+        pts = []
+        for i in range(25):
+            t = i / 24.0
+            x = cx + 7 * math.sin(math.pi * 2.2 * t + phase)
+            y = 44 - t * 30
+            pts.append((x, y))
+        d.line(pts, fill=java_orange_lt, width=4, joint="curve")
+        d.ellipse([pts[0][0] - 2, pts[0][1] - 2,
+                   pts[0][0] + 2, pts[0][1] + 2], fill=java_orange_lt)
+
+    # handle (behind body)
+    d.arc([84, 58, 106, 86], start=-70, end=110, fill=java_orange_dk, width=6)
+
+    # cup body + rim
+    d.rounded_rectangle([38, 52, 90, 100], radius=10, fill=java_orange)
+    d.ellipse([34, 44, 94, 62], fill=java_orange_dk)
+    d.ellipse([38, 47, 90, 59], fill=java_orange_lt)
+    # body highlight
+    d.line([45, 64, 45, 92], fill=java_orange_lt, width=3)
+
+    # saucer
+    d.ellipse([28, 96, 100, 108], fill=(70, 78, 92))
+
+    # J2ME tag
+    f = ImageFont.truetype(FONT, 15)
+    centered(d, (0, 108, 128, 20), "J2ME", f, java_blue)
     img.save(os.path.join(OUT, "icon0.png"))
 
 
