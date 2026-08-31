@@ -212,6 +212,12 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### 游戏启动崩溃修复：ANI 线程池未初始化（2026-09-01，samples 152d350）
+- **症状**：jsr135 集成后游戏启动即死循环，Vita3K 日志刷 `Invalid read of uint32_t at 0x4`，`ldrex/strex` 原子指令重试，PC=0x810aca7a
+- **根因链**：MMAPI 可用后游戏 `Manager.createPlayer(http://...)` 走通 → 媒体下载进 ANI 阻塞框架 → `PoolThread` 的静态事件（全局零初始化=NULL）被 `Os_SignalEvent/Os_WaitForEvent` 使用 → `pthread_mutex_unlock(&NULL->mutex)`（偏移 4）→ pteos 原子操作死循环。**`ANI_Initialize()` 在 CLDC-HI 启动流程中无任何调用者（上游同样），线程池从未初始化**
+- **修复**：vita_main.c 在 `runMidlet` 前显式调 `ANI_Initialize()`（符号未修饰，C 可直接链接）
+- **诊断方法论**：Vita3K 的 PC/LR → `arm-vita-eabi-addr2line -e build/midp_vita -f` 定位到函数 → objdump 全量反汇编 + grep `bl <目标地址>` 枚举调用点 → addr2line 每个调用点还原调用图。这套路子可复用
+
 ### 中文字库扩容 + 自描述 header（2026-09-01，samples b593d80/a9c1049）
 - fontgen 新增 4 段：带圈数字 0x2460、希腊 0x0386、CJK 尾段 0x9FA6-0x9FFF、半角片假名 0xFF61（共 21429 字形，1.41MB）
 - bank header 升级为自描述（magic "J2FB" v1：nsec/gw/gh/stride/data_off/段表），**vita_font.c 加载时动态解析并校验**——以后扩段只改 fontgen.c，运行时零改动
