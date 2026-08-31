@@ -1,0 +1,6 @@
+tools/fontgen
+tools/fontbitmap.bin
+
+# Build assets required by CMake packaging - never ignore these
+!config/fontbitmap.bin
+!config/font.ttf

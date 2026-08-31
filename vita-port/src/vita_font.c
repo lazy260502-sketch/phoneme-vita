@@ -1,12 +1,11 @@
 /*
  * vita_font.c - bitmap-bank CJK/ASCII text rendering for phoneME MIDP.
  *
- * Loads a pre-rendered 1bpp bitmap bank (tools/fontgen.c output).
- * No header parsing - dimensions are hardcoded to match fontgen.c.
- * Bank layout:
- *   bytes 0-39:  header (ignored by this code)
- *   bytes 40+:   sequential 1bpp glyph bitmaps (20x22, 3 bytes/row)
- *                in section order: ASCII, CJK, punct, fullwidth, gen
+ * Loads a pre-rendered 1bpp bitmap bank (tools/fontgen.c output) from
+ * VPK or ux0 override, and draws glyphs by table lookup + blit.
+ * The bank header is self-describing (magic "J2FB", version 1):
+ * section table is parsed at load time, so fontgen can add coverage
+ * without touching this file. Glyph bitmaps are 1bpp, MSB-first.
  */
 #include <kni.h>
 #include <gxj_putpixel.h>
@@ -16,7 +15,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Hardcoded dimensions - MUST match tools/fontgen.c */
+/* Legacy fallback dims if a headerless (very old) bank is loaded */
+#define GW 20
+#define GH 22
+#define STRIDE 3
+
 #include <stdarg.h>
 static SceUID flog_fd = -2;
 static void flog(const char *fmt, ...) {
@@ -34,23 +37,21 @@ static void flog(const char *fmt, ...) {
     if (n > 0) sceIoWrite(flog_fd, buf, n);
 }
 
-#define GW 20
-#define GH 22
-#define STRIDE 3
-#define GLYPH_BYTES (STRIDE * GH) /* 66 */
-#define DATA_OFF 40
-
-/* Section definitions - must match fontgen.c */
-#define NSEC 5
-static const unsigned int sec_first[NSEC] = { 0x20, 0x4E00, 0x3000, 0xFF01, 0x2010 };
-static const unsigned int sec_cnt[NSEC]   = { 95, 20902, 64, 95, 24 };
-
 static unsigned char *fb_data = NULL;
 static unsigned int fb_size = 0;
 static int fb_ready = 0;
 
-/* Section base pointers into fb_data (computed after load) */
-static const unsigned char *sec_base[NSEC];
+/* Parsed from the bank header */
+static int fb_gw = GW, fb_gh = GH, fb_stride = STRIDE;
+static unsigned int fb_data_off = 0;
+static int fb_nsec = 0;
+static unsigned int fb_sec_first[16], fb_sec_cnt[16];
+static const unsigned char *fb_sec_base[16];
+
+/* Tiny LE readers */
+static unsigned int rd32(const unsigned char *p) {
+    return p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned int)p[3] << 24);
+}
 
 static void fb_load(const char *path) {
     SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
@@ -71,6 +72,42 @@ static void fb_load(const char *path) {
         return;
     }
     sceIoClose(fd);
+
+    /* Parse the self-describing header (J2FB v1) */
+    if (fb_size < 28 || memcmp(fb_data, "J2FB", 4) != 0 || fb_data[4] != 1) {
+        flog("fb_load %s: bad header\n", path);
+        free(fb_data);
+        fb_data = NULL;
+        return;
+    }
+    fb_nsec = (int)rd32(fb_data + 8);
+    fb_gw = (int)rd32(fb_data + 12);
+    fb_gh = (int)rd32(fb_data + 16);
+    fb_stride = (int)rd32(fb_data + 20);
+    fb_data_off = rd32(fb_data + 24);
+    if (fb_nsec <= 0 || fb_nsec > 16 ||
+        fb_gw <= 0 || fb_gw > 64 || fb_gh <= 0 || fb_gh > 64 ||
+        fb_stride != (fb_gw + 7) / 8) {
+        flog("fb_load %s: bad dims nsec=%d %dx%d/%d\n",
+             path, fb_nsec, fb_gw, fb_gh, fb_stride);
+        free(fb_data);
+        fb_data = NULL;
+        return;
+    }
+    for (int s = 0; s < fb_nsec; s++) {
+        fb_sec_first[s] = rd32(fb_data + 28 + 8 * s);
+        fb_sec_cnt[s] = rd32(fb_data + 28 + 8 * s + 4);
+    }
+    {
+        unsigned long total = 0;
+        for (int s = 0; s < fb_nsec; s++) total += fb_sec_cnt[s];
+        if (fb_data_off + total * (unsigned long)fb_stride * fb_gh > fb_size) {
+            flog("fb_load %s: truncated\n", path);
+            free(fb_data);
+            fb_data = NULL;
+            return;
+        }
+    }
     fb_ready = 1;
 }
 
@@ -79,29 +116,23 @@ static void fb_ensure(void) {
     if (fb_ready) return;
     fb_load("ux0:/data/J2ME00001/fontbitmap.bin");
     if (!fb_ready) fb_load("app0:/data/J2ME00001/fontbitmap.bin");
-    flog("fb_load done size=%u ready=%d\n", fb_size, fb_ready);
+    flog("fb_load done size=%u ready=%d nsec=%d %dx%d/%d\n",
+         fb_size, fb_ready, fb_nsec, fb_gw, fb_gh, fb_stride);
 }
 
 /* Returns pointer to the 1bpp glyph bitmap for codepoint cp,
  * or NULL if not found. Each glyph is GH rows of STRIDE bytes. */
 static const unsigned char *fb_glyph(unsigned int cp) {
-    static int init = 0;
-    static const unsigned char *base[NSEC];
     if (!fb_ready) {
         return NULL;
     }
-    if (!init) {
-        const unsigned char *p = fb_data + DATA_OFF;
-        int s;
-        for (s = 0; s < NSEC; s++) {
-            base[s] = p;
-            p += (unsigned int)sec_cnt[s] * GLYPH_BYTES;
-        }
-        init = 1;
-    }
-    for (int s = 0; s < NSEC; s++) {
-        if (cp >= sec_first[s] && cp < sec_first[s] + sec_cnt[s]) {
-            return base[s] + (unsigned)(cp - sec_first[s]) * GLYPH_BYTES;
+    for (int s = 0; s < fb_nsec; s++) {
+        if (cp >= fb_sec_first[s] && cp < fb_sec_first[s] + fb_sec_cnt[s]) {
+            unsigned long idx = 0;
+            for (int t = 0; t < s; t++) idx += fb_sec_cnt[t];
+            idx += cp - fb_sec_first[s];
+            return fb_data + fb_data_off
+                 + idx * (unsigned long)fb_stride * fb_gh;
         }
     }
     return NULL;
@@ -117,7 +148,7 @@ int gxjport_get_font_info(int face, int style, int size,
     if (!fb_ready) {
         return KNI_FALSE;
     }
-    if (ascent)  *ascent  = GH - 4;
+    if (ascent)  *ascent  = fb_gh - 4;
     if (descent) *descent = 4;
     if (leading) *leading = 0;
     return KNI_TRUE;
@@ -130,7 +161,7 @@ int gxjport_get_chars_width(int face, int style, int size,
     if (!fb_ready) {
         return -1;
     }
-    return n * GW;
+    return n * fb_gw;
 }
 
 int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
@@ -187,11 +218,11 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
 
         if (g != NULL) {
             int r, c;
-            for (r = 0; r < GH; r++) {
+            for (r = 0; r < fb_gh; r++) {
                 int py = y + r;
-                const unsigned char *row = g + r * STRIDE;
+                const unsigned char *row = g + r * fb_stride;
                 if (py < clipY1 || py >= clipY2) continue;
-                for (c = 0; c < GW; c++) {
+                for (c = 0; c < fb_gw; c++) {
                     int pxx = pen_x + c;
                     if (pxx < clipX1 || pxx >= clipX2) continue;
                     if (row[c >> 3] & (0x80 >> (c & 7))) {
@@ -216,7 +247,7 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
                 }
             }
         }
-        pen_x += GW;
+        pen_x += fb_gw;
     }
 
     {
