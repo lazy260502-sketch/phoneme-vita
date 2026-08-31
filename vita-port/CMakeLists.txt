@@ -101,6 +101,7 @@ set(MIDP_INCLUDE_DIRS
     ${MIDP_DIR}/src/security/crypto/include
     ${MIDP_DIR}/src/security/file_digest/include
     ${MIDP_DIR}/src/security/secure_random_port/include
+    ${MIDP_DIR}/src/lowlevelui/putpixel_port/include
     ${MIDP_BUILD}/generated
     ${MIDP_BUILD}/pcsl/vita_arm/inc
     ${CLDC_DIST}/include
@@ -124,6 +125,7 @@ add_custom_command(
     COMMAND arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} runMidlet_md.o
     COMMAND arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} lfjport_fb_export.o
     COMMAND arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} mastermode_export.o
+    COMMAND arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} gxjport_text.o
     DEPENDS ${MIDP_OBJ_DIR}/libobj.a
     COMMENT "Preparing libobj_no_main.a (dropping runMidlet_md, lfjport_fb_export, mastermode_export)"
     VERBATIM
@@ -136,6 +138,8 @@ add_custom_target(libobj_target DEPENDS ${LIBOBJ_NO_MAIN})
 #==============================================================================
 add_executable(${PROJECT_NAME}
     src/vita_main.c
+    src/vita_menu.c
+    src/vita_font.c
     src/vita_display.c
     src/vita_input.c
     src/vita_pcsl.c
@@ -165,6 +169,7 @@ target_link_libraries(${PROJECT_NAME}
     pcsl_network
     pcsl_print
     pcsl_escfilenames
+    z
     SceDisplay_stub
     SceCtrl_stub
     SceLibKernel_stub
@@ -224,6 +229,8 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
     FILE     ${PORT_DIR}/config/internal.landscape.config data/J2ME00001/lib/internal.landscape.config
     FILE     ${PORT_DIR}/config/system.config            data/J2ME00001/lib/system.config
     FILE     ${MIDP_SYSTEM_JAR}                  data/J2ME00001/midp_system.jar
+    FILE     ${PORT_DIR}/config/font.ttf         data/J2ME00001/font.ttf
+    FILE     ${PORT_DIR}/config/fontbitmap.bin    data/J2ME00001/fontbitmap.bin
     FILE     ${MIDLET_JAR}                       data/J2ME00001/Hello.jar
     ${VITA_SKIN_FILE_ARGS}
 )
