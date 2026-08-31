@@ -217,6 +217,11 @@ int main(int argc, char *argv[]) {
                   DATA_DIR "/lib/system.config");
     }
 
+    /* keep the runtime midp_system.jar in sync with the VPK build (it
+     * gains new classes - e.g. Nokia UI stubs - with every release) */
+    copy_file("app0:/data/J2ME00001/midp_system.jar",
+              DATA_DIR "/midp_system.jar");
+
     snprintf(midp_home, sizeof(midp_home), "%s", DATA_DIR);
     setenv("MIDP_HOME", midp_home, 1);
     midpSetAppDir(DATA_DIR "/appdb");
