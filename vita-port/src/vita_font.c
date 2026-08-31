@@ -32,6 +32,7 @@ static int fb_ascent = 18;
 static void fb_load(const char *path) {
     SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
     unsigned char hdr[40];
+    unsigned int data_off;
     if (fd < 0) {
         return;
     }
@@ -40,15 +41,24 @@ static void fb_load(const char *path) {
         sceIoClose(fd);
         return;
     }
-    fb_gw = hdr[8] | (hdr[9] << 8);
-    fb_gh = hdr[10] | (hdr[11] << 8);
-    /* stride at hdr[12..13] */
-    fb_stride = hdr[12] | (hdr[13] << 8);
-    fb_ascii_first = hdr[16] | (hdr[17] << 8) | (hdr[18] << 16) | (hdr[19] << 24);
-    fb_ascii_count = hdr[20] | (hdr[21] << 8) | (hdr[22] << 16) | (hdr[23] << 24);
-    fb_cjk_first = hdr[24] | (hdr[25] << 8) | (hdr[26] << 16) | (hdr[27] << 24);
-    fb_cjk_count = hdr[28] | (hdr[29] << 8) | (hdr[30] << 16) | (hdr[31] << 24);
-    fb_size = 40u + (unsigned)fb_ascii_count * GLYPH_BYTES +
+    /* layout as written by tools/fontgen.c (verified by byte dump):
+     *   u16@12 GW, u16@16 GH, u16@20 STRIDE, u32@24 data_off,
+     *   u32@28 ascii_count, u32@32 cjk_first(0x4E00), u32@36 cjk_count
+     */
+    fb_gw     = hdr[12] | (hdr[13] << 8);
+    fb_gh     = hdr[16] | (hdr[17] << 8);
+    fb_stride = hdr[20] | (hdr[21] << 8);
+    data_off  = (unsigned)hdr[24] | ((unsigned)hdr[25] << 8) |
+                ((unsigned)hdr[26] << 16) | ((unsigned)hdr[27] << 24);
+    fb_ascii_count = (unsigned)hdr[28] | ((unsigned)hdr[29] << 8) |
+                     ((unsigned)hdr[30] << 16) | ((unsigned)hdr[31] << 24);
+    fb_cjk_first   = (unsigned)hdr[32] | ((unsigned)hdr[33] << 8) |
+                     ((unsigned)hdr[34] << 16) | ((unsigned)hdr[35] << 24);
+    fb_cjk_count   = (unsigned)hdr[36] | ((unsigned)hdr[37] << 8) |
+                     ((unsigned)hdr[38] << 16) | ((unsigned)hdr[39] << 24);
+    fb_ascii_first = 0x20;
+
+    fb_size = data_off + (unsigned)fb_ascii_count * GLYPH_BYTES +
               (unsigned)fb_cjk_count * GLYPH_BYTES;
     fb_data = (unsigned char *)malloc(fb_size);
     if (fb_data == NULL) {
@@ -63,11 +73,13 @@ static void fb_load(const char *path) {
         return;
     }
     sceIoClose(fd);
-    fb_ascii = fb_data + 40;
+    fb_ascii = fb_data + data_off;
     fb_cjk = fb_ascii + (unsigned)fb_ascii_count * GLYPH_BYTES;
     fb_ready = 1;
-    fprintf(stderr, "[font] bitmap bank loaded from %s (%u glyphs)\n",
-            path, fb_ascii_count + fb_cjk_count);
+    fprintf(stderr,
+        "[font] bitmap bank loaded from %s (gw=%d gh=%d stride=%d "
+        "ascii=%u cjk=%u)\n",
+        path, fb_gw, fb_gh, fb_stride, fb_ascii_count, fb_cjk_count);
     fflush(stderr);
 }
 
