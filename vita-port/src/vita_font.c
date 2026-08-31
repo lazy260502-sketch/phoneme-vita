@@ -17,6 +17,23 @@
 #include <string.h>
 
 /* Hardcoded dimensions - MUST match tools/fontgen.c */
+#include <stdarg.h>
+static SceUID flog_fd = -2;
+static void flog(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    int n;
+    if (flog_fd == -2) {
+        flog_fd = sceIoOpen("ux0:/data/J2ME00001/font_debug.log",
+                            SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    }
+    if (flog_fd < 0) return;
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) sceIoWrite(flog_fd, buf, n);
+}
+
 #define GW 20
 #define GH 22
 #define STRIDE 3
@@ -57,6 +74,14 @@ static void fb_load(const char *path) {
     fb_ready = 1;
 }
 
+/* Lazy-load the bank on first use: ux0 override first, then VPK copy */
+static void fb_ensure(void) {
+    if (fb_ready) return;
+    fb_load("ux0:/data/J2ME00001/fontbitmap.bin");
+    if (!fb_ready) fb_load("app0:/data/J2ME00001/fontbitmap.bin");
+    flog("fb_load done size=%u ready=%d\n", fb_size, fb_ready);
+}
+
 /* Returns pointer to the 1bpp glyph bitmap for codepoint cp,
  * or NULL if not found. Each glyph is GH rows of STRIDE bytes. */
 static const unsigned char *fb_glyph(unsigned int cp) {
@@ -88,6 +113,7 @@ static const unsigned char *fb_glyph(unsigned int cp) {
 int gxjport_get_font_info(int face, int style, int size,
                           int *ascent, int *descent, int *leading) {
     (void)face; (void)style; (void)size;
+    fb_ensure();
     if (!fb_ready) {
         return KNI_FALSE;
     }
@@ -100,6 +126,7 @@ int gxjport_get_font_info(int face, int style, int size,
 int gxjport_get_chars_width(int face, int style, int size,
                             const jchar *charArray, int n) {
     (void)face; (void)style; (void)size; (void)charArray;
+    fb_ensure();
     if (!fb_ready) {
         return -1;
     }
@@ -121,11 +148,39 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
         return KNI_FALSE;
     }
 
+    fb_ensure();
+
     clipX1 = clip[0]; clipY1 = clip[1];
     clipX2 = clip[2]; clipY2 = clip[3];
 
     pen_x = x;
+    {
+        static int clip_logged = 0;
+        if (!clip_logged) {
+            clip_logged = 1;
+            flog("first draw clip=[%d,%d,%d,%d] dest=%dx%d fb_ready=%d\n",
+                 clip[0], clip[1], clip[2], clip[3],
+                 dest->width, dest->height, fb_ready);
+        }
+    }
 
+    /* SCREEN DUMP: save dest buffer on FIRST draw_chars call */
+    {
+        static int dumped = 0;
+        if (!dumped && dest->pixelData != NULL) {
+            dumped = 1;
+            SceUID dfd = sceIoOpen("ux0:/data/J2ME00001/screen_dump.bin",
+                                   SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+            if (dfd >= 0) {
+                sceIoWrite(dfd, dest->pixelData,
+                           dest->width * dest->height * 2);
+                sceIoClose(dfd);
+            }
+            flog("screen dumped %dx%d\n", dest->width, dest->height);
+        }
+    }
+
+    int pixels_drawn = 0;
     for (i = 0; i < n; i++) {
         unsigned int cp = (unsigned)chararray[i];
         const unsigned char *g = fb_glyph(cp);
@@ -141,6 +196,7 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
                     if (pxx < clipX1 || pxx >= clipX2) continue;
                     if (row[c >> 3] & (0x80 >> (c & 7))) {
                         dest->pixelData[py * dest->width + pxx] = color;
+                        pixels_drawn++;
                     }
                 }
             }
@@ -155,11 +211,21 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
                     if (px < clipX1 || px >= clipX2) continue;
                     if (rr == 0 || rr == 17 || cc == 0 || cc == 17) {
                         dest->pixelData[py * dest->width + px] = color;
+                        pixels_drawn++;
                     }
                 }
             }
         }
         pen_x += GW;
+    }
+
+    {
+        static int calls = 0;
+        calls++;
+        if (calls <= 10) {
+            flog("draw n=%d cp=0x%04x x=%d y=%d pixels_drawn=%d\n",
+                 n, (unsigned)chararray[0], x, y, pixels_drawn);
+        }
     }
 
     return KNI_TRUE;
