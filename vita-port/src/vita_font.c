@@ -111,7 +111,8 @@ static const unsigned char *fb_glyph(unsigned int cp) {
 int gxjport_get_font_info(int face, int style, int size,
                           int *ascent, int *descent, int *leading) {
     (void)face; (void)style; (void)size;
-    vita_font_init();
+    fb_load("ux0:/data/J2ME00001/fontbitmap.bin");
+        if (!fb_data) fb_load("app0:/data/J2ME00001/fontbitmap.bin");
     if (!fb_ready) {
         return KNI_FALSE;
     }
@@ -124,7 +125,8 @@ int gxjport_get_font_info(int face, int style, int size,
 int gxjport_get_chars_width(int face, int style, int size,
                             const jchar *charArray, int n) {
     (void)face; (void)style; (void)size; (void)charArray;
-    vita_font_init();
+    fb_load("ux0:/data/J2ME00001/fontbitmap.bin");
+        if (!fb_data) fb_load("app0:/data/J2ME00001/fontbitmap.bin");
     if (!fb_ready) {
         return -1;
     }
@@ -142,7 +144,8 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
     gxj_pixel_type color = (gxj_pixel_type)pixel;
 
     (void)dotted; (void)face; (void)style; (void)size; (void)anchor;
-    vita_font_init();
+    fb_load("ux0:/data/J2ME00001/fontbitmap.bin");
+        if (!fb_data) fb_load("app0:/data/J2ME00001/fontbitmap.bin");
 
     dest = (gxj_screen_buffer *)dst;
     if (dest == NULL || dest->pixelData == NULL) {
