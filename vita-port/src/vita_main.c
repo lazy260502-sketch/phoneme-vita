@@ -19,6 +19,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
 
 /* MIDP headers */
 #include <midpAMS.h>
@@ -30,6 +31,7 @@
 extern int runMidlet(int argc, char **argv);
 
 #include "vita_menu.h"
+#include "vita_storage.h"
 #include "vita_version.h"
 
 /* from vita_display.c: must run before the VM starts */
@@ -226,8 +228,26 @@ int main(int argc, char *argv[]) {
 
     snprintf(midp_home, sizeof(midp_home), "%s", DATA_DIR);
     setenv("MIDP_HOME", midp_home, 1);
-    midpSetAppDir(DATA_DIR "/appdb");
+
     midpSetConfigDir(DATA_DIR "/lib");
+
+    /* Per-game RMS isolation: derive appdb path from the jar so each
+     * game gets its own suite/RMS namespace (prevents save-file collision).
+     * The bundled Hello.jar uses the shared "appdb" path. */
+    {
+        char appdb_path[80];
+        get_per_game_appdb(jar_path, appdb_path, sizeof(appdb_path));
+        /* Ensure per-game appdb directory exists */
+        SceUID d = sceIoDopen(appdb_path);
+        if (d < 0) {
+            sceIoMkdir(appdb_path, 0777);
+            dlog_str("[RMS] created per-game appdb: ", appdb_path);
+        } else {
+            sceIoDclose(d);
+        }
+        midpSetAppDir(appdb_path);
+        dlog_str("[RMS] appdb: ", appdb_path);
+    }
 
     /* Java heap before the VM starts */
     setHeapParameters();

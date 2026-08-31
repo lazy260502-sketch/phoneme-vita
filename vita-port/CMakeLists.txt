@@ -143,6 +143,8 @@ add_executable(${PROJECT_NAME}
     src/vita_display.c
     src/vita_input.c
     src/vita_pcsl.c
+    src/vita_storage.c
+    src/vita_audio_javacall.c
 )
 
 # Build-time version header (git build number + hash), always regenerated
@@ -169,10 +171,12 @@ target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--no-whole-archive
     -Wl,--allow-multiple-definition
     -Wl,--start-group
+    ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm
     -lcldc_vm_ani
     -lcldc_vm_anix
     -lcldc_vmtest
+    -lpthread
     -lstdc++
     -Wl,--end-group
 )
