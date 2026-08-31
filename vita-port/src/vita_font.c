@@ -1,11 +1,12 @@
 /*
  * vita_font.c - bitmap-bank CJK/ASCII text rendering for phoneME MIDP.
  *
- * Loads a pre-rendered 1bpp bitmap bank (tools/fontgen.c output) from
- * VPK or ux0 override, and draws glyphs by table lookup + blit.
- * Covers: ASCII 0x20-0x7E, CJK 0x4E00-0x9FA5,
- *         CJK punct 0x3000-0x303F, fullwidth 0xFF01-0xFF5E,
- *         general punct 0x2010-0x2027.
+ * Loads a pre-rendered 1bpp bitmap bank (tools/fontgen.c output).
+ * No header parsing - dimensions are hardcoded to match fontgen.c.
+ * Bank layout:
+ *   bytes 0-39:  header (ignored by this code)
+ *   bytes 40+:   sequential 1bpp glyph bitmaps (20x22, 3 bytes/row)
+ *                in section order: ASCII, CJK, punct, fullwidth, gen
  */
 #include <kni.h>
 #include <gxj_putpixel.h>
@@ -15,34 +16,37 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Hardcoded dimensions - MUST match tools/fontgen.c */
 #define GW 20
 #define GH 22
-#define STRIDE ((GW + 7) / 8)
-#define GLYPH_BYTES (STRIDE * GH)
+#define STRIDE 3
+#define GLYPH_BYTES (STRIDE * GH) /* 66 */
+#define DATA_OFF 40
+
+/* Section definitions - must match fontgen.c */
+#define NSEC 5
+static const unsigned int sec_first[NSEC] = { 0x20, 0x4E00, 0x3000, 0xFF01, 0x2010 };
+static const unsigned int sec_cnt[NSEC]   = { 95, 20902, 64, 95, 24 };
 
 static unsigned char *fb_data = NULL;
 static unsigned int fb_size = 0;
 static int fb_ready = 0;
-static int fb_gw = GW, fb_gh = GH, fb_stride = STRIDE;
-static int fb_ascent = 18;
+
+/* Section base pointers into fb_data (computed after load) */
+static const unsigned char *sec_base[NSEC];
 
 static void fb_load(const char *path) {
     SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-    SceIoStat st;
     if (fd < 0) {
         return;
     }
-    if (sceIoGetstatByFd(fd, &st) < 0 || st.st_size < 40) {
-        sceIoClose(fd);
-        return;
-    }
-    fb_size = (unsigned int)st.st_size;
+    fb_size = (unsigned int)sceIoLseek(fd, 0, SCE_SEEK_END);
+    sceIoLseek(fd, 0, SCE_SEEK_SET);
     fb_data = (unsigned char *)malloc(fb_size);
     if (fb_data == NULL) {
         sceIoClose(fd);
         return;
     }
-    sceIoLseek(fd, 0, SCE_SEEK_SET);
     if (sceIoRead(fd, fb_data, fb_size) != (int)fb_size) {
         free(fb_data);
         fb_data = NULL;
@@ -50,56 +54,29 @@ static void fb_load(const char *path) {
         return;
     }
     sceIoClose(fd);
-    if (memcmp(fb_data, "FBMP", 4) != 0) {
-        free(fb_data);
-        fb_data = NULL;
-        return;
-    }
     fb_ready = 1;
-    fprintf(stderr, "[font] bitmap bank loaded (%u bytes)\n", fb_size);
-    fflush(stderr);
 }
 
-/* Section descriptors in the bank.
- * Each section: first_codepoint, count, then bitmaps sequentially.
- * Must match tools/fontgen.c section generation order. */
-#define NSEC 5
-static const unsigned int sec_first[NSEC] = {
-    0x20,   /* ASCII */
-    0x4E00, /* CJK Unified Ideographs */
-    0x3000, /* CJK Symbols and Punctuation */
-    0xFF01, /* Fullwidth Forms */
-    0x2010, /* General Punctuation dash/quotes */
-};
-static const unsigned int sec_count[NSEC] = {
-    95,   /* 0x20-0x7E */
-    20902,/* 0x4E00-0x9FA5 */
-    64,   /* 0x3000-0x303F */
-    95,   /* 0xFF01-0xFF5E */
-    24,   /* 0x2010-0x2027 */
-};
-
+/* Returns pointer to the 1bpp glyph bitmap for codepoint cp,
+ * or NULL if not found. Each glyph is GH rows of STRIDE bytes. */
 static const unsigned char *fb_glyph(unsigned int cp) {
-    static const unsigned char *sections[NSEC];
-    static int sections_init = 0;
-
+    static int init = 0;
+    static const unsigned char *base[NSEC];
     if (!fb_ready) {
         return NULL;
     }
-    if (!sections_init) {
-        const unsigned char *p = fb_data + 40; /* data starts at byte 40 */
+    if (!init) {
+        const unsigned char *p = fb_data + DATA_OFF;
         int s;
         for (s = 0; s < NSEC; s++) {
-            sections[s] = p;
-            p += (unsigned int)sec_count[s] * GLYPH_BYTES;
+            base[s] = p;
+            p += (unsigned int)sec_cnt[s] * GLYPH_BYTES;
         }
-        sections_init = 1;
+        init = 1;
     }
-
     for (int s = 0; s < NSEC; s++) {
-        if (cp >= sec_first[s] && cp < sec_first[s] + sec_count[s]) {
-            return sections[s] +
-                   (unsigned)(cp - sec_first[s]) * GLYPH_BYTES;
+        if (cp >= sec_first[s] && cp < sec_first[s] + sec_cnt[s]) {
+            return base[s] + (unsigned)(cp - sec_first[s]) * GLYPH_BYTES;
         }
     }
     return NULL;
@@ -111,12 +88,10 @@ static const unsigned char *fb_glyph(unsigned int cp) {
 int gxjport_get_font_info(int face, int style, int size,
                           int *ascent, int *descent, int *leading) {
     (void)face; (void)style; (void)size;
-    fb_load("ux0:/data/J2ME00001/fontbitmap.bin");
-        if (!fb_data) fb_load("app0:/data/J2ME00001/fontbitmap.bin");
     if (!fb_ready) {
         return KNI_FALSE;
     }
-    if (ascent)  *ascent  = fb_gh - 4;
+    if (ascent)  *ascent  = GH - 4;
     if (descent) *descent = 4;
     if (leading) *leading = 0;
     return KNI_TRUE;
@@ -125,39 +100,29 @@ int gxjport_get_font_info(int face, int style, int size,
 int gxjport_get_chars_width(int face, int style, int size,
                             const jchar *charArray, int n) {
     (void)face; (void)style; (void)size; (void)charArray;
-    fb_load("ux0:/data/J2ME00001/fontbitmap.bin");
-        if (!fb_data) fb_load("app0:/data/J2ME00001/fontbitmap.bin");
     if (!fb_ready) {
         return -1;
     }
-    return n * GW; /* fixed-width bank */
+    return n * GW;
 }
 
 int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
                        int face, int style, int size,
                        int x, int y, int anchor,
                        const jchar *chararray, int n) {
-    gxj_screen_buffer tmp;
-    gxj_screen_buffer *dest;
+    gxj_screen_buffer *dest = (gxj_screen_buffer *)dst;
     int i, pen_x;
     int clipX1, clipY1, clipX2, clipY2;
     gxj_pixel_type color = (gxj_pixel_type)pixel;
 
     (void)dotted; (void)face; (void)style; (void)size; (void)anchor;
-    fb_load("ux0:/data/J2ME00001/fontbitmap.bin");
-        if (!fb_data) fb_load("app0:/data/J2ME00001/fontbitmap.bin");
 
-    dest = (gxj_screen_buffer *)dst;
     if (dest == NULL || dest->pixelData == NULL) {
         return KNI_FALSE;
     }
 
     clipX1 = clip[0]; clipY1 = clip[1];
     clipX2 = clip[2]; clipY2 = clip[3];
-    if (clipX1 < 0) clipX1 = 0;
-    if (clipY1 < 0) clipY1 = 0;
-    if (clipX2 > dest->width)  clipX2 = dest->width;
-    if (clipY2 > dest->height) clipY2 = dest->height;
 
     pen_x = x;
 
@@ -166,7 +131,6 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
         const unsigned char *g = fb_glyph(cp);
 
         if (g != NULL) {
-            /* draw 20x22 1bpp bitmap, MSB-first per row */
             int r, c;
             for (r = 0; r < GH; r++) {
                 int py = y + r;
@@ -181,16 +145,16 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
                 }
             }
         } else if (cp >= 0x2E80) {
-            /* tofu box: 18x18 hollow square for missing CJK */
-            int r, c;
-            for (r = 0; r < 18; r++) {
-                int py = y + r;
+            /* tofu box for missing CJK glyphs */
+            int rr, cc;
+            for (rr = 0; rr < 18; rr++) {
+                int py = y + rr;
                 if (py < clipY1 || py >= clipY2) continue;
-                for (c = 0; c < 18; c++) {
-                    int pxx = pen_x + c;
-                    if (pxx < clipX1 || pxx >= clipX2) continue;
-                    if (r == 0 || r == 17 || c == 0 || c == 17) {
-                        dest->pixelData[py * dest->width + pxx] = color;
+                for (cc = 0; cc < 18; cc++) {
+                    int px = pen_x + cc;
+                    if (px < clipX1 || px >= clipX2) continue;
+                    if (rr == 0 || rr == 17 || cc == 0 || cc == 17) {
+                        dest->pixelData[py * dest->width + px] = color;
                     }
                 }
             }
