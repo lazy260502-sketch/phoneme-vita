@@ -212,6 +212,12 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### 中文字库扩容 + 自描述 header（2026-09-01，samples b593d80/a9c1049）
+- fontgen 新增 4 段：带圈数字 0x2460、希腊 0x0386、CJK 尾段 0x9FA6-0x9FFF、半角片假名 0xFF61（共 21429 字形，1.41MB）
+- bank header 升级为自描述（magic "J2FB" v1：nsec/gw/gh/stride/data_off/段表），**vita_font.c 加载时动态解析并校验**——以后扩段只改 fontgen.c，运行时零改动
+- **构建资产已入库**：`config/font.ttf`（16MB，fontgen 唯一输入，此前被顶层 `*.bin`/缺失规则挡在库外！）和 `config/fontbitmap.bin`；tools/font.ttf 重复副本已删；重生成用 `tools/gen_font.sh`（必须 `/usr/bin/gcc-11 -B/usr/bin`，PATH 里的 vitasdk gcc 是 ARM 交叉工具）
+- Vita 端已知空缺：半角 ｱ(U+FF71) 等个别字形该字体缺失（62/63 覆盖）；CJK Ext-A（0x3400 段）未纳入，需要时在 fontgen.c 加段即可
+
 ### 音频/MMAPI 集成（2026-09-01，samples b29d725 / phoneme-midp 9240db2 / phoneme-cldc 4000337）
 - **JSR-135 已进构建**：`build_vita.sh` 开 `USE_JSR_135=true`；javax.microedition.media + com.sun.mmedia 共 228 类已 ROM 化（ROMLog 3442 处引用）；jsr135 KNI 对象（31 个）进 `obj/arm/libobj.a`；nativeFunctionTable 含 nPlayTone 等 247 条
 - **javacall 层**：`vita_audio_javacall.c` 目前只实现 playTone（SceAudioOut 合成方波）+ 24 个符号；头文件声明的 87 个 media 函数中 ~63 个未实现（realize/prefetch/start 等 DirectPlayer 路径）——但链接零错误，因当前 caps 只声明 tone，Java 层不会走未实现路径。**WAV 文件播放是下一迭代**
