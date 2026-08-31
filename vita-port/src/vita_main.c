@@ -252,6 +252,18 @@ int main(int argc, char *argv[]) {
     /* Java heap before the VM starts */
     setHeapParameters();
 
+    /* ANI thread pool init: the ANI blocking framework (used by async
+     * media/network paths, e.g. a game calling Manager.createPlayer on an
+     * http resource) signals statically-allocated pool events, but nothing
+     * in the CLDC-HI startup ever calls ANI_Initialize - the events stay
+     * NULL and the first use crashes in pthread_mutex_unlock(NULL->mutex).
+     * Initialize the pool explicitly before the VM starts. */
+    {
+        extern void ANI_Initialize(void);
+        ANI_Initialize();
+        dlog("[ANI] thread pool initialized\n");
+    }
+
     /* runMidlet arguments:
      *   -classpathext + <jar list> -> additional classpath (getClassPathPlus)
      *   "internal"                 -> INTERNAL_SUITE_ID (no AMS install)
