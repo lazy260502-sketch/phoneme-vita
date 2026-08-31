@@ -33,6 +33,7 @@ static stbtt_fontinfo font_info;
 static int font_loaded = 0;
 
 static int try_load_font(const char *path) {
+    fprintf(stderr, "[font] trying %s\n", fflush(stderr), path), fflush(stderr);
     SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
     long size, total = 0;
     unsigned char *buf;
@@ -62,7 +63,11 @@ static int try_load_font(const char *path) {
     }
     sceIoClose(fd);
 
+    fprintf(stderr, "[font] read %s: %ld/%ld bytes\n", path, (long)total, (long)size);
+    fflush(stderr);
     if (total != size || stbtt_InitFont(&font_info, buf, 0) == 0) {
+        fprintf(stderr, "[font] stbtt_InitFont FAILED\n");
+        fflush(stderr);
         free(buf);
         return 0;
     }
@@ -154,10 +159,22 @@ static Glyph *glyph_get(unsigned int cp, int sc, int st) {
         return NULL;
     }
 
-    idx = stbtt_FindGlyphIndex(&font_info, (int)cp);
-    mask = stbtt_GetGlyphBitmap(&font_info, 0, scale_for(sc), idx,
-                                &aw, &ah, &xo, &yo);
-    stbtt_GetGlyphHMetrics(&font_info, idx, &adv, NULL);
+    {
+        static int first_trace = 1;
+        unsigned long long t0 = sceKernelGetProcessTimeWide();
+        idx = stbtt_FindGlyphIndex(&font_info, (int)cp);
+        mask = stbtt_GetGlyphBitmap(&font_info, scale_for(sc),
+                                    scale_for(sc), idx, &aw, &ah, &xo, &yo);
+        stbtt_GetGlyphHMetrics(&font_info, idx, &adv, NULL);
+        if (first_trace || aw == 0 || idx == 0) {
+            fprintf(stderr,
+                "[font] glyph cp=0x%04x idx=%d bitmap=%dx%d took=%llums\n",
+                cp, idx, aw, ah,
+                (sceKernelGetProcessTimeWide() - t0) / 1000ULL);
+            fflush(stderr);
+            first_trace = 0;
+        }
+    }
 
     if (mask != NULL && aw > 0 && ah > 0) {
         if (st & 1) { /* bold: cheap one-pixel alpha smear to the right */
@@ -272,8 +289,16 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
     (void)dotted;
     vita_font_init();
     if (!font_loaded || chararray == NULL || n <= 0) {
+        fprintf(stderr,
+            "[font] draw_chars FALLBACK to builtin (loaded=%d n=%d)\n",
+            font_loaded, n);
+        fflush(stderr);
         return KNI_FALSE; /* let gxj_text.c draw ASCII via built-in font */
     }
+    fprintf(stderr,
+        "[font] draw_chars n=%d first_cp=0x%04x clip=(%d,%d,%d,%d)\n",
+        n, chararray[0], clip[0], clip[1], clip[2], clip[3]);
+    fflush(stderr);
 
     dest = gxj_get_image_screen_buffer_impl(
         (const java_imagedata *)dst, &tmp, NULL);
@@ -393,5 +418,7 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
         pen_x += (int)(g->advance * scale + 0.5f);
     }
 
+    fprintf(stderr, "[font] draw_chars done, pen_x=%d\n", pen_x);
+    fflush(stderr);
     return KNI_TRUE;
 }
