@@ -67,22 +67,25 @@ static void fb_load(const char *path) {
         sceIoClose(fd);
         return;
     }
-    /* layout as written by tools/fontgen.c (verified by byte dump):
-     *   u16@12 GW, u16@16 GH, u16@20 STRIDE, u32@24 data_off,
-     *   u32@28 ascii_count, u32@32 cjk_first(0x4E00), u32@36 cjk_count
+    /* Exact layout dumped from fontbitmap.bin:
+     *   u16@6  = GW, byte@8 = GH, u16@10 = STRIDE,
+     *   u32@12 = data_off, u32@16 = ascii_first(0x20),
+     *   u32@20 = ascii_count(95), u32@24 = cjk_data_off,
+     *   u32@28 = cjk_first(0x4E00), u32@32 = cjk_count(20902)
      */
-    fb_gw     = hdr[12] | (hdr[13] << 8);
-    fb_gh     = hdr[16] | (hdr[17] << 8);
-    fb_stride = hdr[20] | (hdr[21] << 8);
-    data_off  = (unsigned)hdr[24] | ((unsigned)hdr[25] << 8) |
-                ((unsigned)hdr[26] << 16) | ((unsigned)hdr[27] << 24);
-    fb_ascii_count = (unsigned)hdr[28] | ((unsigned)hdr[29] << 8) |
+    fb_gw     = hdr[6]  | (hdr[7]  << 8);
+    fb_gh     = hdr[8];
+    fb_stride = hdr[10] | (hdr[11] << 8);
+    data_off  = (unsigned)hdr[12] | ((unsigned)hdr[13] << 8) |
+                ((unsigned)hdr[14] << 16) | ((unsigned)hdr[15] << 24);
+    fb_ascii_first = (unsigned)hdr[16] | ((unsigned)hdr[17] << 8) |
+                     ((unsigned)hdr[18] << 16) | ((unsigned)hdr[19] << 24);
+    fb_ascii_count = (unsigned)hdr[20] | ((unsigned)hdr[21] << 8) |
+                     ((unsigned)hdr[22] << 16) | ((unsigned)hdr[23] << 24);
+    fb_cjk_first   = (unsigned)hdr[28] | ((unsigned)hdr[29] << 8) |
                      ((unsigned)hdr[30] << 16) | ((unsigned)hdr[31] << 24);
-    fb_cjk_first   = (unsigned)hdr[32] | ((unsigned)hdr[33] << 8) |
+    fb_cjk_count   = (unsigned)hdr[32] | ((unsigned)hdr[33] << 8) |
                      ((unsigned)hdr[34] << 16) | ((unsigned)hdr[35] << 24);
-    fb_cjk_count   = (unsigned)hdr[36] | ((unsigned)hdr[37] << 8) |
-                     ((unsigned)hdr[38] << 16) | ((unsigned)hdr[39] << 24);
-    fb_ascii_first = 0x20;
 
     fb_size = data_off + (unsigned)fb_ascii_count * GLYPH_BYTES +
               (unsigned)fb_cjk_count * GLYPH_BYTES;
@@ -220,16 +223,56 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
     pixel_color_cache = (gxj_pixel_type)pixel;
     pen_x = x;
 
-    /* one-time diagnostics: prove draw_chars runs and show its inputs */
+    /* ---- ONE-SHOT DECISIVE DIAGNOSTIC ----
+     * 1) log pointer identity: is dst the system screen buffer?
+     * 2) paint 4 corner color markers DIRECTLY into dest->pixelData.
+     *    If they show up on screen, the buffer is the displayed one and
+     *    any missing text is a glyph-content issue. If not, dest is not
+     *    the displayed buffer. No more guessing. */
     {
         static int diag_done = 0;
         if (!diag_done) {
+            extern gxj_screen_buffer gxj_system_screen_buffer;
+            gxj_pixel_type *px = dest->pixelData;
             diag_done = 1;
-            flog("draw_chars entry: fb_ready=%d n=%d first_cp=0x%04x "
-                 "clip=(%d,%d,%d,%d) dest=%dx%d x=%d y=%d\n",
+            flog("dst=%p sysbuf=%p same=%d\n",
+                 dst, (void *)&gxj_system_screen_buffer,
+                 dst == (void *)&gxj_system_screen_buffer);
+            flog("dest=%dx%d pixelData=%p alphaData=%p\n",
+                 dest->width, dest->height,
+                 (void *)dest->pixelData, (void *)dest->alphaData);
+            flog("entry: fb_ready=%d n=%d first_cp=0x%04x clip=(%d,%d,%d,%d) "
+                 "x=%d y=%d\n",
                  fb_ready, n, (unsigned)chararray[0],
-                 clip[0], clip[1], clip[2], clip[3],
-                 dest->width, dest->height, x, y);
+                 clip[0], clip[1], clip[2], clip[3], x, y);
+            if (px != NULL && dest->width > 80 && dest->height > 80) {
+                int m, k;
+                /* corners: TL=white TR=red BL=green BR=blue (RGB565) */
+                const gxj_pixel_type col[4] =
+                    { 0xFFFF, 0xF800, 0x07E0, 0x001F };
+                const int cx[4] = { 0, dest->width - 40,
+                                    0, dest->width - 40 };
+                const int cy[4] = { 0, 0,
+                                    dest->height - 40, dest->height - 40 };
+                for (m = 0; m < 4; m++) {
+                    int written = 0;
+                    for (k = 0; k < 40; k++) {
+                        int yy = cy[m] + k;
+                        int xx;
+                        if (yy < 0 || yy >= dest->height) continue;
+                        for (xx = 0; xx < 40; xx++) {
+                            int xpos = cx[m] + xx;
+                            if (xpos < 0 || xpos >= dest->width) continue;
+                            px[yy * dest->width + xpos] = col[m];
+                            written++;
+                        }
+                    }
+                    flog("marker[%d] wrote %d px at (%d,%d)\n",
+                         m, written, cx[m], cy[m]);
+                }
+                flog("first glyph bitcount check next; screen NOW has "
+                     "4 corner squares if buffer is displayed\n");
+            }
         }
     }
 
@@ -237,10 +280,16 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
         unsigned int cp = (unsigned)chararray[i];
         const unsigned char *g = fb_glyph(cp);
         {
-            static int char_diag = 40;
-            if (char_diag > 0) {
+            static int char_diag = 8;
+            if (char_diag > 0 && g != NULL) {
                 char_diag--;
-                flog("ch cp=0x%04x glyph=%s\n", cp, g ? "ok" : "MISSING");
+                int row, bits = 0;
+                for (row = 0; row < fb_gh; row++) {
+                    const unsigned char *r8 = g + row * fb_stride;
+                    bits += (r8[0] ? 1 : 0) + (r8[1] ? 1 : 0) +
+                            (fb_stride > 2 && r8[2] ? 1 : 0);
+                }
+                flog("ch cp=0x%04x glyph_rows_nonblank=%d/22\n", cp, bits);
             }
         }
         if (g == NULL) {
@@ -271,6 +320,15 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
                     int px = pen_x + c2;
                     if (px < clipX1 || px >= clipX2) continue;
                     if (row[c2 >> 3] & (0x80 >> (c2 & 7))) {
+                        static int first_px_logged = 0;
+                        if (!first_px_logged) {
+                            first_px_logged = 1;
+                            flog("first glyph px written: addr=%p "
+                                 "(x=%d y=%d) color=0x%04x\n",
+                                 (void *)&dest->pixelData[
+                                     py * dest->width + px],
+                                 px, py, (unsigned)pixel_color_cache);
+                        }
                         dest->pixelData[py * dest->width + px] =
                             pixel_color_cache;
                     }
