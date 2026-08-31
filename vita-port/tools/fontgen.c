@@ -91,28 +91,23 @@ int main(int argc, char **argv) {
                                    : (CJK_FIRST + i - ASCII_COUNT);
         int idx = stbtt_FindGlyphIndex(&info, cp);
         int aw = 0, ah = 0, xo = 0, yo = 0;
-        unsigned char *mask = stbtt_GetGlyphBitmap(&info, 0, scale, idx,
+        unsigned char *mask = stbtt_GetGlyphBitmap(&info, scale, scale, idx,
                                                    &aw, &ah, &xo, &yo);
         unsigned char *dst = bank + out_off + (unsigned long)i * GLYPH_BYTES;
         if (mask != NULL && aw > 0 && ah > 0) {
-            int asc_px = (int)(asc * scale + 0.5f);
-            int base_y = 2 + asc_px;             /* baseline row in cell */
             int x, y;
-            for (y = 0; y < ah; y++) {
-                int dy = base_y - yo + y;
-                for (x = 0; x < aw; x++) {
+            /* Place glyph from cell top-left, no baseline math.
+             * CJK glyphs fill the em square so top-left placement
+             * is correct for a fixed-size bitmap cell. */
+            for (y = 0; y < ah && y < GH; y++) {
+                for (x = 0; x < aw && x < GW; x++) {
                     unsigned char a = mask[y * aw + x];
-                    int dx = xo + x;
-                    if (a >= 128 && dy >= 0 && dy < GH &&
-                        dx >= 0 && dx < GW) {
-                        dst[dy * STRIDE + (dx >> 3)] |= (0x80 >> (dx & 7));
+                    if (a >= 100) {
+                        dst[y * STRIDE + (x >> 3)] |= (0x80 >> (x & 7));
                     }
                 }
             }
-            if (cp == 0x88C5 || cp == 'A') {
-                printf("glyph cp=0x%04X aw=%d ah=%d yo=%d base_y=%d\n",
-                       cp, aw, ah, yo, base_y);
-            }
+
             stbtt_FreeBitmap(mask, NULL);
             if (i < ASCII_COUNT) ascii_drawn++; else cjk_drawn++;
         }
