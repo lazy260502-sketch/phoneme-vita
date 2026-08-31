@@ -199,15 +199,16 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
     (void)dotted; (void)face; (void)style; (void)size; (void)anchor;
     vita_font_init();
 
-    dest = gxj_get_image_screen_buffer_impl(
-        (const java_imagedata *)dst, &tmp, NULL);
+    /* gxj_text.c already resolved dst into a gxj_screen_buffer* (stack
+     * copy for images, &gxj_system_screen_buffer for the screen) before
+     * calling us - re-interpreting it as java_imagedata produced garbage
+     * (dest=320x-2 billion) and all pixels went to wild memory. Just
+     * cast it. */
+    (void)tmp;
+    dest = (gxj_screen_buffer *)dst;
     if (dest == NULL) {
         return KNI_FALSE;
     }
-    /* Same rule as gxj_text.c: a null imagedata means "the system screen
-     * buffer" - our tmp would then be garbage (height=-2 billion), and
-     * all glyph pixels were being written to wild memory. */
-    dest = (gxj_screen_buffer *)getScreenBuffer(dest);
 
     clipX1 = clip[0]; clipY1 = clip[1];
     clipX2 = clip[2]; clipY2 = clip[3];
