@@ -15,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <unistd.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -28,8 +27,6 @@
 #include <heap.h>
 
 extern int runMidlet(int argc, char **argv);
-
-#include "vita_menu.h"
 
 /* from vita_display.c: must run before the VM starts */
 extern void vita_display_set_orientation(int landscape);
@@ -152,53 +149,20 @@ int main(int argc, char *argv[]) {
     sceIoMkdir(DATA_DIR "/appdb", 0777);
     sceIoMkdir(DATA_DIR "/lib", 0777);
 
-    /* CRITICAL: run from the data dir and keep ALL VM classpath entries
-     * RELATIVE. The CLDC classpath splits on ':' - an entry like
-     * "ux0:/data/..." gets cut at the colon into "ux0" + "/data/..."
-     * (system classes only loaded by luck: the second fragment happened
-     * to resolve inside app0:). With chdir, "midp_system.jar",
-     * "games/x/game.jar" etc. contain no colon at all. */
-    if (chdir(DATA_DIR) < 0) {
-        dlog("WARNING: sceIoChdir to data dir failed\n");
-    }
-
     /* Default game = bundled Hello.jar; launch.cfg overrides.
      * launch.cfg lines: <jar path> / <class> / [portrait|landscape] */
     copy_file("app0:/data/J2ME00001/Hello.jar", DATA_DIR "/Hello.jar");
-    snprintf(jar_path, sizeof(jar_path), "Hello.jar");
+    snprintf(jar_path, sizeof(jar_path), DATA_DIR "/Hello.jar");
     snprintf(class_name, sizeof(class_name), "HelloMIDlet");
     snprintf(orient, sizeof(orient), "portrait");
-    /* Native game menu: pick an installed game (see vita_menu.c for the
-     * games/ + inbox/ layout). Falls through to launch.cfg / Hello when
-     * the user quits the menu without a selection. */
-    {
-        VitaGameSel sel;
-        sceIoMkdir(DATA_DIR "/games", 0777);
-        sceIoMkdir(DATA_DIR "/inbox", 0777);
-        if (vita_menu_run(&sel)) {
-            snprintf(jar_path, sizeof(jar_path), "%s", sel.jar);
-            snprintf(class_name, sizeof(class_name), "%s", sel.cls);
-            snprintf(orient, sizeof(orient), "%s", sel.orient);
-            /* VM classpath splits on ':' - strip "ux0:/data/J2ME00001/"
-             * so the entry is RELATIVE (see chdir above) */
-            {
-                size_t plen = strlen(DATA_DIR "/");
-                if (strncmp(jar_path, DATA_DIR "/", plen) == 0) {
-                    memmove(jar_path, jar_path + plen, strlen(jar_path) - plen + 1);
-                }
-            }
-            dlog_str("menu jar: ", jar_path);
-            dlog_str("menu class: ", class_name);
-            dlog_str("menu orientation: ", orient);
-        } else if (read_launch_cfg(jar_path, sizeof(jar_path),
-                                   class_name, sizeof(class_name),
-                                   orient, sizeof(orient)) == 0) {
+    if (read_launch_cfg(jar_path, sizeof(jar_path),
+                        class_name, sizeof(class_name),
+                        orient, sizeof(orient)) == 0) {
         dlog_str("launch.cfg jar: ", jar_path);
         dlog_str("launch.cfg class: ", class_name);
         dlog_str("launch.cfg orientation: ", orient);
     } else {
-            dlog("launch.cfg not found, defaults in use");
-        }
+        dlog("launch.cfg not found, defaults in use");
     }
 
     {
@@ -217,11 +181,6 @@ int main(int argc, char *argv[]) {
                   DATA_DIR "/lib/system.config");
     }
 
-    /* keep the runtime midp_system.jar in sync with the VPK build (it
-     * gains new classes - e.g. Nokia UI stubs - with every release) */
-    copy_file("app0:/data/J2ME00001/midp_system.jar",
-              DATA_DIR "/midp_system.jar");
-
     snprintf(midp_home, sizeof(midp_home), "%s", DATA_DIR);
     setenv("MIDP_HOME", midp_home, 1);
     midpSetAppDir(DATA_DIR "/appdb");
@@ -235,7 +194,7 @@ int main(int argc, char *argv[]) {
      *   "internal"                 -> INTERNAL_SUITE_ID (no AMS install)
      *   <classname>                -> MIDlet to launch                       */
     snprintf(classpath, sizeof(classpath),
-             "midp_system.jar:%s", jar_path);
+             DATA_DIR "/midp_system.jar:%s", jar_path);
 
     char *run_argv[] = {
         "runMidlet",
