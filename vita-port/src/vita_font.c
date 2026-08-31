@@ -10,10 +10,36 @@
  */
 #include <kni.h>
 #include <gxj_putpixel.h>
+#include "gxj_intern_graphics.h" /* getScreenBuffer: dst==NULL means the
+                                    system screen buffer on this port */
 #include <psp2/io/fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Direct-to-file diagnostics: the CLDC VM rebinds stdio to tty0 at
+ * startup, so fprintf(stderr) from inside the VM never reaches
+ * midp_stderr.log. This logger keeps its own fd. */
+static SceUID font_log_fd = -2;
+static void flog(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    int n;
+    if (font_log_fd == -2) {
+        font_log_fd = sceIoOpen("ux0:/data/J2ME00001/font_debug.log",
+                                SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    }
+    if (font_log_fd < 0) {
+        return;
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        sceIoWrite(font_log_fd, buf, n);
+    }
+}
 
 #define GW 20
 #define GH 22
@@ -178,6 +204,10 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
     if (dest == NULL) {
         return KNI_FALSE;
     }
+    /* Same rule as gxj_text.c: a null imagedata means "the system screen
+     * buffer" - our tmp would then be garbage (height=-2 billion), and
+     * all glyph pixels were being written to wild memory. */
+    dest = (gxj_screen_buffer *)getScreenBuffer(dest);
 
     clipX1 = clip[0]; clipY1 = clip[1];
     clipX2 = clip[2]; clipY2 = clip[3];
@@ -189,9 +219,29 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
     pixel_color_cache = (gxj_pixel_type)pixel;
     pen_x = x;
 
+    /* one-time diagnostics: prove draw_chars runs and show its inputs */
+    {
+        static int diag_done = 0;
+        if (!diag_done) {
+            diag_done = 1;
+            flog("draw_chars entry: fb_ready=%d n=%d first_cp=0x%04x "
+                 "clip=(%d,%d,%d,%d) dest=%dx%d x=%d y=%d\n",
+                 fb_ready, n, (unsigned)chararray[0],
+                 clip[0], clip[1], clip[2], clip[3],
+                 dest->width, dest->height, x, y);
+        }
+    }
+
     for (i = 0; i < n; i++) {
         unsigned int cp = (unsigned)chararray[i];
         const unsigned char *g = fb_glyph(cp);
+        {
+            static int char_diag = 40;
+            if (char_diag > 0) {
+                char_diag--;
+                flog("ch cp=0x%04x glyph=%s\n", cp, g ? "ok" : "MISSING");
+            }
+        }
         if (g == NULL) {
             /* tofu box for CJK, blank space otherwise */
             if ((cp >= 0x2E80 && cp <= 0x9FFF) ||
