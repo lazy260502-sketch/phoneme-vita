@@ -230,6 +230,7 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
     FILE     ${PORT_DIR}/config/system.config            data/J2ME00001/lib/system.config
     FILE     ${MIDP_SYSTEM_JAR}                  data/J2ME00001/midp_system.jar
     FILE     ${PORT_DIR}/config/font.ttf         data/J2ME00001/font.ttf
+    FILE     ${PORT_DIR}/config/fontbitmap.bin    data/J2ME00001/fontbitmap.bin
     FILE     ${MIDLET_JAR}                       data/J2ME00001/Hello.jar
     ${VITA_SKIN_FILE_ARGS}
 )
