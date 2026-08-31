@@ -30,6 +30,7 @@
 extern int runMidlet(int argc, char **argv);
 
 #include "vita_menu.h"
+#include "vita_version.h"
 
 /* from vita_display.c: must run before the VM starts */
 extern void vita_display_set_orientation(int landscape);
@@ -146,6 +147,7 @@ int main(int argc, char *argv[]) {
     setvbuf(stderr, NULL, _IONBF, 0);
 
     dlog("vita-port J2ME launcher\n");
+    dlog("version: " VITA_PORT_VERSION_STRING "\n");
 
     /* Writable runtime dirs */
     sceIoMkdir(DATA_DIR, 0777);

@@ -145,6 +145,21 @@ add_executable(${PROJECT_NAME}
     src/vita_pcsl.c
 )
 
+# Build-time version header (git build number + hash), always regenerated
+set(VERSION_HEADER ${CMAKE_CURRENT_BINARY_DIR}/vita_version.h)
+add_custom_target(gen_version ALL
+    COMMAND ${CMAKE_COMMAND}
+        -DVERSION_FILE=${VERSION_HEADER}
+        -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -DAPP_VER=${VITA_VERSION}
+        -DAPP_NAME=${VITA_APP_NAME}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenVersion.cmake
+    BYPRODUCTS ${VERSION_HEADER}
+    COMMENT "Generating vita_version.h")
+add_dependencies(${PROJECT_NAME} gen_version)
+
+target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
 add_dependencies(${PROJECT_NAME} libobj_target)
 
 target_link_options(${PROJECT_NAME} PRIVATE
@@ -225,6 +240,10 @@ endforeach()
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
     VERSION  ${VITA_VERSION}
     NAME     ${VITA_APP_NAME}
+    FILE     ${PORT_DIR}/assets/sce_sys/icon0.png                         sce_sys/icon0.png
+    FILE     ${PORT_DIR}/assets/sce_sys/livearea/contents/bg.png          sce_sys/livearea/contents/bg.png
+    FILE     ${PORT_DIR}/assets/sce_sys/livearea/contents/startup.png     sce_sys/livearea/contents/startup.png
+    FILE     ${PORT_DIR}/assets/sce_sys/livearea/contents/template.xml    sce_sys/livearea/contents/template.xml
     FILE     ${PORT_DIR}/config/internal.config          data/J2ME00001/lib/internal.config
     FILE     ${PORT_DIR}/config/internal.landscape.config data/J2ME00001/lib/internal.landscape.config
     FILE     ${PORT_DIR}/config/system.config            data/J2ME00001/lib/system.config

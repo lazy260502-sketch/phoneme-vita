@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<livearea style="a1" format-ver="01.00" content-ver="01.00">
+	<livearea-background>
+		<image>bg.png</image>
+	</livearea-background>
+	<frame id="frame1">
+		<liveitem>
+			<text align="left" text-align="left" text-valign="middle" line-space="26" font-size="28" color="#eef4f8" shadow-color="#000000" shadow-radius="5">
+				J2ME Player
+phoneME MIDP 2.0
+			</text>
+		</liveitem>
+	</frame>
+	<frame id="frame2">
+		<liveitem>
+			<image>startup.png</image>
+		</liveitem>
+	</frame>
+</livearea>

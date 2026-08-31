@@ -34,6 +34,7 @@
 #include <zlib.h>
 
 #include "vita_menu.h"
+#include "vita_version.h"
 
 #define GAMES_DIR "ux0:/data/J2ME00001/games"
 #define INBOX_DIR "ux0:/data/J2ME00001/inbox"
@@ -688,6 +689,7 @@ int vita_menu_run(VitaGameSel *out) {
         fill_rect(0, 0, FB_W, FB_H, C_BG);
         fill_rect(0, 0, FB_W, 52, C_PANEL);
         draw_text(20, 14, "J2ME Player", 4, C_TITLE);
+        draw_textf(300, 22, 2, C_HINT, "%s", VITA_PORT_VERSION_STRING);
         draw_textf(760, 20, 2, C_HINT, "%d game(s)", game_count);
 
         y = 64;
