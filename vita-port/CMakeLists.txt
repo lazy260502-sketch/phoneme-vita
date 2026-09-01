@@ -188,6 +188,7 @@ target_link_options(${PROJECT_NAME} PRIVATE
     ${MIDP_OBJ_DIR}/runMidlet.o
     -Wl,--no-whole-archive
     -Wl,--allow-multiple-definition
+    -Wl,-e,_start
     ${ANI_OBJ_DIR}/ani.o
     ${ANI_OBJ_DIR}/ani_bsd_socket.o
     ${ANI_OBJ_DIR}/os_port.o
@@ -224,7 +225,7 @@ target_link_libraries(${PROJECT_NAME}
 #==============================================================================
 # VPK packaging (config copies carry the 240x320 virtual screen)
 #==============================================================================
-vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} MEMSIZE 128)
+vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} MEMSIZE 128 MODULE_ENTRY "_start,_exit,_exit")
 
 set(MIDLET_JAR ${PORT_DIR}/build/midlet/jar/Hello.jar)
 set(MIDP_SYSTEM_JAR ${MIDP_BUILD}/classes/midp_system.jar)
@@ -283,3 +284,12 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
         DESTINATION .
         RENAME ${VITA_TITLEID}.vpk)
+
+# The SCE elf converter picks a wrong e_entry (an unrelated midpStorage
+# function) after our link-order changes; -Wl,-e and vita-elf-create's
+# -m are both ignored. Patch the entry back to the ELF's real entry
+# (_start) in the generated velf, before fself/vpk consume it.
+add_custom_command(TARGET midp_vita-velf POST_BUILD
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/patch_velf_entry.py
+            ${CMAKE_CURRENT_BINARY_DIR}/midp_vita.velf
+            ${CMAKE_CURRENT_BINARY_DIR}/midp_vita)
