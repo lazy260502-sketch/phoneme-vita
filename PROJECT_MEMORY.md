@@ -212,6 +212,12 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### 游戏卡死修复：playTone 同步阻塞冻结 VM（2026-09-01，samples 64652d4）
+- **症状**：ANI 修复后的 VPK，游戏运行中卡死不动、无任何异常日志
+- **根因**：`javacall_media_play_tone` 原实现是**同步阻塞**——生成 PCM 后逐块 `sceAudioOutOutput` 播完整段才返回。CLDC 是绿色线程模型，nPlayTone 阻塞 = 所有 Java 线程冻结。游戏主循环高频调 tone（按键音/BGM 序列），表现为卡死
+- **修复**：专职播放线程（`sceKernelCreateThread`，原生线程；libpthread 链接有玄学问题不用）+ 无锁序列号握手：VM 线程只写 note/dur/vol 并 `g_req_seq++` 即返回；播放线程 4ms 轮询，播新前比对 seq 实现抢占，`stop_tone` 置标志中断输出；audio port 由播放线程打开消除竞态
+- **下一嫌疑（未实证）**：若修复后仍"启动即永久卡死"，则指向 http→socket 挂起：`CommonDS` 对 `http:` locator 阻塞式 `Connector.open`+`getResponseCode`，而 Vita 的 pcsl 网络是 53 字节 stub（`pcsl/vita_arm/lib/libpcsl_network.c`）。届时可二分验证（临时禁 http 子系统重编 ROM）
+
 ### 游戏启动崩溃修复：ANI 线程池未初始化（2026-09-01，samples 152d350）
 - **症状**：jsr135 集成后游戏启动即死循环，Vita3K 日志刷 `Invalid read of uint32_t at 0x4`，`ldrex/strex` 原子指令重试，PC=0x810aca7a
 - **根因链**：MMAPI 可用后游戏 `Manager.createPlayer(http://...)` 走通 → 媒体下载进 ANI 阻塞框架 → `PoolThread` 的静态事件（全局零初始化=NULL）被 `Os_SignalEvent/Os_WaitForEvent` 使用 → `pthread_mutex_unlock(&NULL->mutex)`（偏移 4）→ pteos 原子操作死循环。**`ANI_Initialize()` 在 CLDC-HI 启动流程中无任何调用者（上游同样），线程池从未初始化**
