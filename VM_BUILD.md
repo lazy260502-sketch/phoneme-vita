@@ -135,3 +135,4 @@ cmake --build build -j8
 | 8 | ar r && 链静默断 | 库成员为空、链接莫名缺符号 | 每步 ar p 验证非空 |
 | 9 | va_list 传 NULL | ARM EABI 编译错（x86 32 位能过） | 用 `va_list()` 值初始化 |
 | 10 | MIDP Java 增量按 mtime | 改 jsr135/上游源后 classes.zip 不更新 | 删 tmpclasses/ + classes.zip 强制全量 |
+| 11 | vita-elf-create 入口选择 | **eboot 直接闪退**（ARM 模式解码 Thumb）；或 JVM 秒退（入口=无关函数被当 main） | 工具默认找 `module_start` 符号（无则 fallback 错误地址）；`-m` 参数不修正 e_entry。修复=`tools/patch_velf_entry.py` 在 POST_BUILD 把 velf e_entry 重写为 ELF 真实入口（**必须保留 Thumb 位 bit0**，strip 掉就是闪退） |
