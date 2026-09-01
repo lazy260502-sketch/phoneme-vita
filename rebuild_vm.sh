@@ -1,0 +1,103 @@
+#!/bin/bash
+#==============================================================================
+# rebuild_vm.sh - Rebuild the CLDC VM (libcldc_vm.a) for PS Vita
+#
+# Verified recipe from the 2026-09-02 rebuild campaign. See VM_BUILD.md
+# for the reasoning behind every step. Run after changing any
+# phoneme-cldc/src/**.cpp|.hpp.
+#
+# Usage:
+#   ./rebuild_vm.sh            # target VM + repack library
+#   ./rebuild_vm.sh tools      # rebuild host loopgen/romgen only (if broken)
+#   ./rebuild_vm.sh clean      # remove target objects (library kept)
+#==============================================================================
+set -eo pipefail
+
+CLDC=/home/zyb/vitasdk/samples/j2me/phoneme-cldc
+BD=$CLDC/build/vita_arm
+L=$BD/dist/lib/libcldc_vm.a
+AR=/home/zyb/.local/vitasdk/bin/arm-vita-eabi-ar
+FLAVOR=release            # debug=AZZERT gaps; product=compiler member; release=OK
+EXCLUDE="AsmStubs_x86_64.o|Interpreter_arm.o|ani.o|ani_bsd_socket.o|os_port.o|poolthread.o"
+
+export JVMWorkSpace=$CLDC
+export JVMBuildSpace=$CLDC/build
+export JDK_DIR=/home/zyb/tools/jdk8u502-b07
+export TOOLS_DIR=/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/tools
+
+die() { echo "FAIL: $*" >&2; exit 1; }
+
+build_tools() {
+    echo "== host loopgen/romgen (32-bit x86 via FORCE_GCC in cfg) =="
+    cd $BD
+    make BUILD_DIR_NAME=vita_arm IsLoopGen=true CLDCBUILD=fp \
+         ENABLE_ENABLING_CHECK=false -j"$(nproc)" loopgen
+    [ -x $BD/loopgen/app/loopgen ] || die "loopgen missing"
+    make BUILD_DIR_NAME=vita_arm IsLoopGen=true ROMGENERATOR_DIR=romgen/app \
+         CLDCBUILD=fp ENABLE_ENABLING_CHECK=false -j"$(nproc)" romgen
+    [ -x $BD/dist/bin/romgen ] || die "romgen missing"
+    echo "== host tools OK =="
+}
+
+build_target() {
+    echo "== target VM objects (ARM, flavor=$FLAVOR) =="
+    cd $BD
+    mkdir -p target/$FLAVOR
+    # Preseed host-object AsmStubs so vpath never feeds it to the ARM assembler
+    cp romgen/app/AsmStubs_x86_64.o target/$FLAVOR/
+    touch -d "2026-08-25" target/$FLAVOR/AsmStubs_x86_64.o
+
+    # Triple-clear on the command line is the core of this recipe:
+    # FORCE_GCC=        else cfg's romgen branch swaps ALL compiler roles to
+    #                   the host g++-11 -> "-marm unrecognized" on ARM sources
+    # GNU_TOOLS_DIR=    else the cross prefix is lost -> bare g++, crt0 not found
+    # CPP_DEF_FLAGS=    else "-B/usr/bin -m32 -DCROSS_GENERATOR=1" leaks in
+    make BUILD_DIR_NAME=vita_arm IsLoopGen=true \
+         LOOP_GENERATOR_DIR=../../linux_arm/loopgen/app \
+         ENABLE_ENABLING_CHECK=false ENABLE_C_INTERPRETER=true \
+         FORCE_GCC= GNU_TOOLS_DIR=/home/zyb/.local/vitasdk CPP_DEF_FLAGS= \
+         -j"$(nproc)" _$FLAVOR || true   # final exe link fails on crt0: expected
+
+    local n; n=$(ls target/$FLAVOR/*.o 2>/dev/null | wc -l)
+    [ "$n" -ge 30 ] || die "only $n objects produced (expect ~31)"
+    echo "== $n ARM objects OK =="
+}
+
+pack_lib() {
+    echo "== repack $L =="
+    [ -f $L ] || die "library not found"
+    cp $L $L.bak
+
+    cd $BD/target/$FLAVOR
+    local m
+    for m in *.o; do
+        echo "$m" | grep -qE "^($EXCLUDE)$" && continue
+        $AR r $L "$m" || die "ar r $m"
+    done
+
+    # Interpreter_arm.o must come from the OLD library: the regenerated .s
+    # lost the jvm_f2i/jvm_d2i float stubs (GP table + fast globals only)
+    cd /tmp
+    $AR p $L.bak Interpreter_arm.o > Interpreter_arm.o 2>/dev/null \
+        || die "cannot extract Interpreter_arm.o from backup"
+    $AR r $L Interpreter_arm.o
+
+    # ar chains fail silently - verify members are non-empty
+    local sz; sz=$($AR p $L Interpreter_arm.o 2>/dev/null | wc -c)
+    [ "$sz" -gt 1000 ] || die "Interpreter_arm.o member is empty ($sz bytes)"
+    local cnt; cnt=$($AR t $L | wc -l)
+    echo "== library packed: $cnt members =="
+}
+
+case "${1:-build}" in
+    tools) build_tools ;;
+    clean) rm -rf $BD/target; echo "target objects removed" ;;
+    build)
+        build_target
+        pack_lib
+        echo ""
+        echo "Next: cd vita-port && git commit ... && cmake --build build -j8"
+        echo "(commit BEFORE building so the version string matches)"
+        ;;
+    *) echo "usage: $0 [build|tools|clean]"; exit 1 ;;
+esac
