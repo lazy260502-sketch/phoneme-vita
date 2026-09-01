@@ -33,6 +33,18 @@ static int g_tone_len = 0;
 
 static int16_t g_out_buffer[OUT_CHUNK_FRAMES * 2];
 
+/*
+ * playTone must be ASYNC: the CLDC VM uses green threads, so blocking
+ * inside nPlayTone freezes every Java thread (games call it from their
+ * main loop for key clicks). The producer (VM thread) only bumps a
+ * sequence number; a dedicated player thread generates and streams the
+ * PCM, preempting itself when a newer request arrives.
+ */
+#include <psp2/kernel/threadmgr.h>
+
+static volatile long g_req_note = -1, g_req_dur = 0, g_req_vol = 0;
+static volatile unsigned int g_req_seq = 0, g_played_seq = 0;
+
 /* ---------------------------------------------------------------------------
  * caps / configuration (static, tone-only)
  * ------------------------------------------------------------------------- */
@@ -112,13 +124,14 @@ static int audio_out_open(void) {
     return 0;
 }
 
-/** Resample mono 16k buffer to 48k stereo chunks; block until done. */
-static void output_tone_blocking(void) {
+/** Resample mono 16k buffer to 48k stereo chunks; block until done.
+ *  Aborts early when stop is requested or a newer tone supersedes. */
+static void output_tone_blocking(unsigned int my_seq) {
     int produced = 0;
     const int repeat = OUT_SAMPLE_RATE / TONE_SAMPLE_RATE; /* 3 */
 
     for (int i = 0; i < g_tone_len; i++) {
-        if (g_tone_stop_requested) break;
+        if (g_tone_stop_requested || g_req_seq != my_seq) break;
         for (int r = 0; r < repeat; r++) {
             if (produced >= OUT_CHUNK_FRAMES) {
                 sceAudioOutOutput(g_audio_port, g_out_buffer);
@@ -138,6 +151,25 @@ static void output_tone_blocking(void) {
     }
 }
 
+/* Dedicated tone player thread: waits for requests, streams them out */
+static int tone_player_thread(SceSize args, void *argp) {
+    (void)args; (void)argp;
+    for (;;) {
+        if (g_req_seq == g_played_seq) {
+            sceKernelDelayThread(4000); /* 4ms idle poll */
+            continue;
+        }
+        unsigned int my_seq = g_req_seq;
+        g_played_seq = my_seq;
+        g_tone_stop_requested = 0;
+        if (audio_out_open() != 0) continue; /* retry on next request */
+        g_tone_len = generate_tone_pcm(midi_note_to_freq(g_req_note),
+                                       (int)g_req_dur, g_req_vol);
+        output_tone_blocking(my_seq);
+    }
+    return 0;
+}
+
 /* ---------------------------------------------------------------------------
  * Mandatory API (signatures must match javacall_multimedia.h)
  * ------------------------------------------------------------------------- */
@@ -146,6 +178,15 @@ javacall_result javacall_media_initialize(void) {
     g_audio_port = -1;
     g_tone_stop_requested = 0;
     g_cfg.mediaCaps = NULL;
+    {
+        SceUID tid = sceKernelCreateThread("j2me_tone", tone_player_thread,
+                                           0x10000100, 0x4000, 0, 0, NULL);
+        if (tid >= 0) {
+            sceKernelStartThread(tid, 0, NULL);
+        }
+        /* Without the player thread the VM would stay silent rather than
+         * hang - acceptable degraded mode. */
+    }
     return JAVACALL_OK;
 }
 
@@ -174,12 +215,13 @@ javacall_result javacall_media_play_tone(int appID, long note,
     if (volume < 0)   volume = 0;
     if (volume > 100) volume = 100;
 
-    if (audio_out_open() != 0) return JAVACALL_NO_AUDIO_DEVICE;
-
-    g_tone_len = generate_tone_pcm(midi_note_to_freq(note),
-                                   (int)duration, volume);
-    g_tone_stop_requested = 0;
-    output_tone_blocking();
+    /* Hand off to the player thread and return immediately - blocking
+     * here would freeze all CLDC green threads (VM-wide stall). The
+     * player thread opens the audio port itself. */
+    g_req_note = note;
+    g_req_dur = duration;
+    g_req_vol = volume;
+    g_req_seq++;
     return JAVACALL_OK;
 }
 
