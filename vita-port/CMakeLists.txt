@@ -143,8 +143,11 @@ add_executable(${PROJECT_NAME}
     src/vita_display.c
     src/vita_input.c
     src/vita_pcsl.c
+    src/vm_rom_stubs.c
     src/vita_storage.c
     src/vita_audio_javacall.c
+    src/vita_media_notify.c
+    src/vita_sms_javacall.c
 )
 
 # Build-time version header (git build number + hash), always regenerated

@@ -137,6 +137,9 @@ void vita_input_reset(void) {
     vita_input_init();
 }
 
+/* Exported by vita_media_notify.c: drains the media event ring */
+extern int vita_media_poll(MidpEvent *out);
+
 /*
  * The platform event pump. Called by midp_check_events() in the VM thread.
  * Semantics per mastermode_port contract: timeout >0/0/-1 — we are a
@@ -152,6 +155,14 @@ void checkForSystemSignal(MidpReentryData *pNewSignal,
     }
 
     vita_input_poll();
+
+    /* Media events first: a blocked MMAPI Java thread waits on
+     * MEDIA_EVENT_SIGNAL, and END_OF_MEDIA must not be starved by
+     * input traffic. */
+    if (vita_media_poll(pNewMidpEvent)) {
+        pNewSignal->waitingFor = MEDIA_EVENT_SIGNAL;
+        return;
+    }
 
     if (ring_pop(pNewMidpEvent)) {
         pNewSignal->waitingFor = UI_SIGNAL;
