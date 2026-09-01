@@ -138,11 +138,17 @@ static volatile unsigned int g_jts_done = 0;   /* last finished request   */
  * ------------------------------------------------------------------------- */
 static const char g_tone_content_type[] = "audio/x-tone-seq";
 
-static javacall_media_caps g_caps_tone = {
-    JAVACALL_MEDIA_FORMAT_TONE,
-    g_tone_content_type,
-    JAVACALL_MEDIA_MEMORY_PROTOCOL | JAVACALL_MEDIA_FILE_LOCAL_PROTOCOL,
-    0
+/* KNIDirectConfig walks mediaCaps as an ARRAY terminated by an
+ * all-zero entry (mediaFormat == 0 / contentTypes == NULL). A single
+ * element made caps++ read whatever follows in .data - strlen() on a
+ * wild pointer froze the VM the moment the game called createPlayer
+ * (music toggle). Always keep the terminator. */
+static javacall_media_caps g_caps_tone[] = {
+    { JAVACALL_MEDIA_FORMAT_TONE,
+      g_tone_content_type,
+      JAVACALL_MEDIA_MEMORY_PROTOCOL | JAVACALL_MEDIA_FILE_LOCAL_PROTOCOL,
+      0 },
+    { 0, NULL, 0, 0 } /* array terminator - do not remove */
 };
 
 static javacall_media_configuration g_cfg = {
@@ -610,7 +616,7 @@ javacall_result javacall_media_get_configuration(
         /*OUT*/ const javacall_media_configuration** configuration) {
     ALOG("get_configuration");
     if (configuration == NULL) return JAVACALL_INVALID_ARGUMENT;
-    g_cfg.mediaCaps = &g_caps_tone;
+    g_cfg.mediaCaps = g_caps_tone;
     *configuration = &g_cfg;
     return JAVACALL_OK;
 }
