@@ -144,7 +144,16 @@ int main(int argc, char *argv[]) {
     char classpath[512];
 
     freopen(DATA_DIR "/midp_stdout.log", "w", stdout);
-    freopen(DATA_DIR "/midp_stderr.log", "w", stderr);
+    /* stderr: the VM's native debug dumps (per-class constant-pool dumps
+     * in ClassFileParser, hidden-flag warnings in Universe) write here on
+     * every class load. On Vita3K each line is a slow emulated
+     * sceIoWrite, and the flood alone stalls the game. Send stderr into
+     * the void - Java-level output still reaches vm_output.log through
+     * JVMSPI_PrintRaw's own fd, and boot diagnostics go to boot_log.txt.
+     * Point stderr at a real file only for native-layer diagnosis. */
+    if (freopen("/dev/null", "w", stderr) == NULL) {
+        sceIoClose(2); /* fallback: fprintf(stderr) turns into cheap EBADF */
+    }
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
