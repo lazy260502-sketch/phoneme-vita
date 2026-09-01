@@ -11,7 +11,7 @@ import sys, struct
 
 velf_path, elf_path = sys.argv[1], sys.argv[2]
 elf = open(elf_path, 'rb').read()
-entry = struct.unpack_from('<I', elf, 0x18)[0] & ~1          # strip Thumb
+entry = struct.unpack_from('<I', elf, 0x18)[0] # keep Thumb bit
 rel = entry - 0x81000000
 v = bytearray(open(velf_path, 'rb').read())
 struct.pack_into('<I', v, 0x18, rel)
