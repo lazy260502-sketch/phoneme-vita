@@ -212,6 +212,37 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### 音乐开关"卡死"根治：VM 重编去转储（2026-09-02，cldc 2959a08 / samples 357f014，VPK b137）
+- **真相**：音乐开关触发 MMAPI 类链**首次加载**（音频集成前这些类 CNF 根本不走加载）→ VM 三处调试转储（ClassFileParser 的 CP dump、ConstantPoolDesc 的 var_oops_do、Universe 的 hidden 警告）每类倾倒数千行 stderr → Vita3K 慢速 I/O 下几分钟出不来 = "卡死"；17403 行日志零异常。fd 0x7 洪水、suite 反复 startSuite 都是伴生现象
+- **修复**：全部转储 gate 在 `VITA_CP_DEBUG` 后（默认关）；libcldc_vm.a 重编（eboot 中三组格式串清零）
+- **VM 重编配方（血泪总结，cldc commit 2959a08 message 有完整版）**：① loopgen/romgen 按 cfg 原设置编 ② target 用 `IsLoopGen=true LOOP_GENERATOR_DIR=... FORCE_GCC= GNU_TOOLS_DIR=... CPP_DEF_FLAGS=（命令行三清）... _release` + JVMWorkSpace/JVMBuildSpace/JDK_DIR/TOOLS_DIR 环境变量 ③ AsmStubs_x86_64.o 从 romgen/app 预置 touch 旧 ④ **release flavor**（debug 引 AZZERT 符号、product 缺编译器成员）⑤ Interpreter_arm.o 用旧库成员（重生成 .s 丢浮点 stub）⑥ ar r 后必须 ar p 验证成员非空（&&链会静默断）⑦ 37 个 `_rom_check_*` 由 vita-port `src/vm_rom_stubs.c` 补
+- **Interpreter_c.cpp:1506**：`invoke_native_entry(..., NULL, ...)` → `va_list()`（ARM EABI va_list 是结构体，NULL 只在 32 位 x86 可编）
+
+### device://tone Player 全链路打通：tone 状态机 + MMAPI 事件桥（2026-09-01）
+- **背景（"开启音乐"冻结根因）**：游戏 `Manager.createPlayer("device://tone")` → `javacall_media_create` 对 tone URI 返回 INVALID_ARGUMENT → `nInit` 抛 `MediaException("Unable to create native player")` → 主线程异常/重试 → UI 冻结。此前 vita_audio_javacall.c 只有 playTone 快捷路径，无 Player 状态机
+- **`vita_audio_javacall.c`（+681 行）实现完整 tone Player 状态机**（create/realize/prefetch/start/stop/resume/close/destroy + get/set_volume/mute + JTS 缓冲与播放）：
+  - `create` 按 UTF-16 精确匹配 `device://tone`，命中则 `javacall_malloc` 分配 `vita_player`（~32KB，内含 32KB JTS 缓冲），未命中返回 INVALID_ARGUMENT
+  - **`get_format` 返回 UNKNOWN 是关键设计**：Java 侧 `HighLevelPlayer` 构造器对 UNKNOWN+`TONE_DEVICE_LOCATOR` 自动映射为 DEVICE_TONE 且 `handledByDevice=true`（HighLevelPlayer.java:291-294），跳过 source.connect/download；若误返回 TONE 会走 MediaDownload 路径
+  - **全部 mandatory API 同步返回 OK**：CLDC green-thread VM 下 KNI 阻塞会冻结全部 Java 线程；`JAVACALL_MM_ASYNC_EXEC` 宏（mm_async_exec.h）在同步 OK 时直接返回，不设 reentry、不阻塞
+  - JTS 播放：`start` 把 `g_jts_req=pl; g_jts_seq++` 交给常驻 `j2me_tone` 线程（复用 playTone 线程），线程内 `jts_expand` 展开为扁平事件表 → 逐事件 `generate_tone_pcm` 方波合成（16k 单声道）→ 3 倍重采样 → SceAudioOut；无 JTS 数据时立即发 END_OF_MEDIA
+  - **REPEAT 语义按规范实现（4 字节 `REPEAT multiplier tone_event`）**：校验器（jts_check_sequence）、pass1 定位（pos+=4）、pass2 展开（读紧随其后的 note/dur 发射 multiplier 次）、PLAY_BLOCK 块体（块尾扫描 +4 偏移、块内 REPEAT 展开）四处一致。**上游 win32 mmtone.c 校验器只消费 2 字节、播放循环把 REPEAT 落 default 当 note 播——是 win32 bug，勿效仿**；权威依据 ToneControl.java（`repeat_event = REPEAT multiplier tone_event`）+ DirectTone.jpp 校验器（pos+=4）
+  - END_OF_MEDIA 的 data 单位是**秒**（Java 侧 MMEventListener `intParam2 * 1000` 转 ms），native 发 `(void*)(long)(duration_ms/1000)`
+- **新建 `vita_media_notify.c`（~90 行，javanotify 事件桥）**：`javanotify_on_media_notification` 在 vita_arm 构建中无实现（唯一上游实现 javanotify_midp_jsr.c 属 javacall_application 子系统，不参与链接；midp_jc_event_send 管线也不在闭包）。仿 vita_input.c 模式：SPSC ring（16 个 MidpEvent，满丢最旧）→ `vita_media_poll`；字段映射与上游 midp_slavemode_javacall.c 对 MIDP_JC_EVENT_MULTIMEDIA 的处理一致（MM_PLAYER_ID/MM_DATA/MM_ISOLATE/MM_EVT_TYPE/MM_EVT_STATUS，MMAPI_EVENT=45）
+- **`vita_input.c` checkForSystemSignal 排水媒体事件**：`vita_media_poll` 命中则 `waitingFor = MEDIA_EVENT_SIGNAL` 返回（媒体事件优先于输入事件，防 END_OF_MEDIA 饿死）；未命中再走原有 UI ring
+- **事件链闭环**：native `javanotify_on_media_notification` → MidpEvent 入 ring → VM 线程 `checkForSystemSignal` 排水 → `midp_master_mode_events.c` `StoreMIDPEventInVmThread` + `eventUnblockJavaThread` → Java `MMEventListener` 收 END_OF_MEDIA/STARTED/STOPPED → `PlayerListener` 回调正常派发，游戏状态机不再卡在等待
+- **编译验证**：`vita-port/build && make` 全绿，`[100%] Built target midp_vita.vpk-vpk`；改动仅 vita-port 三文件 + 新文件，符合最小 diff
+- **已知边缘限制**：PLAY_BLOCK 嵌套 PLAY_BLOCK 不支持（上游校验器同样禁止）；REPEAT multiplier 上限钳到 JTS_MAX_REPEAT(8)（规范上限 127，防事件表溢出）；JTS 序列上限 32768 字节（`nGetJavaBufferSize` 返回值，DirectTone.setSequence 一次性整段传输）
+
+### WMA/SMS(JSR 120) 接入 Vita（2026-09-01）
+- **目标**：让 `sms://`、`cbs://` 协议被 GCF 识别（`Connector.open("sms://:1234")` 不再抛 InvalidArgumentException；WMA API 类进 ROM）
+- **构建接线（核心发现）**：`build_vita.sh` 用命令行覆盖一切 makefile 赋值——启用 JSR 只需在它里面加 `USE_JSR_120=true JSR_120_DIR=/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/jsr120`（jsr120 在 phoneme_source 里，同 jsr135 模式）。jsr120 的 `common_defs.gmk` 会强制 `USE_ABSTRACTIONS=true`，而 `build_vita.sh` 本来就传了 `USE_ABSTRACTIONS=true + ABSTRACTIONS_DIR`，刚好满足
+- **首编 60 个 javac 错误的真相**：不是源码问题——`alljavalist.txt` 是增量文件列表（appendfiles 写 `$?`，即比 classes.zip 新的文件），jsr120 源码时间戳（8/25）早于旧 classes.zip（8/31）导致只有 4 个 JPP 生成文件（其规则让其必"新"）被编译。**修复：`touch` jsr120 全部 .java/.jpp + 删 classes.zip**
+- **javacall_sms_* 符号缺失**：native 层 `smsProtocol_javacall.c` 调 `javacall_sms_*`/`javacall_cbs_*`/`javacall_strdup`，无实现则 `libmidp.so` 链接失败。新增 `vita-port/src/vita_sms_javacall.c`（stub：send/listen 返回 FAIL，`get_number_of_segments` 按 GSM 03.40 真实计算，strdup 用 javacall_malloc）
+- **把 Vita 源文件编进 phoneME 构建的通用机制（本项目原创）**：`build/vita_arm/vita_overlay.mk`（vpath % → vita-port/src；JTWI_NATIVE_FILES += vita_sms_javacall.c），经 `export MAKEFILES=<overlay>` 在 `build_vita.sh` 里注入。GNU make 的 MAKEFILES 预加载文件可追加 vpath 与变量，**零修改上游 gmk**，符合最小 diff 原则
+- **验证方法**：① `jar -tf classes.zip | grep wireless` 显示 5 个接口类 ② `nativeFunctionTable.cpp` 有 `Java_com_sun_midp_io_j2me_sms_Protocol_*` 全部 7 个 KNI ③ `ROMImage_01.cpp` 中 grep 到 romize 后的 sms native 指针 ④ `libmidp.so` 无 undefined reference
+- **运行时行为**：`sms://` 连接可创建；发短信返回失败（Vita 无蜂窝）；收听端口注册失败。游戏内 SMS 功能会优雅降级而非崩溃
+- 注意：`vita_overlay.mk` 在 `phoneme-midp/build/vita_arm/`（生成目录，重建不丢）；若频繁 clean build 建议移到 `midp-vita/` 并调整 build_vita.sh 路径
+
 ### 游戏卡死真因：VM 每类 stderr 转储洪水（2026-09-01，samples 27d7ef0）
 - **症状**：游戏"卡死不动"且无异常——实为 `ClassFileParser.cpp` 里遗留的两段调试转储（`CP tags`/`PRE idx`/`Utf8 idx ... NOT in heap`，诊断 UTF8/hidden 问题时加的）**每加载一个类向 stderr 倾倒几百行**（小游戏 17k 行），Vita3K 模拟 sceIoWrite 慢，I/O 洪水即"卡死"。Vita3K 日志特征：`sceIoWrite: fd 0x7, size: 5x` 高频重复
 - **即时缓解**：vita_main.c 把 stderr 重定向 /dev/null（freopen 失败则 `sceIoClose(2)` 走廉价 EBADF）。Java 输出走 `JVMSPI_PrintRaw` 自己的 fd（vm_output.log）不受影响
