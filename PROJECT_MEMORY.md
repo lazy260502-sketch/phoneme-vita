@@ -212,6 +212,13 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### 游戏卡死真因：VM 每类 stderr 转储洪水（2026-09-01，samples 27d7ef0）
+- **症状**：游戏"卡死不动"且无异常——实为 `ClassFileParser.cpp` 里遗留的两段调试转储（`CP tags`/`PRE idx`/`Utf8 idx ... NOT in heap`，诊断 UTF8/hidden 问题时加的）**每加载一个类向 stderr 倾倒几百行**（小游戏 17k 行），Vita3K 模拟 sceIoWrite 慢，I/O 洪水即"卡死"。Vita3K 日志特征：`sceIoWrite: fd 0x7, size: 5x` 高频重复
+- **即时缓解**：vita_main.c 把 stderr 重定向 /dev/null（freopen 失败则 `sceIoClose(2)` 走廉价 EBADF）。Java 输出走 `JVMSPI_PrintRaw` 自己的 fd（vm_output.log）不受影响
+- **正确修复（已提交待生效）**：cldc commit `291ab15` 用 `VITA_CP_DEBUG` 宏 gate 掉 dump + 静音 Universe 的每类 hidden 警告——**待 VM 重编环境恢复后重编生效**
+- **⚠️ CLDC VM 重编配方问题（未解决）**：完整 `make debug` 会失败——romgen 分支的 `CPP_DEF_FLAGS += -B/usr/bin -m32 ...` 与 `-DCROSS_GENERATOR=1` 泄漏进 target 构建上下文（root.make 的 tools/loopgen/_romgen/_debug 多阶段在同一 make 里共享变量，且 jvm.make 1462 行 `FORCE_GCC` 非空时所有编译角色都被替换）。曾试：`IsTarget=true`+`FORCE_GCC=`+`GNU_TOOLS_DIR=`+`CPP_DEF_FLAGS=` 命令行覆盖→卡在 AsmStubs_x86_64.s / Interpreter_c.cpp（解释器兼容）。重编前需理清 root.make 的多阶段变量流
+- **版本号陷阱**：GenVersion 取 HEAD commit，先改代码后 commit 会导致 VPK 版本串不反映二进制内容——**务必先 commit 再 build**
+
 ### 游戏卡死修复：playTone 同步阻塞冻结 VM（2026-09-01，samples 64652d4）
 - **症状**：ANI 修复后的 VPK，游戏运行中卡死不动、无任何异常日志
 - **根因**：`javacall_media_play_tone` 原实现是**同步阻塞**——生成 PCM 后逐块 `sceAudioOutOutput` 播完整段才返回。CLDC 是绿色线程模型，nPlayTone 阻塞 = 所有 Java 线程冻结。游戏主循环高频调 tone（按键音/BGM 序列），表现为卡死
