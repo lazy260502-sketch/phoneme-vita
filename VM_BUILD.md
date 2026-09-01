@@ -131,7 +131,7 @@ cmake --build build -j8
 | 4 | tools/loopgen/_romgen 目标带 FORCE | 顶层 debug 目标无条件重编宿主工具 | target 直接调 `_release` |
 | 5 | vpath 污染 | ARM as 编 AsmStubs_x86_64.s / 链接错误 ROMImage.cpp | 预置 .o + romgen(loopgen)/app 下保留 Skeleton 副本 |
 | 6 | flavor 选错 | debug=AZZERT 符号缺口；product=编译器成员缺失 | release |
-| 7 | 重生成的 Interpreter_arm.s 缺浮点 stub | jvm_f2i/jvm_d2i undefined | 库成员用旧版（备份提取） |
+| 7 | 重生成的 Interpreter_arm.s 缺浮点 stub | 链接期：jvm_f2i/jvm_d2i undefined；**运行期：GP 表数据被当代码执行——Vita3K 报 Undefined instruction 且地址落在 Interpreter_arm.o 区域、伴随无限递归栈下溢（b139 崩溃实例）** | 库成员用旧版（备份提取），打包后 `nm` 验证 jvm_f2i 存在 |
 | 8 | ar r && 链静默断 | 库成员为空、链接莫名缺符号 | 每步 ar p 验证非空 |
 | 9 | va_list 传 NULL | ARM EABI 编译错（x86 32 位能过） | 用 `va_list()` 值初始化 |
 | 10 | MIDP Java 增量按 mtime | 改 jsr135/上游源后 classes.zip 不更新 | 删 tmpclasses/ + classes.zip 强制全量 |
