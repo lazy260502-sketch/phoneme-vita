@@ -167,18 +167,37 @@ target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 add_dependencies(${PROJECT_NAME} libobj_target)
 
+# Extract the four anilib objects and link them as plain objects.
+# Archive scanning of the rebuilt libcldc_vm_ani.a fails to resolve
+# ANI_Initialize in the full link (a minimal one-file repro against the
+# same archive works), while direct objects are immune to whatever
+# archive edge case is at play.
+set(ANI_OBJ_DIR ${CMAKE_CURRENT_BINARY_DIR}/ani_objs)
+set(ANI_AR /home/zyb/.local/vitasdk/bin/arm-vita-eabi-ar)
+add_custom_command(TARGET ${PROJECT_NAME} PRE_LINK
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${ANI_OBJ_DIR}
+    COMMAND ${ANI_AR} p ${CLDC_DIST}/lib/libcldc_vm_ani.a ani.o > ${ANI_OBJ_DIR}/ani.o
+    COMMAND ${ANI_AR} p ${CLDC_DIST}/lib/libcldc_vm_ani.a ani_bsd_socket.o > ${ANI_OBJ_DIR}/ani_bsd_socket.o
+    COMMAND ${ANI_AR} p ${CLDC_DIST}/lib/libcldc_vm_ani.a os_port.o > ${ANI_OBJ_DIR}/os_port.o
+    COMMAND ${ANI_AR} p ${CLDC_DIST}/lib/libcldc_vm_ani.a poolthread.o > ${ANI_OBJ_DIR}/poolthread.o
+    COMMENT "Extracting anilib objects")
+
 target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--whole-archive
     ${LIBOBJ_NO_MAIN}
     ${MIDP_OBJ_DIR}/runMidlet.o
     -Wl,--no-whole-archive
     -Wl,--allow-multiple-definition
+    ${ANI_OBJ_DIR}/ani.o
+    ${ANI_OBJ_DIR}/ani_bsd_socket.o
+    ${ANI_OBJ_DIR}/os_port.o
+    ${ANI_OBJ_DIR}/poolthread.o
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
-    -lcldc_vm
-    -lcldc_vm_ani
-    -lcldc_vm_anix
-    -lcldc_vmtest
+    ${CLDC_DIST}/lib/libcldc_vm.a
+    ${CLDC_DIST}/lib/libcldc_vm_ani.a
+    ${CLDC_DIST}/lib/libcldc_vm_anix.a
+    ${CLDC_DIST}/lib/libcldc_vmtest.a
     -lpthread
     -lstdc++
     -Wl,--end-group
