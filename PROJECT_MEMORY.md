@@ -212,6 +212,11 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### 启动闪退修复：pte_os pthread 初始化缺失（2026-09-02，samples 93372ca，VPK b148）
+- **症状**：启动闪退，Vita3K 日志刷 `Invalid write at 0x4` + `pte_osAtomicExchange` + `pthread_mutex_unlock`——newlib FILE 锁（freopen/printf）触发 pthread_mutex_unlock → pthread_self() → pte_os 线程跟踪未初始化 → NULL+4 崩溃
+- **根因**：vitasdk pthread 模拟层（pte_os）需要至少一次 pthread 调用初始化内部线程跟踪。旧 libcldc_vm.a 某些代码隐式触发了初始化；VM 重编去转储后不再调用，首次 pthread_mutex_unlock 即崩
+- **修复**：vita_main.c 的 main() 最前面加 `PTHREAD_MUTEX_INITIALIZER` 的 lock/unlock 周期。**以后新增任何 pthread 使用时都不能删除这段初始化**
+
 ### ⭐ VM 编译权威文档（2026-09-02，samples 0ff302d）
 **改 VM 源码（phoneme-cldc/src/**）后：先读 `VM_BUILD.md`、用 `rebuild_vm.sh`**——完整配方（宿主工具/ARM 目标/打包三阶段）+ 十条陷阱表已固化。要点：命令行三清（FORCE_GCC=/GNU_TOOLS_DIR=/CPP_DEF_FLAGS=）+ `_release` 子目标 + AsmStubs 预置 + Interpreter_arm.o 用旧库成员 + ani.o 等 anilib 文件不得混入主库 + ar r 后逐个验证成员非空。
 
