@@ -167,11 +167,9 @@ target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 add_dependencies(${PROJECT_NAME} libobj_target)
 
-# Extract the four anilib objects and link them as plain objects.
-# Archive scanning of the rebuilt libcldc_vm_ani.a fails to resolve
-# ANI_Initialize in the full link (a minimal one-file repro against the
-# same archive works), while direct objects are immune to whatever
-# archive edge case is at play.
+# Extract anilib objects and link as plain objects. Archive scanning of
+# libcldc_vm_ani.a fails to resolve ANI_Initialize in the full link
+# (works in minimal repro - unexplained archive edge case).
 set(ANI_OBJ_DIR ${CMAKE_CURRENT_BINARY_DIR}/ani_objs)
 set(ANI_AR /home/zyb/.local/vitasdk/bin/arm-vita-eabi-ar)
 add_custom_command(TARGET ${PROJECT_NAME} PRE_LINK
@@ -188,17 +186,15 @@ target_link_options(${PROJECT_NAME} PRIVATE
     ${MIDP_OBJ_DIR}/runMidlet.o
     -Wl,--no-whole-archive
     -Wl,--allow-multiple-definition
-    -Wl,-e,_start
     ${ANI_OBJ_DIR}/ani.o
     ${ANI_OBJ_DIR}/ani_bsd_socket.o
     ${ANI_OBJ_DIR}/os_port.o
     ${ANI_OBJ_DIR}/poolthread.o
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
-    ${CLDC_DIST}/lib/libcldc_vm.a
-    ${CLDC_DIST}/lib/libcldc_vm_ani.a
-    ${CLDC_DIST}/lib/libcldc_vm_anix.a
-    ${CLDC_DIST}/lib/libcldc_vmtest.a
+    -lcldc_vm
+    -lcldc_vm_anix
+    -lcldc_vmtest
     -lpthread
     -lstdc++
     -Wl,--end-group
@@ -225,7 +221,7 @@ target_link_libraries(${PROJECT_NAME}
 #==============================================================================
 # VPK packaging (config copies carry the 240x320 virtual screen)
 #==============================================================================
-vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} MEMSIZE 128 MODULE_ENTRY "_start,_exit,_exit")
+vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} MEMSIZE 128)
 
 set(MIDLET_JAR ${PORT_DIR}/build/midlet/jar/Hello.jar)
 set(MIDP_SYSTEM_JAR ${MIDP_BUILD}/classes/midp_system.jar)
@@ -285,10 +281,10 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
         DESTINATION .
         RENAME ${VITA_TITLEID}.vpk)
 
-# The SCE elf converter picks a wrong e_entry (an unrelated midpStorage
-# function) after our link-order changes; -Wl,-e and vita-elf-create's
-# -m are both ignored. Patch the entry back to the ELF's real entry
-# (_start) in the generated velf, before fself/vpk consume it.
+# vita-elf-create picks a wrong velf e_entry (0x395520 = unrelated function)
+# after our link-order changes. Patch it back to the ELF's real entry
+# (_start), keeping the Thumb bit. The build/vita-version.h check above can
+# verify: entry must have bit0 set.
 add_custom_command(TARGET midp_vita-velf POST_BUILD
     COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/patch_velf_entry.py
             ${CMAKE_CURRENT_BINARY_DIR}/midp_vita.velf
