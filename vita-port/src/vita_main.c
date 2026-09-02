@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include <unistd.h>
+#include <pthread.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -136,6 +137,17 @@ static int read_launch_cfg(char *jar, size_t jar_sz,
 
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
+
+    /* Trigger pte_os (pthread emulation) initialization. newlib's FILE
+     * locks (freopen/printf) and ani.o's pthread primitives both call
+     * pthread_self()/pthread_mutex_unlock(), which crash in
+     * pte_osAtomicExchange if pte_os hasn't initialized its thread
+     * tracking. A dummy lock/unlock cycle forces the initialization. */
+    {
+        pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&init_lock);
+        pthread_mutex_unlock(&init_lock);
+    }
 
     char midp_home[256];
     char jar_path[256];
