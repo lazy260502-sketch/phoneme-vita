@@ -107,6 +107,28 @@ static inline uint32_t rgb565_to_abgr(gxj_pixel_type p) {
     return 0xFF000000u | (b << 16) | (g << 8) | r;
 }
 
+/*
+ * Map a physical (960x544) touch coordinate back to the virtual J2ME
+ * screen (240x320 portrait / 320x240 landscape), i.e. invert the
+ * centered/letterboxed scaling done by compute_scaling().
+ * Returns 0 when the touch is inside the virtual screen, -1 when it
+ * lands in the letterbox (out of range; caller should ignore it).
+ */
+int vita_display_map_touch(int px, int py, int *vx, int *vy) {
+    if (vx == NULL || vy == NULL) return -1;
+    if (px < dst_x || px >= dst_x + dst_w ||
+        py < dst_y || py >= dst_y + dst_h) {
+        return -1;
+    }
+    *vx = (px - dst_x) * virt_w / dst_w;
+    *vy = (py - dst_y) * virt_h / dst_h;
+    if (*vx < 0) *vx = 0;
+    if (*vx >= virt_w) *vx = virt_w - 1;
+    if (*vy < 0) *vy = 0;
+    if (*vy >= virt_h) *vy = virt_h - 1;
+    return 0;
+}
+
 static void flip_to_display(void) {
     SceDisplayFrameBuf fb;
     int x, y;

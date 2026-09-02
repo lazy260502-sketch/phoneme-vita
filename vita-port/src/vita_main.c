@@ -267,11 +267,33 @@ int main(int argc, char *argv[]) {
     /* Java heap before the VM starts */
     setHeapParameters();
 
-    /* NOTE: ANI thread pool initialization moved to vita_audio_javacall.c
-     * javacall_media_initialize() - vita_main.c's direct reference to
-     * ANI_Initialize caused an unresolvable link because the archive
-     * member (ani.o) in libcldc_vm_ani.a was never pulled in by ld due
-     * to a stale/missing symbol index. */
+    /* ANI thread pool init: the ANI blocking framework (used by async
+     * media/network paths, e.g. a game calling Manager.createPlayer on an
+     * http resource) signals statically-allocated pool events, but nothing
+     * in the CLDC-HI startup ever calls ANI_Initialize - the events stay
+     * NULL and the first use crashes in pthread_mutex_unlock(NULL->mutex).
+     *
+     * Re-enabled: the "unresolvable link" diagnosis (commit 2f578a6) was
+     * WRONG - plain `-lcldc_vm_ani` resolves ANI_Initialize fine (verified
+     * in the current ELF at 0x810af224). Without this call the pool's
+     * static events are never initialized and games entering an ANI path
+     * crash. */
+    {
+        extern void ANI_Initialize(void);
+        ANI_Initialize();
+        dlog("[ANI] thread pool initialized\n");
+    }
+
+    /* Media subsystem init: creates the dedicated tone player thread
+     * (j2me_tone). Upstream javacall platforms call this from their
+     * platform lifecycle; the vita port never did, so tone playback was
+     * dead (games calling playTone/Player.start got silence and no
+     * END_OF_MEDIA). Idempotent. */
+    {
+        extern int javacall_media_initialize(void);
+        javacall_media_initialize();
+        dlog("[media] tone player thread created\n");
+    }
 
     /* runMidlet arguments:
      *   -classpathext + <jar list> -> additional classpath (getClassPathPlus)

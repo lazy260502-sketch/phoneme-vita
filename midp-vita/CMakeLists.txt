@@ -152,10 +152,12 @@ target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--no-whole-archive
     -Wl,--allow-multiple-definition
     -Wl,--start-group
+    ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm
     -lcldc_vm_ani
     -lcldc_vm_anix
     -lcldc_vmtest
+    -lpthread
     -lstdc++
     -Wl,--end-group
 )

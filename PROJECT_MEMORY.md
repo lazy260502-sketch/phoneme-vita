@@ -212,6 +212,15 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### 启动即崩真因：e_entry 被 patch 成 _start，破坏 SCE module_info 定位器（2026-09-02）
+- **症状**：新 VPK 打开即卡死、Vita3K 闪退。日志：`Loaded module segment 0/1`（尺寸与 velf 完全一致）→ `Linking SELF app0:eboot.bin` → `eboot.bin module NID: 0xAC3E25AB` → **同毫秒** `EXCEPTION_ACCESS_VIOLATION, Read violation at 0x4A6F84D2F`
+- **根因（实锤）**：SCE ELF 的 `e_entry` **不是程序入口**，是 `sce_module_info` 定位器：`(段号<<30) | 段内偏移`（Vita3K `load_self.cpp:492` `module_info_offset = e_entry & 0x3fffffff`、`:689` `module_info_segment_index = e_entry >> 30`；真正的程序入口在 `module_info->module_start`）。vita-elf-create 生成 `e_entry=0x364740` 本来就正确——精确指向 `.sceModuleInfo.rodata`（0x81364740 = 0x81000000+0x364740）。而 `tools/patch_velf_entry.py`（b141 引入）把它改写成 `_start` 偏移 0x6e9 → Vita3K 把段0+0x6e9 处的 .text 机器码当 `sce_module_info_raw` 解析，`import_top/import_end` 全是代码垃圾 → `load_imports` 的 `for (imports=begin; imports<end; imports+=imports->size)` 走野指针 → 读违规闪退
+- **误诊链条（教训）**：入口补丁源于"JVM 秒退/入口错误"误判，此后每次构建症状变化都被归因到 entry，一路强化错误修复；`2f578a6` 的 whole-archive ani 同样基于"ANI_Initialize 链接失败"误诊（实测普通 `-lcldc_vm_ani` 完全能解析）
+- **修复**：①删除 CMakeLists 的 entry patch POST_BUILD（CMake 留注释说明 SCE e_entry 语义防再犯）②`patch_velf_entry.py` 改名 `.DANGEROUS-DISABLED` ③撤掉 whole-archive ani。b148 的 pte_osInit 保留（无害且有防御价值）
+- **排查中排除项（以后别再查一遍）**：reloc 表完整（0x11004c 字节按 SCE 格式精确走完+4 pad）；`.init_array` 4 个构造（register_fini/pthread_setup/frame_dummy/JVMThrow GLOBAL__sub_I）均安全——`pthread_init` 自带守卫幂等调 `pte_osInit`；ani 成员无 init_array；RW 段 1088KB（含新增 jts events 48KB）不是问题；`vita-elf-create` 输出确定性；`vita-make-fself` 输出含时间戳非确定（仅元数据）
+- **验证**：`make` 全绿；产物 velf `e_entry=0x364740` 与 `.sceModuleInfo` 对齐；`ANI_Initialize`/`PoolThread_InitializePool`/`javanotify_on_media_notification`/`jts_expand`/`checkForSystemSignal` 全部在位
+- **方法论**：崩溃在 loader 阶段（"Linking SELF" 后同毫秒）⇒ 查 ELF/SCE 结构与链接脚本，别查应用代码；Vita3K 源码（load_self.cpp/relocation.cpp）是 loader 崩溃第一手资料
+
 ### 启动闪退修复：pte_os pthread 初始化缺失（2026-09-02，samples 93372ca，VPK b148）
 - **症状**：启动闪退，Vita3K 日志刷 `Invalid write at 0x4` + `pte_osAtomicExchange` + `pthread_mutex_unlock`——newlib FILE 锁（freopen/printf）触发 pthread_mutex_unlock → pthread_self() → pte_os 线程跟踪未初始化 → NULL+4 崩溃
 - **根因**：vitasdk pthread 模拟层（pte_os）需要至少一次 pthread 调用初始化内部线程跟踪。旧 libcldc_vm.a 某些代码隐式触发了初始化；VM 重编去转储后不再调用，首次 pthread_mutex_unlock 即崩

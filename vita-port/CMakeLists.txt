@@ -29,7 +29,10 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 #==============================================================================
 set(VITA_APP_NAME "J2ME Player")
 set(VITA_TITLEID  "J2ME00001")
-set(VITA_VERSION  "01.00")
+# 01.01 = b152: touch support + input debug logging
+# 01.02 = b153: Scheduler.cpp VITA fix - event pump driven by timer tick even
+#         when no Java thread is blocked in async native (audio paths sync)
+set(VITA_VERSION  "01.02")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
@@ -176,9 +179,7 @@ target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm
-    -Wl,--whole-archive
     -lcldc_vm_ani
-    -Wl,--no-whole-archive
     -lcldc_vm_anix
     -lcldc_vmtest
     -lpthread
@@ -196,6 +197,7 @@ target_link_libraries(${PROJECT_NAME}
     z
     SceDisplay_stub
     SceCtrl_stub
+    SceTouch_stub
     SceLibKernel_stub
     SceSysmodule_stub
     SceAppMgr_stub
@@ -267,10 +269,11 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
         DESTINATION .
         RENAME ${VITA_TITLEID}.vpk)
 
-# vita-elf-create picks a wrong velf entry (0x392cc0 etc.) after our
-# link-order changes. Rewrite e_entry from the ELF's real entry
-# (_start) in the generated velf, before fself/vpk consume it.
-add_custom_command(TARGET midp_vita-velf POST_BUILD
-    COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/patch_velf_entry.py
-            ${CMAKE_CURRENT_BINARY_DIR}/midp_vita.velf
-            ${CMAKE_CURRENT_BINARY_DIR}/midp_vita)
+# DO NOT patch e_entry in the velf. In the SCE layout e_entry is NOT the
+# program entry - it is the sce_module_info locator: (segment<<30)|offset.
+# vita-elf-create sets it correctly (e.g. 0x364740 -> .sceModuleInfo.rodata
+# at 0x81364740). The kernel derives the real entry from module_info's
+# module_start field; patching e_entry to _start makes Vita3K parse
+# .text bytes as sce_module_info_raw in load_imports and crash with a
+# read violation right after "Linking SELF" (b137->b146 startup crash).
+

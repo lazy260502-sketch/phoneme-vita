@@ -16,8 +16,9 @@ NC='\033[0m'
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VITASDK_ROOT="/home/zyb/.local/vitasdk"
-source "$VITASDK_ROOT/vitasdk.sh"
+export VITASDK_ROOT="/home/zyb/.local/vitasdk"
+export VITASDK="$VITASDK_ROOT"
+export PATH="$VITASDK/bin:$PATH"
 
 PHONEME_CLDC="$SCRIPT_DIR/../phoneme-cldc"
 PHONEME_MIDP="$SCRIPT_DIR/../phoneme-midp"
@@ -111,7 +112,7 @@ echo -e "\n${YELLOW}[Step 3] Building CLDC VM (ARM target)...${NC}"
 cd "$PHONEME_CLDC"
 
 # Source VitaSDK again (we modified PATH)
-source "$VITASDK_ROOT/vitasdk.sh"
+# VitaSDK already sourced at top of script
 
 # Clean ARM build artifacts
 echo "  Cleaning ARM build..."
@@ -166,7 +167,7 @@ echo -e "\n${YELLOW}[Step 5] Building MIDP...${NC}"
 cd "$PHONEME_MIDP"
 
 # Source VitaSDK
-source "$VITASDK_ROOT/vitasdk.sh"
+# VitaSDK already sourced at top of script
 
 # Run MIDP build
 echo "  Building MIDP (using existing CLDC)..."

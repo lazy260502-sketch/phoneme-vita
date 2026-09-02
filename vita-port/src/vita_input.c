@@ -1,5 +1,5 @@
 /*
- * vita_input.c - PS Vita key input for phoneME MIDP
+ * vita_input.c - PS Vita key + touch input for phoneME MIDP
  *
  * Replaces phoneme-midp's mastermode_export.o (whose checkForSystemSignal
  * was an empty stub — the reason no key ever reached a MIDlet). The CMake
@@ -16,14 +16,27 @@
  *            SOFT1/2=-6/-7, GAMEA..D=-13..-16)
  *   ACTION = KEYMAP_STATE_PRESSED / KEYMAP_STATE_RELEASED
  *
- * SceCtrl is sampled on every callback; edge detection turns level state
- * into press/release events. A small SPSC ring buffers bursts (the VM
- * thread is the only consumer).
+ * Touch (SceTouch, clipped to the virtual screen and mapped back from
+ * the letterboxed 960x544 display) is delivered as MIDP_PEN_EVENT:
+ *   type   = MIDP_PEN_EVENT
+ *   X_POS  = virtual x (intParam2)
+ *   Y_POS  = virtual y (intParam3)
+ *   ACTION = KEYMAP_STATE_PRESSED/DRAGGED/RELEASED (intParam1)
+ * This mirrors qvfb_handle_input.c so DisplayEventListener delivers
+ * Canvas.pointerPressed/pointerReleased.
+ *
+ * SceCtrl/SceTouch are sampled on every callback; edge detection turns
+ * level state into press/release events. A small SPSC ring buffers
+ * bursts (the VM thread is the only consumer).
  */
 
 #include <kni.h>
 #include <psp2/ctrl.h>
+#include <psp2/touch.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/io/fcntl.h>
+#include <stdio.h>
+#include <string.h>
 
 #include <midp_logging.h>
 #include <midpServices.h>
@@ -33,6 +46,10 @@
 #include <midp_mastermode_port.h> /* checkForSystemSignal contract */
 
 #define VITA_INPUT_RING_SIZE 16
+
+/* Map a physical (960x544) touch coordinate to the virtual J2ME screen.
+ * Exported by vita_display.c. Returns 0 on hit, -1 in the letterbox. */
+extern int vita_display_map_touch(int px, int py, int *vx, int *vy);
 
 /* ---- SPSC ring: producer fills events, VM thread consumes them ---- */
 static MidpEvent event_ring[VITA_INPUT_RING_SIZE];
@@ -118,6 +135,20 @@ static void vita_input_poll(void) {
         return;
     }
 
+    /* DEBUG: log every button change to verify the VM event pump is
+     * still running (if the VM is frozen on a blocking native call,
+     * checkForSystemSignal never fires and this log stays empty). */
+    {
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "[INPUT] buttons=0x%08X\n", pad.buttons);
+        int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
+                           SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd >= 0) {
+            sceIoWrite(fd, dbg, strlen(dbg));
+            sceIoClose(fd);
+        }
+    }
+
     for (i = 0; key_map[i].vitaButton != 0; i++) {
         unsigned int mask = key_map[i].vitaButton;
         if (changed & mask) {
@@ -128,6 +159,89 @@ static void vita_input_poll(void) {
         }
     }
     prev_buttons = pad.buttons;
+}
+
+/* ---- Touch (pointer) input ----
+ * SceTouch reports the physical front panel (960x544). We map that
+ * coordinate into the virtual J2ME screen (240x320 / 320x240) and emit
+ * MIDP_PEN_EVENT. Track the previous touch position so a held+move
+ * finger turns into KEYMAP_STATE_DRAGGED instead of press/release spam. */
+static int touch_initialized = 0;
+static int touch_x = 0, touch_y = 0;      /* last virtual position */
+static int touch_down = 0;                /* finger currently down */
+
+static void vita_touch_init(void) {
+    if (touch_initialized) {
+        return;
+    }
+    /* Sample once to establish the idle (no-touch) baseline. */
+    SceTouchData touch;
+    sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
+    touch_down = 0;
+    touch_x = touch_y = 0;
+    touch_initialized = 1;
+}
+
+/* Called from checkForSystemSignal before the event ring is drained. */
+static void vita_touch_poll(void) {
+    SceTouchData touch;
+    int n;
+    int px, py, vx, vy;
+    int state;
+
+    if (!touch_initialized) {
+        vita_touch_init();
+    }
+
+    n = sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
+    if (n < 0) {
+        return;
+    }
+
+    if (touch.reportNum <= 0) {
+        /* No finger on the panel. */
+        if (touch_down) {
+            /* Emit release at the last known position. */
+            MidpEvent evt;
+            MIDP_EVENT_INITIALIZE(evt);
+            evt.type = MIDP_PEN_EVENT;
+            evt.ACTION = KEYMAP_STATE_RELEASED;
+            evt.X_POS = touch_x;
+            evt.Y_POS = touch_y;
+            ring_push(&evt);
+            touch_down = 0;
+        }
+        return;
+    }
+
+    /* First report = primary finger. */
+    px = touch.report[0].x;
+    py = touch.report[0].y;
+    if (vita_display_map_touch(px, py, &vx, &vy) != 0) {
+        return; /* touch in the letterbox - ignore */
+    }
+
+    if (!touch_down) {
+        state = KEYMAP_STATE_PRESSED;
+    } else if (vx != touch_x || vy != touch_y) {
+        state = KEYMAP_STATE_DRAGGED;
+    } else {
+        state = 0; /* no change */
+    }
+
+    if (state != 0) {
+        MidpEvent evt;
+        MIDP_EVENT_INITIALIZE(evt);
+        evt.type = MIDP_PEN_EVENT;
+        evt.ACTION = state;
+        evt.X_POS = vx;
+        evt.Y_POS = vy;
+        ring_push(&evt);
+    }
+
+    touch_x = vx;
+    touch_y = vy;
+    touch_down = 1;
 }
 
 /* ---- Exported: also called from vita_main.c after VM start ---- */
@@ -154,7 +268,24 @@ void checkForSystemSignal(MidpReentryData *pNewSignal,
         vita_input_init();
     }
 
+    /* DEBUG: heartbeat - logs every N-th call to prove the VM thread
+     * still reaches the event pump. If this stops while a key press
+     * still produces input_debug.log entries, the VM froze after
+     * sampling the pad (i.e. inside a blocked native call). */
+    static unsigned int hb = 0;
+    if ((hb++ & 0x3FF) == 0) {
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "[HEARTBEAT] checkForSystemSignal #%u\n", hb);
+        int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
+                           SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd >= 0) {
+            sceIoWrite(fd, dbg, strlen(dbg));
+            sceIoClose(fd);
+        }
+    }
+
     vita_input_poll();
+    vita_touch_poll();
 
     /* Media events first: a blocked MMAPI Java thread waits on
      * MEDIA_EVENT_SIGNAL, and END_OF_MEDIA must not be starved by
