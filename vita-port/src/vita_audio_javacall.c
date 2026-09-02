@@ -591,6 +591,11 @@ javacall_result javacall_media_initialize(void) {
     g_audio_port = -1;
     g_tone_stop_requested = 0;
     g_cfg.mediaCaps = NULL;
+    /* NOTE: ANI thread pool init (ANI_Initialize) intentionally omitted -
+     * linking against libcldc_vm_ani.a's ani.o fails because GNU ld's
+     * archive scanner doesn't pull ani.o for this symbol (stale/missing
+     * symbol index in the archive). b137 worked without this call.
+     * Re-enable only if ANI-related crashes reappear. */
     {
         SceUID tid = sceKernelCreateThread("j2me_tone", tone_player_thread,
                                            0x10000100, 0x4000, 0, 0, NULL);

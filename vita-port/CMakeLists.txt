@@ -167,32 +167,18 @@ target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 add_dependencies(${PROJECT_NAME} libobj_target)
 
-# Extract anilib objects and link as plain objects. Archive scanning of
-# libcldc_vm_ani.a fails to resolve ANI_Initialize in the full link
-# (works in minimal repro - unexplained archive edge case).
-set(ANI_OBJ_DIR ${CMAKE_CURRENT_BINARY_DIR}/ani_objs)
-set(ANI_AR /home/zyb/.local/vitasdk/bin/arm-vita-eabi-ar)
-add_custom_command(TARGET ${PROJECT_NAME} PRE_LINK
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${ANI_OBJ_DIR}
-    COMMAND ${ANI_AR} p ${CLDC_DIST}/lib/libcldc_vm_ani.a ani.o > ${ANI_OBJ_DIR}/ani.o
-    COMMAND ${ANI_AR} p ${CLDC_DIST}/lib/libcldc_vm_ani.a ani_bsd_socket.o > ${ANI_OBJ_DIR}/ani_bsd_socket.o
-    COMMAND ${ANI_AR} p ${CLDC_DIST}/lib/libcldc_vm_ani.a os_port.o > ${ANI_OBJ_DIR}/os_port.o
-    COMMAND ${ANI_AR} p ${CLDC_DIST}/lib/libcldc_vm_ani.a poolthread.o > ${ANI_OBJ_DIR}/poolthread.o
-    COMMENT "Extracting anilib objects")
-
 target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--whole-archive
     ${LIBOBJ_NO_MAIN}
     ${MIDP_OBJ_DIR}/runMidlet.o
     -Wl,--no-whole-archive
     -Wl,--allow-multiple-definition
-    ${ANI_OBJ_DIR}/ani.o
-    ${ANI_OBJ_DIR}/ani_bsd_socket.o
-    ${ANI_OBJ_DIR}/os_port.o
-    ${ANI_OBJ_DIR}/poolthread.o
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm
+    -Wl,--whole-archive
+    -lcldc_vm_ani
+    -Wl,--no-whole-archive
     -lcldc_vm_anix
     -lcldc_vmtest
     -lpthread
@@ -280,12 +266,3 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
         DESTINATION .
         RENAME ${VITA_TITLEID}.vpk)
-
-# vita-elf-create picks a wrong velf e_entry (0x395520 = unrelated function)
-# after our link-order changes. Patch it back to the ELF's real entry
-# (_start), keeping the Thumb bit. The build/vita-version.h check above can
-# verify: entry must have bit0 set.
-add_custom_command(TARGET midp_vita-velf POST_BUILD
-    COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/patch_velf_entry.py
-            ${CMAKE_CURRENT_BINARY_DIR}/midp_vita.velf
-            ${CMAKE_CURRENT_BINARY_DIR}/midp_vita)
