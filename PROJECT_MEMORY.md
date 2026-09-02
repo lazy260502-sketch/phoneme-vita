@@ -215,6 +215,12 @@ bash build_jar.sh
 ### ⭐ VM 编译权威文档（2026-09-02，samples 0ff302d）
 **改 VM 源码（phoneme-cldc/src/**）后：先读 `VM_BUILD.md`、用 `rebuild_vm.sh`**——完整配方（宿主工具/ARM 目标/打包三阶段）+ 十条陷阱表已固化。要点：命令行三清（FORCE_GCC=/GNU_TOOLS_DIR=/CPP_DEF_FLAGS=）+ `_release` 子目标 + AsmStubs 预置 + Interpreter_arm.o 用旧库成员 + ani.o 等 anilib 文件不得混入主库 + ar r 后逐个验证成员非空。
 
+### ANI 链接回归修复 + 入口补丁恢复（2026-09-02，samples 63015e9，VPK b146）
+- **ANI_Initialize 链接失败根因**：重造的 `libcldc_vm_ani.a` symbol index 损坏/过期——ld 扫描 archive 拉入 os_port.o 但不拉 ani.o（定义 ANI_Initialize 的成员）。ranlib 修 index 后最小链接过了但完整链接仍失败（不明 archive 边角案例）
+- **解法**：PRE_LINK 提取 ani.o/ani_bsd_socket.o/os_port.o/poolthread.o 四个对象，以普通对象直接链入（对 archive 边角免疫）；从 group 移除 `-lcldc_vm_ani`
+- **入口补丁恢复**：`tools/patch_velf_entry.py` POST_BUILD 把 velf e_entry 从 0x395520（无关函数）修回 _start（0x1471，**Thumb 位保留**）。此前 b143 闪退=Thumb 位被 strip，b141 秒退=入口指向普通函数
+- **VM_BUILD.md 陷阱 11 补充**：链接期症状 jvm_f2i undefined=库成员坏；运行期症状 Undefined instruction + GP 表地址=坏 GP 表成员；秒退=入口指向普通函数；闪退=Thumb 位丢失
+
 ### 音乐开关"卡死"根治：VM 重编去转储（2026-09-02，cldc 2959a08 / samples 357f014，VPK b137）
 - **真相**：音乐开关触发 MMAPI 类链**首次加载**（音频集成前这些类 CNF 根本不走加载）→ VM 三处调试转储（ClassFileParser 的 CP dump、ConstantPoolDesc 的 var_oops_do、Universe 的 hidden 警告）每类倾倒数千行 stderr → Vita3K 慢速 I/O 下几分钟出不来 = "卡死"；17403 行日志零异常。fd 0x7 洪水、suite 反复 startSuite 都是伴生现象
 - **修复**：全部转储 gate 在 `VITA_CP_DEBUG` 后（默认关）；libcldc_vm.a 重编（eboot 中三组格式串清零）
