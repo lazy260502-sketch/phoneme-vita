@@ -266,3 +266,11 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
         DESTINATION .
         RENAME ${VITA_TITLEID}.vpk)
+
+# vita-elf-create picks a wrong velf entry (0x392cc0 etc.) after our
+# link-order changes. Rewrite e_entry from the ELF's real entry
+# (_start) in the generated velf, before fself/vpk consume it.
+add_custom_command(TARGET midp_vita-velf POST_BUILD
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/patch_velf_entry.py
+            ${CMAKE_CURRENT_BINARY_DIR}/midp_vita.velf
+            ${CMAKE_CURRENT_BINARY_DIR}/midp_vita)

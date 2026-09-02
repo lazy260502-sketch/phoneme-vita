@@ -138,15 +138,13 @@ static int read_launch_cfg(char *jar, size_t jar_sz,
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
-    /* Trigger pte_os (pthread emulation) initialization. newlib's FILE
-     * locks (freopen/printf) and ani.o's pthread primitives both call
-     * pthread_self()/pthread_mutex_unlock(), which crash in
-     * pte_osAtomicExchange if pte_os hasn't initialized its thread
-     * tracking. A dummy lock/unlock cycle forces the initialization. */
+    /* Initialize pte_os (the pthread emulation layer used by newlib's
+     * FILE locks and libpthread). Without this, the first
+     * pthread_mutex_unlock on a statically-initialized mutex crashes
+     * at pte_osAtomicExchange(NULL+4). Must be the very first call. */
     {
-        pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
-        pthread_mutex_lock(&init_lock);
-        pthread_mutex_unlock(&init_lock);
+        extern void pte_osInit(void);
+        pte_osInit();
     }
 
     char midp_home[256];
