@@ -212,6 +212,53 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### ⭐⭐⭐⭐ 游戏启动 60ms 崩溃根因闭合：undef_bc→svc 0x1 野崩溃链 + jsr/ret 无实现（2026-09-03，cldc 0e8c406）
+- **症状**：03:46 全编译 VPK 打开游戏即卡死闪退；Vita3K 日志 `unknown NID 0xE1A00001`（~60ms，12:21:55.046）+ `EXCEPTION_ACCESS_VIOLATION Read 0xe3a03000`，PC=0x8109d85c（分发循环 `blx r3`），LR=0x8108ee10，r4=0x81093df0（.text 字节被当指针）
+- **根因链（全链条二进制证据闭合，不依赖用户日志）**：
+  1. C 解释器分发表 **256+256 槽唯缺 jsr(0xa8)/ret(0xa9)/jsr_w(0xc9)**（Bytecodes.hpp 枚举 vs DEF_BC 全量机械比对，其余全部已注册）
+  2. 游戏 jar（2005 前后 javac target<1.5 编译）的 try/finally 产生 jsr/ret；ROM 化系统类已 jsr-free（midp_system.jar 744 类精确流式扫描：此前报的 FloatingDecimal 0xa8@134 是 **ldc2_w 操作数**、CalendarImpl 0xa9@7 是 **iflt 分支操作数**——两次字节扫描均为假阳性，教训：扫描必须线性解码不能裸找字节）
+  3. 命中未注册槽 → `undef_bc()`（Interpreter_c.cpp:4154）打印 "Undefined bytecode hit" 后执行 `BREAKPOINT`
+  4. **BREAKPOINT 在 Vita = SWI 1**（GlobalDefinitions_gcc.hpp:96 注释即此前 Vita 移植改动："0xe6000010 undefined 会崩，改用 0xEF000001"）——Vita3K 不停机、当未知 syscall 报 NID 0xE1A00001（svc 下一条 `mov r0,r1` 的编码 E1A00001）
+  5. svc 返回后 `pop {r4,pc}` 恢复出坏栈 → r4=0x81093df0 → 分发循环把 .text 编码当 g_jpc/表项 → 野指针崩溃（两个变体 0xe3a03000=`mov r3,#0`、0xe3070c9c=`movw r0,#0x7c9c` 均对上）
+  6. Hello.jar 不触达 jsr（其 opcode 集全覆盖）——所以 Hello 测试通过而游戏崩
+- **修复**：Interpreter_c.cpp +34 行实现全部四个入口：`jsr`（PUSH((jint)(address_word)(g_jpc+3)) + branch(true)，与 goto 同 tick 路径）、`jsr_w`（PUSH(jpc+5)+GET_INT 跳转，对齐 goto_w 不加 check_timer_tick）、`ret` 窄形式（g_jpc=GET_LOCAL(GET_BYTE(0))）、wide `ret`（DEF_BC_WIDE→bc_impl_ret_wide，g_jpc=GET_LOCAL(GET_SHORT(0))——bc_impl_wide ADVANCE(1) 后入口 g_jpc 指向 ret opcode 本身，与 iinc_wide 语义一致）。returnAddress 是裸 jint 绝对 bci，**不用 OBJ_PUSH**（非 oop，GC 不追踪）
+- **构建链**：rebuild_vm.sh 全量重编（31 对象全代际）→ libcldc_vm.a 21 成员 → vita-port/build.sh 链接打包。velf 终验：`bc_impl_jsr`@0x102092b3c（push 序列+revsh 分支+tick 调用）、`bc_impl_ret`（ldrb 操作数→GET_LOCAL→写 [r3,#0xb4]）、`bc_impl_jsr_w`（PUSH+rev 全字跳转）逐一反汇编正确
+- **构建环境变化**：宿主 g++-11 已不存在，vita_arm.cfg 两处 FORCE_GCC 改为 `/usr/bin/g++-13 -B/usr/bin -m32`（g++-13-multilib 在位）——cfg 与 0e8c406 一起提交
+- **路径修正（本轮实证）**：VPK 真正构建入口是 **`vita-port/build.sh`**（vita-port/CMakeLists 含 vm_rom_stubs.c 的 InitFPU/_rom_linkcheck 补符号 + 完整 Vita 移植层）；`midp-vita/build_midp_vita.sh` 是旧路线，其 CMake 链接会报 InitFPU/_rom_linkcheck undefined（vm_rom_stubs 不在其闭包），**不要再用它出包**
+- **遗留**：①BREAKPOINT=svc 0x1 加固（改成安全停机）未做——jsr/ret 补齐后 undef 概率已极低，但未来任何 undef 命中仍会野崩 ②游戏 jar 实测待用户确认 ③milestone 崩溃微机制（svc 如何扰栈致 pop 出坏 r4）未完全证明，不影响修复
+
+### ⭐ 事件泵死锁根治：Scheduler 门控放宽（2026-09-02，cldc 83ece23 / vita-port e711a0b，VPK 01.02 b153）
+- **症状**：01.01 版（触屏+input_debug.log 日志版）进入游戏后"卡死"无输入响应，但 **input_debug.log 根本不出现**——心跳日志在 checkForSystemSignal 首行，没日志=事件泵从未被调用，这是决定性证据
+- **根因（实锤）**：`Scheduler.cpp:653` wake_up_timed_out_sleepers 上游门控 `if (!is_slave_mode() && !Universe::scheduler_async()->is_null())`——主模式下**必须有 Java 线程阻塞在异步 native 调用**才驱动事件泵。我们的音频全同步返回（JAVACALL_MM_ASYNC_EXEC）→ 游戏运行期 scheduler_async 恒空 → checkForSystemSignal 永不执行 → 输入/触摸/媒体事件全部滞留 ring。这也解释了"修好音频同步后反而卡死"的矛盾
+- **修复**：`#if defined(VITA)` 分支去掉 scheduler_async 判空，仅保留 `!is_slave_mode()` + `_timer_has_ticked || _estimated_event_readiness > 0`——事件泵改由 10ms timer tick 驱动（ticker 线程→real_time_tick→set_timer_tick→解释器 check_timer_tick→yield 链路已验证完整）
+- **构建陷阱（本次最大教训）**：**不能只替换单个 .o 进旧库**。dist/lib/libcldc_vm.a 是 21 成员的既有 ABI 体系（JVM_TRAPS 宏在 PRODUCT 下展开为空、非 PRODUCT 下带 `Traps*` 参数——符号名都不同）。单换 MergedSrc002 必然与其他 20 个成员 ABI 不匹配，链接期缺 JVMScheduler::start/wait/notify 等一大批。正确做法：`rebuild_vm.sh`（VM_BUILD.md 配方）**全量 32 个 target/release 对象统一重编**再打包
+- **rebuild_vm.sh EXCLUDE 修正（重要）**：脚本原版漏排 6 个"可执行专属"对象（BSDSocket/Main_vita/NativesTable/ROMImage/ReflectNatives/jvmspi——jvm.make LIB_OBJS 1030-1048 行明确 subst 掉的）。混入主库导致 Main_vita 的 main/module_start、ROMImage 与 MIDP 侧冲突、符号拉取链断裂（pte_osInit/ANI_Initialize 链接失败假象）。~~从 KNOWN_GOOD 基线重播种~~ **2026-09-03 起改为全代际重打包（见下方 03:46 记录）**
+- **release flavor 与 jvm_natives_table**：release（非 PRODUCT）+ROMIZING 下 `Natives.cpp:1638` 会引用 `jvm_natives_table`（`#if (!ROMIZING)||(!PRODUCT)`），需把 `NativesTable.o`（纯数据表 R 符号+Java_* 外部引用，无副作用）加进主库；PRODUCT 下无此引用（旧库即 PRODUCT ABI 所以从没暴露）
+- **验证**：最终 eboot `wake_up_timed_out_sleepers` @0x81072588 反汇编确认 is_slave_mode 检查后直接读 _timer_has_ticked([r5,#340])/_estimated_event_readiness([r3,#1580/1588])，**无 scheduler_async 判空**；库 21+1 成员、jvm_f2i 浮点 stub 在位；VPK 14530343 字节、版本串 `J2ME Player v01.02 b152 (e711a0b)`
+- **测试预期**：装 01.02 后进游戏，`ux0:/data/J2ME00001/input_debug.log` 应出现（[HEARTBEAT] 每 1024 次 checkForSystemSignal + [INPUT] 每次按键变化）——文件出现即事件泵复活；触屏（Vita3K 鼠标点击）走 MIDP_PEN_EVENT 路由到 Canvas.pointerPressed/Released
+
+### ⭐⭐ Thumb/ARM 混编崩溃：rebuild_vm.sh 丢 -marm（2026-09-03，VPK 01.02 b153 修复版）
+- **症状**：装上 rebuild_vm.sh 全量重编的 01.02 进游戏即崩。Vita3K 日志：`Undefined instruction at 0x810C0E88, instruction 0x1AFFFFFA` + `Thumb: true` + **同一 PC 无限循环、SP 每轮递减 0x14（无限递归栈下溢）**——与 b139 事故特征同款
+- **根因（实锤）**：`rebuild_vm.sh` 的命令行三清 `CPP_DEF_FLAGS=` 把 cfg 注入的 `-marm` 架构标志一并清掉 → 32 个新 C++ 对象全部编成 **Thumb-2**（`f245/b08b/b9a3` 编码），而老库 `Interpreter_arm.o` 是 **ARM 汇编**。崩溃链：新 Thumb `adjust_heap_size`（_MergedSrc003）Thumb `bl fast_memclear` 不切模式 → 跳进 ARM 汇编 → ARM 编码被 Thumb 状态解码 → 未定义指令。LR=0x810861cb 正是 `bl fast_memclear` 调用点
+- **误判提示**：崩溃点指令 `1afffffa` 本身是合法 ARM `bne`（链表遍历循环）——"指令合法但 Thumb:true 执行"就是模式错乱指纹，别往坏数据/GP 表方向查
+- **正确配方（已被 03:46 全编译路线取代，保留下述宏结论）**：编译命令**必须显式带 `-O2 -DNDEBUG -DPRODUCT -DROMIZING=1 -marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3`**（PRODUCT 宏给出无参 JVM_TRAPS ABI + 无 jvm_natives_table 引用，-marm 保证 ARM 编码）。注意：任何路线下这些标志都不能丢——GNU make 命令行变量会压制 makefile 内 `+=`，`CPP_DEF_FLAGS=` 一旦传空，cfg 里 vita_arm.cfg 232-254 行的全部 `CPP_DEF_FLAGS +=`（架构+特性宏）都被清掉
+- **入库前必须验证四项**：①反汇编为纯 ARM 编码（e3xx/e59x/e1a 开头，无 f2xx Thumb 前缀）②符号为无参版（`wake_up_timed_out_sleepersEv`，非 `EP8JVMTraps`）③`nm | grep -c jvm_natives_table` = 0（PRODUCT 生效）④`wake_up_timed_out_sleepers` 反汇编无 scheduler_async 门控（VITA 修复在位）
+- **CMake 陷阱**：CMake 不把 libcldc_vm.a 当文件依赖——**换库后必须 `rm -f build/midp_vita midp_vita.velf midp_vita.self midp_vita.vpk` 强制重链**，否则只是用旧 self 重打包 VPK（本次 16:47 的 VPK 就是这么混过去的）
+- **最终验证**：新 eboot `wake_up_timed_out_sleepers` @0x81071e70 纯 ARM 编码；`adjust_heap_size → fast_memclear` 为 ARM `bl`（eb00ce87）模式一致；版本串 v01.02 b152；HEARTBEAT/checkForSystemSignal/sceTouchPeek 全在位；VPK 14286958 字节（02:24）
+- **VM_BUILD.md 待补**：三清中 `CPP_DEF_FLAGS=` 只是为了清 romgen 分支的 `-B/usr/bin -m32 -DCROSS_GENERATOR=1`，但 make 层面 cfg 的 -marm 也在 CPP_DEF_FLAGS 里——**用 rebuild_vm.sh 后新对象是 Thumb，与老库 ARM 成员不兼容**。全量重编路线必须同时验证 `-marm` 在编译命令中（grep 干跑输出）；单对象替换路线用上面的显式命令
+
+### ⭐⭐⭐ 库混代崩溃 + 全编译终局修复：rebuild_vm.sh 两缺陷（2026-09-03 03:46 VPK，验证通过待真机/模拟器实测）
+- **症状**：02:24 的 v01.02 修复版进游戏仍崩，Vita3K 日志 `EXCEPTION_ACCESS_VIOLATION, Read violation at 0x13A2C499`，PC=0x8108e6d8（JVMMethod::name()），LR=0x8107c014（Throwable::fillInStackTrace 遍历调用栈）。**注意 Thumb 已不是问题**（日志 `Thumb: false`）——崩溃性质从"指令模式错乱"变成"读野指针"
+- **根因 A（库混代，实锤）**：上一版 pack_lib 从 `/tmp/libcldc_vm.a.KNOWN_GOOD`（Sep 2 基线）重播种 20 个旧对象、只换新 `_MergedSrc002.o` → 库内同名成员字节不同、大小差 2 倍级（旧基线混装配产物）→ 异常路径 fillInStackTrace 遍栈时 method/constants oop 为垃圾（0x13a2c499）→ 崩。**触发条件是 Java 异常抛出**，所以此前正常路径的测试全通过、一进游戏就崩
+- **根因 B（编译标志丢失）**：`CPP_DEF_FLAGS=` 命令行赋值压制 cfg 的全部 `CPP_DEF_FLAGS +=` → 丢 `-marm/-march/-mfloat-abi=hard/-DPRODUCT/-DARM/-DVITA` 等全套 → FLAVOR=release 本身不产生 `-DPRODUCT`（jvm.make 833-835：`CPP_DEF_FLAGS_release=` 为空、product 才有 `-DPRODUCT`）
+- **修复（rebuild_vm.sh，+44/-3 行）**：①build_target() 新增 `CPP_DEF_FLAGS_TARGET`（完整 17 项标志：-DPRODUCT -DROMIZING=1 -DARM -DVITA -D__PSP2__ -Wno-narrowing -fpermissive -marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3 -DSUPPORTS_*×4 -DUSE_VM_EXCEPTIONS=0 -DUSE_BSD_SOCKET=1），make 显式传入 ②pack_lib() **废除 KNOWN_GOOD 重播种**，改为全代际重打包：所有 target 对象逐个 `ar r`；`Interpreter_arm.o` 沿用旧库成员（regenerated .s 丢了 jvm_f2i/jvm_d2i 浮点 stub，且其内嵌 GP 全局符号正是链接期所需）③EXCLUDE 清单不变（12 个可执行专属对象）
+- **全编译验证（本轮"就该全编译"结论的实证）**：31 个 target/release 对象全新生成（03:28）——**全部纯 ARM**（逐对象统计 0 条 16-bit、共 113753 条 32-bit 指令）、**全部 0 debug-ABI 痕迹**（无 `Traps`/`EP8JVMTraps`）；主库 1169032 字节、21 成员全代际一致
+- **强制重链**：删 midp_vita/velf/self/vpk 四产物 → cmake --build 重链 → VPK 14305891 字节（03:46）
+- **eboot 终验（nm 地址 0x102… 与 objdump VMA 0x810… 换算：VMA = nm − 0x81000000）**：①Thumb=0 ②jvm_f2i@0x810a60fc / jvm_d2i@0x810a6154 在位 ③GP 全局在位（_old_generation_end@0x1027019d4、_task_class_init_marker@0x102701bfc 等，由旧代 Interpreter_arm.o 供给——GPSkeleton.cpp 那套只在 ROM 生成器里链入）④修复版 `wake_up_timed_out_sleepers`@VMA 0x81062308（0x19C 字节）全部 6 个 bl 解析确认：JVMScheduler::start+0x98、Protocol::writeByte+0xac（编译器布局巧合，非语义调用）、JVMOs::sleep、add_sync_thread、JVMSynchronizer::enter、gc_epilogue——函数体特征与 09-02 门控放宽修复版一致
+- **产物**：`vita-port/build/midp_vita.vpk`（14305891B, 03:46）；`phoneme-cldc/build/vita_arm/dist/lib/libcldc_vm.a`（1169032B, 03:28，21 成员全代际）；`.bak` 为旧混代库勿再使用
+- **构建期链接报错（预期，无害）**：rebuild_vm.sh 末尾 exe 链接 crt0 失败 `|| true`，38 个 undefined reference（_task_class_init_marker/_old_generation_end/_primordial_sp 等）本就由链接期 Interpreter_arm.o/vita-port 供给，属脚本设计内行为
+- **遗留风险**：异常路径（fillInStackTrace 深栈遍历）在本库代际下是**首次完整实测**；若仍崩，下一步查①事件投递真空（mastermode checkForSystemSignal 空 stub 时机）②C interpreter 帧布局与 oop 遍历一致性
+
 ### 启动即崩真因：e_entry 被 patch 成 _start，破坏 SCE module_info 定位器（2026-09-02）
 - **症状**：新 VPK 打开即卡死、Vita3K 闪退。日志：`Loaded module segment 0/1`（尺寸与 velf 完全一致）→ `Linking SELF app0:eboot.bin` → `eboot.bin module NID: 0xAC3E25AB` → **同毫秒** `EXCEPTION_ACCESS_VIOLATION, Read violation at 0x4A6F84D2F`
 - **根因（实锤）**：SCE ELF 的 `e_entry` **不是程序入口**，是 `sce_module_info` 定位器：`(段号<<30) | 段内偏移`（Vita3K `load_self.cpp:492` `module_info_offset = e_entry & 0x3fffffff`、`:689` `module_info_segment_index = e_entry >> 30`；真正的程序入口在 `module_info->module_start`）。vita-elf-create 生成 `e_entry=0x364740` 本来就正确——精确指向 `.sceModuleInfo.rodata`（0x81364740 = 0x81000000+0x364740）。而 `tools/patch_velf_entry.py`（b141 引入）把它改写成 `_start` 偏移 0x6e9 → Vita3K 把段0+0x6e9 处的 .text 机器码当 `sce_module_info_raw` 解析，`import_top/import_end` 全是代码垃圾 → `load_imports` 的 `for (imports=begin; imports<end; imports+=imports->size)` 走野指针 → 读违规闪退

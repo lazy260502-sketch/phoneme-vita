@@ -18,7 +18,19 @@ BD=$CLDC/build/vita_arm
 L=$BD/dist/lib/libcldc_vm.a
 AR=/home/zyb/.local/vitasdk/bin/arm-vita-eabi-ar
 FLAVOR=release            # debug=AZZERT gaps; product=compiler member; release=OK
-EXCLUDE="AsmStubs_x86_64.o|Interpreter_arm.o|ani.o|ani_bsd_socket.o|os_port.o|poolthread.o"
+# 2026-09-03: FLAVOR=release gives CPP_DEF_FLAGS_release="" (jvm.make:834),
+# so -DPRODUCT is NOT added automatically. The library baseline is a
+# PRODUCT-ABI build (no Traps* symbols, no ...Ev signatures). Every target
+# object MUST be compiled with the same ABI: -DPRODUCT -DROMIZING=1.
+# Without it the new objects are ABI-incompatible with the old library
+# members they replace (fillInStackTrace crash 2026-09-03).
+
+# Objects that belong ONLY to the cldc_vm executable, never to the library.
+# jvm.make LIB_OBJS (lines 1030-1048) explicitly subst's these out:
+# Main_vita has main/module_start, ROMImage clashes with the MIDP-side
+# ROMImage, the rest corrupt symbol pull-in (pte_osInit/ANI_Initialize
+# link failures seen 2026-09-02).
+EXCLUDE="AsmStubs_x86_64.o|Interpreter_arm.o|ani.o|ani_bsd_socket.o|os_port.o|poolthread.o|BSDSocket.o|Main_vita.o|NativesTable.o|ROMImage.o|ReflectNatives.o|jvmspi.o"
 
 export JVMWorkSpace=$CLDC
 export JVMBuildSpace=$CLDC/build
@@ -52,10 +64,30 @@ build_target() {
     #                   the host g++-11 -> "-marm unrecognized" on ARM sources
     # GNU_TOOLS_DIR=    else the cross prefix is lost -> bare g++, crt0 not found
     # CPP_DEF_FLAGS=    else "-B/usr/bin -m32 -DCROSS_GENERATOR=1" leaks in
+    #
+    # 2026-09-03 FIX: the bare "CPP_DEF_FLAGS=" was wrong in a subtle way.
+    # A command-line variable in GNU make CANNOT be appended to by += in the
+    # makefiles, so ALL of vita_arm.cfg's target-section CPP_DEF_FLAGS were
+    # silently dropped: -DARM -DVITA -D__PSP2__, -Wno-narrowing -fpermissive,
+    # -marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3,
+    # -DSUPPORTS_MEMORY_MAPPED_FILES=0 -DSUPPORTS_ADJUSTABLE_MEMORY_CHUNK=0
+    # -DSUPPORTS_TIMER_THREAD=1 -DSUPPORTS_TIMER_INTERRUPT=0 -DUSE_VM_EXCEPTIONS=0
+    # -DUSE_BSD_SOCKET=1. Result: objects were compiled as Thumb without
+    # PRODUCT/ROMIZING -> mixed-generation library -> crash. The command line
+    # must therefore carry the FULL flag set from vita_arm.cfg lines 232-254
+    # plus -DPRODUCT (FLAVOR=release adds nothing) and -DROMIZING=1 (cfg only
+    # exports ROMIZING=true as a make variable, not a -D).
+    CPP_DEF_FLAGS_TARGET="-DPRODUCT -DROMIZING=1 -DARM -DVITA -D__PSP2__ \
+        -Wno-narrowing -fpermissive \
+        -marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3 \
+        -DSUPPORTS_MEMORY_MAPPED_FILES=0 -DSUPPORTS_ADJUSTABLE_MEMORY_CHUNK=0 \
+        -DSUPPORTS_TIMER_THREAD=1 -DSUPPORTS_TIMER_INTERRUPT=0 \
+        -DUSE_VM_EXCEPTIONS=0 -DUSE_BSD_SOCKET=1"
     make BUILD_DIR_NAME=vita_arm IsLoopGen=true \
          LOOP_GENERATOR_DIR=../../linux_arm/loopgen/app \
          ENABLE_ENABLING_CHECK=false ENABLE_C_INTERPRETER=true \
-         FORCE_GCC= GNU_TOOLS_DIR=/home/zyb/.local/vitasdk CPP_DEF_FLAGS= \
+         FORCE_GCC= GNU_TOOLS_DIR=/home/zyb/.local/vitasdk \
+         CPP_DEF_FLAGS="$CPP_DEF_FLAGS_TARGET" \
          -j"$(nproc)" _$FLAVOR || true   # final exe link fails on crt0: expected
 
     local n; n=$(ls target/$FLAVOR/*.o 2>/dev/null | wc -l)
@@ -68,6 +100,13 @@ pack_lib() {
     [ -f $L ] || die "library not found"
     cp $L $L.bak
 
+    # 2026-09-03: NEVER repack from the old KNOWN_GOOD baseline anymore.
+    # That re-seeds 20 old-generation members and only the replaced ones get
+    # updated -> mixed-generation library -> fillInStackTrace crash. All
+    # members that exist in target/$FLAVOR are replaced below, in one pass,
+    # so the whole library is one compile generation.
+    echo "   (full-generation repack: every matching member replaced)"
+
     cd $BD/target/$FLAVOR
     local m
     for m in *.o; do
@@ -76,7 +115,9 @@ pack_lib() {
     done
 
     # Interpreter_arm.o must come from the OLD library: the regenerated .s
-    # lost the jvm_f2i/jvm_d2i float stubs (GP table + fast globals only)
+    # lost the jvm_f2i/jvm_d2i float stubs (GP table + fast globals only).
+    # NOTE: once the regenerated interpreter gains working jvm_f2i/jvm_d2i,
+    # remove this and use the fresh member instead.
     cd /tmp
     $AR p $L.bak Interpreter_arm.o > Interpreter_arm.o 2>/dev/null \
         || die "cannot extract Interpreter_arm.o from backup"
