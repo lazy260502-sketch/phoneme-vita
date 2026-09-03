@@ -212,6 +212,21 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### ⭐⭐⭐⭐ 2026-09-03 第二轮：jsr/ret 修复后游戏仍崩 → undef_bc 安全网改造（cldc a9b44c1）
+- **背景**：用户装上含 jsr/jsr_w/ret/ret_wide 的 VPK（cldc 0e8c406 / samples 5ec5d45）后实测"口袋灵兽"仍异常。新 vita3k.log 显示**同一 undef_bc→svc 0x1 链再次发生**（新地址：LR=0x8108ee90 恰落在新构建 undef_bc 的 svc 指令上；模块 NID 0xE92EFCF7 也证明用户跑的是新构建）。
+- **分发表权威复核结论（排除 jsr/ret 注册问题）**：Python 全量比对（TAGS=0/CPU_VARIANT=1 条件求值）enum 0..201 共 202 项，注册后 MISSING 仅 `[(186,'xxxunusedxxx')]`=保留值；WIDE 表 12 项齐全（含 ret）。**jsr/ret 注册确认无误**。真 opcode 值未出现在 vita3k.log——undef 打印走 fd 0x7 进设备侧 `ux0:/data/J2ME00001/midp_stderr.log`，用户尚未提供该文件。
+- **根因（机制层面，与游戏启动 60ms 崩溃同一机制）**：undef_bc 原实现是 tty 打印 + BREAKPOINT。Vita 上 BREAKPOINT=SWI 1，Vita3K 报 "Import function for NID 0xE1A00001 not found" 后**继续执行**——undef_bc 尾声继续跑，pop 回坏 r4 返回分发循环，野指针崩溃远离第一现场。
+- **修复**：Interpreter_c.cpp undef_bc 重写（commit a9b44c1，+38/-2）：新增 `undef_bc_stop(code,bcp)`——fprintf+tty 打印 opcode/bcp → `Universe::set_stopping()` → `BREAK_INTERPRETER_LOOP(JMP_STOPPED_MANUALLY)`（与 current_thread_to_primordial 相同的合法 longjmp 退出路径，primordial_to_current_thread 主循环 4593 行已有 JMP_STOPPED_MANUALLY 处理）。debug 打印开启时额外经 undef_bc_report 打方法名（Method::print_name_to 有 PRODUCT 门控，故包在 `#if !defined(PRODUCT) || USE_DEBUG_PRINTING` 内）。release 分支走 undef_bc_stop（无方法名但有 opcode/bcp）。
+- **踩坑记录（重要，防再犯）**：
+  1. `JVMUniverse`（handles/Universe.hpp）**没有** `stop()` 方法，只有 `set_stopping()`/`is_stopping()`——首次重编报 `'stop' is not a member of 'JVMUniverse'`。
+  2. 编辑时误删旧 `#if !defined(PRODUCT) || USE_DEBUG_PRINTING` 的开启行留下孤儿 #endif → `unterminated #if` 波及 JarFileParser/Natives.hpp 假错误。**教训：#if 块改写要整体删旧换新，不能只换中段。**
+  3. Interpret() 主循环 guard（查表命中 undef_bc 预拦截）已实现又回退：冗余且若 stop 返回会双重分发同一坏 opcode。undef_bc 自身停机足够。
+  4. vita-port/build.sh 需要 JDK：`export JDK_DIR=/home/zyb/tools/jdk8u502-b07 && export PATH=$JDK_DIR/bin:$PATH`（javac 不在默认 PATH）。
+  5. romgen 宿主链接报 BSDSocket.o wrong format 是已知无害噪音（VM 31 对象 OK + repack 完成即成功）。
+- **验证**：rebuild_vm.sh build 31 对象 OK；库成员 _MergedSrc006.o 反汇编确认 undef_bc 控制流 fprintf→print_cr→longjmp、**无 svc**；新 velf（midp_vita.velf）undef_bc@0x8108eef8（旧构建 0x8108eea4），undef 区域 objdump svc 计数=0。VPK：`vita-port/build/cmake/midp_vita.vpk`（eboot 2417440B，17:02 生成）。
+- **待办/下一步**：用户装新 VPK 后 (1) 若崩，预期 vita3k.log 出现干净退出而非野崩，且 midp_stderr.log 必有 `FATAL: Undefined bytecode 0xNN at bcp 0x…`——拿到 NN 即可定点修真 opcode；(2) 请用户提供 ux0:/data/J2ME00001/midp_stderr.log（Windows 侧 Vita3K 目录 `C:/Users/zyb/AppData/Roaming/Vita3K/Vita3K/ux0/data/J2ME00001/`）——当前已装构建的该文件里其实已有旧格式打印 `Undefined bytecode hit: 0x?? at 0x??`，是最快定凶途径。
+- **遗留风险**：若坏流来自 JSR 子程序外的其它路径（如宽索引/坏 class），undef_bc 只是把野崩变成可控停机+诊断输出，不解决根因；真 opcode 定位后仍需定点修复。
+
 ### ⭐⭐⭐⭐ 游戏启动 60ms 崩溃根因闭合：undef_bc→svc 0x1 野崩溃链 + jsr/ret 无实现（2026-09-03，cldc 0e8c406）
 - **症状**：03:46 全编译 VPK 打开游戏即卡死闪退；Vita3K 日志 `unknown NID 0xE1A00001`（~60ms，12:21:55.046）+ `EXCEPTION_ACCESS_VIOLATION Read 0xe3a03000`，PC=0x8109d85c（分发循环 `blx r3`），LR=0x8108ee10，r4=0x81093df0（.text 字节被当指针）
 - **根因链（全链条二进制证据闭合，不依赖用户日志）**：
