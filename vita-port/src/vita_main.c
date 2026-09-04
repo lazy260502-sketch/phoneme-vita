@@ -153,6 +153,14 @@ int main(int argc, char *argv[]) {
     char orient[32];
     char classpath[512];
 
+    /* Writable runtime dirs - MUST exist before the freopen() calls below.
+     * Otherwise fopen fails silently and stderr stays bound to the tty
+     * device (Vita3K "*** TTY:" per-char stream) so midp_stderr.log stays
+     * empty on FIRST launch (8-31 log-loss incident). */
+    sceIoMkdir(DATA_DIR, 0777);
+    sceIoMkdir(DATA_DIR "/appdb", 0777);
+    sceIoMkdir(DATA_DIR "/lib", 0777);
+
     freopen(DATA_DIR "/midp_stdout.log", "w", stdout);
     /* stderr: TEMPORARILY restored to a file to capture the suite
      * crash-restart loop (music toggle kills GameMidlet; the JVM fatal
@@ -165,11 +173,6 @@ int main(int argc, char *argv[]) {
 
     dlog("vita-port J2ME launcher\n");
     dlog("version: " VITA_PORT_VERSION_STRING "\n");
-
-    /* Writable runtime dirs */
-    sceIoMkdir(DATA_DIR, 0777);
-    sceIoMkdir(DATA_DIR "/appdb", 0777);
-    sceIoMkdir(DATA_DIR "/lib", 0777);
 
     /* CRITICAL: run from the data dir and keep ALL VM classpath entries
      * RELATIVE. The CLDC classpath splits on ':' - an entry like

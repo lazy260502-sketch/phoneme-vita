@@ -174,6 +174,32 @@ data/J2ME00001/
 
 ## 当前状态 🔄
 
+### 2026-09-04 v01.08：★ 回归根因闭合——C 解释器混入导致 GP 表双定义被静默消解（已恢复 8-31 世代 VM 库）
+- **用户的判断是对的**：不是"音频改动"本身，也无需逐症状打补丁。8-31 可玩 → 后续崩溃的**真正回归点 = 9-2 01:20 的 `rebuild_vm.sh`（samples 0ff302d）**。
+- **根因链（全部实测证据）**：
+  1. **8-31 可玩世代（KG 库，`/tmp/libcldc_vm.a.KNOWN_GOOD`，9-2 16:15 备份）没有 C 解释器**——其 `_MergedSrc006.o` 无 `g_jpc`/`g_jpc`/`interpreter_dispatch_table` 符号；VM 跑 **ARM 汇编快速解释器**（`Interpreter_arm.o`），它定义 **`jvm_fast_globals` D 版（1036 字节 .data，r10 基址访问的 GP 指针表）**——这是唯一定义 ✅
+  2. **9-2 `rebuild_vm.sh` 从第一版就自相矛盾**：`ENABLE_C_INTERPRETER=true` 把 `Interpreter_c.cpp`（定义 **B 版 `JVMFastGlobals jvm_fast_globals`**，176 字节零初始化 bss，`Interpreter_c.cpp:4860`）编进 `_MergedSrc006`，又从旧库提取 `Interpreter_arm.o`（D 版）塞回库 → **同名双定义**
+  3. `--allow-multiple-definition`（8-30 8a为修双定义链接错误加的，当时无害）把冲突静默消解 → **最终 ELF 绑定 B 版**（曾实测 `81390564 B`，r5=0x8139255c 现场离它 +0x2000 越界）→ 快速解释器 GP 表全是零/垃圾 → 野跳进 ROM 字节码区滑行 → 崩。9-3~9-4 诊断的"jsr/ret 无实现"（0e8c406）、"dispatch 表污染"（ae48cdb）、"PC=0"（900dd85）、"ROM text 冒充 handler"（d206ff5）**全是这个双定义的下游症状**——C 解释器本来就不该在构建里，jsr/ret 在快速解释器里本来就有实现。
+  4. 崩溃寄存器 ASCII 碎片（"skin"/"btn_"/"srcx"/"srcy"/"pngP"）= 滑行路过的 chameleon 皮肤字符串表（.rodata 0x812ee280+，"keyboard.btn_"、"btn_mid_sel"），佐证执行流失控范围。
+- **修复**：恢复 `/tmp/libcldc_vm.a.KNOWN_GOOD` 为 `phoneme-cldc/build/vita_arm/dist/lib/libcldc_vm.a`（混装问题代备份为 `libcldc_vm.a.cinterp_broken`）；vita-port `./build.sh` 重链。**验证**：最终 ELF `81381ae4 D jvm_fast_globals`（D 版 .data 指针表胜出 ✅），`g_jpc`/`interpreter_dispatch_table` 符号数为 0（C 解释器不在 ✅）。
+- **产物**：`samples/j2me/midp_vita_v0108.vpk`（md5 `0827c5011d9c9a198edd51197f5f7add`，14289566B）。
+- **构建坑（再次踩中，务必牢记）**：
+  - **CMake 库文件级依赖缺失**：库归档更新后 make 判定无需重链，ELF 陈旧——`rm build/cmake/midp_vita` 强制重链后必须 `arm-vita-eabi-nm` 验证绑定（v01.07 就是没验证发了陈旧包）
+  - **javac 不在 PATH**：`build_jar.sh` 需要 `export PATH=/home/zyb/tools/jdk8u502-b07/bin:$PATH`
+- **rebuild_vm.sh 必须修正后才能再用**（本轮未改，防再犯）：`ENABLE_C_INTERPRETER=true` 与"从旧库提取 Interpreter_arm.o"的组合 = 必然双定义。要么去掉 C 解释器（回到快速解释器，当前 KG 世代的做法），要么全量用重新生成的 Interpreter_arm.o（需先恢复 f2i/d2i stub）。**在修正前禁止运行 rebuild_vm.sh**。
+- **9-3~9-4 的 C 解释器侧改动全部无效但无害**（jsr/ret 实现、undef_bc 安全网、面包屑环、看门狗、handler 窗口）——它们编在 `_MergedSrc006` 里，但该成员现在来自 KG 世代（无这些代码）；源码保留，不回滚（若未来切回 C 解释器可复用）。但注意 **OS_vita.cpp 的看门狗（900dd85）也不在了**（KG 世代的 OS_vita.o 无 watchdog 符号）——挂起型崩溃将无转储，只能靠 Vita3K 日志。
+- **测试预期**：v01.08 = 8-31 世代 VM + 之后全部 vita-port/MIDP 层改进（音频 playTone 状态机、media 事件桥、RMS 隔离 groundwork、日志修复）。若仍崩，则根因在 vita-port/MIDP 层（音频线程、事件桥、RMS 隔离），需用 git 在 vita-port 提交线上二分（`b29d725` 之后的提交都只动 vita-port 层，二分成本低）。
+
+### 2026-09-04 v01.07：dispatch 校验窗口改为表自身采样（拦截 ROM-text 冒充 handler）
+- **01.06 实测崩溃形态（用户 vita3k.log）**：进游戏 35ms 后硬崩，PC=0x73726378（"srcx"）、r12=0x73726379（"srcy"+Thumb 位）、r4=0x50676e70（"pngP"）、LR=0x8112bc18（ROM text 内）、Thumb:true——**执行流滑进 ROM 字节码数据当指令执行，间接跳转目标被字符串碎片冒充**。
+- **01.04 校验的漏洞（本轮核心发现）**：旧窗口 `[0x81000000,0x81400000)` **包含 ROM text 块（.rodata 内 0x810fbe58 起）**，被污染成 ROM 字节码地址（r2=0x8112bbf0）的表项顺利通过校验 → blx 跳进数据区滑行。01.03 的 0x125d1784（Java 堆）能拦，01.06 的 ROM 地址拦不住。
+- **修复（cldc d206ff5）**：`Interpreter_c.cpp` 增 `interpreter_handler_min/max`，init 后从初始化完的表采样 min/max 作为唯一合法窗口。实测验证：bc_impl_* 全在 .text `0x8108fb54..0x810a519c`，ROM text 起 0x810fbe58——ROM 地址必然被拒，且无需硬编码链接边界（链接器可自由排布）。污染表项会在 blx 前触发 `bc_crash_report`（64 条面包屑 + slot/handler/legal window 全套诊断），而不是无声硬崩。
+- **构建**：`rebuild_vm.sh` 全代重编（romgen 宿主端仍报错——ROMImage 无需重生成，Java 类未变；31 objects + 21 成员库 OK）。VPK md5 `d38a6c7fe1ab58219f1889b465fe4cb2`。
+- **测试预期**：装 01.07 跑口袋灵兽。**两种结果都有信息量**：
+  - 若出 `dispatch table entry outside handler window` 报告 → 表污染被拦，日志含 slot/handler/窗口——回传即可定位污染源；
+  - 若直接正常进游戏 → 说明 01.06 的硬崩就是 ROM 地址骗过旧校验所致，窗口法闭环。
+- **遗留**：若表项反复被污染，说明有越界写源头未除（01.03 的 0x5d1784 低 24 位与 01.06 皆指向同一污染源）——需在拦截报告后追查写入者（候选：某 bc_impl 的越界 store、或 GC/ROM 化类的静态初始化写穿）。
+
 ### 2026-09-04 v01.06：PC=0 崩溃机制修正 + 解释器看门狗线程（cldc 900dd85，待用户复测）
 - **01.05 崩溃形态再定位（推翻 01.04 的"opcode 越界"结论）**：用户日志显示校验通过后 PC=0（取指错误自刷 53 万行，Vita3K 对 PC=0 只刷日志不杀进程）。反汇编证明分发循环 `blx r2` 前的 `ldrb r2,[r3,#-512]` 取 handler 正常——**表项未被破坏**；PC=0 是 handler 内部间接跳 0（r2 残留为证），即 bc_impl 内部控制流损坏，非分发表越界。01.04 的 handler 范围校验因此拦不住（handler 本身合法）。
 - **看门狗方案（cldc 900dd85，3 文件 +147 行）**：PC=0 后解释器线程彻底失联，任何解释器内巡检都无法执行 → 改由独立线程兜底：
@@ -186,7 +212,8 @@ data/J2ME00001/
   - **手动重编单个合并对象的正确命令**（rebuild_vm.sh 同款旗标，在 target/release 下）：`make _MergedSrc003.o BUILD_DIR_NAME=vita_arm IsLoopGen=true LOOP_GENERATOR_DIR=../../linux_arm/loopgen/app ENABLE_ENABLING_CHECK=false ENABLE_C_INTERPRETER=true FORCE_GCC= GNU_TOOLS_DIR=$VITASDK CPP_DEF_FLAGS="-DPRODUCT -DROMIZING=1 -DARM -DVITA -D__PSP2__ -Wno-narrowing -fpermissive -marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3 -DSUPPORTS_MEMORY_MAPPED_FILES=0 -DSUPPORTS_ADJUSTABLE_MEMORY_CHUNK=0 -DSUPPORTS_TIMER_THREAD=1 -DSUPPORTS_TIMER_INTERRUPT=0 -DUSE_VM_EXCEPTIONS=0 -DUSE_BSD_SOCKET=1"`——**先 rm 旧 .o**（touch 不够，make 判定依赖未变时直接跳过）。
   - **glue 符号定义在 _MergedSrc006**（Interpreter_c.cpp 的 FUNC_UNIMPLEMENTED 宏），`compiler_glue_code_start/end` 声明在 GlobalDefinitions.hpp:1954（`#if ENABLE_COMPILER && USE_COMPILER_GLUE_CODE`）；ObjectHeap.cpp:1240 引用 glue 的代码在 PRODUCT 目标编译下无错——此前脚本日志里的 ObjectHeap/Natives 编译错误来自 romgen 宿主端（CROSS_GENERATOR），可容忍。
   - **ar 重打包必须在 target/release 目录内以 basename 执行**（`ar r $L $m`，m 不带路径），否则报 "No such file"。
-- **产物**：`samples/j2me/midp_vita_v0106.vpk`（md5 ed0d9563b2e0258f3134549d566f1f3e，14308809B，param.sfo AppVer=01.06）。库 21 成员单 PRODUCT 代（Interpreter_arm 沿用旧库 ARM 汇编成员）。
+- **产物**：`samples/j2me/midp_vita_v0106.vpk`（md5 b7cc90fd1f9194041c808c178a784d06，14308905B，param.sfo AppVer=01.06）。库 21 成员单 PRODUCT 代（Interpreter_arm 沿用旧库 ARM 汇编成员）。
+- **vita_main.c 顺序修复（本轮）**：原 `freopen(midp_stdout/stderr.log)` 在 `sceIoMkdir(DATA_DIR)` **之前**——首次安装时 `ux0:/data/J2ME00001/` 不存在，freopen 静默失败，stderr 停留在 tty 设备（Vita3K `*** TTY:` 逐字符流），导致 midp_stderr.log 为空（8-31 日志丢失事故的根因）。已将三个 `sceIoMkdir`（DATA_DIR/appdb/lib）移到 freopen 之前。注意：**8-31 事故的日志并没有真丢**，它进了 Vita3K 的 TTY 流；此后修复了目录顺序，日志会正常落盘。
 - **测试预期**：装 01.06 跑口袋灵兽，若再冻结/崩溃，看门狗会自动转储 64 条面包屑到 `ux0:/data/J2ME00001/midp_stderr.log` 并退出进程（Vita3K 日志出现干净退出而非 53 万行刷屏）——**请回传该日志**，面包屑 bcp/opcode 可直接定位坏 handler。
 
 ### 2026-09-04 v01.04：dispatch 表项破坏修复（待用户复测）
