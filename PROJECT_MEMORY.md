@@ -174,6 +174,13 @@ data/J2ME00001/
 
 ## 当前状态 🔄
 
+### 2026-09-04 v01.04：dispatch 表项破坏修复（待用户复测）
+- **01.03 崩溃定位（vita3k.log 已闭环）**：`Invalid read at 0x125d1784, PC=0x125d1784, LR=0x8109d7a4`。LR 正是分发调用点 `8109d7a0: blx r2` 的下一条 → PC==跳转目标 → r2=handler=0x125d1784（Java 堆地址）→ **`interpreter_dispatch_table[code]` 表项被越界写破坏成野指针**。tripwire 拦不住（g_jfp/g_jsp 合法，表内容本身坏）；面包屑无法落盘（blx 后 CPU 立即异常）。与 01.02 r4=0xdc5d1784 低 24 位相同（0x5d1784）——同一污染源的多轮表现。
+- **修复（ae48cdb）**：Interpret() 分发循环每次 `blx` 前校验 handler ∈ [0x81000000, 0x81400000)，越界先打 slot/handler/表边界到 stderr，再走 bc_crash_report()（面包屑+干净停机）。
+- **romgen 排障笔记（未修，暂不需要）**：`romgen/app/ROMImage.o` 只有 576B 空壳——`ROMImage.cpp` 全包在 `#ifdef ROMIZING` 里，而 jvm.make:348 只在 `IsTarget=true` 时定义 `ROMIZING_CFLAGS`，romgen 是宿主工具（IsTarget=false）所以没 -DROMIZING。链接缺 `_rom_data_block` 即此因。**本轮只改 Interpreter_c.cpp，Java 类库未变，ROMImage 无需重生成**，build 阶段（31 objects + repack libcldc_vm.a 21 members）成功即够。若日后要重生成 ROM，需在 romgen 的 CPP_DEF_FLAGS 里补 -DROMIZING=1。
+- **注意**：`cmake --build build` 的真产物在 `vita-port/build/` 根下；`build/cmake/` 是旧目录（02:08 的 01.03 包），勿混淆。
+- 产物：`samples/j2me/midp_vita_v0104.vpk`（md5 a00017838b809c19d3157e7cacc6fb99）
+
 ### 2026-08-31 里程碑：游戏可玩、中文正常显示 ✅
 - 口袋灵兽等 J2ME 游戏可在 Vita3K 进入并正常游玩，图像与中文文本渲染全部正常
 - 最终根因见"关键文件修改记录"一节（fb_load 无调用点，commit 0fc9e8d）
