@@ -212,6 +212,15 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### ⭐⭐⭐⭐ 2026-09-04 第三轮：新包确认生效但换形崩溃 → 面包屑环形缓冲+不变量巡检（cldc 3494149，VPK 01.03）
+- **版本确认与教训**：用户第三次日志（09:43）确认跑的是 17:02 新包：模块 NID 0xD947F3F4、e_entry 0x36E9E0（旧包 0xE92EFCF7/0x36E930）；此前 09:37 那份日志用户装的是旧包（LR=0x8108ee90=旧 undef_bc 的 svc 地址，与 23:25 现场逐字节相同）。教训：版本号 01.02 不变导致无法从日志分辨包版本——**已把 VITA_VERSION 升为 01.03 并写进 CMakeLists 注释惯例，今后每轮交付必须 bump 版本**。
+- **好消息**：`NID 0xE1A00001 not found`（undef→svc）已从日志消失——分发表 0..201 全注册 + undef_bc 安全停机均生效，jsr/ret 补洞被实测确认。
+- **新崩溃形态**：PC=0x8109d750（分发循环），LR 同值，SP=0x8043f028；r4=0x810911fc 是**代码地址**（bc_impl_lload_3 函数体内 `pop {r4,pc}` 指令处，0x810911dc）；`Invalid read uint8_t at 0xe8bd8010` 即该指令编码被当数据读；二次执行 0xe58320b4=`str r2,[r3,#0xb4]` 编码。机制：某 bc_impl 尾声 `pop {r4,pc}` 从栈上弹回脏 r4（代码指针）返回分发循环，循环用 r4 当解释器全局基址（gp=0x81390564 时 g_jpc=[r4+0xb4]、g_jsp=[r4+0xb0]）→ 野读。与上一轮 r4=bc_impl_lshr 函数首同病：**栈/帧不平衡类，坏栈底**，非特定 opcode 缺失。
+- **本轮修复（cldc 3494149，Interpreter_c.cpp）**：64 项面包屑环形缓冲 bc_ring[]（每条分发前记 code/bcp/jsp）；分发前两条不变量巡检：g_jfp 4 字节对齐、g_jsp>=_current_stack_limit（声明在 GlobalDefinitons.hpp:1917，定义在 InterpreterSkeleton.cpp:218）；命中即 bc_crash_report 打印 g_jpc/g_jsp/g_jfp/总数/方法名（debug 打印版用 Method::print_name_to，release 版无方法名）+ 最近 64 条面包屑到 stderr（设备侧落 midp_stderr.log）与 tty，然后 Universe::set_stopping()+BREAK_INTERPRETER_LOOP(JMP_STOPPED_MANUALLY) 安全停机。该巡检也能覆盖 jsr/ret 等分支改变 g_jfp 后的损坏。
+- **验证**：31 对象 OK；velf 内 bc_ring/bc_ring_idx/bc_ring_count 符号在（.bss 0x102714238 区域）、"VITA FATAL"字符串在、undef_bc 仍在 0x8108eef8；param.sfo AppVer=1.03；VPK 14306614B。
+- **下一步**：用户装 01.03 跑口袋灵兽，若再异常，Vita3K 日志里应出现干净停机（无野崩二次异常），**拿 ux0:/data/J2ME00001/midp_stderr.log**——"VITA FATAL:" 块给出方法名+64 条面包屑（bcp/op/jsp），bcp 可对照 jar 反汇编定真凶；巡检未触发但 VAN 崩的场景则比较 g_jsp 窗口找异常回卷。
+- **遗留风险**：面包屑本身不修根因，是定位手段；若巡检从未触发而崩在 bc_impl 内部（g_jsp 还没低于 limit、g_jfp 恰好对齐），需把巡检加密度（如同时校验 g_jsp<=stack_base）。
+
 ### ⭐⭐⭐⭐ 2026-09-03 第二轮：jsr/ret 修复后游戏仍崩 → undef_bc 安全网改造（cldc a9b44c1）
 - **背景**：用户装上含 jsr/jsr_w/ret/ret_wide 的 VPK（cldc 0e8c406 / samples 5ec5d45）后实测"口袋灵兽"仍异常。新 vita3k.log 显示**同一 undef_bc→svc 0x1 链再次发生**（新地址：LR=0x8108ee90 恰落在新构建 undef_bc 的 svc 指令上；模块 NID 0xE92EFCF7 也证明用户跑的是新构建）。
 - **分发表权威复核结论（排除 jsr/ret 注册问题）**：Python 全量比对（TAGS=0/CPU_VARIANT=1 条件求值）enum 0..201 共 202 项，注册后 MISSING 仅 `[(186,'xxxunusedxxx')]`=保留值；WIDE 表 12 项齐全（含 ret）。**jsr/ret 注册确认无误**。真 opcode 值未出现在 vita3k.log——undef 打印走 fd 0x7 进设备侧 `ux0:/data/J2ME00001/midp_stderr.log`，用户尚未提供该文件。
