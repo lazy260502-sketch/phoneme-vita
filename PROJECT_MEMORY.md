@@ -174,6 +174,21 @@ data/J2ME00001/
 
 ## 当前状态 🔄
 
+### 2026-09-04 v01.06：PC=0 崩溃机制修正 + 解释器看门狗线程（cldc 900dd85，待用户复测）
+- **01.05 崩溃形态再定位（推翻 01.04 的"opcode 越界"结论）**：用户日志显示校验通过后 PC=0（取指错误自刷 53 万行，Vita3K 对 PC=0 只刷日志不杀进程）。反汇编证明分发循环 `blx r2` 前的 `ldrb r2,[r3,#-512]` 取 handler 正常——**表项未被破坏**；PC=0 是 handler 内部间接跳 0（r2 残留为证），即 bc_impl 内部控制流损坏，非分发表越界。01.04 的 handler 范围校验因此拦不住（handler 本身合法）。
+- **看门狗方案（cldc 900dd85，3 文件 +147 行）**：PC=0 后解释器线程彻底失联，任何解释器内巡检都无法执行 → 改由独立线程兜底：
+  - `Interpreter_c.cpp`：主循环心跳 `vita_interpreter_heartbeat++`（volatile）；`undef_bc_stop`/`bc_crash_report` 开头置 `vita_fatal_reported_flag`（防看门狗误报）；`vita_vm_clean_shutdown()` 供 JVM::stop() 正常退出时通知看门狗。
+  - `OS_vita.cpp`：`Os::initialize()` 末尾启动看门狗线程（2000ms 检查间隔、30000ms 超时）；心跳冻结超时 → 调 `vita_interpreter_dump()` 转储面包屑环 64 条到 stderr（设备侧 `ux0:/data/J2ME00001/midp_stderr.log`）→ `sceKernelExitProcess(-3)`。
+  - `JVM.cpp`：`stop()` 调 clean_shutdown（文件级 extern "C" 声明——函数内 extern "C" 不合法）。
+- **误杀风险（如实）**：>30s 无字节码执行的合法暂停（如长加载、阻塞 IO）会触发看门狗转储+退出。若误杀，调大 OS_vita.cpp 的 `WATCHDOG_TIMEOUT_MS`。
+- **构建系统新认知（本轮核心教训，防再犯）**：
+  - **ABI flavor 必须单代**：`Deterministic`/`jvm_perf_count` 是非 PRODUCT 专属符号（develop flag 在 `#ifdef PRODUCT` 下宏为空；`ENABLE_PERFORMANCE_COUNTERS` 在 `ENABLE_MINIMAL_ASSERT_BUILD` 分支被清 0——但该分支 PRODUCT 下不生效，实际由 jvmconfig 的 ENABLE 表决定：非 PRODUCT=1/PRODUCT=0）。`JVM_TRAPS` 在 PRODUCT 下展开为空（GlobalDefinitions.hpp:1244 `#ifndef PRODUCT`）→ 符号 mangled 名都不同（`new_symbolEP12JVMTypeArrayPci` vs `...PciP8JVMTraps`）。**基线库是 PRODUCT 代；任何手动重编对象必须带 rebuild_vm.sh 的完整 PRODUCT 旗标**，否则混装必链接失败（本轮先后报 Deterministic/jvm_perf_count undefined、再报 JVMUniverse 三方法 undefined，全是同一根因的两个侧面）。
+  - **手动重编单个合并对象的正确命令**（rebuild_vm.sh 同款旗标，在 target/release 下）：`make _MergedSrc003.o BUILD_DIR_NAME=vita_arm IsLoopGen=true LOOP_GENERATOR_DIR=../../linux_arm/loopgen/app ENABLE_ENABLING_CHECK=false ENABLE_C_INTERPRETER=true FORCE_GCC= GNU_TOOLS_DIR=$VITASDK CPP_DEF_FLAGS="-DPRODUCT -DROMIZING=1 -DARM -DVITA -D__PSP2__ -Wno-narrowing -fpermissive -marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3 -DSUPPORTS_MEMORY_MAPPED_FILES=0 -DSUPPORTS_ADJUSTABLE_MEMORY_CHUNK=0 -DSUPPORTS_TIMER_THREAD=1 -DSUPPORTS_TIMER_INTERRUPT=0 -DUSE_VM_EXCEPTIONS=0 -DUSE_BSD_SOCKET=1"`——**先 rm 旧 .o**（touch 不够，make 判定依赖未变时直接跳过）。
+  - **glue 符号定义在 _MergedSrc006**（Interpreter_c.cpp 的 FUNC_UNIMPLEMENTED 宏），`compiler_glue_code_start/end` 声明在 GlobalDefinitions.hpp:1954（`#if ENABLE_COMPILER && USE_COMPILER_GLUE_CODE`）；ObjectHeap.cpp:1240 引用 glue 的代码在 PRODUCT 目标编译下无错——此前脚本日志里的 ObjectHeap/Natives 编译错误来自 romgen 宿主端（CROSS_GENERATOR），可容忍。
+  - **ar 重打包必须在 target/release 目录内以 basename 执行**（`ar r $L $m`，m 不带路径），否则报 "No such file"。
+- **产物**：`samples/j2me/midp_vita_v0106.vpk`（md5 ed0d9563b2e0258f3134549d566f1f3e，14308809B，param.sfo AppVer=01.06）。库 21 成员单 PRODUCT 代（Interpreter_arm 沿用旧库 ARM 汇编成员）。
+- **测试预期**：装 01.06 跑口袋灵兽，若再冻结/崩溃，看门狗会自动转储 64 条面包屑到 `ux0:/data/J2ME00001/midp_stderr.log` 并退出进程（Vita3K 日志出现干净退出而非 53 万行刷屏）——**请回传该日志**，面包屑 bcp/opcode 可直接定位坏 handler。
+
 ### 2026-09-04 v01.04：dispatch 表项破坏修复（待用户复测）
 - **01.03 崩溃定位（vita3k.log 已闭环）**：`Invalid read at 0x125d1784, PC=0x125d1784, LR=0x8109d7a4`。LR 正是分发调用点 `8109d7a0: blx r2` 的下一条 → PC==跳转目标 → r2=handler=0x125d1784（Java 堆地址）→ **`interpreter_dispatch_table[code]` 表项被越界写破坏成野指针**。tripwire 拦不住（g_jfp/g_jsp 合法，表内容本身坏）；面包屑无法落盘（blx 后 CPU 立即异常）。与 01.02 r4=0xdc5d1784 低 24 位相同（0x5d1784）——同一污染源的多轮表现。
 - **修复（ae48cdb）**：Interpret() 分发循环每次 `blx` 前校验 handler ∈ [0x81000000, 0x81400000)，越界先打 slot/handler/表边界到 stderr，再走 bc_crash_report()（面包屑+干净停机）。
