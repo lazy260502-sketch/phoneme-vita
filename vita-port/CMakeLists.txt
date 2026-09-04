@@ -32,7 +32,7 @@ set(VITA_TITLEID  "J2ME00001")
 # 01.01 = b152: touch support + input debug logging
 # 01.02 = b153: Scheduler.cpp VITA fix - event pump driven by timer tick even
 #         when no Java thread is blocked in async native (audio paths sync)
-set(VITA_VERSION  "01.04")
+set(VITA_VERSION  "01.05")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
