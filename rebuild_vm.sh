@@ -83,9 +83,18 @@ build_target() {
         -DSUPPORTS_MEMORY_MAPPED_FILES=0 -DSUPPORTS_ADJUSTABLE_MEMORY_CHUNK=0 \
         -DSUPPORTS_TIMER_THREAD=1 -DSUPPORTS_TIMER_INTERRUPT=0 \
         -DUSE_VM_EXCEPTIONS=0 -DUSE_BSD_SOCKET=1"
+    # 2026-09-04 FIX: NEVER pass ENABLE_C_INTERPRETER=true. It compiles
+    # Interpreter_c.cpp into _MergedSrc006, which brings a second, BSS
+    # (zero-initialized) definition of jvm_fast_globals that silently
+    # wins over Interpreter_arm.o's .data GP pointer table under
+    # --allow-multiple-definition -> every r10-based GP-table access in
+    # the fast interpreter reads garbage -> wild jumps into ROM bytecode
+    # (the 0902-0904 launch-crash regression, root cause closed in v01.08).
+    # It also moves SNI_*/StackmapGenerator*/fplib definitions into 006,
+    # splitting the MergedSrc grouping away from the 8-31 baseline.
     make BUILD_DIR_NAME=vita_arm IsLoopGen=true \
          LOOP_GENERATOR_DIR=../../linux_arm/loopgen/app \
-         ENABLE_ENABLING_CHECK=false ENABLE_C_INTERPRETER=true \
+         ENABLE_ENABLING_CHECK=false \
          FORCE_GCC= GNU_TOOLS_DIR=/home/zyb/.local/vitasdk \
          CPP_DEF_FLAGS="$CPP_DEF_FLAGS_TARGET" \
          -j"$(nproc)" _$FLAVOR || true   # final exe link fails on crt0: expected
@@ -118,6 +127,9 @@ pack_lib() {
     # lost the jvm_f2i/jvm_d2i float stubs (GP table + fast globals only).
     # NOTE: once the regenerated interpreter gains working jvm_f2i/jvm_d2i,
     # remove this and use the fresh member instead.
+    # SAFETY: after packing, verify the library has EXACTLY ONE definition
+    #   arm-vita-eabi-nm $L | grep jvm_fast_globals   -> single "D" line
+    # and zero C-interpreter symbols (g_jpc/g_jsp/interpreter_dispatch_table).
     cd /tmp
     $AR p $L.bak Interpreter_arm.o > Interpreter_arm.o 2>/dev/null \
         || die "cannot extract Interpreter_arm.o from backup"
@@ -126,6 +138,13 @@ pack_lib() {
     # ar chains fail silently - verify members are non-empty
     local sz; sz=$($AR p $L Interpreter_arm.o 2>/dev/null | wc -c)
     [ "$sz" -gt 1000 ] || die "Interpreter_arm.o member is empty ($sz bytes)"
+
+    # 2026-09-04: hard guards against the double-definition regression.
+    local dcount; dcount=$(/home/zyb/.local/vitasdk/bin/arm-vita-eabi-nm $L 2>/dev/null | grep -c " D jvm_fast_globals")
+    [ "$dcount" -eq 1 ] || die "jvm_fast_globals: expected exactly 1 D definition, got $dcount"
+    local ccount; ccount=$(/home/zyb/.local/vitasdk/bin/arm-vita-eabi-nm $L 2>/dev/null | grep -cE "g_jpc|g_jsp|interpreter_dispatch_table")
+    [ "$ccount" -eq 0 ] || die "C-interpreter symbols leaked into library ($ccount)"
+
     local cnt; cnt=$($AR t $L | wc -l)
     echo "== library packed: $cnt members =="
 }

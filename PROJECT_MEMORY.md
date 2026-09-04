@@ -174,6 +174,21 @@ data/J2ME00001/
 
 ## 当前状态 🔄
 
+### 2026-09-04 v01.09：音频开关卡死根因 = KG 库带回类加载转储洪水；库合成（KG 骨架 + 无转储新世代 004/005 + 独立补丁成员）
+- **用户实测 v01.08**：✅ 能正常进游戏（GP 表双定义根因闭合确认）；❌ 音乐开关处卡死无响应——"回到前几天的问题"。
+- **根因（实测证据链）**：
+  1. 音乐开关触发 MMAPI 类链首次加载 → **KG 库（8-31 世代）的 `_MergedSrc004.o`/`_MergedSrc005.o` 里类加载 stderr 转储还活着**（strings 实测：004 含 `CP tags`/`PRE idx`/`NOT in heap`，005 含 `var_oops_do`；9-4 世代库 = 0）→ Vita3K 慢速 I/O 下每类数千行 = "卡死"。这正是 9-2 cldc 2959a08（`VITA_CP_DEBUG` 门控三处转储）修掉的老病——**修复在源码里但不在 KG 二进制里**（KG 备份于 9-2 16:15，早于该源码修复进库的世代）。
+  2. v01.08 恢复 KG 库 = 连同修复一起回退，老病复发。**源码树当前是干净的**（`ClassFileParser.cpp`/`ConstantPoolDesc.cpp` 转储均已被 `#ifdef VITA_CP_DEBUG` 门控）。
+- **修复：库合成而非整库回退**（既保留 KG 世代"无 C 解释器"的正确骨架，又拿到无转储的类加载代码）：
+  1. **KG 库为基础**（D 版 GP 表、无 C 解释器、事件泵修复都在，反汇编确认）
+  2. **替换 `004`/`005` 为 9-4 世代的无转储版本**（来自 `libcldc_vm.a.cinterp_broken` 提取——这两个成员自身干净：0 转储串、0 C 解释器符号）
+  3. **世代分组漂移补齐**：新世代把 SNI_*/StackmapGenerator*/fplib 从 004/005 挪进了 006（006 带 C 解释器不能整拿）→ 用 `tools/build_extra_o.sh`（006 头文件链 hpp-only + include 源文件 + 完整 PRODUCT 旗标）独立编译 7 个补丁成员补回：`sni.o`、`StackmapGenerator.o`、`Cosine/Sine/Tangent_kernel.o`、`JFP_lib_sin/cos.o`，外加 `vita_vm_clean_shutdown` 空 shim（真身在 Interpreter_c.cpp，仅设看门狗标志；KG 世代无看门狗，no-op 安全）
+  4. **闭合验证**：71 个缺失定义全部闭合；库级符号闭合检查（`tools/symcheck.sh`）泄漏 111 个全是预期外部（JVMSPI/libc/_rom_*）；最终 ELF `81381b58 D jvm_fast_globals` ✅、C 解释器符号 0 ✅、转储字符串 0 ✅
+- **产物**：`samples/j2me/midp_vita_v0109.vpk`（md5 `ed0d9563b2e0258f3134549d566f1f3e`，14308809B）。库双备份：`/tmp/libcldc_vm.a.V0109_HYBRID` + `dist/lib/libcldc_vm.a.v0109_hybrid`。
+- **rebuild_vm.sh 已修正（本轮）**：①删除 `ENABLE_C_INTERPRETER=true`（根源矛盾开关，注释说明双定义机理）②`pack_lib` 加硬校验：`jvm_fast_globals` 必须恰好 1 个 D 定义、库内 0 个 C 解释器符号，违反即 die——防再犯。禁用令解除，但**运行后必须跑 `tools/symcheck.sh` 复验**。
+- **工具沉淀**：`tools/build_extra_o.sh`（独立 TU 补丁成员编译：006 头链 hpp-only + PRODUCT ABI 旗标）、`tools/symcheck.sh`（库符号闭合检查）——从 /tmp 固化进项目。
+- **测试预期**：v01.09 = v01.08 全部 + 类加载转储清除。音乐开关应不再卡死（Vita3K stderr 也不再刷 fd 0x7 洪水）。若音乐开关仍卡但无日志洪水 → 剩余嫌疑是 MMAPI Player 状态机（vita-port 层 `vita_audio_javacall.c`），届时看 `midp_stderr.log` 定位。
+
 ### 2026-09-04 v01.08：★ 回归根因闭合——C 解释器混入导致 GP 表双定义被静默消解（已恢复 8-31 世代 VM 库）
 - **用户的判断是对的**：不是"音频改动"本身，也无需逐症状打补丁。8-31 可玩 → 后续崩溃的**真正回归点 = 9-2 01:20 的 `rebuild_vm.sh`（samples 0ff302d）**。
 - **根因链（全部实测证据）**：
