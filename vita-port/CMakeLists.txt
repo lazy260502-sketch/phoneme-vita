@@ -32,7 +32,12 @@ set(VITA_TITLEID  "J2ME00001")
 # 01.01 = b152: touch support + input debug logging
 # 01.02 = b153: Scheduler.cpp VITA fix - event pump driven by timer tick even
 #         when no Java thread is blocked in async native (audio paths sync)
-set(VITA_VERSION  "01.10")
+# 01.11 = MEDIA_EVENT_SIGNAL routing enabled: midp_master_mode_events.o was
+#         built 08-28 without -DENABLE_JSR_135 (make doesn't track CFLAGS),
+#         so END_OF_MEDIA was dropped at the switch default case and the
+#         music toggle deadlocked the VM. Rebuilt with USE_JSR_135=true
+#         config; jump table slot 36 now routes to StoreMIDPEventInVmThread.
+set(VITA_VERSION  "01.11")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
