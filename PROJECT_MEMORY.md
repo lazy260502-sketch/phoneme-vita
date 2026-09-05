@@ -174,6 +174,16 @@ data/J2ME00001/
 
 ## 当前状态 🔄
 
+### 2026-09-05 v01.10：音乐开关卡死真凶 #2——GC encode 无门控转储洪水（最后一个）
+- **用户实测 v01.09 重发版（b162）**：✅ 能进游戏、CP tags 洪水消失（上轮修复生效）；❌ 音乐开关仍卡死。
+- **根因**：`ObjectHeap.cpp:2134` 的 **GC 压缩编码转储无任何门控**——每次 GC 压缩对**每个存活对象**打一行 `GC encode:`。音乐开关 → MMAPI 类链加载 → 分配压力触发 GC → 数千对象 = 数千行 stderr → Vita3K 慢 I/O = "卡死"。与 CP tags 洪水**同一故障模式、不同源头**。用户日志铁证：洪水内容从 CP tags 变成了 GC encode。
+- **不是存储问题**：日志里 RMS/文件系统零异常，卡死瞬间恰好是 GC encode 洪水开始处。
+- **修复**：①`ObjectHeap.cpp` 加 `#ifdef VITA_GC_DEBUG` 门控（cldc b82a81f，与 2959a08 同款最小补丁）②`tools/build_merged_o.sh` 新工具：按库内同款 PRODUCT ABI 旗标重编单个 `_MergedSrcNNN.cpp` 作替换成员③重编 003（GC encode 所在成员）移植进库。
+- **全库终验**：转储串（GC encode/CP tags/PRE idx/NOT in heap/var_oops_do）全 0、`D jvm_fast_globals` 唯一、C 解释器符号 0。ELF：`81381ae0 D jvm_fast_globals`。
+- **产物**：`samples/j2me/midp_vita_v0110.vpk`，md5 `08ab999d33e9bdbbe440fce9bc312e2e`，版本串 `v01.10 b164 (8d02608)`。
+- **源码 dump 审计（本轮已做）**：`grep fprintf(stderr` 全量过一遍，ClassFileParser 全部门控、JavaDebugger 仅 KDWP 异常路径（不可达）、ObjectHeap 已修——**已知无门控洪水源清零**。若音乐开关仍卡，stderr 应已干净，届时转向 vita-port 层 MMAPI 状态机排查（`vita_audio_javacall.c`，看 `midp_stderr.log` 定位）。
+- **库备份**：`libcldc_vm.a.v0109_hybrid_pre_gcfix`（GC 修复前）、`.v0109_hybrid`（混合库初版）、`.kg_puredumps`（纯 KG）。
+
 ### 2026-09-05 v01.09 重发：上次归档拷错文件，用户从未运行过混合库
 - **事故**：0904 归档 `midp_vita_v0109.vpk` 时 `cp` 的源是 `vita-port/build/midp_vita.vpk`（旧布局残留，Sep 4 08:57 = b159/fc3c534 世代），而真正 17:16 的混合库构建产物在 `vita-port/build/cmake/midp_vita.vpk`。**用户装的其实是 v01.08 世代二进制**——日志版本串 `b159 (fc3c534)` + CP tags 转储洪水与 v01.08 行为完全吻合（能进游戏、音乐开关卡死）。
 - **教训两条**：
