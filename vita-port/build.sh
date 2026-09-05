@@ -91,6 +91,10 @@ echo ""
 echo "=============================================="
 echo "  Build successful"
 echo "  VPK: $BUILD_DIR/midp_vita.vpk"
+# 2026-09-05: canonical artifact path is build/cmake/midp_vita.vpk (the
+# bare build/midp_vita.vpk is a STALE leftover from the old layout - the
+# 0904 v0109 mixup archived that stale file and shipped the wrong binary).
+echo "  NOTE: always archive from $BUILD_DIR/midp_vita.vpk"
 echo "=============================================="
 echo ""
 echo "Deploy: copy VPK to Vita/Vita3K, then to switch games create"
