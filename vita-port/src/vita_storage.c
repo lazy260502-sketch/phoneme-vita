@@ -23,6 +23,20 @@
 #include <string.h>
 #include <zlib.h>
 
+/* Match both "games/..." (relative, what vita_main.c actually passes)
+ * and "/games/..." (absolute). The old check only matched "/games/",
+ * so every game silently fell back to the shared appdb. */
+static const char *find_games_seg(const char *jar_path) {
+    const char *p = strstr(jar_path, "/games/");
+    if (p != NULL) {
+        return p;
+    }
+    if (strncmp(jar_path, "games/", 6) == 0) {
+        return jar_path;
+    }
+    return NULL;
+}
+
 /* Derive a 4-char hex tag from the JAR path. */
 static unsigned int crc16_of_game_name(const char *jar_path) {
     const char *p;
@@ -30,8 +44,8 @@ static unsigned int crc16_of_game_name(const char *jar_path) {
     size_t name_len = 0;
     unsigned int crc;
 
-    /* Look for "/games/<name>/" segment */
-    p = strstr(jar_path, "/games/");
+    /* Look for "games/<name>/" segment */
+    p = find_games_seg(jar_path);
     if (p != NULL) {
         const char *name = p + 7; /* skip "/games/" */
         const char *slash = strchr(name, '/');
@@ -93,7 +107,7 @@ int get_per_game_appdb(const char *game_jar,
 
     /* Bundled Hello.jar or any path NOT under games/ -> shared appdb.
      * This keeps the existing behaviour for the default demo. */
-    if (strstr(game_jar, "/games/") == NULL) {
+    if (find_games_seg(game_jar) == NULL) {
         snprintf(out_buf, buf_sz, "%s/appdb", data_dir);
         return 0;
     }

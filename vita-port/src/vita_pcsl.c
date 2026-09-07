@@ -70,10 +70,26 @@ jsize pcsl_string_utf16_length(const pcsl_string *str) {
 
 jsize pcsl_string_utf8_length(const pcsl_string *str) {
     if (str == NULL || str->data == NULL) {
-        return 0;
+        return -1;
     }
-    /* Rough estimate: each UTF-16 char may take 1-3 UTF-8 bytes */
-    return str->length * 3;
+    /* Real UTF-8 byte length (no NUL). Callers like midpGetJarEntry
+     * compare this against on-disk entry name lengths - it must be
+     * exact, not an estimate (v01.24 "JAR Corrupt" root cause:
+     * "META-INF/MANIFEST.MF" 20 chars returned as 60, name match
+     * could never succeed, CD walk ran past the last entry). */
+    jsize n = 0;
+    jsize i;
+    for (i = 0; i < str->length; i++) {
+        jchar c = str->data[i];
+        if (c < 0x80) {
+            n += 1;
+        } else if (c < 0x800) {
+            n += 2;
+        } else {
+            n += 3;
+        }
+    }
+    return n;
 }
 
 pcsl_string_status pcsl_string_convert_to_utf8(const pcsl_string *string,
@@ -83,18 +99,37 @@ pcsl_string_status pcsl_string_convert_to_utf8(const pcsl_string *string,
     if (string == NULL || buffer == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    jsize len = string->length;
-    if (buffer_length < len + 1) {
-        return PCSL_STRING_BUFFER_OVERFLOW;
-    }
-    /* Simple: just copy jchar to jbyte (ASCII subset) */
+    /* Proper UTF-16 -> UTF-8 conversion (multi-byte sequences
+     * included, NUL terminated) matching upstream semantics. */
+    jsize o = 0;
     jsize i;
-    for (i = 0; i < len; i++) {
-        buffer[i] = (jbyte)(string->data[i] & 0xFF);
+    for (i = 0; i < string->length; i++) {
+        jchar c = string->data[i];
+        jsize need;
+        if (c < 0x80) {
+            need = 1;
+        } else if (c < 0x800) {
+            need = 2;
+        } else {
+            need = 3;
+        }
+        if (o + need >= buffer_length) {
+            return PCSL_STRING_BUFFER_OVERFLOW;
+        }
+        if (c < 0x80) {
+            buffer[o++] = (jbyte)c;
+        } else if (c < 0x800) {
+            buffer[o++] = (jbyte)(0xC0 | (c >> 6));
+            buffer[o++] = (jbyte)(0x80 | (c & 0x3F));
+        } else {
+            buffer[o++] = (jbyte)(0xE0 | (c >> 12));
+            buffer[o++] = (jbyte)(0x80 | ((c >> 6) & 0x3F));
+            buffer[o++] = (jbyte)(0x80 | (c & 0x3F));
+        }
     }
-    buffer[len] = 0;
+    buffer[o] = 0;
     if (converted_length != NULL) {
-        *converted_length = len;
+        *converted_length = o;
     }
     return PCSL_STRING_OK;
 }
@@ -485,19 +520,30 @@ const jbyte *pcsl_string_get_utf8_data(const pcsl_string *str) {
     if (str == NULL || str->data == NULL) {
         return NULL;
     }
-    /* Convert to static buffer - not thread safe, but works for stubs */
-    static jbyte buf[4096];
-    jsize i;
-    for (i = 0; i < str->length && i < (jsize)sizeof(buf) - 1; i++) {
-        buf[i] = (jbyte)(str->data[i] & 0xFF);
+    /* Upstream contract: fresh malloc'd buffer, released by the
+     * paired pcsl_string_release_utf8_data call (which frees it).
+     * The old stub returned a static buffer and the release stub
+     * leaked - see midpGetJarEntry / InstallerCommandLine usage. */
+    jsize len = pcsl_string_utf8_length(str);
+    if (len < 0) {
+        return NULL;
     }
-    buf[str->length] = 0;
+    jbyte *buf = (jbyte *)malloc((size_t)len + 1);
+    if (buf == NULL) {
+        return NULL;
+    }
+    if (pcsl_string_convert_to_utf8(str, buf, len + 1, NULL) != PCSL_STRING_OK) {
+        free(buf);
+        return NULL;
+    }
     return buf;
 }
 
 void pcsl_string_release_utf8_data(const jbyte *buf, const pcsl_string *str) {
-    (void)buf;
     (void)str;
+    /* Must free the buffer returned by pcsl_string_get_utf8_data
+     * (upstream frees the pcsl_mem_malloc'd block here). */
+    free((void *)buf);
 }
 
 const jchar *pcsl_string_get_utf16_data(const pcsl_string *str) {
@@ -555,6 +601,31 @@ typedef struct {
     char path[256];  /* File path for debugging */
 } VitaFileHandle;
 
+/* Relative-path resolution for raw sceIo* calls.
+ * The VM class loader opens classpath jars via newlib stdio
+ * (OsFile_vita.cpp -> jvm_fopen), which resolves relative paths
+ * against the process cwd (= DATA_DIR after the chdir in
+ * vita_main.c). Raw sceIo* calls do NOT honor the cwd - they need
+ * an absolute device-prefixed path. JarReader (MIDlet MANIFEST
+ * loading) reaches pcsl_file_open with the same relative jar path
+ * used on the classpath; without the prefix sceIoOpen fails and
+ * readJarEntry throws "JAR not found" (v01.23 regression hunt).
+ * The root is queried at runtime with getcwd() so nothing is
+ * hardcoded - it follows whatever vita_main.c chdir'd to. */
+static void vita_resolve_path(const char *in, char *out, size_t outsz) {
+    if (strchr(in, ':') != NULL || in[0] == '/') {
+        /* already device-prefixed (ux0:, app0:...) or rooted */
+        snprintf(out, outsz, "%s", in);
+    } else {
+        char root[256];
+        if (getcwd(root, sizeof(root)) == NULL || root[0] == '\0') {
+            /* fall back to the canonical data dir if cwd unavailable */
+            snprintf(root, sizeof(root), "ux0:/data/J2ME00001");
+        }
+        snprintf(out, outsz, "%s/%s", root, in);
+    }
+}
+
 int pcsl_file_init(void) {
     return 0;
 }
@@ -588,13 +659,19 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
         return -1;
     }
 
-    /* Convert jchar path to char for Vita IO */
+    /* Convert jchar path to UTF-8 for Vita IO */
     char path_utf8[512];
-    jsize i;
-    for (i = 0; i < fileName->length && i < (jsize)sizeof(path_utf8) - 1; i++) {
-        path_utf8[i] = (char)(fileName->data[i] & 0xFF);
+    jsize converted = 0;
+    if (pcsl_string_convert_to_utf8(fileName, (jbyte *)path_utf8,
+                                    sizeof(path_utf8), &converted)
+        != PCSL_STRING_OK) {
+        free(vf);
+        return -1;
     }
-    path_utf8[i] = '\0';
+    /* Resolve relative paths against the data root (see
+     * vita_resolve_path comment): raw sceIo* ignores the cwd. */
+    char abs_path[600];
+    vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
 
     /* Convert PCSL flags to Vita/Unix flags - explicit mapping (bit values differ!) */
     int oflags = 0;
@@ -615,23 +692,25 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
     debug_log(log_buf);
 
     /* Try to open the file using Vita IO */
-    vf->fd = sceIoOpen(path_utf8, oflags, 0777);
+    vf->fd = sceIoOpen(abs_path, oflags, 0777);
     if (vf->fd < 0) {
         /* Try with app0: prefix for files in the VPK */
         char app0_path[512];
         snprintf(app0_path, sizeof(app0_path), "app0:%s", path_utf8);
         vf->fd = sceIoOpen(app0_path, oflags, 0777);
         if (vf->fd < 0) {
-            snprintf(log_buf, sizeof(log_buf), "[file_open] FAILED '%s' (0x%x)\n", path_utf8, (int)vf->fd);
+            snprintf(log_buf, sizeof(log_buf), "[file_open] FAILED '%s' (0x%x)\n", abs_path, (int)vf->fd);
             debug_log(log_buf);
             free(vf);
             return -1;
         }
         debug_log("[file_open] ok via app0 prefix\n");
         strncpy(vf->path, app0_path, sizeof(vf->path) - 1);
+        vf->path[sizeof(vf->path) - 1] = '\0';
     } else {
         debug_log("[file_open] ok direct\n");
-        strncpy(vf->path, path_utf8, sizeof(vf->path) - 1);
+        strncpy(vf->path, abs_path, sizeof(vf->path) - 1);
+        vf->path[sizeof(vf->path) - 1] = '\0';
     }
 
     *handle = vf;
@@ -675,28 +754,99 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
         return -1;
     }
     
-    /* Convert jchar path to char */
+    /* Convert jchar path to UTF-8 */
     char path_utf8[512];
-    jsize i;
-    for (i = 0; i < fileName->length && i < (jsize)sizeof(path_utf8) - 1; i++) {
-        path_utf8[i] = (char)(fileName->data[i] & 0xFF);
+    if (pcsl_string_convert_to_utf8(fileName, (jbyte *)path_utf8,
+                                    sizeof(path_utf8), NULL) != PCSL_STRING_OK) {
+        return -1;
     }
-    path_utf8[i] = '\0';
+    char abs_path[600];
+    vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
     
     /* Try with app0: prefix */
     char app0_path[512];
     snprintf(app0_path, sizeof(app0_path), "app0:%s", path_utf8);
     
-    int result = sceIoRemove(app0_path);
+    int result = sceIoRemove(abs_path);
     if (result < 0) {
-        result = sceIoRemove(path_utf8);
+        result = sceIoRemove(app0_path);
     }
     return result;
 }
 
+/* Vita has no sceIoFtruncate, so shrink by read-rewrite: save the
+ * first `size` bytes, reopen the same path with O_TRUNC, write them
+ * back. The file position is preserved (clamped to the new size) to
+ * match POSIX ftruncate semantics callers expect.
+ * A previous stub returned success without doing anything, so
+ * RecordStoreImpl.compactRecords left stale blocks past the new
+ * logical size - the second launch then walked garbage record
+ * headers ("first launch OK, every launch after broken"). */
 int pcsl_file_truncate(void *handle, long size) {
-    (void)handle;
-    (void)size;
+    if (handle == NULL || size < 0) {
+        return -1;
+    }
+
+    VitaFileHandle *vf = (VitaFileHandle *)handle;
+    if (vf->fd < 0) {
+        return -1;
+    }
+
+    SceOff cur_pos = sceIoLseek(vf->fd, 0, SCE_SEEK_CUR);
+    SceOff file_size = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
+    if (cur_pos < 0 || file_size < 0) {
+        return -1;
+    }
+
+    if (size >= file_size) {
+        /* Growing (or unchanged): RMS never does this; just restore
+         * the position and report success. */
+        sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
+        return 0;
+    }
+
+    /* Save the bytes that must survive. */
+    unsigned char *buf = (unsigned char *)malloc((size_t)size > 0 ? (size_t)size : 1);
+    if (buf == NULL) {
+        return -1;
+    }
+
+    sceIoLseek(vf->fd, 0, SCE_SEEK_SET);
+    long got = 0;
+    while (got < size) {
+        int n = sceIoRead(vf->fd, buf + got, size - got);
+        if (n <= 0) {
+            free(buf);
+            sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
+            return -1;
+        }
+        got += n;
+    }
+
+    /* Rewrite the file in place via the path captured at open time
+     * (always the resolved absolute path that opened successfully). */
+    sceIoClose(vf->fd);
+    vf->fd = sceIoOpen(vf->path, SCE_O_RDWR | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (vf->fd < 0) {
+        free(buf);
+        return -1;
+    }
+
+    long put = 0;
+    while (put < size) {
+        int n = sceIoWrite(vf->fd, buf + put, size - put);
+        if (n <= 0) {
+            free(buf);
+            return -1;
+        }
+        put += n;
+    }
+    free(buf);
+
+    if (cur_pos > size) {
+        cur_pos = size;
+    }
+    sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
     return 0;
 }
 
@@ -705,24 +855,25 @@ int pcsl_file_exist(const pcsl_string *fileName) {
         return 0;
     }
     
-    /* Convert jchar path to char */
+    /* Convert jchar path to UTF-8 */
     char path_utf8[512];
-    jsize i;
-    for (i = 0; i < fileName->length && i < (jsize)sizeof(path_utf8) - 1; i++) {
-        path_utf8[i] = (char)(fileName->data[i] & 0xFF);
+    if (pcsl_string_convert_to_utf8(fileName, (jbyte *)path_utf8,
+                                    sizeof(path_utf8), NULL) != PCSL_STRING_OK) {
+        return 0;
     }
-    path_utf8[i] = '\0';
+    char abs_path[600];
+    vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
     
     /* Try with app0: prefix */
     char app0_path[512];
     snprintf(app0_path, sizeof(app0_path), "app0:%s", path_utf8);
     
     SceIoStat stat;
-    if (sceIoGetstat(app0_path, &stat) >= 0) {
+    if (sceIoGetstat(abs_path, &stat) >= 0) {
         return 1;
     }
     
-    if (sceIoGetstat(path_utf8, &stat) >= 0) {
+    if (sceIoGetstat(app0_path, &stat) >= 0) {
         return 1;
     }
     
@@ -734,10 +885,33 @@ int pcsl_file_commitwrite(void *handle) {
     return 0;
 }
 
+/* Real rename via sceIoRename. The old stub always failed, breaking
+ * every write_file() commit in the suite store (temp file + rename
+ * pattern, suitestore_intern.c) - data stayed in the .tmp file and
+ * the real file was never created/updated. */
 int pcsl_file_rename(const pcsl_string *oldName, const pcsl_string *newName) {
-    (void)oldName;
-    (void)newName;
-    return -1;
+    if (oldName == NULL || oldName->data == NULL ||
+        newName == NULL || newName->data == NULL) {
+        return -1;
+    }
+
+    char old_utf8[512], new_utf8[512];
+    if (pcsl_string_convert_to_utf8(oldName, (jbyte *)old_utf8,
+                                    sizeof(old_utf8), NULL) != PCSL_STRING_OK ||
+        pcsl_string_convert_to_utf8(newName, (jbyte *)new_utf8,
+                                    sizeof(new_utf8), NULL) != PCSL_STRING_OK) {
+        return -1;
+    }
+
+    /* Raw sceIo* needs absolute device-prefixed paths (see
+     * vita_resolve_path): both names arrive as storage-root
+     * relative paths from midpStorage. */
+    char old_abs[600], new_abs[600];
+    vita_resolve_path(old_utf8, old_abs, sizeof(old_abs));
+    vita_resolve_path(new_utf8, new_abs, sizeof(new_abs));
+
+    int rv = sceIoRename(old_abs, new_abs);
+    return (rv < 0) ? -1 : 0;
 }
 
 void *pcsl_file_openfilelist(const pcsl_string *string) {
@@ -793,24 +967,25 @@ long pcsl_file_sizeof(const pcsl_string *fileName) {
         return -1;
     }
     
-    /* Convert jchar path to char */
+    /* Convert jchar path to UTF-8 */
     char path_utf8[512];
-    jsize i;
-    for (i = 0; i < fileName->length && i < (jsize)sizeof(path_utf8) - 1; i++) {
-        path_utf8[i] = (char)(fileName->data[i] & 0xFF);
+    if (pcsl_string_convert_to_utf8(fileName, (jbyte *)path_utf8,
+                                    sizeof(path_utf8), NULL) != PCSL_STRING_OK) {
+        return -1;
     }
-    path_utf8[i] = '\0';
+    char abs_path[600];
+    vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
     
     /* Try with app0: prefix */
     char app0_path[512];
     snprintf(app0_path, sizeof(app0_path), "app0:%s", path_utf8);
     
     SceIoStat stat;
-    if (sceIoGetstat(app0_path, &stat) >= 0) {
+    if (sceIoGetstat(abs_path, &stat) >= 0) {
         return (long)stat.st_size;
     }
     
-    if (sceIoGetstat(path_utf8, &stat) >= 0) {
+    if (sceIoGetstat(app0_path, &stat) >= 0) {
         return (long)stat.st_size;
     }
     
@@ -1185,12 +1360,23 @@ jlong Java_com_sun_cldchi_jvm_JVM_monotonicTimeMillis(void) {
 
 /* getInternalPropertyInt - from properties_port.
  * JAVA_HEAP_SIZE: the default (1280KB) cannot hold the chameleon skin
- * images plus a game; give the VM a real heap. MAX_ISOLATES=1 (single
- * isolate build) keeps the AMS reservation math at its floor. */
+ * images plus a game; give the VM a real heap. 48MB: UC browser
+ * (a heavyweight MIDlet) hit OutOfMemoryError during startApp on the
+ * SECOND launch while 32MB worked on the first - the round-loop
+ * launcher needs headroom for the VM restart path too. Heap chunks
+ * come from malloc (OsMemory_vita uses jvm_malloc) and the newlib
+ * arena is 96MB, so 48MB Java + native usage still fits.
+ * MAX_ISOLATES=1 (single isolate build) keeps the AMS reservation
+ * math at its floor.
+ *
+ * v01.28 REGRESSION: with 48MB the VM now hangs (no display, no tty
+ * output) during bootstrap on the FIRST UC launch under Vita3K, while
+ * 32MB started fine in v01.26. Rolled back to 32MB until the bootstrap
+ * memory math is re-validated. */
 int getInternalPropertyInt(const char *key) {
     if (key != NULL) {
         if (strcmp(key, "JAVA_HEAP_SIZE") == 0) {
-            return 32 * 1024 * 1024; /* 32MB */
+            return 32 * 1024 * 1024; /* 32MB (48MB regressed first launch) */
         }
         if (strcmp(key, "MAX_ISOLATES") == 0) {
             return 1;

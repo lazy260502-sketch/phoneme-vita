@@ -37,7 +37,7 @@ set(VITA_TITLEID  "J2ME00001")
 #         so END_OF_MEDIA was dropped at the switch default case and the
 #         music toggle deadlocked the VM. Rebuilt with USE_JSR_135=true
 #         config; jump table slot 36 now routes to StoreMIDPEventInVmThread.
-set(VITA_VERSION  "01.11")
+set(VITA_VERSION  "01.28")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
@@ -156,7 +156,13 @@ add_executable(${PROJECT_NAME}
     src/vita_audio_javacall.c
     src/vita_media_notify.c
     src/vita_sms_javacall.c
+    src/vita_checkevents.c
 )
+
+# Size of the bundled jar, baked into the binary for the runtime
+# copy-integrity check (must be defined BEFORE the gen_version target)
+set(MIDLET_JAR ${PORT_DIR}/build/midlet/jar/Hello.jar)
+file(SIZE ${MIDLET_JAR} HELLO_JAR_SIZE_N)
 
 # Build-time version header (git build number + hash), always regenerated
 set(VERSION_HEADER ${CMAKE_CURRENT_BINARY_DIR}/vita_version.h)
@@ -166,6 +172,7 @@ add_custom_target(gen_version ALL
         -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
         -DAPP_VER=${VITA_VERSION}
         -DAPP_NAME=${VITA_APP_NAME}
+        -DHELLO_JAR_SIZE=${HELLO_JAR_SIZE_N}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenVersion.cmake
     BYPRODUCTS ${VERSION_HEADER}
     COMMENT "Generating vita_version.h")
@@ -175,7 +182,19 @@ target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 add_dependencies(${PROJECT_NAME} libobj_target)
 
-target_link_options(${PROJECT_NAME} PRIVATE
+# Link order matters: the port-layer objects MUST be seen by the linker
+# BEFORE ${PCSL_LIB_DIR}/libpcsl_multimedia.a. That archive is a
+# gen_stubs.py-generated all-stub file (javacall_media_* return
+# NOT_IMPLEMENTED); with --allow-multiple-definition the FIRST
+# definition wins, so an archive-first order silently overrides this
+# port's real audio implementation (v01.12-v01.14 "Failed to play
+# tone" root cause - the KNI layer saw the stub's NOT_IMPLEMENTED and
+# the real code in vita_audio_javacall.c never executed, which is also
+# why audio_debug.log never appeared).
+# target_link_options() always lands BEFORE the object files, so the
+# whole-archive block + library group must live in target_link_libraries,
+# which CMake orders after its own objects.
+target_link_libraries(${PROJECT_NAME}
     -Wl,--whole-archive
     ${LIBOBJ_NO_MAIN}
     ${MIDP_OBJ_DIR}/runMidlet.o
@@ -216,7 +235,6 @@ target_link_libraries(${PROJECT_NAME}
 #==============================================================================
 vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} MEMSIZE 128)
 
-set(MIDLET_JAR ${PORT_DIR}/build/midlet/jar/Hello.jar)
 set(MIDP_SYSTEM_JAR ${MIDP_BUILD}/classes/midp_system.jar)
 
 add_custom_command(

@@ -35,13 +35,22 @@ extern int runMidlet(int argc, char **argv);
 #include "vita_storage.h"
 #include "vita_version.h"
 
+/* Baked in by build_jar.sh -> cmake (HELLO_JAR_SIZE): size of the
+ * Hello.jar bundled in the VPK, used for the runtime copy check. */
+#ifndef HELLO_JAR_SIZE
+#define HELLO_JAR_SIZE 0
+#endif
+
 /* from vita_display.c: must run before the VM starts */
 extern void vita_display_set_orientation(int landscape);
 
 /* vitaSDK newlib: the default malloc arena is 32MB, which is too small for
- * a 32MB Java heap on top of everything else (the VM refused to start with
+ * the Java heap on top of everything else (the VM refused to start with
  * "Could not allocate VM heap"). This overrides the weak default; the app
- * memory partition is 128MB (see CMakeLists MEMSIZE). */
+ * memory partition is 128MB (see CMakeLists MEMSIZE).
+ * v01.28: rolled 96MB back to 64MB together with the 32MB Java heap -
+ * the 48MB/96MB pair (v01.27) hung the VM during bootstrap on first UC
+ * launch. Keep both values in sync when re-raising. */
 unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 
 #define DATA_DIR "ux0:/data/J2ME00001"
@@ -66,13 +75,21 @@ static void dlog_str(const char *prefix, const char *s) {
     dlog("\n");
 }
 
-/* Copy a file via sceIo (used to seed the writable data dir from app0:). */
+/* Copy a file via sceIo (used to seed the writable data dir from app0:).
+ * IMPORTANT: remove the destination first instead of relying on
+ * SCE_O_TRUNC - Vita3K does not honor O_TRUNC, so copying a SHORTER
+ * file over a longer one leaves a stale tail. The corrupted length
+ * then fails JarFileParser's EOCD length check (endpos+22+com==len)
+ * and EVERY class in the jar throws ClassNotFoundException
+ * (v01.16-v01.18 "CNFE for all classes" root cause; caught by the
+ * "runtime Hello.jar size=X (expected Y)" boot-log check). */
 static void copy_file(const char *src, const char *dst) {
     SceUID in = sceIoOpen(src, SCE_O_RDONLY, 0);
     if (in < 0) {
         return;
     }
-    SceUID out = sceIoOpen(dst, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    sceIoRemove(dst); /* ignore error - may not exist */
+    SceUID out = sceIoOpen(dst, SCE_O_WRONLY | SCE_O_CREAT, 0777);
     if (out >= 0) {
         static char buf[4096];
         ssize_t n;
@@ -187,146 +204,204 @@ int main(int argc, char *argv[]) {
     /* Default game = bundled Hello.jar; launch.cfg overrides.
      * launch.cfg lines: <jar path> / <class> / [portrait|landscape] */
     copy_file("app0:/data/J2ME00001/Hello.jar", DATA_DIR "/Hello.jar");
-    snprintf(jar_path, sizeof(jar_path), "Hello.jar");
-    snprintf(class_name, sizeof(class_name), "HelloMIDlet");
-    snprintf(orient, sizeof(orient), "portrait");
-    /* Native game menu: pick an installed game (see vita_menu.c for the
-     * games/ + inbox/ layout). Falls through to launch.cfg / Hello when
-     * the user quits the menu without a selection. */
     {
         VitaGameSel sel;
         sceIoMkdir(DATA_DIR "/games", 0777);
         sceIoMkdir(DATA_DIR "/inbox", 0777);
-        if (vita_menu_run(&sel)) {
-            snprintf(jar_path, sizeof(jar_path), "%s", sel.jar);
-            snprintf(class_name, sizeof(class_name), "%s", sel.cls);
-            snprintf(orient, sizeof(orient), "%s", sel.orient);
-            /* VM classpath splits on ':' - strip "ux0:/data/J2ME00001/"
-             * so the entry is RELATIVE (see chdir above) */
+
+        /* One-time subsystem init (NOT inside the round loop):
+         * ANI pool events + the tone player thread are global/static and
+         * survive VM rounds; re-creating the tone thread every round would
+         * leak one thread per game launch (javacall_media_initialize has
+         * NO idempotence guard).
+         *
+         * ANI thread pool init: the ANI blocking framework (used by async
+         * media/network paths, e.g. a game calling Manager.createPlayer on
+         * an http resource) signals statically-allocated pool events, but
+         * nothing in the CLDC-HI startup ever calls ANI_Initialize - the
+         * events stay NULL and the first use crashes in
+         * pthread_mutex_unlock(NULL->mutex).
+         *
+         * Re-enabled: the "unresolvable link" diagnosis (commit 2f578a6)
+         * was WRONG - plain `-lcldc_vm_ani` resolves ANI_Initialize fine
+         * (verified in the current ELF at 0x810af224). Without this call
+         * the pool's static events are never initialized and games
+         * entering an ANI path crash. */
+        {
+            extern void ANI_Initialize(void);
+            ANI_Initialize();
+            dlog("[ANI] thread pool initialized\n");
+        }
+        /* Media subsystem init: creates the dedicated tone player thread
+         * (j2me_tone). Upstream javacall platforms call this from their
+         * platform lifecycle; the vita port never did, so tone playback
+         * was dead (games calling playTone/Player.start got silence and
+         * no END_OF_MEDIA). */
+        {
+            extern int javacall_media_initialize(void);
+            javacall_media_initialize();
+            dlog("[media] tone player thread created\n");
+        }
+
+        /* Launcher main loop: menu -> run MIDlet -> back to menu.
+         * The MIDlet exit only ends the VM round (runMidlet returns);
+         * the PROCESS never exits. This is deliberate:
+         *  1) phoneME supports in-process VM restart (JVM_Initialize is
+         *     idempotent, midpInitialize/midpFinalize fully pair up,
+         *     Universe::apocalypse frees the Java heap and resets all
+         *     bootstrap state - upstream runs MIDP in a loop this way).
+         *  2) NEVER call sceKernelExitProcess: Vita3K's relaunch path
+         *     (request_process_exit -> on_game_closed) races its GUI and
+         *     crashes the emulator. Staying alive avoids it entirely.
+         * Each round re-seeds config/appdb/heap parameters because
+         * midpFinalize tears them down. */
+        for (;;) {
+            snprintf(jar_path, sizeof(jar_path), "Hello.jar");
+            /* AUDIO DEBUG: ToneTest (self-driving MMAPI smoke test) is the
+             * default while the audio investigation is active. Switch back
+             * to "HelloMIDlet" when it concludes. */
+            snprintf(class_name, sizeof(class_name), "ToneTest");
+            snprintf(orient, sizeof(orient), "portrait");
+
+            /* Native game menu: pick an installed game (see vita_menu.c
+             * for the games/ + inbox/ layout). Falls through to
+             * launch.cfg / Hello when the user quits without a selection. */
+            if (vita_menu_run(&sel)) {
+                snprintf(jar_path, sizeof(jar_path), "%s", sel.jar);
+                snprintf(class_name, sizeof(class_name), "%s", sel.cls);
+                snprintf(orient, sizeof(orient), "%s", sel.orient);
+                /* VM classpath splits on ':' - strip "ux0:/data/J2ME00001/"
+                 * so the entry is RELATIVE (see chdir above) */
+                {
+                    size_t plen = strlen(DATA_DIR "/");
+                    if (strncmp(jar_path, DATA_DIR "/", plen) == 0) {
+                        memmove(jar_path, jar_path + plen,
+                                strlen(jar_path) - plen + 1);
+                    }
+                }
+                dlog_str("menu jar: ", jar_path);
+                dlog_str("menu class: ", class_name);
+                dlog_str("menu orientation: ", orient);
+            } else if (read_launch_cfg(jar_path, sizeof(jar_path),
+                                       class_name, sizeof(class_name),
+                                       orient, sizeof(orient)) == 0) {
+                dlog_str("launch.cfg jar: ", jar_path);
+                dlog_str("launch.cfg class: ", class_name);
+                dlog_str("launch.cfg orientation: ", orient);
+            } else {
+                dlog("launch.cfg not found, defaults in use");
+            }
+
             {
-                size_t plen = strlen(DATA_DIR "/");
-                if (strncmp(jar_path, DATA_DIR "/", plen) == 0) {
-                    memmove(jar_path, jar_path + plen, strlen(jar_path) - plen + 1);
+                int landscape = (strcmp(orient, "portrait") != 0);
+                vita_display_set_orientation(landscape);
+                /* Seed config from the read-only VPK copy; the display
+                 * properties in internal.config must match the chosen
+                 * orientation. Re-copied EVERY round: midpFinalize tears
+                 * down the property store. */
+                if (landscape) {
+                    copy_file("app0:/data/J2ME00001/lib/internal.landscape.config",
+                              DATA_DIR "/lib/internal.config");
+                } else {
+                    copy_file("app0:/data/J2ME00001/lib/internal.config",
+                              DATA_DIR "/lib/internal.config");
+                }
+                copy_file("app0:/data/J2ME00001/lib/system.config",
+                          DATA_DIR "/lib/system.config");
+                copy_file("app0:/data/J2ME00001/midp_system.jar",
+                          DATA_DIR "/midp_system.jar");
+            }
+
+            snprintf(midp_home, sizeof(midp_home), "%s", DATA_DIR);
+            setenv("MIDP_HOME", midp_home, 1);
+
+            midpSetConfigDir(DATA_DIR "/lib");
+
+            /* Per-game RMS isolation: derive appdb path from the jar so each
+             * game gets its own suite/RMS namespace (prevents save-file
+             * collision). The bundled Hello.jar uses the shared "appdb"
+             * path. Re-set EVERY round (midpFinalize resets initLevel). */
+            {
+                char appdb_path[80];
+                get_per_game_appdb(jar_path, appdb_path, sizeof(appdb_path));
+                /* Ensure per-game appdb directory exists */
+                SceUID d = sceIoDopen(appdb_path);
+                if (d < 0) {
+                    sceIoMkdir(appdb_path, 0777);
+                    dlog_str("[RMS] created per-game appdb: ", appdb_path);
+                } else {
+                    sceIoDclose(d);
+                }
+                midpSetAppDir(appdb_path);
+                dlog_str("[RMS] appdb: ", appdb_path);
+            }
+
+            /* Java heap before the VM starts (re-set EVERY round:
+             * Arguments::finalize clears the config after cleanup) */
+            setHeapParameters();
+
+            /* runMidlet arguments:
+             *   -classpathext + <jar list> -> additional classpath (getClassPathPlus)
+             *   "internal"                 -> INTERNAL_SUITE_ID (no AMS install)
+             *   <classname>                -> MIDlet to launch
+             *   <jar path>                 -> arg0 for the MIDlet. CRITICAL: the
+             *       internal suite only loads MANIFEST/JAD properties when
+             *       args[0] ends in .jar/.jad
+             *       (CldcMIDletSuiteLoader.createMIDletSuite). Without it
+             *       getAppProperty() returns null for EVERYTHING and
+             *       framework apps (UC etc.) crash with NullPointerException
+             *       in startApp. The path must be RELATIVE (cwd = DATA_DIR)
+             *       so the same entry also resolves via pcsl_file for
+             *       JarReader. */
+            snprintf(classpath, sizeof(classpath),
+                     "midp_system.jar:%s", jar_path);
+
+            char *run_argv[] = {
+                "runMidlet",
+                "-classpathext",
+                classpath,
+                "internal",
+                class_name,
+                jar_path,
+            };
+            int run_argc = 6;
+
+            dlog_str("classpath: ", classpath);
+            dlog_str("starting MIDlet: ", class_name);
+
+            /* Copy-integrity check: log the runtime jar size so a truncated
+             * copy (shorter than the VPK original) is visible in the boot
+             * log. The expected size is baked in at build time. */
+            {
+                SceUID fd = sceIoOpen(DATA_DIR "/Hello.jar", SCE_O_RDONLY, 0);
+                if (fd >= 0) {
+                    SceOff sz = sceIoLseek(fd, 0, SCE_SEEK_END);
+                    sceIoClose(fd);
+                    char m[96];
+                    snprintf(m, sizeof(m),
+                             "runtime Hello.jar size=%lld (expected %lld)\n",
+                             (long long)sz, (long long)HELLO_JAR_SIZE);
+                    dlog(m);
+                } else {
+                    dlog("runtime Hello.jar MISSING\n");
                 }
             }
-            dlog_str("menu jar: ", jar_path);
-            dlog_str("menu class: ", class_name);
-            dlog_str("menu orientation: ", orient);
-        } else if (read_launch_cfg(jar_path, sizeof(jar_path),
-                                   class_name, sizeof(class_name),
-                                   orient, sizeof(orient)) == 0) {
-        dlog_str("launch.cfg jar: ", jar_path);
-        dlog_str("launch.cfg class: ", class_name);
-        dlog_str("launch.cfg orientation: ", orient);
-    } else {
-            dlog("launch.cfg not found, defaults in use");
-        }
+
+            int status = runMidlet(run_argc, run_argv);
+
+            {
+                char msg[64];
+                snprintf(msg, sizeof(msg),
+                         "runMidlet returned %d - back to menu\n", status);
+                dlog(msg);
+            }
+        } /* for(;;) - menu round loop: NEVER exits */
     }
 
-    {
-        int landscape = (strcmp(orient, "portrait") != 0);
-        vita_display_set_orientation(landscape);
-        /* Seed config from the read-only VPK copy; the display properties
-         * in internal.config must match the chosen orientation. */
-        if (landscape) {
-            copy_file("app0:/data/J2ME00001/lib/internal.landscape.config",
-                      DATA_DIR "/lib/internal.config");
-        } else {
-            copy_file("app0:/data/J2ME00001/lib/internal.config",
-                      DATA_DIR "/lib/internal.config");
-        }
-        copy_file("app0:/data/J2ME00001/lib/system.config",
-                  DATA_DIR "/lib/system.config");
-    }
-
-    /* keep the runtime midp_system.jar in sync with the VPK build (it
-     * gains new classes - e.g. Nokia UI stubs - with every release) */
-    copy_file("app0:/data/J2ME00001/midp_system.jar",
-              DATA_DIR "/midp_system.jar");
-
-    snprintf(midp_home, sizeof(midp_home), "%s", DATA_DIR);
-    setenv("MIDP_HOME", midp_home, 1);
-
-    midpSetConfigDir(DATA_DIR "/lib");
-
-    /* Per-game RMS isolation: derive appdb path from the jar so each
-     * game gets its own suite/RMS namespace (prevents save-file collision).
-     * The bundled Hello.jar uses the shared "appdb" path. */
-    {
-        char appdb_path[80];
-        get_per_game_appdb(jar_path, appdb_path, sizeof(appdb_path));
-        /* Ensure per-game appdb directory exists */
-        SceUID d = sceIoDopen(appdb_path);
-        if (d < 0) {
-            sceIoMkdir(appdb_path, 0777);
-            dlog_str("[RMS] created per-game appdb: ", appdb_path);
-        } else {
-            sceIoDclose(d);
-        }
-        midpSetAppDir(appdb_path);
-        dlog_str("[RMS] appdb: ", appdb_path);
-    }
-
-    /* Java heap before the VM starts */
-    setHeapParameters();
-
-    /* ANI thread pool init: the ANI blocking framework (used by async
-     * media/network paths, e.g. a game calling Manager.createPlayer on an
-     * http resource) signals statically-allocated pool events, but nothing
-     * in the CLDC-HI startup ever calls ANI_Initialize - the events stay
-     * NULL and the first use crashes in pthread_mutex_unlock(NULL->mutex).
-     *
-     * Re-enabled: the "unresolvable link" diagnosis (commit 2f578a6) was
-     * WRONG - plain `-lcldc_vm_ani` resolves ANI_Initialize fine (verified
-     * in the current ELF at 0x810af224). Without this call the pool's
-     * static events are never initialized and games entering an ANI path
-     * crash. */
-    {
-        extern void ANI_Initialize(void);
-        ANI_Initialize();
-        dlog("[ANI] thread pool initialized\n");
-    }
-
-    /* Media subsystem init: creates the dedicated tone player thread
-     * (j2me_tone). Upstream javacall platforms call this from their
-     * platform lifecycle; the vita port never did, so tone playback was
-     * dead (games calling playTone/Player.start got silence and no
-     * END_OF_MEDIA). Idempotent. */
-    {
-        extern int javacall_media_initialize(void);
-        javacall_media_initialize();
-        dlog("[media] tone player thread created\n");
-    }
-
-    /* runMidlet arguments:
-     *   -classpathext + <jar list> -> additional classpath (getClassPathPlus)
-     *   "internal"                 -> INTERNAL_SUITE_ID (no AMS install)
-     *   <classname>                -> MIDlet to launch                       */
-    snprintf(classpath, sizeof(classpath),
-             "midp_system.jar:%s", jar_path);
-
-    char *run_argv[] = {
-        "runMidlet",
-        "-classpathext",
-        classpath,
-        "internal",
-        class_name,
-    };
-    int run_argc = 5;
-
-    dlog_str("classpath: ", classpath);
-    dlog_str("starting MIDlet: ", class_name);
-
-    int status = runMidlet(run_argc, run_argv);
-
-    {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "runMidlet returned %d\n", status);
-        dlog(msg);
-    }
-
+    /* NOT REACHED: the launcher loop runs until the process is killed.
+     * Deliberately no sceKernelExitProcess here (see note above). */
     if (g_log != NULL) {
         fclose(g_log);
     }
-    return status;
+    return 0;
 }

@@ -446,6 +446,243 @@ static void save_cfg(const GameEntry *g) {
     }
 }
 
+/* ------------------------------------------------------------------
+ * MIDlet-class validation + fallback (FileManagerMIDl lesson).
+ *
+ * Many jars (esp. Chinese feature-phone software) ship a MANIFEST
+ * whose MIDlet-1 class name does not match any .class actually in the
+ * jar - Class.forName throws CNFE before a single pixel is drawn.
+ *
+ * verify_class_in_jar(): walks the zip central directory once and
+ * checks that <class>.class exists as an entry (cheap: only reads
+ * entry NAMES, no decompression).
+ *
+ * resolve_class_in_jar(): fallback picker when the MANIFEST name is
+ * wrong. Strategy in order:
+ *   1. exact suffix matches ending in "MIDlet" (best signal)
+ *   2. any class ending in "MIDlet"/"Midlet"
+ *   3. class whose simple name best matches the jar's base name
+ * Tie-break: shortest fully-qualified name (top-level classes are
+ * the likelier entry points).
+ * ------------------------------------------------------------------ */
+
+/* callback-based central-directory walk (names only) */
+typedef void (*zip_entry_cb)(const char *name, unsigned int name_len, void *ctx);
+
+static void zip_walk_names(const char *jarpath, zip_entry_cb cb, void *ctx) {
+    SceUID fd;
+    unsigned int size;
+    unsigned char *data = NULL;
+    long i, eocd = -1, p, scan;
+    unsigned int cd_count, e;
+
+    fd = sceIoOpen(jarpath, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return;
+    }
+    size = (unsigned int)sceIoLseek(fd, 0, SCE_SEEK_END);
+    sceIoLseek(fd, 0, SCE_SEEK_SET);
+    data = (unsigned char *)malloc(size ? size : 1);
+    if (data == NULL) {
+        sceIoClose(fd);
+        return;
+    }
+    if (sceIoRead(fd, data, size) != (int)size) {
+        free(data);
+        sceIoClose(fd);
+        return;
+    }
+
+    scan = (long)size - 22;
+    for (i = scan; i >= 0 && i >= scan - 65536; i--) {
+        if (rd32(data + i) == 0x06054b50u) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd >= 0) {
+        cd_count = rd16(data + eocd + 10);
+        p = (long)rd32(data + eocd + 16);
+
+        for (e = 0; e < cd_count; e++) {
+            unsigned int name_len, extra_len, comment_len;
+            const unsigned char *nm;
+
+            if (p + 46 > (long)size || rd32(data + p) != 0x02014b50u) {
+                break;
+            }
+            name_len = rd16(data + p + 28);
+            extra_len = rd16(data + p + 30);
+            comment_len = rd16(data + p + 32);
+            nm = data + p + 46;
+            if (p + 46 + (long)name_len > (long)size) {
+                break;
+            }
+            cb((const char *)nm, name_len, ctx);
+            p += 46 + name_len + extra_len + comment_len;
+        }
+    }
+
+    free(data);
+    sceIoClose(fd);
+}
+
+/* does <cls>.class exist in the jar? (cls uses '/' separators) */
+struct verify_ctx {
+    const char *cls;
+    size_t cls_len;
+    int found;
+};
+
+static void verify_cb(const char *name, unsigned int name_len, void *ctx_) {
+    struct verify_ctx *ctx = (struct verify_ctx *)ctx_;
+    if (!ctx->found && name_len == ctx->cls_len + 6 &&
+        memcmp(name, ctx->cls, ctx->cls_len) == 0 &&
+        memcmp(name + ctx->cls_len, ".class", 6) == 0) {
+        ctx->found = 1;
+    }
+}
+
+static int verify_class_in_jar(const char *jarpath, const char *cls) {
+    struct verify_ctx ctx;
+    char dotname[128];
+    size_t i, n;
+
+    if (cls == NULL || cls[0] == '\0') {
+        return 0;
+    }
+    /* convert dotted name to slashed */
+    n = strlen(cls);
+    if (n >= sizeof(dotname)) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        dotname[i] = (cls[i] == '.') ? '/' : cls[i];
+    }
+    dotname[n] = '\0';
+
+    ctx.cls = dotname;
+    ctx.cls_len = n;
+    ctx.found = 0;
+    zip_walk_names(jarpath, verify_cb, &ctx);
+    return ctx.found;
+}
+
+/* fallback picker state */
+struct resolve_ctx {
+    char best[128];
+    int best_score;   /* higher = better */
+};
+
+/* score a candidate: 3 = *MIDlet exact-cased, 2 = *Midlet any-case,
+ * 1 = same simple name as jar base, 0 = otherwise (not stored) */
+static int score_candidate(const char *name, unsigned int name_len) {
+    /* work on a local NUL-terminated copy */
+    char buf[160];
+    const char *simple;
+    int score = 0;
+
+    if (name_len < 7 || name_len >= sizeof(buf)) {
+        return -1; /* not a class entry or too long */
+    }
+    if (memcmp(name + name_len - 6, ".class", 6) != 0) {
+        return -1;
+    }
+    memcpy(buf, name, name_len - 6);
+    buf[name_len - 6] = '\0';
+
+    /* skip inner classes and known non-entry names */
+    if (strstr(buf, "$") != NULL) {
+        return -1;
+    }
+    if (strncmp(buf, "META-INF/", 9) == 0) {
+        return -1;
+    }
+
+    simple = strrchr(buf, '/');
+    simple = (simple != NULL) ? simple + 1 : buf;
+
+    if (strcmp(simple, "MIDlet") == 0) {
+        return 3;
+    }
+    if (strlen(simple) >= 6 &&
+        (strcmp(simple + strlen(simple) - 6, "MIDlet") == 0 ||
+         strcmp(simple + strlen(simple) - 6, "Midlet") == 0)) {
+        return 2;
+    }
+    return 1; /* any top-level class - weak candidate */
+}
+
+static void resolve_cb(const char *name, unsigned int name_len, void *ctx_) {
+    struct resolve_ctx *ctx = (struct resolve_ctx *)ctx_;
+    int score = score_candidate(name, name_len);
+    char buf[160];
+    unsigned int i;
+
+    if (score <= 0) {
+        return;
+    }
+    /* shorter FQN wins on ties (top-level classes are likelier) */
+    if (score > ctx->best_score ||
+        (score == ctx->best_score && ctx->best[0] != '\0' &&
+         name_len - 6 < strlen(ctx->best))) {
+        memcpy(buf, name, name_len - 6);
+        buf[name_len - 6] = '\0';
+        for (i = 0; buf[i]; i++) {
+            if (buf[i] == '/') {
+                buf[i] = '.';
+            }
+        }
+        strncpy(ctx->best, buf, sizeof(ctx->best) - 1);
+        ctx->best[sizeof(ctx->best) - 1] = '\0';
+        ctx->best_score = score;
+    }
+}
+
+/* If the MANIFEST class is missing from the jar, pick the best
+ * available MIDlet-ish class instead. Returns 1 when out was fixed. */
+static int resolve_class_in_jar(const char *jarpath, char *out, size_t outsz) {
+    struct resolve_ctx ctx;
+    ctx.best[0] = '\0';
+    ctx.best_score = 0;
+    zip_walk_names(jarpath, resolve_cb, &ctx);
+    if (ctx.best_score >= 2 && ctx.best[0] != '\0') {
+        strncpy(out, ctx.best, outsz - 1);
+        out[outsz - 1] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+/* Validate + fix the class name of one game entry. Called at scan and
+ * install time. Writes game.cfg when the resolution changed anything. */
+static void validate_game_class(GameEntry *g, int allow_resave) {
+    char fixed[128];
+
+    if (g->cls[0] == '\0') {
+        return; /* nothing parsed - leave for the VM's own error path */
+    }
+    if (verify_class_in_jar(g->jar, g->cls)) {
+        return; /* MANIFEST class is fine */
+    }
+
+    fprintf(stderr, "[menu] class '%s' not in jar '%s' - resolving\n",
+            g->cls, g->jar);
+    fflush(stderr);
+
+    fixed[0] = '\0';
+    if (resolve_class_in_jar(g->jar, fixed, sizeof(fixed)) &&
+        strcmp(fixed, g->cls) != 0) {
+        fprintf(stderr, "[menu] resolved '%s' -> '%s'\n", g->cls, fixed);
+        fflush(stderr);
+        strncpy(g->cls, fixed, sizeof(g->cls) - 1);
+        g->cls[sizeof(g->cls) - 1] = '\0';
+        if (allow_resave) {
+            save_cfg(g);
+        }
+    }
+}
+
 static int dir_exists(const char *path) {
     SceUID d = sceIoDopen(path);
     if (d < 0) {
@@ -508,6 +745,10 @@ static void scan_games(void) {
         if (g->cls[0] == '\0') {
             parse_manifest_class(g->jar, g->cls, sizeof(g->cls));
         }
+        /* fix jars whose MANIFEST class does not exist (FileManagerMIDl
+         * lesson): verify against the central directory and fall back
+         * to the best MIDlet-ish class; persist the fix in game.cfg */
+        validate_game_class(g, 1);
         game_count++;
     }
     sceIoDclose(d);
@@ -563,6 +804,7 @@ static void install_inbox(char *msg, size_t msg_sz) {
             snprintf(tmp.dir, sizeof(tmp.dir), "%s", dstdir);
             snprintf(tmp.jar, sizeof(tmp.jar), "%s/" JAR_NAME, dstdir);
             parse_manifest_class(tmp.jar, tmp.cls, sizeof(tmp.cls));
+            validate_game_class(&tmp, 1);
             save_cfg(&tmp);
         }
     }
@@ -633,6 +875,12 @@ int vita_menu_run(VitaGameSel *out) {
             }
             if ((btn & SCE_CTRL_CROSS) && game_count == 0) {
                 break; /* fall back to launch.cfg / Hello */
+            }
+            if (btn & SCE_CTRL_TRIANGLE) {
+                /* Always allow falling back to launch.cfg / bundled
+                 * tests even with games installed (needed to run
+                 * ToneTest etc. for bring-up). */
+                break;
             }
         } else {
             GameEntry *g = &games[sel];
@@ -744,13 +992,19 @@ int vita_menu_run(VitaGameSel *out) {
             draw_text(20, 512,
                       "UP/DOWN select  X open  START install inbox  SEL rescan",
                       1, C_HINT);
+            draw_text(20, 530,
+                      "TRIANGLE: run launch.cfg / bundled tests",
+                      1, C_HINT);
         }
 
         menu_flip();
         sceDisplayWaitVblankStart(); /* 60 Hz, no flicker */
     }
 
-    free(menu_fb);
-    menu_fb = NULL;
+    /* Keep menu_fb allocated after the menu exits (no free): the display
+     * still scans it out until the VM installs its own framebuffer, and
+     * handing those pages back to malloc let the VM heap overwrite them -
+     * garbage on screen during startup (v01.27 "no picture" symptom).
+     * 2MB once per process is an acceptable cost of the round-loop menu. */
     return have_selection;
 }

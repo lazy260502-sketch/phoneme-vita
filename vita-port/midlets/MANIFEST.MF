@@ -4,5 +4,6 @@ MIDlet-Vendor: Vita
 MIDlet-1: Hello, , HelloMIDlet
 MIDlet-2: Canvas, , CanvasTest
 MIDlet-3: Input, , InputTest
+MIDlet-4: Tone, , ToneTest
 MicroEdition-Profile: MIDP-2.0
 MicroEdition-Configuration: CLDC-1.1
