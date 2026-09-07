@@ -45,9 +45,6 @@
 #include <keymap_input.h>
 #include <midp_mastermode_port.h> /* checkForSystemSignal contract */
 
-/* vita_net.c: select() over registered fds and wake blocked IO threads */
-extern void vita_net_poll(void);
-
 #define VITA_INPUT_RING_SIZE 16
 
 /* Map a physical (960x544) touch coordinate to the virtual J2ME screen.
@@ -383,10 +380,6 @@ void checkForSystemSignal(MidpReentryData *pNewSignal,
 
     vita_input_poll();
     vita_touch_poll();
-
-    /* Wake any Java threads blocked in socket connect/read/write: scan
-     * registered fds, signal NETWORK_READ/WRITE/EXCEPTION as ready. */
-    vita_net_poll();
 
     /* Media events first: a blocked MMAPI Java thread waits on
      * MEDIA_EVENT_SIGNAL, and END_OF_MEDIA must not be starved by

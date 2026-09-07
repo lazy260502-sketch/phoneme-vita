@@ -28,9 +28,21 @@
 #include <midp_check_events.h>
 #include <ani.h>
 
+/* vita_net.c: select() over registered fds and wake Java threads
+ * blocked in socket connect/read/write with NETWORK_*_SIGNAL. Lives at
+ * this orchestration level (not inside the input pump) because network
+ * readiness is a peer of the MIDP pump and the ANI pool wait, not a
+ * form of user input. */
+extern void vita_net_poll(void);
+
 void JVMSPI_CheckEvents(JVMSPI_BlockedThreadInfo *blocked_threads,
                         int blocked_threads_count,
                         jlong timeout) {
+    /* 0. Network readiness scan: wake any protocol thread blocked on a
+     * socket before this cycle's MIDP pump runs, so a read that became
+     * possible last cycle is not delayed by input/media work. */
+    vita_net_poll();
+
     /* 1. MIDP event pump: checkForSystemSignal samples the pad and the
      * touch panel, drains the media ring, and routes anything found to
      * the foreground queue / waiting threads. Must run with a 0
