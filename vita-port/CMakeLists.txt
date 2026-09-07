@@ -152,6 +152,7 @@ add_executable(${PROJECT_NAME}
     src/vita_display.c
     src/vita_input.c
     src/vita_pcsl.c
+    src/vita_net.c
     src/vm_rom_stubs.c
     src/vita_storage.c
     src/vita_audio_javacall.c
@@ -224,6 +225,8 @@ target_link_libraries(${PROJECT_NAME}
     SceDisplay_stub
     SceCtrl_stub
     SceTouch_stub
+    SceNet_stub
+    SceNetCtl_stub
     SceLibKernel_stub
     SceSysmodule_stub
     SceAppMgr_stub

@@ -1,6 +1,55 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-07
 
+## 2026-09-07 v01.30 网络层恢复：UC 浏览器进不去 → socket 全 stub 所致
+
+### 现象与根因
+用户反馈 UC 浏览器一直进不去。排查确认：**当前树的网络是纯 stub**
+（`vita_pcsl.c` 的 `pcsl_socket_open_start` 直接 return -1），任何
+`Connector.open("http://...")` 在 TCP 层即失败 → UC 启动即挂/退出。
+8-30 曾有真实现 `vita_net.c`（~845 行，BSD socket 全量），但该版从未
+单独 commit，8-30 全面回退时被 git clean 掉，之后所有版本网络均为
+stub。
+
+### 恢复来源（git 考古）
+`vita_net.c` 找回自 **dangling commit d93fc0a3**（8-30 "save change"，
+`git fsck --lost-found` 发现）。内容：pcsl socket/server-socket/
+network/datagram 全量真实现——newlib BSD socket 包装（内部 sceNet）、
+非阻塞 connect（EINPROGRESS→WOULDBLOCK）、gethostbyname（getaddrinfo）、
+`vita_net_early_init()`（sceSysmoduleLoadModule(NET)+sceNetInit+sceNetCtlInit）、
+`vita_net_poll()`（select 全 fd 集→NETWORK_READ/WRITE/EXCEPTION_SIGNAL
+唤醒阻塞协议线程）。HTTP 是纯 Java（com.sun.midp.io.j2me.http）跑在
+socket:// 上，TCP 通即 HTTP 通。
+
+### 改动（4 文件 +16/-311 + 新增 845 行）
+1. `src/vita_net.c`（恢复）：全部 pcsl 网络函数真实现。
+2. `src/vita_pcsl.c`：整段删除网络 stub（原 1008-1317 行，37 函数 +
+   htons/htonl 辅助——这些在 net.c 有同名真实现，**必须删否则重复
+   定义**）。
+3. `src/vita_main.c`：main 里 `vita_net_early_init()`（VM 启动前）。
+4. `src/vita_input.c`：checkForSystemSignal 里 `vita_net_poll()`
+   （input/touch poll 之后、media 之前）。
+5. `CMakeLists.txt`：+`src/vita_net.c`、+`SceNet_stub SceNetCtl_stub`
+   （SceSysmodule_stub 原已有）。
+
+### 经验
+- **功能合并回退时必须先把每个功能的文件单独 commit**——8-30 的教训
+  重演：vita_net.c 只存在于 patch/dangling commit 里，恢复靠 git fsck
+  考古。此后每完成一个功能立即 commit。
+- pcsl 网络函数在 stub 与真实现间切换时，htons/htonl/getRawIpNumber
+  这类小辅助也是重复定义点，别只看 socket_* 大函数。
+- dangling commit 是救命稻草：`git fsck --lost-found` 找回未提交工作。
+
+### 验证
+- 构建成功；`nm midp_vita`：`vita_net_early_init/vita_net_poll/
+  pcsl_socket_open_start/pcsl_network_gethostbyname_start` 全部 T 符号
+  唯一（无重复定义）。
+- 产物 `vita-port/build/cmake/midp_vita.vpk`（16:13）。
+- 待用户实测：UC 浏览器联网、NetTest MIDlet（HttpConnection GET
+  example.com）。**注意**：DNS（getaddrinfo）与 sceNetCtlInit 在
+  Vita3K 的支持度未知——若 UC 仍进不去，看 midp_stderr.log 的
+  `[net]`/errno 定位是 DNS 还是连接阶段。
+
 ## 2026-09-07 v01.29 修复第 2 轮：zip 大小写比较单向折叠 + 触摸坐标系 2 倍（用户日志实锤）
 
 ### 用户日志（midp_stderr.log）关键证据

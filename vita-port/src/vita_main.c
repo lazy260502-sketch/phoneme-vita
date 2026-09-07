@@ -44,6 +44,10 @@ extern int runMidlet(int argc, char **argv);
 /* from vita_display.c: must run before the VM starts */
 extern void vita_display_set_orientation(int landscape);
 
+/* from vita_net.c: sceNet stack init; must run before the VM starts so
+ * the first socket call from a MIDlet does not hit an idle stack */
+extern void vita_net_early_init(void);
+
 /* vitaSDK newlib: the default malloc arena is 32MB, which is too small for
  * the Java heap on top of everything else (the VM refused to start with
  * "Could not allocate VM heap"). This overrides the weak default; the app
@@ -189,6 +193,8 @@ int main(int argc, char *argv[]) {
     setvbuf(stderr, NULL, _IONBF, 0);
 
     dlog("vita-port J2ME launcher\n");
+
+    vita_net_early_init();
     dlog("version: " VITA_PORT_VERSION_STRING "\n");
 
     /* CRITICAL: run from the data dir and keep ALL VM classpath entries
