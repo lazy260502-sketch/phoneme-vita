@@ -37,7 +37,16 @@ set(VITA_TITLEID  "J2ME00001")
 #         so END_OF_MEDIA was dropped at the switch default case and the
 #         music toggle deadlocked the VM. Rebuilt with USE_JSR_135=true
 #         config; jump table slot 36 now routes to StoreMIDPEventInVmThread.
-set(VITA_VERSION  "01.29")
+# 01.30 = b170: real network stack restored (vita_net.c) + net_poll moved
+#         to JVMSPI_CheckEvents + per-call net logging (net_log.txt) +
+#         REAL-DEVICE INSTALL FIX: drop MEMSIZE 128 from vita_create_self
+#         - fself -m is a KiB budget where 0x1000-0x12800 is System-mode
+#         only and 0 is the only legal value for a normal app; 128 (0x80)
+#         produced an invalid SELF control info that Vita3K ignored but
+#         real hw rejects with 0x8010113D on install. Also raised the
+#         sceNetInit pool 64KB -> 1MB (DNS resolver lives in it; official
+#         net_http_bsd sample uses 1MB).
+set(VITA_VERSION  "01.30")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
@@ -238,7 +247,11 @@ target_link_libraries(${PROJECT_NAME}
 #==============================================================================
 # VPK packaging (config copies carry the 240x320 virtual screen)
 #==============================================================================
-vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} MEMSIZE 128)
+# MEMSIZE deliberately NOT set: fself -m <kib> has no legal value for a
+# normal app except 0 (see vita-make-fself usage); passing 128 wrote an
+# invalid memory budget into the SELF control info -> real-device install
+# fails with 0x8010113D (Vita3K never checks it).
+vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
 
 set(MIDP_SYSTEM_JAR ${MIDP_BUILD}/classes/midp_system.jar)
 

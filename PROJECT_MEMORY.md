@@ -1,6 +1,39 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-07
 
+## 2026-09-07 v01.30 修订 2：真机安装 0x8010113D + 网络日志全链路埋点
+
+### 真机 0x8010113D（安装失败）
+- **根因**：`vita_create_self(... MEMSIZE 128)`——fself `-m` 是 **KiB
+  内存预算**，Normal app 合法值仅 0（0x1000-0x12800 仅 System mode），
+  128(0x80) 写入 SELF control info 后真机 SceShellSync 拒绝安装；
+  Vita3K 不校验该字段所以模拟器一直没事。128 来自初始 commit 288337c
+  （作者可能误以为单位是 MB）。
+- **修复**：CMakeLists 去掉 MEMSIZE（留注释说明）；字节级验证 VPK 内
+  eboot.bin 与 `vita-make-fself -s -c`（无 -m）输出完全一致。
+- **教训**：`vita.cmake` 的 MEMSIZE 直接透传 fself -m，语义是 KiB 预算
+  而非 MB；模拟器宽松真机严格，**首次真机部署前应 diff 一次 fself
+  参数**。
+
+### 网络日志全链路（vita_net.c）
+- 之前 `vita_net.c` 一行日志都没有 → "网络不可用但看不到 log"。
+- 新增 `vnet_log()`：stderr（midp_stderr.log）+ `ux0:/data/net_log.txt`
+  追加式双写（stderr 每次启动被截断，net_log 跨启动留存；每行
+  fopen/fclose 防强杀丢日志，同 vm_output.log 方案）。
+- 埋点覆盖：early_init 三步返回码、getLocalIP、gethostbyname 成败、
+  socket open（ip/port）、connect 即时/异步/失败+errno、SO_ERROR、
+  recv/send 失败+errno、EOF。任一环失败都能定位。
+
+### 其它
+- sceNetInit 内存池 64KB → **1MB**（DNS resolver 也从池分配；官方
+  net_http_bsd 示例用 1MB，64KB 极易饿死 DNS）。
+- net_poll 从 vita_input.c 移到 vita_checkevents.c（JVMSPI_CheckEvents
+  step 0，MIDP 泵之前）：输入泵不应知道网络存在；调用频率/时机不变。
+- `multi_replace` 一次吞掉了 `VITA_NET_MAX_FDS` 定义（替换串衔接处
+  消费未补回）→ 编译报 undeclared 才发现。多段替换后必须编译验证。
+- build.sh 依旧吞 make 错误码照报 successful（v01.28 已知坑，再次
+  实锤：本次 Error 2 被包成 "Build successful"）。
+
 ## 2026-09-07 v01.30 网络层恢复：UC 浏览器进不去 → socket 全 stub 所致
 
 ### 现象与根因

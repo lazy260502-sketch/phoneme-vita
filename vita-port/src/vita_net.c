@@ -23,6 +23,8 @@
  */
 
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -44,8 +46,37 @@
 
 #include <midpServices.h> /* NETWORK_*_SIGNAL for vita_net_poll() */
 
+/* ---- logging: stderr (midp_stderr.log) + ux0:/data/net_log.txt ----
+ * Dedicated append-only file: midp_stderr.log is truncated per launch
+ * and shared with VM/AMS spew; net_log.txt survives across launches so
+ * "no log at all" (crash before freopen) is distinguishable from "net
+ * never called". Per-line fopen/fclose - safe against force-kill
+ * (the 8-31 empty-log incident). */
+static void vnet_log(const char *fmt, ...)
+{
+    va_list ap;
+    char buf[256];
+    FILE *f;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    fprintf(stderr, "%s", buf);
+    fflush(stderr);
+    f = fopen("ux0:/data/net_log.txt", "a");
+    if (f != NULL) {
+        fprintf(f, "%s", buf);
+        fclose(f);
+    }
+}
 /* Max fds tracked for the select() scan in vita_net_poll(). */
 #define VITA_NET_MAX_FDS 32
+#define VITA_NET_MEM_SIZE (1 * 1024 * 1024) /* 1MB: DNS resolver + socket
+                                             * buffers live in this pool;
+                                             * 64KB starved them (official
+                                             * samples use 1MB) */
+static char g_net_mem[VITA_NET_MEM_SIZE];
 
 /* FIONREAD is not exposed by newlib's sys/ioctl.h on Vita; available()
  * is implemented with a 1-byte MSG_PEEK recv + socket buffer query. */
@@ -86,23 +117,25 @@ int pcsl_lastNetworkError = 0; /* mirrors upstream `lastError` */
 
 /* ---- called from vita_main.c before the VM starts ---- */
 void vita_net_early_init(void) {
-    static char net_mem[64 * 1024];
     SceNetInitParam param;
+    int rc;
 
     if (g_net_up) {
         return;
     }
 
-    sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+    rc = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+    vnet_log("[NET] sysmodule load: 0x%08X\n", rc);
 
     memset(&param, 0, sizeof(param));
-    param.memory = net_mem;
-    param.size = sizeof(net_mem);
+    param.memory = g_net_mem;
+    param.size = sizeof(g_net_mem);
     param.flags = 0;
-   sceNetInit(&param);
+    rc = sceNetInit(&param);
+    vnet_log("[NET] sceNetInit: 0x%08X\n", rc);
 
-    /* Bring up the WLAN device. Best-effort: Vita3K accepts no-op. */
-    sceNetCtlInit();
+    rc = sceNetCtlInit();
+    vnet_log("[NET] sceNetCtlInit: 0x%08X\n", rc);
 
     g_net_up = 1;
 }
@@ -207,10 +240,13 @@ int pcsl_socket_open_start(unsigned char *ipBytes, int port,
     (void)pContext;
 
     vita_net_early_init();
+    vnet_log("[NET] socket_open ip=%u.%u.%u.%u port=%d\n",
+             ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3], port);
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
     pcsl_lastNetworkError = errno;
     if (fd < 0) {
+        vnet_log("[NET] socket() FAILED errno=%d\n", errno);
         return PCSL_NET_IOERROR;
     }
 
@@ -230,6 +266,7 @@ int pcsl_socket_open_start(unsigned char *ipBytes, int port,
         h = na_create(fd);
         if (h == NULL) { close(fd); return PCSL_NET_IOERROR; }
         *pHandle = h;
+        vnet_log("[NET] connect immediate OK fd=%d\n", fd);
         return PCSL_NET_SUCCESS;
     }
 
@@ -238,10 +275,12 @@ int pcsl_socket_open_start(unsigned char *ipBytes, int port,
         if (h == NULL) { close(fd); return PCSL_NET_IOERROR; }
         *pHandle = h;
         *pContext = NULL;
+        vnet_log("[NET] connect EINPROGRESS fd=%d (thread will block)\n", fd);
         return PCSL_NET_WOULDBLOCK;
     }
 
     pcsl_lastNetworkError = errno;
+    vnet_log("[NET] connect FAILED errno=%d\n", errno);
     close(fd);
     return PCSL_NET_CONNECTION_NOTFOUND;
 }
@@ -258,13 +297,16 @@ int pcsl_socket_open_finish(void *handle, void *context) {
 
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen) < 0) {
         pcsl_lastNetworkError = errno;
+        vnet_log("[NET] open_finish getsockopt FAILED errno=%d\n", errno);
     } else {
         pcsl_lastNetworkError = err;
     }
 
     if (err == 0) {
+        vnet_log("[NET] connect DONE fd=%d\n", fd);
         return PCSL_NET_SUCCESS;
     }
+    vnet_log("[NET] connect FAILED fd=%d SO_ERROR=%d\n", fd, err);
     na_destroy(handle);
     close(fd);
     return PCSL_NET_IOERROR;
@@ -288,7 +330,11 @@ static int socket_read_common(void *handle, unsigned char *pData, int len,
         if (errno == EINTR) {
             return PCSL_NET_INTERRUPTED;
         }
+        vnet_log("[NET] recv FAILED fd=%d errno=%d\n", fd, errno);
         return PCSL_NET_IOERROR;
+    }
+    if (n == 0) {
+        vnet_log("[NET] recv EOF fd=%d\n", fd);
     }
     /* n == 0 means orderly EOF; report as success with 0 bytes so the
      * Java layer sees stream end (that is how the BSD port behaves). */
@@ -326,6 +372,7 @@ static int socket_write_common(void *handle, char *pData, int len,
         if (errno == EINTR) {
             return PCSL_NET_INTERRUPTED;
         }
+        vnet_log("[NET] send FAILED fd=%d errno=%d\n", fd, errno);
         return PCSL_NET_IOERROR;
     }
     *pBytesWritten = n;
@@ -525,9 +572,11 @@ int pcsl_network_getLocalIPAddressAsString(char *pLocalIPAddress) {
     vita_net_early_init();
     memset(&info, 0, sizeof(info));
     if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &info) < 0) {
+        vnet_log("[NET] getLocalIP: NetCtl INFO FAILED (wifi down?)\n");
         strcpy(pLocalIPAddress, "0.0.0.0");
         return PCSL_NET_SUCCESS;
     }
+    vnet_log("[NET] getLocalIP: %s\n", info.ip_address);
     strncpy(pLocalIPAddress, info.ip_address, 15);
     pLocalIPAddress[15] = '\0';
     return PCSL_NET_SUCCESS;
@@ -545,6 +594,8 @@ int pcsl_network_gethostbyname_start(char *hostname, unsigned char *pAddress,
     hp = gethostbyname(hostname);
     pcsl_lastNetworkError = errno;
     if (hp == NULL || hp->h_addrtype != AF_INET) {
+        vnet_log("[NET] gethostbyname('%s') FAILED h_errno/errno=%d\n",
+                 hostname, errno);
         return PCSL_NET_IOERROR;
     }
     realLen = 4;
@@ -553,6 +604,8 @@ int pcsl_network_gethostbyname_start(char *hostname, unsigned char *pAddress,
     }
     memcpy(pAddress, hp->h_addr_list[0], realLen);
     *pLen = realLen;
+    vnet_log("[NET] gethostbyname('%s') = %u.%u.%u.%u\n",
+             hostname, pAddress[0], pAddress[1], pAddress[2], pAddress[3]);
     return PCSL_NET_SUCCESS;
 }
 
