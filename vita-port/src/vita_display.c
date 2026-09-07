@@ -273,14 +273,14 @@ jboolean lfjport_is_display_buildin(int hardwareId) {
 }
 
 jboolean lfjport_is_display_pen_supported(int hardwareId) {
-    /* Touch integration comes in a later phase (MIDP_PEN_EVENT). */
+    /* Vita front touch panel -> MIDP_PEN_EVENT (vita_input.c). */
     (void)hardwareId;
-    return KNI_FALSE;
+    return KNI_TRUE;
 }
 
 jboolean lfjport_is_display_pen_motion_supported(int hardwareId) {
     (void)hardwareId;
-    return KNI_FALSE;
+    return KNI_TRUE;
 }
 
 int lfjport_get_display_capabilities(int hardwareId) {

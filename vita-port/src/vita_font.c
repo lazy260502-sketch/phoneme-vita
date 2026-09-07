@@ -261,3 +261,103 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
 
     return KNI_TRUE;
 }
+
+/* ------------------------------------------------------------------ */
+/* Native-menu rendering (UTF-8 -> codepoints -> 1bpp glyph blit).     */
+/* Used by vita_menu.c so game names from MANIFEST.MF (often GBK/UTF-8 */
+/* Chinese) draw with the same bank the Java layer uses.               */
+/* ------------------------------------------------------------------ */
+
+/* Decode one UTF-8 sequence; returns bytes consumed, *cp = codepoint.
+ * GBK bytes (lead 0x81-0xFE) are NOT valid UTF-8 - callers that hit
+ * them get *cp = cp with the high bytes preserved via gb fallback. */
+static int utf8_decode(const unsigned char *s, int avail, unsigned int *cp) {
+    unsigned int c = s[0];
+    if (c < 0x80) {
+        *cp = c;
+        return 1;
+    }
+    if ((c & 0xE0) == 0xC0 && avail >= 2 && (s[1] & 0xC0) == 0x80) {
+        *cp = ((c & 0x1F) << 6) | (s[1] & 0x3F);
+        return 2;
+    }
+    if ((c & 0xF0) == 0xE0 && avail >= 3 && (s[1] & 0xC0) == 0x80 &&
+        (s[2] & 0xC0) == 0x80) {
+        *cp = ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        return 3;
+    }
+    if ((c & 0xF8) == 0xF0 && avail >= 4 && (s[1] & 0xC0) == 0x80 &&
+        (s[2] & 0xC0) == 0x80 && (s[3] & 0xC0) == 0x80) {
+        *cp = ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
+              ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        return 4;
+    }
+    *cp = c; /* invalid byte: pass through (draws tofu/ascii) */
+    return 1;
+}
+
+int vita_menu_font_gw(void) {
+    fb_ensure();
+    return fb_ready ? fb_gw : 0;
+}
+
+int vita_menu_font_gh(void) {
+    fb_ensure();
+    return fb_ready ? fb_gh : 0;
+}
+
+/* Draw a UTF-8 string into a 32bpp framebuffer (0xAABBGGRR), clipped to
+ * [0,w)x[0,h). Returns the pen x after the last glyph. Missing glyphs
+ * draw a tofu box; ASCII without the bank falls back to caller. */
+int vita_menu_draw_utf8(uint32_t *fb, int w, int h,
+                        int x, int y, const char *utf8, uint32_t color) {
+    const unsigned char *s = (const unsigned char *)utf8;
+    int avail = (int)strlen(utf8);
+    int pen_x = x;
+
+    fb_ensure();
+    if (fb == NULL || !fb_ready) {
+        return pen_x;
+    }
+
+    while (avail > 0) {
+        unsigned int cp;
+        const unsigned char *g;
+        int used = utf8_decode(s, avail, &cp);
+        int r, c;
+
+        g = fb_glyph(cp);
+        if (g != NULL) {
+            for (r = 0; r < fb_gh; r++) {
+                int py = y + r;
+                const unsigned char *row = g + r * fb_stride;
+                if (py < 0 || py >= h) continue;
+                for (c = 0; c < fb_gw; c++) {
+                    int px = pen_x + c;
+                    if (px < 0 || px >= w) continue;
+                    if (row[c >> 3] & (0x80 >> (c & 7))) {
+                        fb[py * w + px] = color;
+                    }
+                }
+            }
+        } else if (cp >= 0x2E80) {
+            /* tofu box for missing CJK glyphs */
+            for (r = 0; r < fb_gh; r++) {
+                int py = y + r;
+                if (py < 0 || py >= h) continue;
+                for (c = 0; c < fb_gw; c++) {
+                    int px = pen_x + c;
+                    if (px < 0 || px >= w) continue;
+                    if (r == 0 || r == fb_gh - 1 || c == 0 ||
+                        c == fb_gw - 1) {
+                        fb[py * w + px] = color;
+                    }
+                }
+            }
+        }
+        pen_x += fb_gw;
+        s += used;
+        avail -= used;
+    }
+    return pen_x;
+}

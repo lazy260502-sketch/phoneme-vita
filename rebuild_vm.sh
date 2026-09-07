@@ -30,7 +30,11 @@ FLAVOR=release            # debug=AZZERT gaps; product=compiler member; release=
 # Main_vita has main/module_start, ROMImage clashes with the MIDP-side
 # ROMImage, the rest corrupt symbol pull-in (pte_osInit/ANI_Initialize
 # link failures seen 2026-09-02).
-EXCLUDE="AsmStubs_x86_64.o|Interpreter_arm.o|ani.o|ani_bsd_socket.o|os_port.o|poolthread.o|BSDSocket.o|Main_vita.o|NativesTable.o|ROMImage.o|ReflectNatives.o|jvmspi.o"
+# InterpreterSkeleton.o / OopMapsSkeleton.o are HOST loopgen/romgen stub
+# tables (empty interpreter_dispatch_table() etc.) - they must never enter
+# the Vita library (v01.28: repack pulled them in and the C-interpreter
+# guard caught interpreter_dispatch_table leaking).
+EXCLUDE="AsmStubs_x86_64.o|Interpreter_arm.o|InterpreterSkeleton.o|OopMapsSkeleton.o|ani.o|ani_bsd_socket.o|os_port.o|poolthread.o|BSDSocket.o|Main_vita.o|NativesTable.o|ROMImage.o|ReflectNatives.o|jvmspi.o"
 
 export JVMWorkSpace=$CLDC
 export JVMBuildSpace=$CLDC/build

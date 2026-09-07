@@ -34,7 +34,14 @@
 #include <zlib.h>
 
 #include "vita_menu.h"
+#include "vita_icon.h"
 #include "vita_version.h"
+
+/* from vita_font.c: menu-side UTF-8 rendering over the shared CJK bank */
+int vita_menu_font_gw(void);
+int vita_menu_font_gh(void);
+int vita_menu_draw_utf8(uint32_t *fb, int w, int h,
+                        int x, int y, const char *utf8, uint32_t color);
 
 #define GAMES_DIR "ux0:/data/J2ME00001/games"
 #define INBOX_DIR "ux0:/data/J2ME00001/inbox"
@@ -109,8 +116,29 @@ static void fill_rect(int x, int y, int w, int h, uint32_t color) {
     }
 }
 
-/* 5x7 glyph scaled 3x -> 15x21 px characters */
+/* 5x7 glyph scaled 3x -> 15x21 px characters. Pure-ASCII fast path;
+ * strings containing UTF-8 multibyte sequences (Chinese game names)
+ * route through the shared CJK bitmap bank in vita_font.c instead. */
 static void draw_text(int x, int y, const char *s, int scale, uint32_t color) {
+    int has_multibyte = 0;
+    const unsigned char *p;
+    for (p = (const unsigned char *)s; *p; p++) {
+        if (*p >= 0x80) { has_multibyte = 1; break; }
+    }
+    if (has_multibyte) {
+        /* Route through the shared CJK bitmap bank (vita_font.c). When
+         * the bank failed to load nothing would be drawn at all - fall
+         * back to '?' placeholders so the row is still visible. */
+        int nx = vita_menu_draw_utf8(menu_fb, FB_W, FB_H, x, y, s, color);
+        if (nx == x) {
+            int nq = (int)strlen(s);
+            int k;
+            for (k = 0; k < nq; k++) {
+                draw_text(x + k * 6 * scale, y, "?", scale, color);
+            }
+        }
+        return;
+    }
     while (*s) {
         unsigned idx = (unsigned char)*s;
         int row, col, sx, sy;
@@ -198,6 +226,7 @@ typedef struct {
     char name[128];
     char jar[176];
     char cls[128];
+    char icon[128];   /* icon path inside the jar ("" = none) */
     int landscape;
 } GameEntry;
 
@@ -316,10 +345,17 @@ static unsigned char *zip_read_entry(const char *jarpath, const char *want,
             match = 1;
             for (k = 0; k < name_len; k++) {
                 char a = (char)nm[k];
+                char b = want[k];
+                /* case-insensitive on BOTH sides (the entry-name-only
+                 * fold made every lowercase want, e.g. "40.png",
+                 * unmatched - the v01.29 icon failure) */
                 if (a >= 'a' && a <= 'z') {
                     a = (char)(a - 32);
                 }
-                if (a != want[k]) {
+                if (b >= 'a' && b <= 'z') {
+                    b = (char)(b - 32);
+                }
+                if (a != b) {
                     match = 0;
                     break;
                 }
@@ -374,6 +410,136 @@ done:
         sceIoClose(fd);
     }
     return result;
+}
+
+/* Find "Name: value" in a MANIFEST buffer. Handles the manifest line
+ * continuation rule (a line starting with a single space continues the
+ * previous attribute). Matching is case-insensitive per the MIDP spec.
+ * Returns value length or -1 when absent; value copied into out. */
+static int manifest_get(const unsigned char *buf, long n,
+                        const char *name, char *out, size_t outsz) {
+    long i;
+    size_t nlen = strlen(name);
+    out[0] = '\0';
+    for (i = 0; i < n; ) {
+        long ls, le, vs, ve, p;
+        /* only line starts */
+        if (i > 0 && buf[i - 1] != '\n') {
+            while (i < n && buf[i] != '\n') i++;
+            i++; /* skip past '\n' */
+            continue;
+        }
+        ls = i;
+        /* line extent (before continuation join) */
+        le = ls;
+        while (le < n && buf[le] != '\n' && buf[le] != '\r') le++;
+        if (le - ls < (long)nlen + 1 || buf[ls + nlen] != ':') {
+            i = le;
+            while (i < n && (buf[i] == '\n' || buf[i] == '\r')) i++;
+            continue;
+        }
+        {
+            long k;
+            int match = 1;
+            for (k = 0; k < (long)nlen; k++) {
+                char a = buf[ls + k], b = name[k];
+                if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+                if (a != b) { match = 0; break; }
+            }
+            if (!match) {
+                i = le;
+                while (i < n && (buf[i] == '\n' || buf[i] == '\r')) i++;
+                continue;
+            }
+        }
+        /* value: skip ": " then join continuations */
+        vs = ls + nlen + 1;
+        while (vs < le && buf[vs] == ' ') vs++;
+        ve = le;
+        p = ve;
+        while (p + 1 < n && (buf[p] == '\r' || buf[p] == '\n') &&
+               buf[p + 1] == ' ') {
+            p += 2;
+            while (p < n && buf[p] != '\r' && buf[p] != '\n') p++;
+            ve = p;
+        }
+        {
+            size_t o = 0;
+            long q;
+            for (q = vs; q < ve && o + 1 < outsz; q++) {
+                char ch = (char)buf[q];
+                if (ch >= 0x20) out[o++] = ch;
+            }
+            while (o > 0 && out[o - 1] == ' ') o--;
+            out[o] = '\0';
+            return (int)o;
+        }
+    }
+    return -1;
+}
+
+/* Display name: MIDlet-Name attribute; falls back to the jar base name
+ * (i.e. the directory name) when absent. */
+static void parse_manifest_name(const char *jarpath, const char *fallback,
+                                char *out, size_t outsz) {
+    long n = 0;
+    unsigned char *buf = zip_read_entry(jarpath, "META-INF/MANIFEST.MF", &n);
+    out[0] = '\0';
+    if (buf != NULL && n > 0 &&
+        manifest_get(buf, n, "MIDlet-Name", out, outsz) > 0) {
+        free(buf);
+        return;
+    }
+    free(buf);
+    strncpy(out, fallback, outsz - 1);
+    out[outsz - 1] = '\0';
+}
+
+/* Icon path: 2nd comma field of the "MIDlet-1: name, icon, class" line.
+ * Returns 1 and fills out when an icon is declared. */
+static int parse_manifest_icon(const char *jarpath, char *out, size_t outsz) {
+    long n = 0;
+    unsigned char *buf;
+    long i;
+    out[0] = '\0';
+    buf = zip_read_entry(jarpath, "META-INF/MANIFEST.MF", &n);
+    if (buf == NULL || n <= 0) {
+        free(buf);
+        return 0;
+    }
+    for (i = 0; i + 9 <= n; i++) {
+        if (memcmp(buf + i, "MIDlet-1:", 9) == 0) {
+            long p = i + 9;
+            long line_end = p;
+            long c1 = -1, c2 = -1;
+            int len = 0;
+            while (line_end < n && buf[line_end] != '\n' &&
+                   buf[line_end] != '\r') {
+                line_end++;
+            }
+            for (p = i + 9; p < line_end; p++) {
+                if (buf[p] == ',') {
+                    if (c1 < 0) c1 = p; else { c2 = p; break; }
+                }
+            }
+            /* 2nd field: (c1, c2) or (c1, line_end) */
+            if (c1 >= 0) {
+                long s = c1 + 1, e = (c2 >= 0) ? c2 : line_end;
+                while (s < e && buf[s] == ' ') s++;
+                while (e > s && buf[e - 1] == ' ') e--;
+                while (s < e && len + 1 < (int)outsz) {
+                    char ch = (char)buf[s++];
+                    if (ch >= 0x20) out[len++] = ch;
+                }
+                out[len] = '\0';
+            }
+            break;
+        }
+    }
+    free(buf);
+    /* Empty icon field is legal ("name, , class") */
+    return out[0] != '\0';
 }
 
 /* The class is the text after the LAST comma on the "MIDlet-1:" line;
@@ -692,6 +858,116 @@ static int dir_exists(const char *path) {
     return 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* Icon rendering: decode the jar's icon PNG once per scan and cache    */
+/* the 32bpp pixels; nearest-neighbour scale into a square box.         */
+/* ------------------------------------------------------------------ */
+
+#define ICON_CACHE_MAX MAX_GAMES
+static uint32_t *icon_pix[ICON_CACHE_MAX];
+static int icon_w[ICON_CACHE_MAX], icon_h[ICON_CACHE_MAX];
+
+static void icon_cache_clear(void) {
+    int i;
+    for (i = 0; i < ICON_CACHE_MAX; i++) {
+        free(icon_pix[i]);
+        icon_pix[i] = NULL;
+        icon_w[i] = icon_h[i] = 0;
+    }
+}
+
+static void icon_load(const GameEntry *g, int idx) {
+    long n = 0;
+    unsigned char *buf;
+    /* MIDlet-1 icon paths are conventionally written with a leading '/'
+     * ("/res/icon.png") but zip entry names never have one, so strip it
+     * before the lookup (zip_read_entry matches entry names exactly). */
+    const char *path = g->icon;
+    if (idx < 0 || idx >= ICON_CACHE_MAX || g->icon[0] == '\0') {
+        return;
+    }
+    while (*path == '/') {
+        path++;
+    }
+    buf = zip_read_entry(g->jar, path, &n);
+    if (buf == NULL) {
+        fprintf(stderr, "[icon] zip entry not found: '%s' (from '%s')\n",
+                path, g->icon);
+        fflush(stderr);
+        return; /* declared but missing: menu shows text-only row */
+    }
+    if (!vita_icon_decode_png(buf, (unsigned long)n,
+                              &icon_pix[idx], &icon_w[idx], &icon_h[idx])) {
+        fprintf(stderr, "[icon] png decode FAILED: '%s' size=%ld\n",
+                path, n);
+        fflush(stderr);
+    }
+    free(buf);
+}
+
+/* Draw game[idx]'s icon scaled to fit box x..x+box (aspect preserved,
+ * nearest-neighbour sampling handles non-integer factors), vertically
+ * centered on (y + box/2). No-op when the game has no decodable icon. */
+static void draw_icon_scaled(int x, int y, const GameEntry *g, int box) {
+    int idx = (int)(g - games);
+    const uint32_t *src;
+    int sw, sh;
+    int dw, dh, ox, oy;
+    int r, c;
+
+    if (menu_fb == NULL || idx < 0 || idx >= ICON_CACHE_MAX ||
+        icon_pix[idx] == NULL) {
+        return;
+    }
+    src = icon_pix[idx];
+    sw = icon_w[idx];
+    sh = icon_h[idx];
+
+    /* fit into the box, keep aspect */
+    if (sw > sh) {
+        dw = box;
+        dh = box * sh / sw;
+    } else {
+        dh = box;
+        dw = box * sw / sh;
+    }
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    ox = x + (box - dw) / 2;
+    oy = y + (box - dh) / 2;
+
+    for (r = 0; r < dh; r++) {
+        int py = oy + r;
+        int srcy = (r * sh) / dh;
+        const uint32_t *srow = src + (size_t)srcy * sw;
+        if (py < 0 || py >= FB_H) continue;
+        for (c = 0; c < dw; c++) {
+            int px = ox + c;
+            uint32_t v = srow[(c * sw) / dw];
+            int a = (int)(v >> 24);
+            if (px < 0 || px >= FB_W) continue;
+            if (a < 8) continue;             /* transparent */
+            if (a < 0xF8) {                  /* cheap alpha blend to bg */
+                uint32_t bg = menu_fb[py * FB_W + px];
+                int bg_r = (int)(bg & 0xFF), bg_g = (int)((bg >> 8) & 0xFF);
+                int bg_b = (int)((bg >> 16) & 0xFF);
+                int bg_a = (int)(bg >> 24);
+                int fg_r = (int)(v & 0xFF), fg_g = (int)((v >> 8) & 0xFF);
+                int fg_b = (int)((v >> 16) & 0xFF);
+                int rr = (bg_r * (256 - a) + fg_r * a) >> 8;
+                int gg = (bg_g * (256 - a) + fg_g * a) >> 8;
+                int bb = (bg_b * (256 - a) + fg_b * a) >> 8;
+                int aa = (bg_a * (256 - a) + 255 * a) >> 8;
+                menu_fb[py * FB_W + px] =
+                    ((uint32_t)aa << 24) | ((uint32_t)bb << 16) |
+                    ((uint32_t)gg << 8) | (uint32_t)rr;
+            } else {
+                menu_fb[py * FB_W + px] = v | 0xFF000000u;
+            }
+        }
+    }
+}
+
 static void scan_games(void) {
     SceUID d;
     SceIoDirent ent;
@@ -715,8 +991,11 @@ static void scan_games(void) {
         }
         g = &games[game_count];
         snprintf(g->dir, sizeof(g->dir), GAMES_DIR "/%s", ent.d_name);
-        strncpy(g->name, ent.d_name, sizeof(g->name) - 1);
         snprintf(g->jar, sizeof(g->jar), "%s/" JAR_NAME, g->dir);
+        /* display name: MIDlet-Name from MANIFEST (often Chinese), the
+         * directory name is only the fallback */
+        parse_manifest_name(g->jar, ent.d_name, g->name, sizeof(g->name));
+        parse_manifest_icon(g->jar, g->icon, sizeof(g->icon));
 
         /* game.cfg: line1 class ('-' = auto), line2 orientation */
         g->landscape = 0;
@@ -749,6 +1028,7 @@ static void scan_games(void) {
          * lesson): verify against the central directory and fall back
          * to the best MIDlet-ish class; persist the fix in game.cfg */
         validate_game_class(g, 1);
+        icon_load(g, game_count);
         game_count++;
     }
     sceIoDclose(d);
@@ -945,7 +1225,8 @@ int vita_menu_run(VitaGameSel *out) {
             if (i == sel) {
                 fill_rect(16, y - 4, FB_W - 32, row_h, C_SEL);
             }
-            draw_text(28, y, games[i].name, 2,
+            draw_icon_scaled(28, y, &games[i], row_h - 8);
+            draw_text(60, y, games[i].name, 2,
                       games[i].cls[0] ? C_FG : C_WARN);
             draw_text(880, y, games[i].landscape ? "L" : "P", 2, C_HINT);
             if (games[i].cls[0] == '\0') {
@@ -969,7 +1250,8 @@ int vita_menu_run(VitaGameSel *out) {
             GameEntry *g = &games[sel];
             fill_rect(280, 120, 400, 70 + DLG_N * 40, C_PANEL);
             fill_rect(280, 120, 400, 3, C_TITLE);
-            draw_text(300, 134, g->name, 2, C_TITLE);
+            draw_icon_scaled(300, 130, g, 44);
+            draw_text(354, 134, g->name, 2, C_TITLE);
             for (i = 0; i < DLG_N; i++) {
                 int iy = 120 + 56 + i * 40;
                 const char *label;
@@ -1000,6 +1282,8 @@ int vita_menu_run(VitaGameSel *out) {
         menu_flip();
         sceDisplayWaitVblankStart(); /* 60 Hz, no flicker */
     }
+
+    icon_cache_clear();
 
     /* Keep menu_fb allocated after the menu exits (no free): the display
      * still scans it out until the VM installs its own framebuffer, and

@@ -37,7 +37,7 @@ set(VITA_TITLEID  "J2ME00001")
 #         so END_OF_MEDIA was dropped at the switch default case and the
 #         music toggle deadlocked the VM. Rebuilt with USE_JSR_135=true
 #         config; jump table slot 36 now routes to StoreMIDPEventInVmThread.
-set(VITA_VERSION  "01.28")
+set(VITA_VERSION  "01.29")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
@@ -148,6 +148,7 @@ add_executable(${PROJECT_NAME}
     src/vita_main.c
     src/vita_menu.c
     src/vita_font.c
+    src/vita_icon.c
     src/vita_display.c
     src/vita_input.c
     src/vita_pcsl.c
@@ -218,6 +219,7 @@ target_link_libraries(${PROJECT_NAME}
     pcsl_network
     pcsl_print
     pcsl_escfilenames
+    png
     z
     SceDisplay_stub
     SceCtrl_stub

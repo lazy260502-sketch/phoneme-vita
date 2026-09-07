@@ -169,10 +169,46 @@ static void vita_input_poll(void) {
 static int touch_initialized = 0;
 static int touch_x = 0, touch_y = 0;      /* last virtual position */
 static int touch_down = 0;                /* finger currently down */
+/* Front panel report space: real HW reports in a 1920x1088 grid while
+ * the display is 960x544 (the SDK touch sample uses "y >= 1000" as a
+ * swipe threshold, proving the 2x scale). Read the active area from
+ * the panel info instead of hardcoding, so Vita3K quirks also work. */
+static int touch_max_x = 1919, touch_max_y = 1087;
 
 static void vita_touch_init(void) {
     if (touch_initialized) {
         return;
+    }
+    /* MANDATORY: the front panel starts in the INACTIVE sampling state.
+     * Without this call sceTouchPeek succeeds but always reports
+     * reportNum == 0, so touch silently looks "not supported". */
+    SceTouchSamplingState ss = SCE_TOUCH_SAMPLING_STATE_STOP;
+    int ssr = sceTouchGetSamplingState(SCE_TOUCH_PORT_FRONT, &ss);
+    if (ss != SCE_TOUCH_SAMPLING_STATE_START) {
+        ssr = sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT,
+                                       SCE_TOUCH_SAMPLING_STATE_START);
+    }
+    {
+        SceTouchPanelInfo panel;
+        memset(&panel, 0, sizeof(panel));
+        if (sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &panel) == 0 &&
+            panel.maxAaX > 0 && panel.maxAaY > 0) {
+            touch_max_x = panel.maxAaX;
+            touch_max_y = panel.maxAaY;
+        }
+    }
+    /* DEBUG: record the sampling-state setup for field diagnosis. */
+    {
+        char dbg[128];
+        snprintf(dbg, sizeof(dbg),
+                 "[TOUCH] init: state=%d set=%d max=(%d,%d)\n",
+                 (int)ss, ssr, touch_max_x, touch_max_y);
+        int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
+                           SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd >= 0) {
+            sceIoWrite(fd, dbg, strlen(dbg));
+            sceIoClose(fd);
+        }
     }
     /* Sample once to establish the idle (no-touch) baseline. */
     SceTouchData touch;
@@ -188,6 +224,9 @@ static void vita_touch_poll(void) {
     int n;
     int px, py, vx, vy;
     int state;
+    /* DEBUG: log a touch lifecycle line only on state transitions so
+     * the file stays readable (poll runs every pump cycle). */
+    static int dbg_down = -1; /* -1 = unknown, 1 = on panel, 0 = off */
 
     if (!touch_initialized) {
         vita_touch_init();
@@ -195,11 +234,35 @@ static void vita_touch_poll(void) {
 
     n = sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
     if (n < 0) {
+        if (dbg_down != -2) {
+            char dbg[64];
+            snprintf(dbg, sizeof(dbg), "[TOUCH] peek FAILED n=%d\n", n);
+            int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
+                               SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                               0777);
+            if (fd >= 0) {
+                sceIoWrite(fd, dbg, strlen(dbg));
+                sceIoClose(fd);
+            }
+            dbg_down = -2;
+        }
         return;
     }
 
     if (touch.reportNum <= 0) {
         /* No finger on the panel. */
+        if (dbg_down != 0) {
+            char dbg[48];
+            snprintf(dbg, sizeof(dbg), "[TOUCH] up\n");
+            int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
+                               SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                               0777);
+            if (fd >= 0) {
+                sceIoWrite(fd, dbg, strlen(dbg));
+                sceIoClose(fd);
+            }
+            dbg_down = 0;
+        }
         if (touch_down) {
             /* Emit release at the last known position. */
             MidpEvent evt;
@@ -214,10 +277,27 @@ static void vita_touch_poll(void) {
         return;
     }
 
-    /* First report = primary finger. */
-    px = touch.report[0].x;
-    py = touch.report[0].y;
+    /* First report = primary finger. Reports arrive in the panel's own
+     * space (1920x1088 on HW) - normalize into the 960x544 display
+     * space the display mapping expects. */
+    px = touch.report[0].x * 960 / (touch_max_x + 1);
+    py = touch.report[0].y * 544 / (touch_max_y + 1);
     if (vita_display_map_touch(px, py, &vx, &vy) != 0) {
+        /* Finger on the panel but in the letterbox - log only the first
+         * contact so a resting finger does not spam the log. */
+        if (dbg_down != 1) {
+            char dbg[80];
+            snprintf(dbg, sizeof(dbg),
+                     "[TOUCH] down OUTSIDE (phys %d,%d)\n", px, py);
+            int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
+                               SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                               0777);
+            if (fd >= 0) {
+                sceIoWrite(fd, dbg, strlen(dbg));
+                sceIoClose(fd);
+            }
+            dbg_down = 1;
+        }
         return; /* touch in the letterbox - ignore */
     }
 
@@ -227,6 +307,20 @@ static void vita_touch_poll(void) {
         state = KEYMAP_STATE_DRAGGED;
     } else {
         state = 0; /* no change */
+    }
+
+    if (dbg_down != 2) {
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg),
+                 "[TOUCH] down INSIDE phys=(%d,%d) virt=(%d,%d)\n",
+                 px, py, vx, vy);
+        int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
+                           SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd >= 0) {
+            sceIoWrite(fd, dbg, strlen(dbg));
+            sceIoClose(fd);
+        }
+        dbg_down = 2;
     }
 
     if (state != 0) {
