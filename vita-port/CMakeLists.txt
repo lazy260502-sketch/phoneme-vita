@@ -46,7 +46,7 @@ set(VITA_TITLEID  "J2ME00001")
 #         real hw rejects with 0x8010113D on install. Also raised the
 #         sceNetInit pool 64KB -> 1MB (DNS resolver lives in it; official
 #         net_http_bsd sample uses 1MB).
-set(VITA_VERSION  "01.30")
+set(VITA_VERSION  "01.31")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
