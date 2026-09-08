@@ -11,11 +11,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 
 /* PS Vita headers */
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/io/dirent.h>
+#include <psp2/appmgr.h>
 
 /* PCSL string headers */
 #include <pcsl_string.h>
@@ -1160,8 +1162,66 @@ long pcsl_file_sizeof(const pcsl_string *fileName) {
 }
 
 long pcsl_file_getusedspace(const pcsl_string *dirName) {
-    (void)dirName;
-    return 0;
+    /* v01.34: was "return 0". The real consumer chain is
+     * storage_get_free_space() = totalSpace - usedSpace, where
+     * totalSpace comes from the system.jam_space property
+     * (config/internal.config, bytes). Used to matter only for the
+     * RecordStore space checks; with used=0 and the default 4MB
+     * total they "worked" by accident. Now honestly sums the regular
+     * files directly inside the given storage root (one level, like
+     * the POSIX reference: "does not consider files in
+     * subdirectories"). */
+    char path_utf8[600];
+    char abs_dir[620];
+    SceUID dfd;
+    SceIoDirent entry;
+    long total = 0;
+
+    if (dirName == NULL || dirName->data == NULL) {
+        return -1;
+    }
+    if (pcsl_string_convert_to_utf8(dirName, (jbyte *)path_utf8,
+                                    sizeof(path_utf8), NULL)
+        != PCSL_STRING_OK) {
+        return -1;
+    }
+    vita_resolve_path(path_utf8, abs_dir, sizeof(abs_dir));
+
+    dfd = sceIoDopen(abs_dir);
+    if (dfd < 0) {
+        return -1;
+    }
+
+    while (sceIoDread(dfd, &entry) > 0) {
+        if (entry.d_stat.st_attr & SCE_SO_IFDIR) {
+            continue; /* directories do not count */
+        }
+        total += (long)entry.d_stat.st_size;
+    }
+    sceIoDclose(dfd);
+
+    return total;
+}
+
+/* Checks the size of free space on the storage device. The pcsl_file.h
+ * declaration takes no parameters (upstream marks it for removal); the
+ * storage root is fixed on this port, so query ux0: directly.
+ * sceAppMgrGetDevInfo is the only documented way to get partition
+ * sizes from user mode (SceAppMgr_stub is already linked). */
+long pcsl_file_getfreespace(void) {
+    uint64_t max_size = 0;
+    uint64_t free_size = 0;
+
+    if (sceAppMgrGetDevInfo("ux0:", &max_size, &free_size) < 0) {
+        return 0;
+    }
+    /* long is 32-bit on ARM; a multi-GB free byte count overflows, but
+     * every caller (RMS space checks) only compares against small
+     * budgets, so saturate at LONG_MAX instead of wrapping negative. */
+    if (free_size > (uint64_t)LONG_MAX) {
+        return LONG_MAX;
+    }
+    return (long)free_size;
 }
 
 jchar pcsl_file_getfileseparator(void) {
