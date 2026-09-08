@@ -1,6 +1,28 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-08
 
+## 2026-09-08 v01.38：UC 数据初始化慢的 I/O 放大器（debug_log）+ 网络修复实测确认
+
+### 网络线关闭（实测证据）
+
+- 用户 v01.37 实测 net_log：`gethostbyname` 全部秒回、`connect immediate OK fd=15/16`（连 uc.ucweb.com/ucus.ucweb.com 均直连成功）——**v01.35 的 g_handles 修复实测生效**，select 唤醒链正常（连接走的是 immediate OK，未触发 EINPROGRESS 也无妨）。网络层不再有已知问题。
+
+### UC「卡在数据初始化」的 I/O 放大器（v01.38 修复）
+
+- `pcsl_file_open` 每次被调都 `debug_log()`：**open+write+close 三个 syscall 写 debug_log.txt，成功路径写两行 = 6 个额外 syscall/次**。UC 初始化要开几百个文件（RMS 恢复/配置/皮肤），I/O 放大约 3 倍；Vita3K 还为每个 syscall 打一行 trace 日志，双重放大。
+- 修复：`VITA_FILE_DEBUG` 宏开关（默认 0 关闭），所有 debug_log 调用点进 `#if`。
+- 附带：`pcsl_file_unlink` 在"ux0 文件存在但被锁"时不再 fallback 删 app0 副本（必然再失败，占用日志翻倍的来源）。
+
+### 「还是报占用」的定性与现状
+
+- v01.37 起"占用报错"= 预期行为：共享冲突在保护 UC 活存档不被 suite 清理循环删掉（见 v01.36/v01.37 章节）。
+- v01.38 后噪音减半（不再有成对的 app0 fallback 失败）。剩余：每个受保护文件一组三行（Vita3K 打的），**无害、无法从应用侧消除**（除非模拟器修 FILE_SHARE_DELETE）。
+
+### 教训
+
+1. **调试日志本身会成为性能 bug**：per-call 的 open/write/close 型日志在高频路径（file_open）上等于把 I/O 放大数倍——发布前必须用编译期开关关闭，不是靠"日志文件小"判断影响。
+2. 修复网络/文件层后要主动找"实测证据"关闭问题线（本次 net_log 的 immediate OK），避免已修问题继续占用排查注意力。
+
 ## 2026-09-08 v01.37：撤销 v01.36 句柄驱逐——共享冲突一直在「意外保护」UC 存档（重要教训）
 
 ### 症状（用户 v01.36 实测）

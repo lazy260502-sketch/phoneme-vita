@@ -688,7 +688,15 @@ int pcsl_file_finalize(void) {
     return 0;
 }
 
-/* Simple sceIo-based debug logging for Vita */
+/* Simple sceIo-based debug logging for Vita. DISABLED by default:
+ * writing one line per pcsl_file_open (open+write+close on the host
+ * side per call, plus a trace line per syscall in Vita3K) doubled
+ * the syscall count of UC's init (hundreds of opens) and was a major
+ * contributor to the "stuck on data init" slowness. Flip to 1 only
+ * while actively debugging file-layer issues. */
+#define VITA_FILE_DEBUG 0
+
+#if VITA_FILE_DEBUG
 static void debug_log_init(void) {}
 static void debug_log(const char *msg) {
     static SceUID log_fd = -1;
@@ -702,6 +710,7 @@ static void debug_log(const char *msg) {
         log_fd = -1;  // Reset so next call reopens
     }
 }
+#endif
 
 int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
     if (fileName == NULL || fileName->data == NULL || handle == NULL) {
@@ -740,10 +749,12 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
     if (flags & PCSL_FILE_O_APPEND) oflags |= SCE_O_APPEND;
 
     /* DEBUG: log the open request */
+#if VITA_FILE_DEBUG
     debug_log_init();
     char log_buf[1024];
     snprintf(log_buf, sizeof(log_buf), "[file_open] path='%s' flags=0x%x\n", path_utf8, oflags);
     debug_log(log_buf);
+#endif
 
     /* Try to open the file using Vita IO */
     vf->fd = sceIoOpen(abs_path, oflags, 0777);
@@ -763,17 +774,23 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
         }
         vf->fd = sceIoOpen(app0_path, oflags, 0777);
         if (vf->fd < 0) {
+#if VITA_FILE_DEBUG
             snprintf(log_buf, sizeof(log_buf), "[file_open] FAILED '%s' (0x%x)\n",
                      abs_path, (int)vf->fd);
             debug_log(log_buf);
+#endif
             free(vf);
             return -1;
         }
+#if VITA_FILE_DEBUG
         debug_log("[file_open] ok via app0 prefix\n");
+#endif
         strncpy(vf->path, app0_path, sizeof(vf->path) - 1);
         vf->path[sizeof(vf->path) - 1] = '\0';
     } else {
+#if VITA_FILE_DEBUG
         debug_log("[file_open] ok direct\n");
+#endif
         strncpy(vf->path, abs_path, sizeof(vf->path) - 1);
         vf->path[sizeof(vf->path) - 1] = '\0';
     }
@@ -850,16 +867,6 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
     char abs_path[600];
     vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
     
-    /* VPK fallback: swap the ux0:/data prefix for app0: (same layout
-     * inside the VPK) - the raw "app0:%s" form was invalid for
-     * absolute paths. */
-    char app0_path[600];
-    if (strncmp(abs_path, "ux0:/data/", 10) == 0) {
-        snprintf(app0_path, sizeof(app0_path), "app0:/%s", abs_path + 5);
-    } else {
-        snprintf(app0_path, sizeof(app0_path), "app0:%s", abs_path);
-    }
-    
     int result = sceIoRemove(abs_path);
     if (result < 0) {
         if (vita_unlink_enoent_is_ok(abs_path)) {
@@ -874,12 +881,12 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
          * code, so UC's RMS data came back half-written and the second
          * launch broke (NPE + 1 fps). The sharing violation is actually
          * PROTECTING live suite data from midp_remove_suite's cleanup
-         * loop: report failure and let the file survive. The three log
-         * lines Vita3K prints for the failed syscall are cosmetic. */
-        result = sceIoRemove(app0_path);
-        if (result < 0 && vita_unlink_enoent_is_ok(app0_path)) {
-            return 0;
-        }
+         * loop: report failure and let the file survive. The log lines
+         * Vita3K prints for the failed syscall are cosmetic.
+         * Also: do NOT fall back to the app0 copy here - the ux0 file
+         * exists (stat succeeded above), so an app0 attempt can only
+         * fail again and double the log noise. */
+        return result;
     }
     return result;
 }

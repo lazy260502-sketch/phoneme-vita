@@ -145,7 +145,20 @@ set(VITA_TITLEID  "J2ME00001")
 #         pcsl_file_unlink now reports the failure (file survives);
 #         the registry + evict helper stay in place unused for a
 #         future targeted fix (evict only on real uninstall).
-set(VITA_VERSION  "01.37")
+#
+# v01.38 (2026-09-08): init-slowness fix + noise halving. (a) The
+#         per-open debug_log() (open+write+close of debug_log.txt for
+#         EVERY pcsl_file_open, two lines on success) multiplied UC's
+#         init I/O by ~3x - hundreds of opens during RMS/config/skin
+#         restore each costing 3 extra syscalls plus a Vita3K trace
+#         line per syscall. Disabled behind VITA_FILE_DEBUG (default
+#         0). (b) pcsl_file_unlink no longer falls back to the app0
+#         copy when the ux0 file exists but is locked: the app0 remove
+#         always failed too, doubling the "file in use" log noise with
+#         zero benefit. Net effect: UC data-init is much faster and
+#         the remaining sharing-violation lines are one group per
+#         protected suite file (expected, harmless).
+set(VITA_VERSION  "01.38")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
