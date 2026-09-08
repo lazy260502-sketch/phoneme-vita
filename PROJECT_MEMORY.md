@@ -1,6 +1,40 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-08
 
+## 2026-09-08 v01.34：目录枚举 stub 是 UC 二次启动 NPE 根因（重要教训：stub 的连锁失效模式）
+
+### 症状与误导性线索
+
+- 用户实测：UC 首次能进（v01.33 修复生效），**第二次启动 `java.lang.NullPointerException: 0 at ao.a(), bci=4`**，删除 `rms/appdb_1A35` 后又能进一次。
+- 日志里 `remove rms/appdb_1A35/FFFFFFFF` Error 32（文件被占用）一度是头号嫌疑——**不是根因**（那是 suite 关闭时的良性清理尝试），真根因是枚举 stub。
+
+### 真根因：pcsl_file_openfilelist 是 NULL stub
+
+- 调用链（全部源码核实）：`RecordStore.listRecordStores()` → `RecordStoreFile.listRecordStores` (jpp) → native `getNumberOfStores` → `rmsdb_get_number_of_record_stores` → `rmsdb_get_number_of_record_stores_int` → `storage_open_file_iterator` → `pcsl_file_openfilelist` → **NULL** → 返回 `OUT_OF_MEM_LEN` → JNI 层 `KNI_ThrowNew(midpOutOfMemoryError)` → UC 启动状态恢复中断 → `ao.a()` NPE。
+- **首启能过的原因**：RMS 创建走 `pcsl_file_open`/`pcsl_file_exist`（真实实现）；只有"列出已有 store"需要枚举。删目录后列表合法为空 → 绕过失败路径 → "又能进一次"。这就是"删 appdb 恢复"症状的机制。
+- 受害面不止 UC：`midp_remove_suite` 的文件清理循环、`rmsdb_remove_record_stores_for_suite`、`RecordStore.listRecordStores` 全走此枚举。
+
+### 修复（vita_pcsl.c，+158 行）
+
+- `pcsl_file_openfilelist/getnextentry/closefilelist` 用 `sceIoDopen/Dread/Dclose` 实现，**严格按上游 POSIX 参考契约**（`pcsl/file/posix/pcsl_posix.c` + `pcsl/file/util/pcsl_util_filelist.c`）：
+  - 输入串语义 = `root目录 + match前缀`；按最后一个分隔符拆分（`pcsl_string_last_index_of`，jchar 单位）
+  - 每次 getnextentry 返回下一个前缀匹配的目录项，结果 = `string[0..rootLength) + entry名` 完整路径（caller free）
+  - 跳过 `.`/`..`；目录本体经 `vita_resolve_path` 解析（相对路径防御）
+- RMS 文件布局（顺带查实）：suite 存储是 **sRoot 下扁平文件** `root + <suiteId8位hex> + <后缀>`；后缀集合 `.ss/.ii/.ap/.db/.idx/.jar/.ssr/.tmp` + `_suites.dat/_trans.dat/_icons.dat`（`suitestore_constants.xml`）。`FFFFFFFF` = `INTERNAL_SUITE_ID(-1)`，临时 suite（从 jar 直接启动的 UC）的 RMS 基名 = `getSecureFilenameBase(-1)` = `build_suite_filename(-1, EMPTY)`。
+- 验证：ELF 三符号 T；`getnextentry` 内 `sceIoDread` 调用确认；APP_VER=01.34。提交 79f5dbc。
+
+### 教训（重要）
+
+1. **stub 的失效模式是"条件性成功"**：创建路径真实、枚举路径 stub → 首启成功、二启失败——极易误判为"持久化数据损坏"。以后遇到"首启 OK 二启挂"先查该功能的**完整 API 面**（创建/读/写/枚举/删除）是否都有实现，而不是先怀疑数据损坏。
+2. 上游契约不能凭直觉写：`pcsl_string_last_index_of(const pcsl_string*, jint)` 签名与 POSIX 版 `PCSLStorageDirInfo`（rootLength jchar 单位含分隔符）都从参考实现核对后才动手。
+3. 日志里 Error 32/0x80010002 的 remove 失败在 suite 生命周期里大量出现，多数良性——**判断主因要看调用时序与是否有后续读坏数据**，单条 remove 失败不构成根因。
+
+### 遗留风险
+
+- `pcsl_file_getfreespace/getusedspace` 仍是弱实现（返回 0），`RecordStoreFile.spaceAvailable*` 会拿到 0——若 UC 检查可用空间可能误判 Full；实测若有 RecordStoreFullException 再实现（`sceIoDopen` + stat 累加）。
+- RMS 的 `.idx` 索引文件（tree_index/linear_index）路径未实测。
+- 真机未测；Vita3K 的 sceIoDread 对大目录行为需观察。
+
 ## 2026-09-08 v01.33：fcntl NBIO 对 sceNet fd 无效（connect 冻结 VM 27s）+ vm_output 竖排修复
 
 ### 用户 v01.32 实测反馈 → 三个现象，一真两良性
