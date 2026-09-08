@@ -1,5 +1,33 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-07
+> Last Updated: 2026-09-08
+
+## 2026-09-08 v01.31：LCDUI 初始化崩溃修复（UC 进不去死因）+ 菜单扫描缓存
+
+### 崩溃根因（Vita3K EXCEPTION_ACCESS_VIOLATION，UC 等 MIDlet 启动即死）
+
+- 现象：Vita3K 崩溃 `EXCEPTION_ACCESS_VIOLATION 0xC0000005`，PC=0x810346c6，"Invalid read at 0x0"；net_log.txt 只有 3 行 init 成功日志（网络调用从未发生）。
+- 归因（二进制级）：`arm-vita-eabi-addr2line -e midp_vita -f -C 0x810346c6` → `DisplayDeviceContainer.getDisplayDevicesIds0`。反汇编确认：native 侧拿 `lfjport_get_display_device_ids` 返回的 ids 指针（r5）→ `SNI_NewArray` → 循环 `ldr r2,[r5,#4]!` 解引用 NULL。
+- 根因：`vita-port/src/vita_display.c` 的 `lfjport_get_display_device_ids` 违反契约——`*n=1` 但 `return NULL`。正确契约见上游 `phoneme-midp/src/highlevelui/fb_application/reference/native/fbapp_export.c:398`：返回 `static jint display_device_ids[] = {0}`。
+- Java 链路：`DisplayDeviceContainer` 构造（LCDUI 初始化即触发）→ `getDisplayDevicesIds0()` → 循环 `ids.length` 读元素 → 死。HTTP 任何调用之前。
+- 修复：vita_display.c 返回静态数组 `{0}`；反汇编验证新实现 `str 1->*n; ldr r0,[pc,#4]`（返回 0x813bf4b8 非 NULL）。提交 3c30ee8。
+- 为何此前游戏能跑：待查（可能 v01.30 前该函数路径不同，或游戏走不同初始化顺序）；不影响本修复正确性。
+
+### 次要理论排查（closed，不成立）
+
+- `DisplayEventListener` type=54 未知 id NPE 理论：ROM 化 midp_system.jar 里**没有任何类调用 `MMEventHandler.setListener`**（JSR135 Player 实现 BasicPlayer 不在构建里，`USE_JSR_135` 实际 false）；MMAPI 事件即使到达 Java 队列也因无注册 listener 被丢弃。vita_media_notify.c 的 push 侧字段布局与上游 javacall 桥（midp_msgQueue_md.c:197）一致，无害。
+
+### 菜单扫描缓存（用户诉求：首次启动慢，是否逐一解析 jar → 是）
+
+- 原状：`scan_games()` 每游戏开 jar 4-5 次（MANIFEST x3 + 中央目录 class 验证 + icon PNG）+ PNG 解码，每游戏几百 ms，每次启动/重扫重复。
+- 方案：每游戏目录 `cache.bin`（magic 'J2CB' v1），键 = jar size + mtime 双字（`sceRtcGetTick`）。命中：不读 jar，name/cls/icon 从缓存取，game.cfg 只刷新人工 class 覆盖与 landscape；icon 用缓存里的 PNG 原始字节解码（免 jar IO）。不匹配：全量重解析 + 重写缓存。
+- rescan 纹理保留：`icon_cache_keep/restore_kept` 让未变游戏已解码纹理跨扫描存活（SELECT 重扫零解码）。
+- 踩坑记录：①`g->dir "/" CACHE_NAME` 字符串拼接不能直接进 `sceIoOpen` 参数（要 snprintf）；②`sceRtcGetTick(const SceDateTime*, SceRtcTick*)` 出参型，不是返回 tick 值；③multi_replace 衔接处又吞了一次 `icon_load` 函数签名行（第二次发生，**多段替换后必须编译**）；④git commit -m 中文长消息会被终端回显污染，用 `git commit -F <file>`。
+- 提交：27d56b8（cache.bin）+ 3c30ee8（崩溃修复）+ 55c2a17（APP_VER 01.31）。
+
+### 验证状态
+
+- 增量构建 EXIT=0，midp_vita.vpk（APP_VER=01.31）已重新打包，待用户 Vita3K/真机装新 VPK 实测 UC。
+- 若 UC 仍进不去：net_log.txt 现在有全链路埋点，可定位网络阶段卡点。
 
 ## 2026-09-07 v01.30 修订 2：真机安装 0x8010113D + 网络日志全链路埋点
 
