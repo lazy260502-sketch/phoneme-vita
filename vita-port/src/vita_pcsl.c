@@ -694,12 +694,23 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
     /* Try to open the file using Vita IO */
     vf->fd = sceIoOpen(abs_path, oflags, 0777);
     if (vf->fd < 0) {
-        /* Try with app0: prefix for files in the VPK */
-        char app0_path[512];
-        snprintf(app0_path, sizeof(app0_path), "app0:%s", path_utf8);
+        /* Not in the writable data dir - retry inside the VPK. The VPK
+         * mirrors the data layout (data/J2ME00001/lib/*.png), so swap
+         * the ux0:/data device prefix for app0:. Building the fallback
+         * from the RAW path here produced "app0:ux0:/..." for absolute
+         * inputs (always ENOENT) and a WRONG root for relative ones
+         * once cwd != DATA_DIR. */
+        char app0_path[600];
+        if (strncmp(abs_path, "ux0:/data/", 10) == 0) {
+            snprintf(app0_path, sizeof(app0_path), "app0:/%s",
+                     abs_path + 5);
+        } else {
+            snprintf(app0_path, sizeof(app0_path), "app0:%s", abs_path);
+        }
         vf->fd = sceIoOpen(app0_path, oflags, 0777);
         if (vf->fd < 0) {
-            snprintf(log_buf, sizeof(log_buf), "[file_open] FAILED '%s' (0x%x)\n", abs_path, (int)vf->fd);
+            snprintf(log_buf, sizeof(log_buf), "[file_open] FAILED '%s' (0x%x)\n",
+                     abs_path, (int)vf->fd);
             debug_log(log_buf);
             free(vf);
             return -1;
@@ -763,9 +774,15 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
     char abs_path[600];
     vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
     
-    /* Try with app0: prefix */
-    char app0_path[512];
-    snprintf(app0_path, sizeof(app0_path), "app0:%s", path_utf8);
+    /* VPK fallback: swap the ux0:/data prefix for app0: (same layout
+     * inside the VPK) - the raw "app0:%s" form was invalid for
+     * absolute paths. */
+    char app0_path[600];
+    if (strncmp(abs_path, "ux0:/data/", 10) == 0) {
+        snprintf(app0_path, sizeof(app0_path), "app0:/%s", abs_path + 5);
+    } else {
+        snprintf(app0_path, sizeof(app0_path), "app0:%s", abs_path);
+    }
     
     int result = sceIoRemove(abs_path);
     if (result < 0) {
@@ -864,9 +881,13 @@ int pcsl_file_exist(const pcsl_string *fileName) {
     char abs_path[600];
     vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
     
-    /* Try with app0: prefix */
-    char app0_path[512];
-    snprintf(app0_path, sizeof(app0_path), "app0:%s", path_utf8);
+    /* VPK fallback: swap the ux0:/data prefix for app0: */
+    char app0_path[600];
+    if (strncmp(abs_path, "ux0:/data/", 10) == 0) {
+        snprintf(app0_path, sizeof(app0_path), "app0:/%s", abs_path + 5);
+    } else {
+        snprintf(app0_path, sizeof(app0_path), "app0:%s", abs_path);
+    }
     
     SceIoStat stat;
     if (sceIoGetstat(abs_path, &stat) >= 0) {
@@ -976,9 +997,13 @@ long pcsl_file_sizeof(const pcsl_string *fileName) {
     char abs_path[600];
     vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
     
-    /* Try with app0: prefix */
-    char app0_path[512];
-    snprintf(app0_path, sizeof(app0_path), "app0:%s", path_utf8);
+    /* VPK fallback: swap the ux0:/data prefix for app0: */
+    char app0_path[600];
+    if (strncmp(abs_path, "ux0:/data/", 10) == 0) {
+        snprintf(app0_path, sizeof(app0_path), "app0:/%s", abs_path + 5);
+    } else {
+        snprintf(app0_path, sizeof(app0_path), "app0:%s", abs_path);
+    }
     
     SceIoStat stat;
     if (sceIoGetstat(abs_path, &stat) >= 0) {

@@ -93,10 +93,13 @@ static void hex4(unsigned int val, char *out) {
 }
 
 /*
- * Get the per-game appdb path.
+ * Get the appdb path for a game (v01.32: all suite storage lives under
+ * the rms/ subdir so ux0:/data/J2ME00001 stays tidy):
+ *   game under games/  -> <data>/rms/appdb_<CRC16 of game name>
+ *   anything else      -> <data>/rms/appdb (bundled Hello.jar)
  *   game_jar: path to the game jar (e.g. "games/PocketMonster/game.jar"
  *             or "Hello.jar")
- *   out_buf:  output buffer, must be at least 80 bytes
+ *   out_buf:  output buffer, must be at least 96 bytes
  * Returns 0 on success.
  */
 int get_per_game_appdb(const char *game_jar,
@@ -108,12 +111,12 @@ int get_per_game_appdb(const char *game_jar,
     /* Bundled Hello.jar or any path NOT under games/ -> shared appdb.
      * This keeps the existing behaviour for the default demo. */
     if (find_games_seg(game_jar) == NULL) {
-        snprintf(out_buf, buf_sz, "%s/appdb", data_dir);
+        snprintf(out_buf, buf_sz, "%s/rms/appdb", data_dir);
         return 0;
     }
 
     tag = crc16_of_game_name(game_jar);
     hex4(tag, tag_str);
-    snprintf(out_buf, buf_sz, "%s/appdb_%s", data_dir, tag_str);
+    snprintf(out_buf, buf_sz, "%s/rms/appdb_%s", data_dir, tag_str);
     return 0;
 }

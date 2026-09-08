@@ -46,7 +46,21 @@ set(VITA_TITLEID  "J2ME00001")
 #         real hw rejects with 0x8010113D on install. Also raised the
 #         sceNetInit pool 64KB -> 1MB (DNS resolver lives in it; official
 #         net_http_bsd sample uses 1MB).
-set(VITA_VERSION  "01.31")
+# 01.32 = b171: LCDUI init hang fix chain -
+#         (a) pcsl_file_* app0-fallback built from the RAW path produced
+#             "app0:ux0:/..." (always ENOENT): skin PNGs in the VPK's
+#             data/J2ME00001/lib/ were unreachable, chameleon came up
+#             with ~30 missing images and UC WEB hung in init. The
+#             fallback now swaps the "ux0:/data/" prefix for "app0:/".
+#         (b) per-game appdb was set by the launcher but then silently
+#             discarded: runMidlet unconditionally re-ran
+#             midpSetAppDir(getApplicationDir()) = MIDP_HOME + "/appdb",
+#             so every suite shared the one appdb and the appdb_XXXX
+#             dirs stayed empty. runMidlet now keeps a launcher-provided
+#             dir (new midpGetAppDir query); storage moved under rms/
+#             (rms/appdb + rms/appdb_<TAG>) with a one-time rename
+#             migration of the old shared appdb.
+set(VITA_VERSION  "01.32")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar

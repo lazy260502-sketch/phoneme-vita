@@ -177,10 +177,19 @@ int main(int argc, char *argv[]) {
     /* Writable runtime dirs - MUST exist before the freopen() calls below.
      * Otherwise fopen fails silently and stderr stays bound to the tty
      * device (Vita3K "*** TTY:" per-char stream) so midp_stderr.log stays
-     * empty on FIRST launch (8-31 log-loss incident). */
+     * empty on FIRST launch (8-31 log-loss incident).
+     * v01.32: all suite storage moved into the rms/ subdir. Migrate the
+     * pre-01.32 shared appdb so existing saves survive the update. */
     sceIoMkdir(DATA_DIR, 0777);
-    sceIoMkdir(DATA_DIR "/appdb", 0777);
+    sceIoMkdir(DATA_DIR "/rms", 0777);
     sceIoMkdir(DATA_DIR "/lib", 0777);
+    {
+        SceUID dd = sceIoDopen(DATA_DIR "/appdb");
+        if (dd >= 0) {
+            sceIoDclose(dd);
+            sceIoRename(DATA_DIR "/appdb", DATA_DIR "/rms/appdb");
+        }
+    }
 
     freopen(DATA_DIR "/midp_stdout.log", "w", stdout);
     /* stderr: TEMPORARILY restored to a file to capture the suite
@@ -325,16 +334,19 @@ int main(int argc, char *argv[]) {
 
             /* Per-game RMS isolation: derive appdb path from the jar so each
              * game gets its own suite/RMS namespace (prevents save-file
-             * collision). The bundled Hello.jar uses the shared "appdb"
-             * path. Re-set EVERY round (midpFinalize resets initLevel). */
+             * collision). The bundled Hello.jar uses the shared
+             * "rms/appdb" path. Re-set EVERY round (midpFinalize resets
+             * initLevel). The buffer is static: midpSetAppDir() only
+             * stores the pointer, and a stack buffer here would dangle
+             * once this block exits (runMidlet reads it later). */
             {
-                char appdb_path[80];
+                static char appdb_path[96];
                 get_per_game_appdb(jar_path, appdb_path, sizeof(appdb_path));
-                /* Ensure per-game appdb directory exists */
+                /* Ensure appdb directory exists */
                 SceUID d = sceIoDopen(appdb_path);
                 if (d < 0) {
                     sceIoMkdir(appdb_path, 0777);
-                    dlog_str("[RMS] created per-game appdb: ", appdb_path);
+                    dlog_str("[RMS] created appdb: ", appdb_path);
                 } else {
                     sceIoDclose(d);
                 }
