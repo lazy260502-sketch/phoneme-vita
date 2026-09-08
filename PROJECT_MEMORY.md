@@ -31,7 +31,10 @@
 
 ### 遗留风险
 
-- `pcsl_file_getfreespace/getusedspace` 仍是弱实现（返回 0），`RecordStoreFile.spaceAvailable*` 会拿到 0——若 UC 检查可用空间可能误判 Full；实测若有 RecordStoreFullException 再实现（`sceIoDopen` + stat 累加）。
+- `pcsl_file_getfreespace/getusedspace` 仍返回 0 的风险已在补全提交（b98c165）消除：
+  - `getusedspace`：sceIoDopen/Dread 单层遍历 storage root 求和（POSIX 参考语义，不含子目录）
+  - `getfreespace`：`sceAppMgrGetDevInfo("ux0:")` 真实空闲字节（long 32 位饱和 LONG_MAX）
+  - **关键联动**：`internal.config`(+landscape) 增加 `system.jam_space: 100000000`——`storage_get_free_space = totalSpace - used`，而 `totalSpace` 默认 4MB（`DEFAULT_TOTAL_SPACE`），不设此属性时 RMS 数据超 4MB 会误报 `RecordStoreFullException`。属性单位字节（上游 linux_fb 参照 1000000），读取点在 `midpInit.c:253` `getInternalProperty("system.jam_space")`。
 - RMS 的 `.idx` 索引文件（tree_index/linear_index）路径未实测。
 - 真机未测；Vita3K 的 sceIoDread 对大目录行为需观察。
 
