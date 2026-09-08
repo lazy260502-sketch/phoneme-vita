@@ -94,7 +94,30 @@ set(VITA_TITLEID  "J2ME00001")
 #         path results). This also un-breaks midp_remove_suite's file
 #         cleanup loop and rmsdb_remove_record_stores_for_suite,
 #         which iterate the same way.
-set(VITA_VERSION  "01.34")
+#
+# v01.35 (2026-09-08): silence the misleading "file in use" noise from
+#         midp_remove_suite's cleanup loop. Vita3K maps SCE errno onto
+#         the wrong Windows errno table when it logs io_error_impl, so a
+#         plain ENOENT (0x80010002 = 0x80010000 | 2, "file does not
+#         exist") shows up as "Error code: 32 (another program is using
+#         this file)". The cleanup loop unlinks every enumerated entry
+#         unconditionally, so a target that vanished (or is only a
+#         filename prefix of a store) legitimately returns ENOENT.
+#         pcsl_file_unlink now treats "already gone" as success (probed
+#         with sceIoGetstat, no hardcoded code), so storage_delete_file
+#         stops printing the noise and the loop no longer aborts early
+#         on a vanished entry.
+#
+#         (net) vita_net.c: g_handles[] was a BSS global (zero-filled),
+#         so na_create() never found an fd==-1 free slot and returned
+#         NULL for EVERY non-blocking (EINPROGRESS) connect - the
+#         "connect EINPROGRESS -> select -> NETWORK_*_SIGNAL" wake chain
+#         silently died and real connects to web servers never completed
+#         (net_log: socket_open OK but no connect result for reachable
+#         hosts; only unreachable WAP proxy 10.0.0.172 logged the
+#         immediate ETIMEDOUT errno=116). Explicitly initialised the
+#         table to fd=-1.
+set(VITA_VERSION  "01.35")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar

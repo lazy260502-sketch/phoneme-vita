@@ -762,6 +762,26 @@ int pcsl_file_write(void *handle, unsigned char *buf, long size) {
     return sceIoWrite(vf->fd, buf, size);
 }
 
+/* Degraded-noise helper for unlink: Vita3K maps SCE errno values onto
+ * the wrong Windows errno table when it logs io_error_impl, so a plain
+ * ENOENT (0x80010002 = 0x80010000 | 2, "file does not exist") shows up
+ * as "Error code: 32 (another program is using this file)". That is a
+ * misreport, not a real sharing violation. midp_remove_suite's cleanup
+ * loop unlinks every enumerated entry unconditionally, so a target that
+ * vanished (or that is only a filename prefix of a store) legitimately
+ * returns ENOENT; deleting an already-gone file has achieved its goal.
+ * Treat that as success so storage_delete_file does not print noise, but
+ * without hardcoding the code: probe with sceIoGetstat - if the path no
+ * longer exists the unlink is considered done. */
+static int vita_unlink_enoent_is_ok(const char *abs_path) {
+    SceIoStat st;
+    if (sceIoGetstat(abs_path, &st) >= 0) {
+        return 0; /* still there: the earlier remove really failed */
+    }
+    /* Getstat also failed with ENOENT - nothing to delete. */
+    return 1;
+}
+
 int pcsl_file_unlink(const pcsl_string *fileName) {
     if (fileName == NULL || fileName->data == NULL) {
         return -1;
@@ -788,7 +808,15 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
     
     int result = sceIoRemove(abs_path);
     if (result < 0) {
+        if (vita_unlink_enoent_is_ok(abs_path)) {
+            /* The target was already gone (Vita3K misreports this as
+             * "file in use"). Treat delete-of-a-gone-file as success. */
+            return 0;
+        }
         result = sceIoRemove(app0_path);
+        if (result < 0 && vita_unlink_enoent_is_ok(app0_path)) {
+            return 0;
+        }
     }
     return result;
 }

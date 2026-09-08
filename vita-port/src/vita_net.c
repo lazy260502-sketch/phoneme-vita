@@ -110,7 +110,12 @@ typedef struct NetHandle {
     int fd;
 } NetHandle;
 
-static NetHandle g_handles[VITA_NET_MAX_FDS];
+static NetHandle g_handles[VITA_NET_MAX_FDS] = {
+    { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 },
+    { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 },
+    { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 },
+    { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }
+};
 static int g_net_up = 0;
 
 /* fcntl(O_NONBLOCK) is a NO-OP on sceNet descriptors: newlib's socket fd

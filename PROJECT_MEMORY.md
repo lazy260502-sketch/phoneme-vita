@@ -1,6 +1,28 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-08
 
+## 2026-09-08 v01.35：破除「FFFFFFFF 被占用」误报 + UC 联网失败根因（g_handles 表未初始化）
+
+### 一、`remove_file appdb_1A35/FFFFFFFF "文件被占用"` 是 Vita3K 的误报（非占用、非 bug）
+
+- **真错误码**：`io_error_impl` 明确打印 `remove_file (sceIoRemove) returned 0x80010002`。SCE I/O 错误编码 = `0x80010000 + errno`，`0x80010002 - 0x80010000 = 0x2 = ENOENT`（对照新lib `sys/errno.h: ENOENT 2`）。**是"文件不存在"，不是"共享冲突"**。
+- **误报机制**：Vita3K 打日志时把 SCE errno 映射到 **Windows errno 表**，错把 `ENOENT(2)` 显示成 `Error code: 32 (另一个程序正在使用此文件)` —— 纯映射错误。用户看到的"被占用"是假的。
+- **谁触发**：`midp_remove_suite` 清理循环（`suitestore_task_manager.c:452`）对枚举出的**每个**条目无条件 `storage_delete_file` → `pcsl_file_unlink` → `sceIoRemove`。当目标已不存在（裸 `FFFFFFFF` 只是 suiteId 前缀，真实文件是 `FFFFFFFF<name>.db`；或已被前序删除步骤删净），`sceIoRemove` 返回 ENOENT → 走 `io_error_impl` 打印。**与文件是否被删无关，删不删文件夹都会报**（因为删的是一个本来就不存在的条目）。
+- **修复（vita_pcsl.c）**：`pcsl_file_unlink` 在 `sceIoRemove` 失败后，用 `sceIoGetstat` 探测——若路径已不存在则视为"删除已达成"，返回成功。不硬编码错误码，真机/Vita3K 通吃。附带收益：清理循环不再因 ENOENT 提前 `break`，后续文件能删干净。
+- **结论**：这条日志是 Vita3K 特有害噪音，真机不会有；修复后归零。
+
+### 二、UC 联网失败根因：`g_handles` 表未初始化，所有非阻塞 connect 静默失败
+
+- **症状**：net_log.txt 中连真实服务器 `uc.ucweb.com`(120.241.3.205)/`u.ucfly.com`(219.133.46.180) 只有 `socket_open`，**无任何 connect 结果**；只有不可达的移动 WAP 代理 `10.0.0.172` 打印 `connect FAILED errno=116`（ETIMEDOUT，UC 内置 CMWAP 回退，当前网络必超时，正常）。
+- **根因**：`vita_net.c` 的 `static NetHandle g_handles[VITA_NET_MAX_FDS]` 是 **BSS 全局，默认全 0**。`na_create()` 靠 `g_handles[i].fd == -1` 找空槽——初始全是 0，**永远匹配不到，永远返回 NULL**。于是所有走 `EINPROGRESS` 的非阻塞 connect（NBIO 由 v01.33 的 `vita_set_nbio` 正确设置）都在 `h == NULL` 处静默 `close(fd); return PCSL_NET_IOERROR`——**没有日志**。这就解释了两类主机的日志差异：可达主机走 EINPROGRESS→na_create NULL→静默失败；不可达代理 connect 直接返回 ETIMEDOUT→打 FAILED（在 na_create 前）。
+- **修复（vita_net.c）**：`g_handles` 显式初始化为全部 `{ -1 }`（32 个）。na_create 从此能正确注册 fd，select 表生效，EINPROGRESS→select→NETWORK_*_SIGNAL 唤醒链恢复。
+- **教训**：依赖"表里某个哨兵值"的空槽查找，表必须显式初始化；BSS 零值（fd=0）恰好是非法 fd，但不是哨兵 `-1`，会使"找空槽"逻辑永久失败。此类 bug 无编译告警、无运行日志（NULL 路径常被上层吞掉），只能靠审查 + 实测日志追。
+
+### 验证
+
+- 两修复均编译通过，APP_VER=01.35，VPK `/home/zyb/vitasdk/samples/j2me/vita-port/build/cmake/midp_vita.vpk`（08:52）。
+- 提交：见 `git -C vita-port log`。
+
 ## 2026-09-08 v01.34：目录枚举 stub 是 UC 二次启动 NPE 根因（重要教训：stub 的连锁失效模式）
 
 ### 症状与误导性线索
