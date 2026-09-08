@@ -134,7 +134,18 @@ set(VITA_TITLEID  "J2ME00001")
 #         when the remove failed and the file still exists, evicts all
 #         same-path handles (sceIoClose + fd=-1: the POSIX "name gone"
 #         state) and retries the remove once.
-set(VITA_VERSION  "01.36")
+#
+# v01.37 (2026-09-08): REVERTED the v01.36 eviction. Making the remove
+#         succeed turned out to be WRONG: midp_remove_suite's cleanup
+#         loop targets the appdb entries of the RUNNING temp suite
+#         (FFFFFFFF* = UC's live RMS data), and the sharing violation
+#         had been accidentally PROTECTING that data across launches.
+#         v01.36 evicted fds still held by Java code -> RMS files came
+#         back half-written -> second launch broke (NPE, ~1 fps).
+#         pcsl_file_unlink now reports the failure (file survives);
+#         the registry + evict helper stay in place unused for a
+#         future targeted fix (evict only on real uninstall).
+set(VITA_VERSION  "01.37")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar

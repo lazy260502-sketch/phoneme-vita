@@ -637,7 +637,11 @@ static void vita_handle_unregister(VitaFileHandle *vf) {
 }
 
 /* Close every open handle referring to abs_path (see registry comment).
- * Returns how many were evicted. */
+ * Returns how many were evicted. Currently unused: v01.36's eviction
+ * broke UC's second launch (see pcsl_file_unlink), but the mechanism is
+ * kept for a future targeted fix (e.g. evict only during a real suite
+ * uninstall, never while a MIDlet is running). */
+__attribute__((unused))
 static int vita_handles_evict(const char *abs_path) {
     int i, evicted = 0;
     for (i = 0; i < VITA_MAX_OPEN_FILES; i++) {
@@ -859,22 +863,19 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
     int result = sceIoRemove(abs_path);
     if (result < 0) {
         if (vita_unlink_enoent_is_ok(abs_path)) {
-            /* The target was already gone (Vita3K misreports this as
-             * "file in use"). Treat delete-of-a-gone-file as success. */
+            /* The target was already gone. Treat delete-of-a-gone-file
+             * as success. */
             return 0;
         }
-        /* The file still exists AND the remove failed: on Vita3K this
-         * is ERROR_SHARING_VIOLATION (Error 32, reported to us as
-         * 0x80010002) - some open handle in this process refers to it
-         * and Windows cannot delete it. POSIX allows unlinking open
-         * files, which phoneME's cleanup loops rely on: evict every
-         * same-path handle (fd becomes -1, like an unlinked fd) and
-         * retry the remove once. */
-        vita_handles_evict(abs_path);
-        result = sceIoRemove(abs_path);
-        if (result < 0 && vita_unlink_enoent_is_ok(abs_path)) {
-            return 0;
-        }
+        /* The file still exists and the remove failed: ERROR_SHARING_VIOLATION
+         * under Vita3K (it returns 0x80010002 for this too). v01.36 used to
+         * evict same-path handles and retry here, which made the remove
+         * succeed - but the eviction also killed fds still held by Java
+         * code, so UC's RMS data came back half-written and the second
+         * launch broke (NPE + 1 fps). The sharing violation is actually
+         * PROTECTING live suite data from midp_remove_suite's cleanup
+         * loop: report failure and let the file survive. The three log
+         * lines Vita3K prints for the failed syscall are cosmetic. */
         result = sceIoRemove(app0_path);
         if (result < 0 && vita_unlink_enoent_is_ok(app0_path)) {
             return 0;
