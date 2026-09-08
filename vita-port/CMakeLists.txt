@@ -60,7 +60,26 @@ set(VITA_TITLEID  "J2ME00001")
 #             dir (new midpGetAppDir query); storage moved under rms/
 #             (rms/appdb + rms/appdb_<TAG>) with a one-time rename
 #             migration of the old shared appdb.
-set(VITA_VERSION  "01.32")
+#
+# v01.33 (2026-09-08): two runtime fixes driven by the first v01.32 log
+#         capture:
+#         (a) sockets never became non-blocking: fcntl(O_NONBLOCK) is a
+#             NO-OP on sceNet descriptors (newlib's fd IS the sceNetSocket
+#             id), so connect() blocked in-syscall and froze the whole VM
+#             for 27s until ETIMEDOUT (net_log errno=116 + Vita3K
+#             sceNetConnect 0x8041013C at +27s). Non-blocking is now set
+#             with sceNetSetsockopt(SCE_NET_SO_NBIO) at socket creation
+#             (client + server), restoring the EINPROGRESS -> select() ->
+#             NETWORK_*_SIGNAL wake chain the port was designed around.
+#         (b) vm_output.log rendered one-char-per-line: CLDC's
+#             PrintStream.write(int) invokes JVMSPI_PrintRaw PER CHARACTER
+#             (length==1) and the debug hook appended '\n' per call.
+#             JVMSPI_PrintRaw now writes the bytes verbatim (fwrite).
+#         Note: the sceNetInit 0x80410110 (EBUSY) + sceNetResolverCreate
+#         stub warnings in Vita3K are benign: newlib's gethostbyname
+#         lazily re-inits the net stack on the second launch round; the
+#         first init in vita_net_early_init() already succeeded.
+set(VITA_VERSION  "01.33")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar

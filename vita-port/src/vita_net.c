@@ -1,6 +1,10 @@
 /*
  * vita_net.c - Real BSD-socket network layer for phoneME MIDP on PS Vita
  *
+ * v01.33: non-blocking mode switched from fcntl(O_NONBLOCK) (a NO-OP on
+ * sceNet descriptors) to sceNetSetsockopt(SCE_NET_SO_NBIO) - see
+ * vita_set_nbio() below for the 27s-freeze incident details.
+ *
  * Replaces the pcsl_socket/pcsl_network stubs in vita_pcsl.c. HTTP/HTTPS
  * (JSR-118) is pure Java over socket://, so implementing the TCP client
  * layer below unlocks HttpConnection for MIDlets.
@@ -27,7 +31,6 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
@@ -83,14 +86,11 @@ static char g_net_mem[VITA_NET_MEM_SIZE];
 static int vita_socket_available(int fd, int *pBytesAvailable) {
     /* Peek one byte non-blocking; if a byte exists data is pending. The
      * exact count is not obtainable cheaply on Vita; available() is a hint
-     * in MIDP (InputStream.available()), exactness is not required. */
+     * in MIDP (InputStream.available()), exactness is not required.
+     * The socket is already NBIO (vita_set_nbio at open time), so the
+     * MSG_PEEK recv cannot block. */
     unsigned char probe;
-    int n;
-    int flags = fcntl(fd, F_GETFL, 0);
-
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    n = recv(fd, (char *)&probe, 1, MSG_PEEK);
-    fcntl(fd, F_SETFL, flags);
+    int n = recv(fd, (char *)&probe, 1, MSG_PEEK);
 
     if (n < 0) {
         return (errno == EWOULDBLOCK || errno == EAGAIN) ? 0 : -1;
@@ -112,6 +112,18 @@ typedef struct NetHandle {
 
 static NetHandle g_handles[VITA_NET_MAX_FDS];
 static int g_net_up = 0;
+
+/* fcntl(O_NONBLOCK) is a NO-OP on sceNet descriptors: newlib's socket fd
+ * is the raw sceNetSocket id, and non-blocking mode on Vita is a socket
+ * option (SCE_NET_SO_NBIO), not a file status flag. With the old fcntl
+ * attempt connect() blocked inside the syscall - observed as a 27s VM
+ * freeze ending in ETIMEDOUT (errno 116) under Vita3K. Must be called
+ * before connect()/accept()/recv() on every socket we create. */
+static void vita_set_nbio(int fd) {
+    int on = 1;
+    sceNetSetsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                     &on, sizeof(on));
+}
 
 int pcsl_lastNetworkError = 0; /* mirrors upstream `lastError` */
 
@@ -233,7 +245,6 @@ int pcsl_socket_open_start(unsigned char *ipBytes, int port,
                            void **pHandle, void **pContext) {
     int fd;
     int one = 1;
-    int flags;
     struct sockaddr_in addr;
     NetHandle *h;
 
@@ -252,15 +263,12 @@ int pcsl_socket_open_start(unsigned char *ipBytes, int port,
 
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    vita_set_nbio(fd); /* non-blocking connect: EINPROGRESS => wait on WRITE */
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)port);
     memcpy(&addr.sin_addr.s_addr, ipBytes, 4);
-
-    /* Non-blocking connect: EINPROGRESS => thread waits on WRITE signal */
-    flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
         h = na_create(fd);
@@ -464,6 +472,7 @@ int pcsl_server_socket_open_start(int port, void **pHandle, void **pContext) {
         return PCSL_NET_IOERROR;
     }
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&one, sizeof(one));
+    vita_set_nbio(fd); /* accept() must return EWOULDBLOCK, not block */
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -785,7 +794,7 @@ int pcsl_datagram_open_start(int port, void **pHandle, void **pContext) {
         return PCSL_NET_IOERROR;
     }
     setsockopt(fd, SOL_SOCKET, SO_BROADCAST, (char *)&one, sizeof(one));
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    vita_set_nbio(fd); /* recvfrom must EWOULDBLOCK, never block */
 
     if (port != 0) {
         memset(&addr, 0, sizeof(addr));
