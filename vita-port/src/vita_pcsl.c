@@ -935,22 +935,164 @@ int pcsl_file_rename(const pcsl_string *oldName, const pcsl_string *newName) {
     return (rv < 0) ? -1 : 0;
 }
 
-void *pcsl_file_openfilelist(const pcsl_string *string) {
-    (void)string;
-    return NULL;
+/* ======================================================================
+ * Directory enumeration (pcsl_file_openfilelist/getnextentry/closefilelist)
+ *
+ * v01.34: these were NULL/-1 stubs since the first port. Every consumer
+ * that walks a directory silently saw "no entries":
+ *   - RecordStore.listRecordStores() -> getNumberOfStores -> NULL handle
+ *     -> OUT_OF_MEM_LEN -> OutOfMemoryError thrown FROM NATIVE, aborting
+ *     UC's startup state restore (ao.a() NPE one frame up). First launch
+ *     worked because creates go through pcsl_file_open/exist (real), but
+ *     any second launch that first LISTS the stores died - "delete the
+ *     appdb dir and it works again" symptom.
+ *   - midp_remove_suite's file cleanup loop also iterates this way, so
+ *     suite removal left files behind.
+ * Contract copied from the reference POSIX port (pcsl/file/posix): the
+ * input string is "rootdir + match-prefix". We split at the last file
+ * separator, opendir the root, and on each getnextentry() return the
+ * next readdir() entry whose name starts with the match prefix, as a
+ * FULL path (root + entry name) in *result (caller frees).
+ * ====================================================================== */
+
+typedef struct VitaDirIter {
+    int   rootLength;   /* in jchars, includes the trailing '/'  */
+    int   matchLength;  /* in jchars, prefix after the separator */
+    SceUID dfd;         /* sceIoDopen handle, < 0 when exhausted */
+} VitaDirIter;
+
+void* pcsl_file_openfilelist(const pcsl_string *string) {
+    VitaDirIter *it;
+    char path_utf8[600];
+    SceUID dfd;
+    int filelistLen, rootLength;
+    jchar sep;
+
+    if (string == NULL || string->data == NULL) {
+        return NULL;
+    }
+
+    /* Resolve the directory part against the data root, the same way
+     * pcsl_file_open does (relative storage paths like "appdb_1A35/"
+     * arrive here from midpStorage). */
+    if (pcsl_string_convert_to_utf8(string, (jbyte *)path_utf8,
+                                    sizeof(path_utf8), NULL)
+        != PCSL_STRING_OK) {
+        return NULL;
+    }
+
+    filelistLen = pcsl_string_length(string);
+    rootLength = (int)pcsl_string_last_index_of(
+        string, (jint)pcsl_file_getfileseparator());
+    if (rootLength < 0) {
+        rootLength = 0; /* no separator: everything is a match prefix */
+    } else {
+        rootLength++;   /* include the separator in the root */
+    }
+
+    /* Trim the match prefix off the directory we open. The separator
+     * scan above is in jchars; do the same on the UTF-8 copy. */
+    {
+        char *slash = strrchr(path_utf8, '/');
+        if (rootLength > 0 && slash != NULL) {
+            /* keep rootLength-1 jchars == bytes up to the slash */
+            *(slash + 1) = '\0';
+        }
+    }
+
+    sep = pcsl_file_getfileseparator();
+    (void)sep;
+
+    {
+        char abs_dir[600];
+        vita_resolve_path(path_utf8, abs_dir, sizeof(abs_dir));
+        dfd = sceIoDopen(abs_dir);
+    }
+    if (dfd < 0) {
+        return NULL;
+    }
+
+    it = (VitaDirIter *)malloc(sizeof(VitaDirIter));
+    if (it == NULL) {
+        sceIoDclose(dfd);
+        return NULL;
+    }
+    it->rootLength = rootLength;
+    it->matchLength = filelistLen - rootLength;
+    it->dfd = dfd;
+    return it;
 }
 
 int pcsl_file_closefilelist(void *handle) {
-    (void)handle;
+    VitaDirIter *it = (VitaDirIter *)handle;
+    if (it == NULL) {
+        return -1;
+    }
+    if (it->dfd >= 0) {
+        sceIoDclose(it->dfd);
+    }
+    free(it);
     return 0;
 }
 
 int pcsl_file_getnextentry(void *handle, const pcsl_string *string,
                            pcsl_string *result) {
-    (void)handle;
-    (void)string;
-    (void)result;
-    return -1;
+    VitaDirIter *it = (VitaDirIter *)handle;
+    SceIoDirent entry;
+    pcsl_string matchName = PCSL_STRING_NULL;
+    pcsl_string rootpath = PCSL_STRING_NULL;
+    pcsl_string returnVal = PCSL_STRING_NULL;
+    char match_utf8[256];
+    int matchLen = 0;
+    int rv = -1;
+
+    if (it == NULL || it->dfd < 0) {
+        return -1;
+    }
+
+    /* Match prefix = string[rootLength .. rootLength+matchLength) */
+    if (it->matchLength > 0) {
+        if (pcsl_string_substring(string, it->rootLength,
+                                  it->rootLength + it->matchLength,
+                                  &matchName) != PCSL_STRING_OK) {
+            return -1;
+        }
+        if (pcsl_string_convert_to_utf8(&matchName, (jbyte *)match_utf8,
+                                        sizeof(match_utf8), NULL)
+            == PCSL_STRING_OK) {
+            matchLen = strlen(match_utf8);
+        }
+        pcsl_string_free(&matchName);
+    }
+
+    while (sceIoDread(it->dfd, &entry) > 0) {
+        const char *name = entry.d_name;
+
+        if (name[0] == '\0' || strcmp(name, ".") == 0 ||
+            strcmp(name, "..") == 0) {
+            continue;
+        }
+        if (matchLen > 0 && strncmp(name, match_utf8, matchLen) != 0) {
+            continue;
+        }
+
+        /* Found one: result = string[0 .. rootLength) + name */
+        if (pcsl_string_substring(string, 0, it->rootLength, &rootpath)
+                != PCSL_STRING_OK ||
+            pcsl_string_convert_from_utf8((const jbyte *)name,
+                                          (jsize)strlen(name),
+                                          &returnVal) != PCSL_STRING_OK ||
+            pcsl_string_cat(&rootpath, &returnVal, result)
+                != PCSL_STRING_OK) {
+            break;
+        }
+        rv = 0;
+        break;
+    }
+
+    pcsl_string_free(&returnVal);
+    pcsl_string_free(&rootpath);
+    return rv;
 }
 
 long pcsl_file_seek(void *handle, long offset, long position) {

@@ -79,7 +79,22 @@ set(VITA_TITLEID  "J2ME00001")
 #         stub warnings in Vita3K are benign: newlib's gethostbyname
 #         lazily re-inits the net stack on the second launch round; the
 #         first init in vita_net_early_init() already succeeded.
-set(VITA_VERSION  "01.33")
+#
+# v01.34 (2026-09-08): RMS directory enumeration was a NULL stub.
+#         RecordStore.listRecordStores() -> getNumberOfStores ->
+#         pcsl_file_openfilelist() returned NULL -> OUT_OF_MEM_LEN ->
+#         OutOfMemoryError raised from native inside UC's startup
+#         state restore (observed as ao.a() NPE one frame up). First
+#         launch worked (creates go through pcsl_file_open/exist,
+#         both real); every subsequent launch died - deleting the
+#         appdb dir "fixed" it because the listing then legitimately
+#         returned empty. Implemented openfilelist/getnextentry/
+#         closefilelist with sceIoDopen/Dread/Dclose following the
+#         reference POSIX contract (root + match-prefix split, full
+#         path results). This also un-breaks midp_remove_suite's file
+#         cleanup loop and rmsdb_remove_record_stores_for_suite,
+#         which iterate the same way.
+set(VITA_VERSION  "01.34")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
