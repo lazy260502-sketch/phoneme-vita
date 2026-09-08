@@ -158,7 +158,14 @@ set(VITA_TITLEID  "J2ME00001")
 #         zero benefit. Net effect: UC data-init is much faster and
 #         the remaining sharing-violation lines are one group per
 #         protected suite file (expected, harmless).
-set(VITA_VERSION  "01.38")
+# v01.39: anilib/vita os_port.cpp Os_WaitForEventOrTimeout condition fix
+#   (upstream is "ms != 0", Vita port had "ms == 0" - for any positive
+#    timeout the timespec stayed {0,0}=epoch so pthread_cond_timedwait
+#    returned ETIMEDOUT immediately; the scheduler's 50ms event-pump
+#    wait degenerated into a busy loop: fps=1, heartbeat counter
+#    racing (#1..#8193+), UC init crawl. Also rebuilt os_port.o and
+#    repacked libcldc_vm_ani.a / libcldc_vm_ani_r.a.)
+set(VITA_VERSION  "01.39")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
