@@ -294,10 +294,15 @@ int lfjport_get_display_capabilities(int hardwareId) {
 }
 
 jint *lfjport_get_display_device_ids(jint *n) {
+    /* Contract (fbapp_export.c upstream): return a non-NULL array of ids.
+     * Returning NULL with *n=1 made KNI_SetIntArrayElement dereference NULL
+     * in DisplayDeviceContainer.getDisplayDevicesIds0 and crash the VM. */
+    static jint display_device_ids[] = { 0 };
+
     if (n != NULL) {
         *n = 1;
     }
-    return NULL;
+    return display_device_ids;
 }
 
 void lfjport_display_device_state_changed(int hardwareId, int state) {
