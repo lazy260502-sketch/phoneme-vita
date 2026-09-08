@@ -1,9 +1,31 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-08
 
+## 2026-09-08 v01.36：「FFFFFFFF 被占用」真相 = Windows 共享冲突，v01.35 误判纠正（对照 Vita3K 源码逐行验证）
+
+### v01.35 为什么没修好（误判复盘）
+
+- v01.35 从 `sceIoRemove returned 0x80010002` 推出"ENOENT=文件不存在，Vita3K 映射错误"——**被 Vita3K 骗了**。
+- **实锤（拉取用户实际版本 Vita3K v0.2.1 496939b6 的 `io.cpp` 源码对照）**：`remove_file()` 里 `fs::detail::remove()` 失败时，`LOG_ERROR("Error code: {} ({})", error_code.value(), error_code.message())` 打印的是 **Windows API 原话** —— `Error code: 32` = `ERROR_SHARING_VIOLATION`，**这次是真实占用**，不是误报；然后 Vita3K 对"不存在"和"被占用"**一律硬编码返回** `IO_ERROR(SCE_ERROR_ERRNO_ENOENT)` = `0x80010002`。返回码无区分度，v01.35 的"ENOENT=不存在"推理在此场景失效。
+- 另一实锤：`open_file()` 的 `FileStats` 用 `create_shared_file`（`_wfopen`，**无 FILE_SHARE_DELETE**）持有 `FILE*`——只要进程内任何 fd 开着该文件，Windows `fs::remove` 必 Error 32。**POSIX 允许 unlink 已打开文件**（phoneME 清理循环依赖此语义），Windows 不允许——平台语义差异是根因。
+- 日志三行（`Cannot remove file` / `Error code: 32` / `io_error_impl returned 0x80010002`）**全部是 Vita3K 打的**，应用侧改返回值处理消不掉，必须让 sceIoRemove 真正成功。
+
+### 修复（vita_pcsl.c）：句柄注册表 + 删除前驱逐
+
+- `g_open_handles[64]`：`pcsl_file_open` 成功时注册、`pcsl_file_close` 注销（`vita_handle_register/unregister`）。
+- `pcsl_file_unlink` 新流程：remove 失败 → `sceIoGetstat` 仍存在（=真占用，区别于不存在）→ `vita_handles_evict(abs_path)` 把**同路径**的所有句柄 `sceIoClose`+`fd=-1`（模拟 POSIX"名字先消失，fd 随后失效"）→ 重试 remove。"已不存在=成功"逻辑保留。
+- `pcsl_file_truncate` 内部 close→reopen 同一 `vf`（注册表指针/路径不变），无需改动。
+- 验证：编译通过，APP_VER=01.36，VPK 11:16。
+
+### 教训（重要）
+
+1. **模拟器的错误返回码可能无区分度**：Vita3K 把 ENOENT 和共享冲突都折成 `0x80010002`，判断真实失败原因**不能只看返回码**，要对照模拟器源码的 HLE 实现（这次是 `io.cpp remove_file` 的 `error_code.message()` 帟暴露了 Windows 真错）。
+2. **跨平台语义差异要在移植层补偿**：POSIX "unlink open file" vs Windows 共享冲突——上游代码天然依赖 POSIX 语义时，移植层要么提供句柄注册表驱逐，要么保证删除前句柄全关。
+3. **教训的教训**：v01.35 的推理链（返回码→ENOENT→"文件不存在"）单看自洽，但没有对照模拟器源码验证就下了结论——**涉及模拟器行为时，先拉对应版本源码核对，再下结论**。
+
 ## 2026-09-08 v01.35：破除「FFFFFFFF 被占用」误报 + UC 联网失败根因（g_handles 表未初始化）
 
-### 一、`remove_file appdb_1A35/FFFFFFFF "文件被占用"` 是 Vita3K 的误报（非占用、非 bug）
+### 一、`remove_file appdb_1A35/FFFFFFFF "文件被占用"` ~~是 Vita3K 的误报~~（v01.36 纠正：一半误判，见上章节——ENOENT 部分确是误吞，但 Error 32 部分是真实共享冲突，v01.35 的"纯误报"结论不成立）
 
 - **真错误码**：`io_error_impl` 明确打印 `remove_file (sceIoRemove) returned 0x80010002`。SCE I/O 错误编码 = `0x80010000 + errno`，`0x80010002 - 0x80010000 = 0x2 = ENOENT`（对照新lib `sys/errno.h: ENOENT 2`）。**是"文件不存在"，不是"共享冲突"**。
 - **误报机制**：Vita3K 打日志时把 SCE errno 映射到 **Windows errno 表**，错把 `ENOENT(2)` 显示成 `Error code: 32 (另一个程序正在使用此文件)` —— 纯映射错误。用户看到的"被占用"是假的。

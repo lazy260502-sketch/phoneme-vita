@@ -117,7 +117,24 @@ set(VITA_TITLEID  "J2ME00001")
 #         hosts; only unreachable WAP proxy 10.0.0.172 logged the
 #         immediate ETIMEDOUT errno=116). Explicitly initialised the
 #         table to fd=-1.
-set(VITA_VERSION  "01.35")
+#
+# v01.36 (2026-09-08): the v01.35 ENOENT-tolerance patch was NOT enough.
+#         Verified against the user's exact Vita3K build (v0.2.1
+#         496939b6, io.cpp remove_file): the "Error code: 32" line is
+#         Windows' ERROR_SHARING_VIOLATION message verbatim - a REAL
+#         sharing violation, not an errno mis-mapping. Vita3K's
+#         open_file() holds a FILE* (_wfopen, no FILE_SHARE_DELETE) for
+#         every open fd, so a remove fails with Error 32 whenever ANY
+#         handle in-process still refers to the file; Vita3K then
+#         returns 0x80010002 for BOTH "not exist" and "in use", which
+#         is what misled v01.35. POSIX allows unlinking open files
+#         (phoneME's cleanup loops rely on it), Windows does not. Fix:
+#         an open-handle registry in vita_pcsl.c - pcsl_file_open
+#         registers, pcsl_file_close unregisters, and pcsl_file_unlink,
+#         when the remove failed and the file still exists, evicts all
+#         same-path handles (sceIoClose + fd=-1: the POSIX "name gone"
+#         state) and retries the remove once.
+set(VITA_VERSION  "01.36")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
