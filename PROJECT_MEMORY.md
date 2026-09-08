@@ -1,6 +1,85 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-08
 
+## 2026-09-08 v01.33：fcntl NBIO 对 sceNet fd 无效（connect 冻结 VM 27s）+ vm_output 竖排修复
+
+### 用户 v01.32 实测反馈 → 三个现象，一真两良性
+
+1. **connect 卡死 27 秒**（真 bug）：net_log 显示 `socket_open ip=120.241.3.205 port=80` 后无 connect 结果，Vita3K 日志 `sceNetConnect` 从 11:28:32 阻塞到 11:28:59 才返回 `0x8041013C`（= `SCE_NET_ERROR_ETIMEDOUT`），vita_net.c 日志 `errno=116`（= `ETIMEDOUT`）。
+2. **vm_output.log 一字符一行**（真 bug）：CLDC 的 `PrintStream.write(int)`（`write(int b) → byteOut.write(b)`）**逐字符**调 `JVMSPI_PrintRaw(s,1)`；v01.28 的逐行钩子每次 `fprintf("%.*s\n")` 强加换行 → 竖排。
+3. `sceNetInit 0x80410110`（EBUSY）+ `sceNetResolverCreate` stub 警告（良性）：第二轮启动 newlib `gethostbyname` 内部 lazy 再 init 网络栈；`10.0.0.172` 是 UC 内置 CMWAP 移动代理回退（直连失败才走），当前网络环境必超时，非我方 bug。
+4. **v01.32 修复确认生效**：suite 落在 `rms/appdb_1A35/FFFFFFFF`（per-game appdb）；`[MIDLET] created+registered OK: cn.uc.application.app.WebClient`（此前崩溃点已过）。`remove_file FFFFFFFF` 失败是 suite 关闭清理，良性（2026-09-07 已有结论）。
+
+### 根因：fcntl(O_NONBLOCK) 对 sceNet 描述符是 no-op
+
+- 二进制级验证链：newlib `socket()`@810f8e98 → `sceNetSocket`（fd 直通，错误码经 `__vita_scenet_errno_to_errno` 转换）；newlib `select`@810f15f8 → `sceNetEpollCreate/Control/Wait/Destroy`（select 对 net fd 有效）；但 `fcntl` 只作用于文件描述符标志，sceNet fd 的非阻塞模式是**socket 选项**：`sceNetSetsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO=0x1100, &on, 4)`（net.h:388）。
+- 后果：socket 一直是阻塞模式，`connect()` 阻塞在 syscall 里，VM 事件泵线程全冻结（`checkForSystemSignal`/`vita_net_poll` 也跑不了），27s 后 ETIMEDOUT。此前 v01.30 时代"网络能用"是因为当时网络调用全 stub 直接失败返回，从没真正 connect 过。
+- 修复：`vita_net.c` 新增 `vita_set_nbio(fd)`，在 TCP client（`pcsl_socket_open_start`）、server（`pcsl_server_socket_open_start`）、UDP（`pcsl_datagram_open_start`）创建时统一调用；`vita_socket_available()` 的 MSG_PEEK 依赖 socket 已 NBIO（删掉原来的临时 fcntl 翻转）。
+- 恢复的设计链：NBIO connect → `EINPROGRESS` → `PCSL_NET_WOULDBLOCK` → Java 线程 `midp_thread_wait(NETWORK_WRITE_SIGNAL)` → `vita_net_poll()` select 就绪 → `midp_thread_signal` 唤醒 → `getsockopt(SO_ERROR)` 完成握手。
+
+### 修复：JVMSPI_PrintRaw 原样透传（phoneme-midp cf018c2）
+
+- `midp_run.c`：`fprintf("%.*s\n")` → `fwrite(s,1,length)`；换行由 Java println 自带。逐次 fopen/fclose 防强杀丢日志方案不变。最终 ELF 验证 `fopen→fwrite→fclose`。
+
+### 踩坑（新增）
+
+- **build.sh 的 make 失败会被吞**：`make ... 2>&1 | tail -20 || {...}` 里管道退出码是 tail 的（成功），`set -e` 拦不住——脚本继续打出成功横幅但 VPK 是旧的（本次 APP_VER 仍 01.32、VPK 时间戳早于 midp 重编才发现）。判断构建成败要 `ls -la --time-style` 对时间戳 + 查 APP_VER，或手动 `make`。本次 datagram 段漏改的 fcntl 就是手动 make 才暴露的。
+- errno/错误码速查：newlib errno 116=ETIMEDOUT、119=EINPROGRESS、120=EALREADY、11=EAGAIN/EWOULDBLOCK；sceNet 0x8041013C=ETIMEDOUT、0x80410110=EBUSY（`psp2/net/net.h`）。
+
+### 验证与产物
+
+- `midp_run.o`：`JVMSPI_PrintRaw` 内 `bl fopen/fwrite/fclose`（无 fprintf 格式串）。
+- 最终 ELF：`pcsl_socket_open_start` 序列 `socket(8100766c) → sceNetSetsockopt(810076c0) → connect(810076e0)`；全 ELF 6 处 sceNetSetsockopt 调用。
+- VPK：APP_VER=01.33，`build/cmake/midp_vita.vpk`（04:20:15）。
+- 提交：phoneme-midp cf018c2（PrintRaw）+ samples c5722f0（vita_net.c NBIO + CMakeLists v01.33 注释）。
+
+### 遗留风险
+
+- 直连 `120.241.3.205:80`（uc.ucweb.com）本身超时与否取决于网络环境（该 IP 是 UC 老服务器的电信出口）；修好 NBIO 后若仍连不上，属服务器/路由问题，换网络验证。CMWAP 代理 10.0.0.172 在当前环境必不通（UC 无设置页时可能反复重试）。
+- datagram/available 路径的 NBIO 改动未实测（无 UDP MIDlet）；MSG_PEEK 假设 socket 已 NBIO，若后续有 UDP MIDlet 异常优先查这里。
+- 若 UC 在连接阶段表现"卡住但没死"，属预期：EINPROGRESS + select 唤醒链首次真正运转，观察 net_log 是否出现 `connect DONE`/`connect EINPROGRESS` 行。
+
+## 2026-09-08 v01.32：UC 卡初始化真根因（皮肤图 app0 fallback 失效）+ appdb 覆盖修复 + rms/ 目录归整
+
+### 三个用户反馈 → 两个根因 + 一个修复
+
+1. **"UC 还是卡住初始化"** → 直接根因：30 张皮肤 PNG 全部 `FAILED (0x80010002)`（ENOENT）。chameleon 皮肤资源池初始化带缺图进行，LCDUI 初始化链路挂起。位置在 `games/app/game.jar` 与 `appdb/FFFFFFFF` 打开日志之后。
+2. **"很多 png 资源没有"** → **资源其实都在**：VPK 内 `data/J2ME00001/lib/` 有全部 178 张 PNG（python3 zipfile 解包验证，`screen.image_wash`/`scroll.*`/`softbtn.*`/`ticker.*`/`alert.*` 一个不缺）。打不开是 fallback bug（见下）。
+3. **"为什么数据都访问 appdb/FFFFFFFF，appdb_XXXX 却全空"** → `FFFFFFFF` = `INTERNAL_SUITE_ID(-1)` 的 8 位 hex（`GET_SUITE_ID_LEN=8`，`midp_suiteid2pcsl_string`），suite 存储路径 = `sRoot + suiteId`。`sRoot` 永远是共享 appdb，因为 per-game 设置被上游覆盖（见下）。
+
+### 根因 A：pcsl app0 fallback 拼接非法路径（皮肤图打不开）
+
+- `vita_pcsl.c` 的 `pcsl_file_open/unlink/exist/sizeof` 在 ux0 打开失败后 fallback：`snprintf(app0_path, "app0:%s", path_utf8)`——用**原始输入路径**。输入是绝对路径 `ux0:/data/...` 时产生 `app0:ux0:/...`（恒 ENOENT）；该命中 VPK 的场景只有皮肤图（`lib/<name>.png`，绝对路径），于是全军覆没。
+- 路径链：`ResourceHandler.getSystemImageResource` → `getAmsResource(name+".raw"/".png")` → `File.getStorageRoot(INTERNAL_STORAGE_ID)` = `sRoot`（= appdb dir = `ux0:/data/J2ME00001`）→ `lib/...` 由 skin 代码拼上。VPK 内布局是 `data/J2ME00001/lib/*.png`，所以正确 fallback 是把 `ux0:/data/` 前缀换成 `app0:/`。
+- 修复：四处 fallback 统一改为基于 `vita_resolve_path` 产物的前缀替换：`strncmp(abs,"ux0:/data/",10)==0 → "app0:/"+(abs+5)`（注意 +5 跳过 `ux0:`，无重复斜杠）。字节级验证：`ux0:/data/` @810ffff4、`app0:/%s` @81100000。
+- ROM 化皮肤机制说明：`lfj_load_image_from_rom`（SkinRomizationTool 生成的 178 项查找表，在 `lfj_image_rom.o`）**已生效**，但 Java 侧部分资源（`SkinResourcesImpl` 之外的 `ResourceHandler` 路径）仍走文件系统，两条路都要通。
+
+### 根因 B：runMidlet 无条件覆盖 midpSetAppDir（appdb_XXXX 全空）
+
+- 覆盖链：`vita_main.c` 启动器每轮 `midpSetAppDir(per-game appdb_<TAG>)` → `runMidlet()`（`phoneme-midp/src/ams/example/jams/native/runMidlet.c:134-141`）**无条件** `midpSetAppDir(getApplicationDir(...))` → `commandLineUtil_md.c` 的 `getApplicationDir` 从 `MIDP_HOME` 重建 `MIDP_HOME + "/appdb"`（APPDB_DIR 硬编码）→ sRoot 永远 = 共享 appdb。
+- `storageInitialize(config_home, app_dir)` 在 `midpInit(LIST_LEVEL)` 里用 `midpAppDir` 填 `sRoot[0]`；`midp_suite_exists(INTERNAL_SUITE_ID)` 直接返回 OK 不查 `_suites.dat`，所以**空的 per-game appdb 目录可直接用**，无需种子拷贝。
+- 修复（phoneme-midp 0767127，3 文件 +29/-8）：新增 `midpGetAppDir()`（midpInit.c + midpAMS.h）；runMidlet 仅当 `midpGetAppDir()==NULL` 才回退 `getApplicationDir`。USE_NATIVE_APP_MANAGER=false，nams 的同类调用点不在链接里。
+- 附带修 UB：`midpSetAppDir` 只存指针，vita_main 传的是栈缓冲 `char appdb_path[80]` → 出块悬空。改 `static char appdb_path[96]`。
+
+### 目录归整（用户诉求：数据文件夹收进子目录）
+
+- suite 存储统一移入 `rms/` 子目录：`ux0:/data/J2ME00001/rms/appdb`（共享/Hello）+ `rms/appdb_<TAG>`（per-game）。`get_per_game_appdb` 输出带 `rms/` 前缀。
+- 迁移：启动时 `sceIoDopen(DATA_DIR "/appdb")` 存在则 `sceIoRename` → `rms/appdb`（一次性，老存档保留）。旧 `appdb_XXXX` 空目录不迁移（无数据），会残留在原处，可手动删。
+- 目录布局变为：`J2ME00001/{lib/, games/, inbox/, rms/, cache 等}`。
+
+### 验证与产物
+
+- `bash build_vita.sh`（phoneme-midp）exit=0：`libobj.a` 已含 `midpGetAppDir` T 定义 + runMidlet.o U 引用。**注意**：构建尾部 `libmidp.so` 链接失败（`_rom_linkcheck_mffd_false` 未定义）是**预先存在**的中间产物问题——`CREATE_MIDP_SHARED_LIB=true` 的检查性链接需要 `vm_rom_stubs.c`（在 vita-port 侧），不影响 `libobj.a` 生成与最终链接。
+- `bash build.sh`（vita-port）exit=0；`midpGetAppDir` T @8103d95c 在最终 ELF。
+- VPK：178 张 lib PNG 在包内；param.sfo APP_VER=01.32。
+- 提交：phoneme-midp 0767127 + samples 145a382（CMakeLists 版本注释含完整因果链）。
+
+### 遗留风险
+
+- UC 实测若仍卡：下一个埋点是 `SkinResourcesImpl_ifLoadAllResources0`（AMS isolate 分支，`ENABLE_MULTIPLE_ISOLATES=false` 时返回 FALSE 走 lazy load）与 chameleon `ResourceHandler` 的 `/raw` 路径；另需看 `vm_output.log`/`midp_stderr.log`。
+- `libmidp.so` 链接噪音每次 `build_vita.sh` 都会报 Error 1（exit 码却为 0 的原因是脚本最后一步 cp/chmod 成功）——判断成败要看 `libobj.a` 时间戳，不要只看脚本退出码。
+- 若用户嫌弃旧 `appdb_XXXX` 空目录残留：下次可加"检测 rms/ 存在则清理旧 appdb_*"。
+
 ## 2026-09-08 v01.31：LCDUI 初始化崩溃修复（UC 进不去死因）+ 菜单扫描缓存
 
 ### 崩溃根因（Vita3K EXCEPTION_ACCESS_VIOLATION，UC 等 MIDlet 启动即死）
