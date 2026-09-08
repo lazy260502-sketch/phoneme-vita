@@ -11,6 +11,8 @@
  *   ux0:/data/J2ME00001/games/<name>/game.jar    installed game
  *   ux0:/data/J2ME00001/games/<name>/game.cfg    line1=class ('-' = auto),
  *                                                line2=portrait|landscape
+ *   ux0:/data/J2ME00001/games/<name>/cache.bin   scan cache (jar fp +
+ *                                                name/class/icon metadata)
  *   ux0:/data/J2ME00001/inbox/*.jar              drop jars here, START
  *                                                installs them
  *
@@ -30,6 +32,7 @@
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/rtc.h>
 
 #include <zlib.h>
 
@@ -858,6 +861,155 @@ static int dir_exists(const char *path) {
     return 1;
 }
 
+/* ------------------------------------------------------------------
+ * Per-game metadata cache (<gamedir>/cache.bin).
+ *
+ * scan_games() opens each jar up to five times (MANIFEST x3, central
+ * directory walk for class validation, icon PNG) and PNG-decodes the
+ * icon - a few hundred ms per game on real hardware, all repeated on
+ * every boot and every rescan.
+ *
+ * cache.bin stores everything the scan needs, keyed by a fingerprint
+ * of the jar (size + mtime). On fingerprint hit the jar is never
+ * opened; on mismatch (jar reinstalled/replaced) it is re-parsed and
+ * the cache rewritten.
+ *
+ * Layout (little-endian, all u32 unless noted):
+ *   magic  'J2CB'   version 1   jar_size   jar_mtime_lo   jar_mtime_hi
+ *   name_len  name bytes        cls_len  cls bytes
+ *   icondecl_len  icondecl bytes (path inside jar, "" = none)
+ *   iconpng_len  icon PNG bytes (0 = none)  [icon PNG data follows]
+ * ------------------------------------------------------------------ */
+
+#define CACHE_NAME "cache.bin"
+#define CACHE_MAGIC 0x4243324Au /* 'J2CB' */
+
+static int cache_valid(const GameEntry *g,
+                       unsigned int jar_size, const SceDateTime *mtime) {
+    SceUID fd;
+    unsigned int hdr[6];
+    int ok = 0;
+    char path[256];
+    SceRtcTick tick;
+
+    snprintf(path, sizeof(path), "%s/" CACHE_NAME, g->dir);
+    fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    if (sceIoRead(fd, hdr, sizeof(hdr)) == (int)sizeof(hdr) &&
+        hdr[0] == CACHE_MAGIC && hdr[1] == 1 &&
+        hdr[2] == jar_size &&
+        sceRtcGetTick(mtime, &tick) >= 0 &&
+        hdr[3] == (unsigned int)(tick.tick & 0xFFFFFFFFu) &&
+        hdr[4] == (unsigned int)(tick.tick >> 32)) {
+        ok = 1;
+    }
+    sceIoClose(fd);
+    return ok;
+}
+
+/* read one length-prefixed field; returns malloc'd buffer or NULL */
+static unsigned char *cache_read_field(SceUID fd, unsigned int *out_len) {
+    unsigned int len;
+    unsigned char *buf;
+
+    if (sceIoRead(fd, &len, sizeof(len)) != (int)sizeof(len) ||
+        len > 512 * 1024) {
+        return NULL;
+    }
+    buf = (unsigned char *)malloc(len ? len : 1);
+    if (buf == NULL) {
+        return NULL;
+    }
+    if (len > 0 && sceIoRead(fd, buf, len) != (int)len) {
+        free(buf);
+        return NULL;
+    }
+    *out_len = len;
+    return buf;
+}
+
+/* load everything from a validated cache; returns 1 on success */
+static int cache_load(GameEntry *g, unsigned char **icon_png,
+                      unsigned int *icon_png_len) {
+    SceUID fd;
+    unsigned int nl, cl, il, pl;
+    unsigned char *name, *cls, *icondecl, *png;
+    char path[256];
+
+    snprintf(path, sizeof(path), "%s/" CACHE_NAME, g->dir);
+    fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    sceIoLseek(fd, sizeof(unsigned int) * 6, SCE_SEEK_SET);
+    name = cache_read_field(fd, &nl);
+    cls = cache_read_field(fd, &cl);
+    icondecl = cache_read_field(fd, &il);
+    png = cache_read_field(fd, &pl);
+    sceIoClose(fd);
+
+    if (name == NULL || cls == NULL || icondecl == NULL || png == NULL ||
+        nl == 0 || nl >= sizeof(g->name) || cl >= sizeof(g->cls) ||
+        il >= sizeof(g->icon)) {
+        free(name); free(cls); free(icondecl); free(png);
+        return 0;
+    }
+    memcpy(g->name, name, nl); g->name[nl] = '\0';
+    memcpy(g->cls, cls, cl); g->cls[cl] = '\0';
+    memcpy(g->icon, icondecl, il); g->icon[il] = '\0';
+    *icon_png = png;
+    *icon_png_len = pl;
+    free(name); free(cls); free(icondecl);
+    return 1;
+}
+
+/* write one length-prefixed field */
+static int cache_write_field(SceUID fd, const void *data, unsigned int len) {
+    if (sceIoWrite(fd, &len, sizeof(len)) != (int)sizeof(len)) {
+        return 0;
+    }
+    if (len > 0 && sceIoWrite(fd, data, len) != (int)len) {
+        return 0;
+    }
+    return 1;
+}
+
+/* persist the scan result for next boot */
+static void cache_save(const GameEntry *g, const unsigned char *icon_png,
+                       unsigned int icon_png_len,
+                       unsigned int jar_size, const SceDateTime *mtime) {
+    char path[256];
+    SceUID fd;
+    unsigned int hdr[6];
+    SceRtcTick tick;
+
+    snprintf(path, sizeof(path), "%s/" CACHE_NAME, g->dir);
+    fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd < 0) {
+        return;
+    }
+    hdr[0] = CACHE_MAGIC;
+    hdr[1] = 1;
+    hdr[2] = jar_size;
+    if (sceRtcGetTick(mtime, &tick) >= 0) {
+        hdr[3] = (unsigned int)(tick.tick & 0xFFFFFFFFu);
+        hdr[4] = (unsigned int)(tick.tick >> 32);
+    } else {
+        hdr[3] = hdr[4] = 0;
+    }
+    hdr[5] = 0;
+    sceIoWrite(fd, hdr, sizeof(hdr));
+    if (cache_write_field(fd, g->name, (unsigned int)strlen(g->name)) &&
+        cache_write_field(fd, g->cls, (unsigned int)strlen(g->cls)) &&
+        cache_write_field(fd, g->icon, (unsigned int)strlen(g->icon)) &&
+        cache_write_field(fd, icon_png, icon_png_len)) {
+        /* written */
+    }
+    sceIoClose(fd);
+}
+
 /* ------------------------------------------------------------------ */
 /* Icon rendering: decode the jar's icon PNG once per scan and cache    */
 /* the 32bpp pixels; nearest-neighbour scale into a square box.         */
@@ -866,6 +1018,10 @@ static int dir_exists(const char *path) {
 #define ICON_CACHE_MAX MAX_GAMES
 static uint32_t *icon_pix[ICON_CACHE_MAX];
 static int icon_w[ICON_CACHE_MAX], icon_h[ICON_CACHE_MAX];
+/* decoded-texture reuse: cache_hit_pix[i] mirrors icon_pix[i] ownership so
+ * scan_games() can keep the texture of an unchanged game without re-decode */
+static uint32_t *cache_hit_pix[ICON_CACHE_MAX];
+static int cache_hit_w[ICON_CACHE_MAX], cache_hit_h[ICON_CACHE_MAX];
 
 static void icon_cache_clear(void) {
     int i;
@@ -873,6 +1029,34 @@ static void icon_cache_clear(void) {
         free(icon_pix[i]);
         icon_pix[i] = NULL;
         icon_w[i] = icon_h[i] = 0;
+    }
+}
+
+/* keep the decoded texture of game idx for the next scan (no re-decode) */
+static void icon_cache_keep(int idx) {
+    if (idx < 0 || idx >= ICON_CACHE_MAX) {
+        return;
+    }
+    cache_hit_pix[idx] = icon_pix[idx];
+    cache_hit_w[idx] = icon_w[idx];
+    cache_hit_h[idx] = icon_h[idx];
+    /* ownership moved; clear so icon_cache_clear won't double-free */
+    icon_pix[idx] = NULL;
+    icon_w[idx] = icon_h[idx] = 0;
+}
+
+/* restore textures kept by icon_cache_keep() into the active slot */
+static void icon_cache_restore_kept(void) {
+    int i;
+    for (i = 0; i < ICON_CACHE_MAX; i++) {
+        if (cache_hit_pix[i] != NULL) {
+            free(icon_pix[i]);
+            icon_pix[i] = cache_hit_pix[i];
+            icon_w[i] = cache_hit_w[i];
+            icon_h[i] = cache_hit_h[i];
+            cache_hit_pix[i] = NULL;
+            cache_hit_w[i] = cache_hit_h[i] = 0;
+        }
     }
 }
 
@@ -982,6 +1166,11 @@ static void scan_games(void) {
         GameEntry *g;
         char cfgpath[256];
         SceUID fd;
+        SceDateTime mtime;
+        unsigned int jar_size;
+        unsigned char *icon_png = NULL;
+        long icon_png_len_l = 0;
+        unsigned int icon_png_len_c = 0;
 
         if (!SCE_S_ISDIR(ent.d_stat.st_mode)) {
             continue;
@@ -992,46 +1181,123 @@ static void scan_games(void) {
         g = &games[game_count];
         snprintf(g->dir, sizeof(g->dir), GAMES_DIR "/%s", ent.d_name);
         snprintf(g->jar, sizeof(g->jar), "%s/" JAR_NAME, g->dir);
-        /* display name: MIDlet-Name from MANIFEST (often Chinese), the
-         * directory name is only the fallback */
-        parse_manifest_name(g->jar, ent.d_name, g->name, sizeof(g->name));
-        parse_manifest_icon(g->jar, g->icon, sizeof(g->icon));
 
-        /* game.cfg: line1 class ('-' = auto), line2 orientation */
-        g->landscape = 0;
-        snprintf(cfgpath, sizeof(cfgpath), "%s/" CFG_NAME, g->dir);
-        fd = sceIoOpen(cfgpath, SCE_O_RDONLY, 0);
-        if (fd >= 0) {
-            char buf[256];
-            int n = sceIoRead(fd, buf, sizeof(buf) - 1);
-            sceIoClose(fd);
-            if (n > 0) {
-                char *nl, *p2;
-                buf[n] = '\0';
-                nl = strpbrk(buf, "\r\n");
-                if (nl != NULL) {
-                    *nl = '\0';
-                    p2 = nl + 1 + strspn(nl + 1, "\r\n");
-                    if (strncmp(p2, "landscape", 9) == 0) {
-                        g->landscape = 1;
+        /* fingerprint: jar size + mtime ( sceIoGetstat by path ) */
+        {
+            SceIoStat st;
+            if (sceIoGetstat(g->jar, &st) < 0) {
+                continue; /* jar vanished; skip this entry */
+            }
+            jar_size = (unsigned int)st.st_size;
+            mtime = st.st_mtime;
+        }
+
+        if (cache_valid(g, jar_size, &mtime) &&
+            cache_load(g, &icon_png, &icon_png_len_c)) {
+            /* cache hit: no jar open at all. game.cfg may still carry a
+             * newer manual class override / orientation - refresh both. */
+            g->landscape = 0;
+            snprintf(cfgpath, sizeof(cfgpath), "%s/" CFG_NAME, g->dir);
+            fd = sceIoOpen(cfgpath, SCE_O_RDONLY, 0);
+            if (fd >= 0) {
+                char buf[256];
+                int n = sceIoRead(fd, buf, sizeof(buf) - 1);
+                sceIoClose(fd);
+                if (n > 0) {
+                    char *nl, *p2;
+                    buf[n] = '\0';
+                    nl = strpbrk(buf, "\r\n");
+                    if (nl != NULL) {
+                        *nl = '\0';
+                        p2 = nl + 1 + strspn(nl + 1, "\r\n");
+                        if (strncmp(p2, "landscape", 9) == 0) {
+                            g->landscape = 1;
+                        }
+                    }
+                    if (buf[0] != '\0' && strcmp(buf, "-") != 0) {
+                        strncpy(g->cls, buf, sizeof(g->cls) - 1);
+                        g->cls[sizeof(g->cls) - 1] = '\0';
                     }
                 }
-                if (buf[0] != '\0' && strcmp(buf, "-") != 0) {
-                    strncpy(g->cls, buf, sizeof(g->cls) - 1);
+            }
+            /* decode icon from the cached PNG bytes (cheap, no jar IO) */
+            if (icon_png_len_c > 0 && icon_png != NULL) {
+                if (vita_icon_decode_png(icon_png,
+                                         (unsigned long)icon_png_len_c,
+                                         &icon_pix[game_count],
+                                         &icon_w[game_count],
+                                         &icon_h[game_count])) {
+                    fprintf(stderr,
+                            "[icon] cached png decode FAILED\n");
+                    fflush(stderr);
                 }
             }
+            free(icon_png);
+        } else {
+            /* cache miss: full parse, then persist for next boot */
+            /* display name: MIDlet-Name from MANIFEST (often Chinese),
+             * the directory name is only the fallback */
+            parse_manifest_name(g->jar, ent.d_name,
+                                g->name, sizeof(g->name));
+            parse_manifest_icon(g->jar, g->icon, sizeof(g->icon));
+
+            /* game.cfg: line1 class ('-' = auto), line2 orientation */
+            g->landscape = 0;
+            snprintf(cfgpath, sizeof(cfgpath), "%s/" CFG_NAME, g->dir);
+            fd = sceIoOpen(cfgpath, SCE_O_RDONLY, 0);
+            if (fd >= 0) {
+                char buf[256];
+                int n = sceIoRead(fd, buf, sizeof(buf) - 1);
+                sceIoClose(fd);
+                if (n > 0) {
+                    char *nl, *p2;
+                    buf[n] = '\0';
+                    nl = strpbrk(buf, "\r\n");
+                    if (nl != NULL) {
+                        *nl = '\0';
+                        p2 = nl + 1 + strspn(nl + 1, "\r\n");
+                        if (strncmp(p2, "landscape", 9) == 0) {
+                            g->landscape = 1;
+                        }
+                    }
+                    if (buf[0] != '\0' && strcmp(buf, "-") != 0) {
+                        strncpy(g->cls, buf, sizeof(g->cls) - 1);
+                    }
+                }
+            }
+            if (g->cls[0] == '\0') {
+                parse_manifest_class(g->jar, g->cls, sizeof(g->cls));
+            }
+            /* fix jars whose MANIFEST class does not exist
+             * (FileManagerMIDlet lesson): verify against the central
+             * directory and fall back to the best MIDlet-ish class;
+             * persist the fix in game.cfg */
+            validate_game_class(g, 1);
+            icon_load(g, game_count);
+
+            /* keep this scan's decoded texture alive across the rescan
+             * (icon_cache_clear would otherwise free it) */
+            icon_cache_keep(game_count);
+
+            /* persist for next boot: name/cls/icon path + icon PNG
+             * source bytes so next boot skips every jar open */
+            if (g->icon[0] != '\0') {
+                const char *ipath = g->icon;
+                while (*ipath == '/') {
+                    ipath++;
+                }
+                icon_png = zip_read_entry(g->jar, ipath, &icon_png_len_l);
+            }
+            cache_save(g, icon_png,
+                       icon_png ? (unsigned int)icon_png_len_l : 0,
+                       jar_size, &mtime);
+            free(icon_png);
+            icon_png = NULL;
         }
-        if (g->cls[0] == '\0') {
-            parse_manifest_class(g->jar, g->cls, sizeof(g->cls));
-        }
-        /* fix jars whose MANIFEST class does not exist (FileManagerMIDl
-         * lesson): verify against the central directory and fall back
-         * to the best MIDlet-ish class; persist the fix in game.cfg */
-        validate_game_class(g, 1);
-        icon_load(g, game_count);
         game_count++;
     }
     sceIoDclose(d);
+    icon_cache_restore_kept();
 }
 
 static void uninstall_game(GameEntry *g) {
@@ -1284,6 +1550,7 @@ int vita_menu_run(VitaGameSel *out) {
     }
 
     icon_cache_clear();
+    icon_cache_restore_kept();
 
     /* Keep menu_fb allocated after the menu exits (no free): the display
      * still scans it out until the VM installs its own framebuffer, and
