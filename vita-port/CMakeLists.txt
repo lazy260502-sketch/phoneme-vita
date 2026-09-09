@@ -167,10 +167,28 @@ set(VITA_TITLEID  "J2ME00001")
 #     as the abs_path buffers).
 #   - truncate reopen failure now recovers a usable fd (no O_TRUNC)
 #     so the handle never stays half-dead.
+# v01.41: Vita3K O_TRUNC blind spot - the REAL I/O adaptation gap
+#   - Vita3K's translate_open_mode() (io/src/filesystem.cpp) has NO
+#     SCE_O_TRUNC branch: every sceIoOpen maps to "rb+" and O_TRUNC
+#     is silently dropped. Our close+reopen(O_TRUNC) truncate NEVER
+#     shrank anything under the emulator - the saved prefix was
+#     written back over the first `size` bytes and the stale tail
+#     survived forever. RMS compact "succeeded" while garbage record
+#     headers lived past the new logical size -> slow/damaged second
+#     launches; sizeofopenfile kept reporting the OLD size.
+#   - pcsl_file_truncate now swaps via remove+create+write-back and
+#     VERIFIES the new file is 0 bytes before writing (a failed
+#     remove under Vita3K = sharing violation now reports failure
+#     instead of silently corrupting).
+#   - pcsl_file_open emulates O_TRUNC the same way for the
+#     OPEN_READ_WRITE_TRUNCATE path (suite temp files).
+#   - pcsl_file_seek/read/write/sizeofopenfile fail fast on dead
+#     handles (fd<0) with a one-shot stderr breadcrumb, killing the
+#     EBADFD syscall noise at its source.
 # NOTE: real-device 0x8010113D still unresolved; eboot.bin verified
 #   byte-identical to a clean `vita-make-fself -s -c` (no -m) and the
 #   SFO matches VitaSDK defaults - needs A/B testing on hardware.
-set(VITA_VERSION  "01.40")
+set(VITA_VERSION  "01.41")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar

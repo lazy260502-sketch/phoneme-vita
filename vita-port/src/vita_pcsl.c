@@ -763,6 +763,32 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
 
     /* Try to open the file using Vita IO */
     vf->fd = sceIoOpen(abs_path, oflags, 0777);
+    if (vf->fd >= 0 && (oflags & SCE_O_TRUNC)) {
+        /* Vita3K's translate_open_mode() has no SCE_O_TRUNC branch -
+         * every open maps to "rb+" and the flag is silently dropped,
+         * so a pre-existing file keeps its old length (see
+         * pcsl_file_truncate for the full story). Emulate truncation
+         * here for the OPEN_READ_WRITE_TRUNCATE path (storage_open
+         * uses it for suite temp files): remove+create is the only
+         * sequence that empties the file on BOTH Vita3K and a real
+         * device. The just-opened fd is closed first: Vita3K's
+         * remove_file fails with a sharing violation while any FILE*
+         * of the file exists in-process. */
+        SceOff sz = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
+        if (sz > 0) {
+            sceIoClose(vf->fd);
+            sceIoRemove(abs_path);
+            vf->fd = sceIoOpen(abs_path, SCE_O_RDWR | SCE_O_CREAT, 0777);
+            if (vf->fd < 0) {
+                /* Old file still there (remove failed) - retry a
+                 * plain rw open so the handle at least stays valid,
+                 * and report failure like any open error. */
+                vf->fd = sceIoOpen(abs_path, SCE_O_RDWR, 0777);
+                free(vf);
+                return -1;
+            }
+        }
+    }
     if (vf->fd < 0) {
         /* Not in the writable data dir - retry inside the VPK. The VPK
          * mirrors the data layout (data/J2ME00001/lib/*.png), so swap
@@ -826,6 +852,9 @@ int pcsl_file_read(void *handle, unsigned char *buf, long size) {
     }
     
     VitaFileHandle *vf = (VitaFileHandle *)handle;
+    if (vf->fd < 0) {
+        return -1; /* dead handle - fail fast (see pcsl_file_seek) */
+    }
     return sceIoRead(vf->fd, buf, size);
 }
 
@@ -835,6 +864,9 @@ int pcsl_file_write(void *handle, unsigned char *buf, long size) {
     }
     
     VitaFileHandle *vf = (VitaFileHandle *)handle;
+    if (vf->fd < 0) {
+        return -1; /* dead handle - fail fast (see pcsl_file_seek) */
+    }
     return sceIoWrite(vf->fd, buf, size);
 }
 
@@ -896,10 +928,31 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
     return result;
 }
 
-/* Vita has no sceIoFtruncate, so shrink by read-rewrite: save the
- * first `size` bytes, reopen the same path with O_TRUNC, write them
- * back. The file position is preserved (clamped to the new size) to
- * match POSIX ftruncate semantics callers expect.
+/* Vita has no sceIoFtruncate syscall, so shrink by read-rewrite.
+ *
+ * v01.41 root-cause rewrite. The v01.40 close->reopen(O_TRUNC)
+ * emulation NEVER actually truncated under Vita3K: the emulator's
+ * translate_open_mode() (io/src/filesystem.cpp) has NO SCE_O_TRUNC
+ * branch - every open lands in "rb+". So the reopen kept the old
+ * length, writing the saved prefix back just overwrote the first
+ * `size` bytes, and the stale tail stayed forever. RMS compact
+ * then reported success while garbage record headers survived
+ * past the new logical size ("second launch stuck on init"),
+ * and pcsl_file_sizeofopenfile kept reporting the OLD size.
+ * On real hardware O_TRUNC works, so this is an emulator-only
+ * silent data corruption the v01.40 log analysis could not see.
+ *
+ * The ONLY sequence that truncates on BOTH Vita3K and a real
+ * device is remove + create + write-back:
+ *   - remove frees the name (works even while our fd is open on
+ *     Vita3K only if the FILE* is closed first - so we close),
+ *   - create gives a guaranteed 0-byte file,
+ *   - write-back restores the surviving prefix.
+ *
+ * Failure safety: the prefix bytes live in memory during the
+ * swap, so a failure at any step can still restore them (best
+ * effort) - the same window the old implementation had.
+ *
  * A previous stub returned success without doing anything, so
  * RecordStoreImpl.compactRecords left stale blocks past the new
  * logical size - the second launch then walked garbage record
@@ -945,20 +998,32 @@ int pcsl_file_truncate(void *handle, long size) {
         got += n;
     }
 
-    /* Rewrite the file in place via the path captured at open time
-     * (always the resolved absolute path that opened successfully). */
+    /* Swap the file via remove+create (O_TRUNC is dead on Vita3K,
+     * see the function header). vf->path always holds the resolved
+     * absolute path that opened successfully. */
     sceIoClose(vf->fd);
-    vf->fd = sceIoOpen(vf->path, SCE_O_RDWR | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    int removed = (sceIoRemove(vf->path) >= 0);
+    vf->fd = sceIoOpen(vf->path, SCE_O_RDWR | SCE_O_CREAT, 0777);
     if (vf->fd < 0) {
-        /* Reopen-with-truncate failed (historically: path truncated to
-         * 256 bytes; also possible sharing violation). Nothing was
-         * modified yet - the original bytes are still on disk - but the
-         * old fd is already gone. Recover a usable fd WITHOUT O_TRUNC so
-         * the handle stays valid for later reads/seeks; report the
-         * truncate failure itself to the caller as before. Without this
-         * recovery every subsequent pcsl_file_seek on this handle hit
-         * sceIoLseek(fd<0) = EBADFD (0x80010051) forever. */
+        /* Recovery attempt without O_CREAT (covers the case where the
+         * remove failed and the old file is still there). If this also
+         * fails the handle stays fd=-1 and every later
+         * pcsl_file_seek hits EBADFD - unavoidable at this point, but
+         * nothing was written so the on-disk state is consistent. */
         vf->fd = sceIoOpen(vf->path, SCE_O_RDWR, 0777);
+        free(buf);
+        return -1;
+    }
+
+    /* Verify the swap really produced an empty file. If the remove
+     * failed (e.g. Windows sharing violation: some other FILE* still
+     * holds this file inside Vita3K), the create-open silently lands
+     * on the OLD file ("rb+" - no truncation in the emulator) and
+     * writing the prefix back would leave the stale tail again. That
+     * is exactly the silent RMS corruption class this rewrite fixes;
+     * fail honestly and let the caller see the error instead. */
+    SceOff check = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
+    if (!removed || check != 0) {
         free(buf);
         return -1;
     }
@@ -1223,6 +1288,20 @@ long pcsl_file_seek(void *handle, long offset, long position) {
         case PCSL_FILE_SEEK_END: whence = SCE_SEEK_END; break;
         default: return -1;
     }
+
+    /* A dead handle (fd closed by a failed truncate/open recovery)
+     * would turn every seek into sceIoLseek(-1) = EBADFD
+     * (0x80010051) noise. Fail fast and leave one breadcrumb in the
+     * boot log so a residual seek-after-death is locatable without
+     * re-enabling the (very slow) full file trace. */
+    if (vf->fd < 0) {
+        static int reported = 0;
+        if (!reported) {
+            reported = 1;
+            fprintf(stderr, "[pcsl] seek on dead handle '%s'\n", vf->path);
+        }
+        return -1;
+    }
     
     return sceIoLseek(vf->fd, offset, whence);
 }
@@ -1233,6 +1312,9 @@ long pcsl_file_sizeofopenfile(void *handle) {
     }
     
     VitaFileHandle *vf = (VitaFileHandle *)handle;
+    if (vf->fd < 0) {
+        return -1; /* dead handle - fail fast (see pcsl_file_seek) */
+    }
     SceOff current = sceIoLseek(vf->fd, 0, SCE_SEEK_CUR);
     SceOff size = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
     sceIoLseek(vf->fd, current, SCE_SEEK_SET);
