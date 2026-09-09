@@ -671,6 +671,10 @@ static int vita_handles_evict(const char *abs_path) {
  * readJarEntry throws "JAR not found" (v01.23 regression hunt).
  * The root is queried at runtime with getcwd() so nothing is
  * hardcoded - it follows whatever vita_main.c chdir'd to. */
+/* Forward declaration: used by pcsl_file_open's O_TRUNC emulation
+ * (above) but defined next to the other unlink helpers (below). */
+static void vita_report_held(const char *op, const char *path);
+
 static void vita_resolve_path(const char *in, char *out, size_t outsz) {
     if (strchr(in, ':') != NULL || in[0] == '/') {
         /* already device-prefixed (ux0:, app0:...) or rooted */
@@ -779,11 +783,19 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
             sceIoClose(vf->fd);
             sceIoRemove(abs_path);
             vf->fd = sceIoOpen(abs_path, SCE_O_RDWR | SCE_O_CREAT, 0777);
-            if (vf->fd < 0) {
-                /* Old file still there (remove failed) - retry a
-                 * plain rw open so the handle at least stays valid,
-                 * and report failure like any open error. */
-                vf->fd = sceIoOpen(abs_path, SCE_O_RDWR, 0777);
+            if (vf->fd < 0 || sceIoLseek(vf->fd, 0, SCE_SEEK_END) != 0) {
+                /* Either the create-open failed, or the remove was
+                 * blocked by another in-process handle and the open
+                 * silently landed on the OLD non-empty file ("rb+"
+                 * never truncates - same corruption class the
+                 * truncate rewrite fixed). Do NOT hand out a handle
+                 * whose contents contradict the requested O_TRUNC:
+                 * close, report and fail the open honestly. */
+                vita_report_held("open(O_TRUNC)", abs_path);
+                if (vf->fd >= 0) {
+                    sceIoClose(vf->fd);
+                    vf->fd = -1;
+                }
                 free(vf);
                 return -1;
             }
@@ -881,6 +893,24 @@ int pcsl_file_write(void *handle, unsigned char *buf, long size) {
  * Treat that as success so storage_delete_file does not print noise, but
  * without hardcoding the code: probe with sceIoGetstat - if the path no
  * longer exists the unlink is considered done. */
+static void vita_report_held(const char *op, const char *path) {
+    static char seen[8][160];
+    static int seen_n = 0;
+    int i;
+    for (i = 0; i < seen_n; i++) {
+        if (strncmp(seen[i], path, sizeof(seen[0])) == 0) {
+            return;
+        }
+    }
+    if (seen_n < 8) {
+        strncpy(seen[seen_n], path, sizeof(seen[0]) - 1);
+        seen[seen_n][sizeof(seen[0]) - 1] = '\0';
+        seen_n++;
+    }
+    fprintf(stderr, "[pcsl] %s blocked, file open elsewhere: %s\n",
+            op, path);
+}
+
 static int vita_unlink_enoent_is_ok(const char *abs_path) {
     SceIoStat st;
     if (sceIoGetstat(abs_path, &st) >= 0) {
@@ -911,6 +941,7 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
              * as success. */
             return 0;
         }
+        vita_report_held("unlink", abs_path);
         /* The file still exists and the remove failed: ERROR_SHARING_VIOLATION
          * under Vita3K (it returns 0x80010002 for this too). v01.36 used to
          * evict same-path handles and retry here, which made the remove
@@ -1024,6 +1055,7 @@ int pcsl_file_truncate(void *handle, long size) {
      * fail honestly and let the caller see the error instead. */
     SceOff check = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
     if (!removed || check != 0) {
+        vita_report_held("truncate", vf->path);
         free(buf);
         return -1;
     }
