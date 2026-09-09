@@ -202,7 +202,14 @@ set(VITA_TITLEID  "J2ME00001")
 #   - build.sh: `make | tail` exit code came from tail - a failed
 #     make printed "Build successful" and shipped a stale VPK. Now
 #     pipefail.
-set(VITA_VERSION  "01.42")
+# v01.43: kill the residual "file in use" log triplet at the source -
+#   pcsl_file_unlink pre-checks the open-handle registry and SKIPS the
+#   sceIoRemove when one of OUR live handles holds the path (Windows/
+#   Vita3K cannot delete an in-process-open file anyway). Same honest
+#   failure for the caller, but Vita3K no longer logs
+#   "Cannot remove file / Error code: 32 / io_error_impl" every round
+#   for the live FFFFFFFF suite data.
+set(VITA_VERSION  "01.43")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar

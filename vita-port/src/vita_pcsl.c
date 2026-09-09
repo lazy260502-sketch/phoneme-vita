@@ -660,6 +660,26 @@ static int vita_handles_evict(const char *abs_path) {
     return evicted;
 }
 
+/* True when at least one of OUR registered handles still refers to
+ * abs_path with a live fd. pcsl_file_unlink uses this to SKIP the
+ * sceIoRemove it already knows must fail: Windows/Vita3K cannot delete
+ * a file with an in-process FILE* open (no FILE_SHARE_DELETE), and
+ * attempting it only feeds the emulator's 3-line "Cannot remove file /
+ * Error code: 32 / io_error_impl" complaint into vita3k.log. The
+ * caller still gets an honest failure - v01.37 semantics are untouched
+ * (the held file is LIVE suite data and must survive); only the
+ * emulator-side log noise is eliminated (v01.43). */
+static int vita_handles_held(const char *abs_path) {
+    int i;
+    for (i = 0; i < VITA_MAX_OPEN_FILES; i++) {
+        VitaFileHandle *vf = g_open_handles[i];
+        if (vf != NULL && vf->fd >= 0 && strcmp(vf->path, abs_path) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Relative-path resolution for raw sceIo* calls.
  * The VM class loader opens classpath jars via newlib stdio
  * (OsFile_vita.cpp -> jvm_fopen), which resolves relative paths
@@ -933,7 +953,21 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
     }
     char abs_path[600];
     vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
-    
+
+    /* v01.43: registry pre-check BEFORE the syscall. A live same-path
+     * handle means the file is open right here in this process - under
+     * Windows/Vita3K semantics the remove below can only fail with a
+     * sharing violation (Vita3K logs it as the scary "Error code: 32"
+     * triplet). That delete is never legitimate here: the v01.36 lesson
+     * proved the held FFFFFFFF files are the RUNNING suite's live RMS
+     * data and must survive. So skip the doomed syscall entirely and
+     * report the failure once via the breadcrumb - same return value
+     * the caller always saw, but Vita3K's log stays clean. */
+    if (vita_handles_held(abs_path)) {
+        vita_report_held("unlink", abs_path);
+        return -1;
+    }
+
     int result = sceIoRemove(abs_path);
     if (result < 0) {
         if (vita_unlink_enoent_is_ok(abs_path)) {
