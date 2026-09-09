@@ -1320,6 +1320,20 @@ int pcsl_file_getnextentry(void *handle, const pcsl_string *string,
         if (matchLen > 0 && strncmp(name, match_utf8, matchLen) != 0) {
             continue;
         }
+        /* v01.44: never return subdirectories. The upstream POSIX port
+         * relies on readdir()+stat; FFFFFFFF (suite id) directories
+         * under the appdb root matched the caller's match prefix, got
+         * handed back as "files", and midp_remove_suite's cleanup loop
+         * then passed them to pcsl_file_unlink. Removing a directory
+         * that an open RMS handle anchors is impossible on Windows
+         * (Vita3K logs it as the "Error code: 32" triplet) and pointless
+         * on a real device: the per-file iteration in
+         * rmsdb_remove_record_stores_for_suite + the storage iterator
+         * already delete every file inside first. Skip dirs so the
+         * cleanup loop only ever sees real files. */
+        if (entry.d_stat.st_attr & SCE_SO_IFDIR) {
+            continue;
+        }
 
         /* Found one: result = string[0 .. rootLength) + name */
         if (pcsl_string_substring(string, 0, it->rootLength, &rootpath)

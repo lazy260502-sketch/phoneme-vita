@@ -209,7 +209,12 @@ set(VITA_TITLEID  "J2ME00001")
 #   failure for the caller, but Vita3K no longer logs
 #   "Cannot remove file / Error code: 32 / io_error_impl" every round
 #   for the live FFFFFFFF suite data.
-set(VITA_VERSION  "01.43")
+# v01.44: pcsl_file_getnextentry no longer returns subdirectories.
+#   The b194 log proved the remaining "Error code: 32" came from the
+#   cleanup loop unlinking the appdb/FFFFFFFF DIRECTORY itself (it
+#   matched the iterator's prefix and was handed back as a file).
+#   Directories are skipped now (same filter getsizeoffilelist uses).
+set(VITA_VERSION  "01.44")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
