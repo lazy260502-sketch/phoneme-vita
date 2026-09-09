@@ -1,5 +1,92 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-08
+> Last Updated: 2026-09-09
+
+## 2026-09-09 v01.41：I/O 适配层系统性重审——Vita3K O_TRUNC 盲区是占用/EBADFD/慢的共同根因
+
+### 用户反馈（v01.40 实测无效）
+
+- 占用（Error 32）仍在、seek EBADFD 警告仍在——path 600 + truncate 兜底没治本。用户要求"好好分析下 io 是不是没适配好"。
+
+### 系统性对照结论（上游 pcsl posix/win32 vs 我们的 vita_pcsl.c vs Vita3K HLE 源码）
+
+逐函数读完三层后的**决定性发现**：
+
+1. **Vita3K `translate_open_mode()`（io/src/filesystem.cpp）没有 SCE_O_TRUNC 分支**——所有 open 都映射 `"rb+"`（master 与历史提交 345d807488 确认一致，用户 v0.2.1 同样中招）。`O_TRUNC` 被**静默丢弃**。
+2. 因此 v01.40 的 truncate（close→reopen(O_TRUNC)→写回）在 Vita3K 上**从未真正截断过**：保存的前缀覆盖了文件头部，**旧尾巴永久残留**；RMS compact 报告成功但垃圾记录头活在新逻辑尺寸之后 → 二启读损坏数据/慢；`pcsl_file_sizeofopenfile` 一直返回旧尺寸。**真机上 O_TRUNC 是生效的——这是模拟器特有的静默数据损坏**，也是 v01.40 日志分析看不见它的原因。
+3. Vita3K `close_file` 是同步 `std_files.erase(fd)`（shared_ptr<FILE> 即时 fclose）——排除"句柄延迟释放"假说；Error 32 = remove 时**确有另一个 Vita3K FILE\* 仍开着**（`_wfopen` 无 FILE_SHARE_DELETE，Windows 下进程内任何打开句柄都阻止删除）。我们的 truncate close→reopen 窗口 + `OPEN_READ_WRITE_TRUNCATE` 路径都是制造这种窗口的源头。
+4. `FileStats` 自带 `truncate()`（`_chsize_s`）且 io.cpp 有 `truncate_file()`，但**未挂到任何 sceIo 导出**（SceLibKernel 导出表无 sceIoTruncate）——真机也无此 syscall，不能依赖。
+5. 上游 win32 pcsl：truncate=`_chsize(fd)`（不动 fd）、close 先 commitwrite——语义参考；Vita 无对应 syscall，只能重建文件。
+6. RMS 栈事实（排除项）：`storage_open` 返回 `(int)handle`（指针截断，ARM32 无损，仅日志噪音）；`ENABLE_RECORDSTORE_FILE_LOCK=1` 已启用；Java 侧 `RecordStoreFile.close` 有 `handle=-1` 防护（396-401 行）；`storageCleanup` finalize 依赖该字段防 double-close——Java 层句柄生命周期健康，问题全在 pcsl 语义层。
+
+### v01.41 修复（vita-port 提交 1204cac）
+
+- `pcsl_file_truncate`：close→**remove→create(O_RDWR|O_CREAT)→校验新文件为 0 字节→写回**。校验失败（remove 被共享冲突挡掉）就诚实报错，不再静默损坏。真机/模拟器行为一致（remove+create 在两边都真正清空）。
+- `pcsl_file_open`：带 `SCE_O_TRUNC` 打开成功且文件非空时，同样 close→remove→create 仿真（`storage_open` 的 `OPEN_READ_WRITE_TRUNCATE` 路径，suitestore 临时文件复用场景）。
+- `pcsl_file_seek/read/write/sizeofopenfile`：fd<0 快速失败 + 一次性 stderr 面包屑（`[pcsl] seek on dead handle '<path>'`）——EBADFD 系统调用噪音在源头掐断，且下次复现能直接定位肇事路径。
+
+### 预期与验证点（等用户实测）
+
+- 二启不再卡数据初始化（RMS compact 真正生效，垃圾尾巴没了）。
+- seek EBADFD 警告应消失或变成一条可定位的 stderr 面包屑。
+- 占用（Error 32）应大幅减少：truncate 不再有 O_TRUNC reopen 窗口；若仍有，剩下的就是 midp_file_cache flush 时序，届时再查。
+- 慢：本地缓存恢复后 UC 应明显变快（不再每次全量重下）。
+
+### 教训（补充进方法论）
+
+1. **模拟器的 syscall 语义要用它的源码验证，不能按 POSIX 直觉假设**——`translate_open_mode` 一共 20 行，读了就绝不会写出依赖 O_TRUNC 的代码。
+2. "修了报错但没好"时，下一步不是再修报错，而是**找没报错的静默失败**（O_TRUNC 被丢弃时不报任何错）。
+3. 跨平台文件操作的正确性锚点是"**这个序列在两个平台都产生相同的磁盘状态**"，不是"这个调用在 POSIX 语义下正确"。
+
+## 2026-09-09 v01.40：EBADFD(0x80010051) seek 风暴 = 句柄路径截断；真机 0x8010113D 仍开放
+
+### v01.39 实测结论（用户确认）
+
+- ✅ 不再卡死、二启正常启动——调度器忙转修复生效。
+- ⚠️ 还是慢；vita3k.log 出现 `seek_file (_sceIoLseek) returned 0x80010051`，UC 无法读本地缓存。
+- ❌ 真机安装仍报 0x8010113D（v01.30 的 MEMSIZE 修复没解决真机问题）。
+
+### EBADFD 根因（v01.40 修复）
+
+- 0x80010051 = errno 81 = EBADFD。Vita3K seek_file 只在 fd<0 或 fd 不在打开表时返回它——**phoneME 拿着死 fd 在 seek**。
+- 链条：`VitaFileHandle.path[256]` 太短 → UC 深层缓存路径被 strncpy 截断 → RMS compact 走 `pcsl_file_truncate`（close→reopen O_TRUNC）→ reopen 打开**不存在的截断路径**失败 → `vf->fd=-1` 但 handle 仍被 Java 层持有 → 之后每次 seek/read 都是 `sceIoLseek(负fd)`=EBADFD → **UC 本地缓存永久失效，每次启动全走网络**（"太慢"的真因之一）。
+- 修复（vita-port 提交 6e9be4b）：path 扩到 600（与 abs_path 同宽）；truncate reopen 失败时用无 O_TRUNC 重开兜底恢复 fd（truncate 本身仍报失败，但句柄不再半死）。
+
+### 真机 0x8010113D 排查记录（未解决，需分流实验）
+
+- 已排除：①eboot.bin 与 `vita-make-fself -s -c`（无 -m）参考输出**逐字节一致**（CMP 验证）；②param.sfo 与 VitaSDK 默认输出一致（ATTRIBUTE=32768 是所有 homebrew 的 mksfoex 默认值，非异常）；③VPK 结构完整（livearea/icon/template 齐全，13.8MiB 压缩）。
+- 待做的 A/B 实验（按成本排序）：
+  1. 用 VitaSDK 官方 samples 的 hello_world.vpk 装真机——若也失败，是**真机环境问题**（Hen 版本/存储/安装方式），与本 VPK 无关；
+  2. 若 hello_world 能装：做一个"hello 壳+我们的 eboot.bin"混装 VPK 定位是 eboot 还是资源问题；
+  3. 检查真机 Hen（h-encore 版本对 fself -c 的兼容性）与安装途径（VitaShell 复制 ux0:/vpk 后安装 vs FTP 直装）。
+- 教训：模拟器能装 ≠ 真机能装；但**先验证对照样本**再怀疑自己，避免又是 MEMSIZE 式的误判。
+
+## 2026-09-08 v01.39：调度器忙转根因——os_port.cpp 超时条件抄反（ms == 0 应为 ms != 0）
+
+### 症状与诊断路径
+
+- UC 症状链：一启正常（能开 m.baidu.com）→ 退出卡住 → 强关窗口 → 二启卡在数据初始化、fps=1、极卡。
+- 决定性证据组合：
+  - `runmidlet_debug.log`：**2 次 ENTRY、0 次 RETURNED**——`midp_run_midlet_with_args_cp` 从未返回，VM 轮次没正常走完；
+  - `input_debug.log` 二启会话：心跳 #1→#8193（约 840 万次事件泵调用）无触摸——**VM 活着但全速空转**；
+  - `midp_stderr.log`：二启网络全通（连到 m.baidu.com/ms.bdstatic.com），说明 UC 引导走完，卡在初始化阶段。
+
+### 根因（确定 bug，非猜测）
+
+- `phoneme-cldc/src/anilib/vita/os_port.cpp` 的 `Os_WaitForEventOrTimeout`：上游 `anilib/linux/os_port.cpp` 是 `if (ms != 0)`（基于 gettimeofday 算绝对超时），**Vita 移植时抄成 `if (ms == 0)`**——`ms > 0` 时 timespec 恒为 `{0,0}`（1970-01-01）→ `pthread_cond_timedwait` 立即 ETIMEDOUT。
+- 后果链：`JVMSPI_CheckEvents`（vita_checkevents.c）把 ANI 等待 clamp 到 50ms → `ANI_WaitForThreadUnblocking` → `PoolThread_WaitForFinishOrTimeout(…, 50)` → 立即返回 → 调度器**永不真正睡眠**，50ms 等待变成 0ms 忙循环 → CPU 烧满、fps=1、心跳计数狂奔、UC 初始化被拖死。基线提交 98b12b5 就带此 bug（git show 确认）。
+
+### 修复（v01.39）
+
+- `os_port.cpp`：`if (ms == 0)` → `if (ms != 0)`（+注释说明来历），phoneme-cldc 提交 5956a99。
+- 重编：`cd build/vita_arm/target/release && make CLDCBUILD=fp ENABLE_ENABLING_CHECK=false os_port.o`（用体系自身的 release 配方，`arm-vita-eabi-g++`，注意 build/vita_arm/dist/lib 下的 `g++` 同为交叉编译器符号链接）。
+- 重打包：在 `dist/lib` 内 `arm-vita-eabi-ar r libcldc_vm_ani.a <新os_port.o>`、同法 `_r` 变体（vita-port 链接的是 `libcldc_vm_ani`/`_anix`）。
+- 验证：velf `.text` 内 `Os_WaitForEventOrTimeout` 指令流为 `bl gettimeofday; orrs r3,r6,r8; streq…; beq`——与库内修复版逐指令一致。VPK=build/cmake/midp_vita.vpk（APP_VER 01.39）。
+
+### 教训
+
+1. **移植平台代码时逐字符对照上游**：一个 `==`/`!=` 抄反在 pthread 超时路径上不报错、不崩，只表现为"性能差/卡顿"，极难归因。凡从上游复制的函数，落地前 diff 一遍原版。
+2. **心跳计数是免费的性能仪表**：input_debug 心跳每 1024 次泵一条，速率异常（百万级 vs 预期 ~2万/分钟）直接暴露忙转。
+3. 待观察：退出卡死（一启退出挂住）是否同根因（忙转下 ANI/pthread 竞态）或另有独立原因——v01.39 实测后若退出仍卡，下一嫌疑是 SVM 模式 MIDletDestroyTimer 失效（上游注释明说 timer 在 SVM 不工作）与 EventQueue.shutdown 等待链。
 
 ## 2026-09-08 v01.38：UC 数据初始化慢的 I/O 放大器（debug_log）+ 网络修复实测确认
 
