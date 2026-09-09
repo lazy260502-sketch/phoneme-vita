@@ -1,6 +1,31 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-09
 
+## 2026-09-09 v01.42：6 小时长会话 Vita3K 闪退——菜单循环累积内存泄漏（vita-port 提交 503cd4b）
+
+### 用户报告（b188 实测）
+
+- "vita3k 直接闪退了"。时间线：17:49 启动 Vita3K → 安装 VPK → UC **完整正常一轮**（联网 OK、vmStatus=2001 MAIN_EXIT 干净退出、回菜单）→ 用户构建为 04:30 的 b188（v01.41 核心但**无 v01.41a fd 泄漏修复**）→ vita3k.log 尾部停在 [00:02:20.513] input_debug.log 打开（约 6 小时 13 分后），闪退。
+
+### 根因排查（坐实）
+
+1. **`menu_fb` 每轮 2MB 泄漏**（vita_menu.c:1380）：`vita_menu_run` 每次进菜单 `memalign(2MB)` 直接覆盖 static 指针，旧块永不释放。注释声称"每进程 2MB 可接受"——但代码是**每轮**执行，菜单↔游戏切换 N 轮 = N×2MB。修复：`if (menu_fb == NULL)` 才分配，进程生命周期复用。
+2. **icon 纹理覆盖泄漏**：`icon_cache_restore_kept()` 把上一轮的解码纹理放回 `icon_pix[]` 槽位后，`scan_games()` 的 cache-hit/miss 两条路径的 `vita_icon_decode_png(&icon_pix[idx],...)` 直接覆盖指针不 free——每游戏每轮漏一张 icon（~16-64KB）。修复：decode 前 free 旧槽位。
+3. **次要结论**：b188 无 v01.41a 修复，O_TRUNC 恢复路径的 fd 泄漏（open 成功后 free 未 close）会在多轮后累积孤儿 FILE*——Error 32 与资源消耗的放大器。v01.41a（8a4db28）已修。
+4. **debug_log.txt 之谜定论**：用户 b188 日志有 debug_log.txt 写入（open/write/close 每次重开模式）但 git 历史中 b188/b189/b190 的 `VITA_FILE_DEBUG` 都是 0——04:30 构建发生在 1204cac 提交前，构建时工作区临时开着 `=1`，提交时改回 0。**构建产物与提交内容可能不一致，横幅只保证 HEAD，不保证工作区干净**。教训：构建前 `git status` 确认干净。
+5. **image_wash 双重前缀疑云排除**：摘要中的 "app0:ux0:/..." 证据实为 09-05 v01.32 时代的老分析残留；b188 的 `pcsl_file_exist` 已正确做前缀交换（本轮日志唯一 Missing file 是 vm_boot.log 探测，正常）。
+6. **vita_stubs.c 旧双实现确认不碍事**：`phoneme-midp/src/vita_stubs.c` 是旧 pcsl 实现（无条件 debug_log、path[256]、`app0:%s` 裸拼接），其 .o 在 phoneme-midp 构建树存在但**不在任何链接的 .a 里**（libobj.a/libpcsl_file.a 均不含）；当前 velf 的 pcsl 符号单一定义且为新代码。
+
+### 附带修复
+
+- **build.sh pipefail**：`make | tail -20 || {...}` 的退出码来自 tail——make 失败也打印 "Build successful"（05:16 事故根因）。已加 `set -o pipefail`。
+
+### 验证与遗留
+
+- v01.42 b192 构建成功，版本横幅与 HEAD 一致；待用户长会话复测（菜单↔游戏多轮 + 挂数小时）。
+- 闪退若仍复现：向用户要 vita3k.log 被省略段（592-18790 行）的尾部 ~50 行 + 是否在 [00:02] 启动了第二轮游戏。
+- 6 小时菜单空转的 Vita3K 侧资源累积（host 侧）仍是候选——若 b192 仍闪退且时间点与游戏轮次无关，转向模拟器本体。
+
 ## 2026-09-09 v01.41：I/O 适配层系统性重审——Vita3K O_TRUNC 盲区是占用/EBADFD/慢的共同根因
 
 ### 用户反馈（v01.40 实测无效）
