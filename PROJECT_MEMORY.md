@@ -1881,3 +1881,34 @@ Vita3K 日志位置:
   硬编码 GW=20 GH=22 STRIDE=3 DATA_OFF=40，fb_glyph 查 5 个区段返回 1bpp 位图指针，
   draw_chars 直接 blit。fontbitmap.bin 由 tools/fontgen.c 生成（覆盖 ASCII+CJK+punct+
   fullwidth+gen 共 21180 字形），打包进 VPK。
+
+## 2026-09-09 v01.44：Error 32 终局定案（b195, 22f5ffc）
+
+### 用户 vita3k.log 全量取证结论（17:49-00:02 会话，~2 万行）
+1. **设备上的二进制不是 b194**。指纹：日志中每次文件 open 前后出现
+   `debug_log.txt` 的 64B+22B 写入 = vita_pcsl.c `VITA_FILE_DEBUG=1` 的
+   `[file_open] path=ux0:/data/J2ME00001/appdb/FFFFFFFF flags=0x2`（64B）
+   + `[file_open] ok direct\n`（22B）。v01.38 (44e7e71, 9-08 12:12) 才把
+   该开关置 0，b194 ELF 无 "debug_log.txt" 字符串。用户 17:49/20:17 装的
+   VPK 是 pre-v01.38 的 debug 构建（8-31 04:30 时代）。
+2. **Error 32 的真实删除目标是目录本身**：`ux0:/data/J2ME00001/appdb/FFFFFFFF`
+   （suite id 目录，无文件名后缀）。链路：midp_remove_suite 清理循环 →
+   storage_get_next_file_in_iterator → 我们的 pcsl_file_getnextentry
+   不跳过子目录 → FFFFFFFF 目录被当文件返回 → storage_delete_file →
+   pcsl_file_unlink(目录)。Windows 下目录被 RMS 句柄锚定必然拒绝 →
+   Error 32 ×2（ux0 + Vita3K 内部 app0 fallback）。
+3. **崩溃日志也是旧二进制的**：00:01:37.746 EXCEPTION_ACCESS_VIOLATION
+   PC=0x8103350e（用 b194 addr2line 解析为 Graphics_drawArc，但旧二进制
+   地址空间不同，仅供定位参考）。Vita3K exception_handler 记录后进程继续，
+   崩溃后句柄生命周期错乱 → remove 执行 → Error 32。v01.42 后未再复现 6h
+   闪退，b194/v01.44 上是否仍崩需复测。
+4. **正常退出路径（17:56 会话）同一旧二进制无 Error 32**：v01.37 evict 语义
+   命中后 remove 重试成功。Error 32 只在崩溃/异常路径出现。
+5. b194 的 v01.43 预检查本身工作正常（拦截活句柄路径），但覆盖不到
+   "目录被当文件删" —— 这是 v01.44 (22f5ffc) 修的：getnextentry 加
+   `entry.d_stat.st_attr & SCE_SO_IFDIR` 跳过（与 getsizeoffilelist 同款过滤）。
+
+### 验金方法（防再犯）
+- 判定设备二进制版本：看菜单右上角 `vXX.XX bNN (hash)`，或 vita3k.log 中
+  有无 per-open `debug_log.txt` 写入（有 = pre-v01.38）。
+- b194 产物验证：`strings build/cmake/midp_vita | grep debug_log.txt` = 0。
