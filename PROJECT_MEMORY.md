@@ -1,6 +1,29 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-09
 
+## 2026-09-09 v01.43：消除残留的「占用」日志三连——unlink 前查注册表跳过注定失败的 remove（vita-port 提交 547a471）
+
+### 用户报告（v01.42 实测）
+
+- "文件占用问题还是存在"。实测 VPK 已是 b192（stderr 横幅 `v01.42 b192 (503cd4b)` + `[pcsl] unlink blocked, file open elsewhere: ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFF` 面包屑生效），UC 全程正常（联网、vmStatus=2001 干净退出）。
+- 注意：用户附的 vita3k.log 是旧文件（Downloads\windows-latest 遗留副本：17:49→00:02 那次 6 小时会话、Version: 1.28、debug_log.txt 写入全是 b188 特征），不要拿它对照新构建。
+
+### 现状定论
+
+- 唯一残留的"占用" = `rms/appdb_1A35/FFFFFFFF*`（internal suite -1 的活 RMS 数据）被 phoneME 的 suite 清理逻辑 unlink，而 UC 自己的句柄还开着 → Windows/Vita3K 无 FILE_SHARE_DELETE 必失败（Error 32 三行噪音，v01.36 已实锤）。
+- v01.37 的"如实报失败"在功能上是对的（数据活着、UC 正常），代价是每轮三行装饰性日志。
+
+### 修复（v01.43）
+
+- `pcsl_file_unlink` 在调 sceIoRemove **之前**先查 `g_open_handles` 注册表（新 `vita_handles_held()`）：本进程有同路径活句柄 → 直接跳过注定失败的 syscall，`vita_report_held` 打一条面包屑后返回 -1。
+- 语义与 v01.37 完全一致（调用方拿到同样的失败、文件照样保住），只是 Vita3K 再也看不到这次删除——三行噪音从源头消失。
+- 注册表由 open/close 维护，路径是 resolve 后的绝对路径，与 unlink 的 abs_path 同源，不会误判。
+
+### 验证
+
+- v01.43 b194 (547a471) 构建成功。预期：下一轮日志中 `[pcsl] unlink blocked` 面包屑仍在（每路径一条），Vita3K 日志中 `Cannot remove file / Error code: 32 / io_error_impl` 三连消失。
+- 若用户仍报"占用"：需要用户提供新的 vita3k.log 确认三连是否消失，以及面包屑出现次数。
+
 ## 2026-09-09 v01.42：6 小时长会话 Vita3K 闪退——菜单循环累积内存泄漏（vita-port 提交 503cd4b）
 
 ### 用户报告（b188 实测）
