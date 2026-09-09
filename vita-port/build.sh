@@ -71,6 +71,11 @@ cmake -S "$PORT_DIR" -B "$BUILD_DIR" \
     tail -30 /tmp/vita_port_cmake.log
     exit 1
 }
+# pipefail: without it the exit status of `make | tail` comes from tail,
+# so a FAILED make still printed "Build successful" and shipped a stale
+# VPK (2026-09-09 05:16 incident: 05:16 build failed, the 05:24 VPK was
+# rebuilt, but the pattern stays a trap).
+set -o pipefail
 make -C "$BUILD_DIR" -j4 2>&1 | tail -20 || {
     echo "make failed, full log:"
     make -C "$BUILD_DIR" 2>&1 | tail -40

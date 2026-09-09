@@ -1222,6 +1222,12 @@ static void scan_games(void) {
             }
             /* decode icon from the cached PNG bytes (cheap, no jar IO) */
             if (icon_png_len_c > 0 && icon_png != NULL) {
+                /* restore_kept() may have parked last round's texture
+                 * here: free it before decode overwrites the pointer
+                 * (leaks one icon per game per round otherwise). */
+                free(icon_pix[game_count]);
+                icon_pix[game_count] = NULL;
+                icon_w[game_count] = icon_h[game_count] = 0;
                 if (vita_icon_decode_png(icon_png,
                                          (unsigned long)icon_png_len_c,
                                          &icon_pix[game_count],
@@ -1273,6 +1279,12 @@ static void scan_games(void) {
              * directory and fall back to the best MIDlet-ish class;
              * persist the fix in game.cfg */
             validate_game_class(g, 1);
+            /* cache-miss path decodes straight into icon_pix[idx]:
+             * same overwrite-leak guard as the cache-hit path above
+             * (restore_kept() parks old textures in these slots). */
+            free(icon_pix[game_count]);
+            icon_pix[game_count] = NULL;
+            icon_w[game_count] = icon_h[game_count] = 0;
             icon_load(g, game_count);
 
             /* keep this scan's decoded texture alive across the rescan
@@ -1377,7 +1389,15 @@ int vita_menu_run(VitaGameSel *out) {
     int have_selection = 0;
     char msg[120] = "";
 
-    menu_fb = (uint32_t *)memalign(0x100, FB_W * FB_H * 4);
+    /* Allocate ONCE per process and reuse across rounds: menu_fb is a
+     * static, so a plain memalign here used to overwrite the pointer
+     * every round, leaking the old 2MB block (6h session with several
+     * menu<->game rounds = tens of MB gone). The "no free on exit"
+     * policy below only ever meant "don't hand the block back while
+     * the display still scans it out" - it never justified leaking. */
+    if (menu_fb == NULL) {
+        menu_fb = (uint32_t *)memalign(0x100, FB_W * FB_H * 4);
+    }
     if (menu_fb == NULL) {
         return 0;
     }
@@ -1556,6 +1576,7 @@ int vita_menu_run(VitaGameSel *out) {
      * still scans it out until the VM installs its own framebuffer, and
      * handing those pages back to malloc let the VM heap overwrite them -
      * garbage on screen during startup (v01.27 "no picture" symptom).
-     * 2MB once per process is an acceptable cost of the round-loop menu. */
+     * The block itself lives for the whole process now (see the alloc
+     * above): nothing is leaked per round anymore. */
     return have_selection;
 }

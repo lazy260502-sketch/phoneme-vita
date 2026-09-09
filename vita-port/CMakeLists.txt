@@ -188,7 +188,21 @@ set(VITA_TITLEID  "J2ME00001")
 # NOTE: real-device 0x8010113D still unresolved; eboot.bin verified
 #   byte-identical to a clean `vita-make-fself -s -c` (no -m) and the
 #   SFO matches VitaSDK defaults - needs A/B testing on hardware.
-set(VITA_VERSION  "01.41")
+# v01.41a: fd leak fix in the O_TRUNC open recovery (close the new fd
+#   before free on the failure path) + held-file stderr breadcrumbs.
+# v01.42: long-session memory leaks - the 6h Vita3K crash hunt
+#   - menu_fb: vita_menu_run() memalign'd 2MB EVERY round and the
+#     static pointer overwrite leaked the old block (comment claimed
+#     "once per process" but the code ran per round). Allocate once,
+#     reuse across rounds.
+#   - icon textures: restore_kept() parks last round's decoded icons
+#     in icon_pix[]; both scan_games paths decoded straight into the
+#     slot, overwriting (and leaking) the parked texture. Free before
+#     decode.
+#   - build.sh: `make | tail` exit code came from tail - a failed
+#     make printed "Build successful" and shipped a stale VPK. Now
+#     pipefail.
+set(VITA_VERSION  "01.42")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
