@@ -600,7 +600,12 @@ pcsl_string_status pcsl_esc_extract_attached(const pcsl_string *escaped,
  */
 typedef struct {
     int fd;  /* Vita file descriptor */
-    char path[256];  /* File path for debugging */
+    char path[600];  /* Full resolved path, same size as abs_path buffers.
+     * Was 256: deep UC cache paths got silently truncated by strncpy,
+     * then pcsl_file_truncate's close+reopen opened a NONEXISTENT path,
+     * left fd=-1, and every later seek/read on the still-live handle
+     * returned EBADFD (0x80010051) - UC could no longer read its local
+     * cache and fell back to full network reloads ("too slow"). */
 } VitaFileHandle;
 
 /* Open-handle registry: POSIX allows unlinking an open file (the name
@@ -945,6 +950,15 @@ int pcsl_file_truncate(void *handle, long size) {
     sceIoClose(vf->fd);
     vf->fd = sceIoOpen(vf->path, SCE_O_RDWR | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (vf->fd < 0) {
+        /* Reopen-with-truncate failed (historically: path truncated to
+         * 256 bytes; also possible sharing violation). Nothing was
+         * modified yet - the original bytes are still on disk - but the
+         * old fd is already gone. Recover a usable fd WITHOUT O_TRUNC so
+         * the handle stays valid for later reads/seeks; report the
+         * truncate failure itself to the caller as before. Without this
+         * recovery every subsequent pcsl_file_seek on this handle hit
+         * sceIoLseek(fd<0) = EBADFD (0x80010051) forever. */
+        vf->fd = sceIoOpen(vf->path, SCE_O_RDWR, 0777);
         free(buf);
         return -1;
     }

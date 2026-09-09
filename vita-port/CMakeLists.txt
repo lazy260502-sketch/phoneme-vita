@@ -158,14 +158,19 @@ set(VITA_TITLEID  "J2ME00001")
 #         zero benefit. Net effect: UC data-init is much faster and
 #         the remaining sharing-violation lines are one group per
 #         protected suite file (expected, harmless).
-# v01.39: anilib/vita os_port.cpp Os_WaitForEventOrTimeout condition fix
-#   (upstream is "ms != 0", Vita port had "ms == 0" - for any positive
-#    timeout the timespec stayed {0,0}=epoch so pthread_cond_timedwait
-#    returned ETIMEDOUT immediately; the scheduler's 50ms event-pump
-#    wait degenerated into a busy loop: fps=1, heartbeat counter
-#    racing (#1..#8193+), UC init crawl. Also rebuilt os_port.o and
-#    repacked libcldc_vm_ani.a / libcldc_vm_ani_r.a.)
-set(VITA_VERSION  "01.39")
+# v01.40: EBADFD (0x80010051) seek storm fix
+#   - VitaFileHandle.path was 256 bytes: deep UC cache paths were
+#     silently truncated; pcsl_file_truncate's close+reopen then opened
+#     a nonexistent path, left fd=-1, and every later seek on the
+#     still-live handle returned EBADFD - UC lost its local cache and
+#     re-downloaded everything ("too slow"). path now 600 bytes (same
+#     as the abs_path buffers).
+#   - truncate reopen failure now recovers a usable fd (no O_TRUNC)
+#     so the handle never stays half-dead.
+# NOTE: real-device 0x8010113D still unresolved; eboot.bin verified
+#   byte-identical to a clean `vita-make-fself -s -c` (no -m) and the
+#   SFO matches VitaSDK defaults - needs A/B testing on hardware.
+set(VITA_VERSION  "01.40")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
