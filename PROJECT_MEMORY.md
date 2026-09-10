@@ -1913,29 +1913,43 @@ Vita3K 日志位置:
   有无 per-open `debug_log.txt` 写入（有 = pre-v01.38）。
 - b194 产物验证：`strings build/cmake/midp_vita | grep debug_log.txt` = 0。
 
-## 2026-09-10 b195 首份用户 stderr 复盘：一切符合预期
+## 2026-09-10 v01.45：b195 残余 Error 32 定案（truncate 换file踩孪生句柄）
 
-### 用户 midp_stderr.log（v01.44 b195, c8191bc）逐条解释
-1. **版本指纹滞后是构建时序问题，不是装错包**：`version:` 行读的是
-   GenVersion.cmake 在构建时刻的 git HEAD。b195 VPK 构建于 09-09 11:56，
-   而 v01.44 提交 22f5ffc 在 11:58 才打 → hash 停在上一个 c8191bc。
-   **代码确认是 v01.44**：日志里 `[pcsl] unlink blocked` 面包屑 v01.43
-   才引入，且 APP_VER 01.44 来自手动 VITA_VERSION。教训：VPK 要在提交
-   后再构建，否则指纹滞后一代（本次已重建为 b197/de6e6f7 对齐）。
-2. **`[pcsl] unlink blocked, file open elsewhere: .../rms/appdb_1A35/FFFFFFFF`
-   是预检查在工作，不是 Error 32**：sceIoRemove 根本没执行，Vita3K 日志
-   干净。被拦目标是**文件**（2616B，`midp-rms` 魔数完好，1 条活记录）——
-   internal suite（id=-1→hex FFFFFFFF）的合法 RMS db，record store 名为
-   空 → 路径 = root + suiteHex + ""（buildSuiteFilename nameLen=0 分支），
-   没有 .db 后缀是**正常形态**。UC 启动时 RMS 句柄持有它，MIDP 框架某处
-   （可能是 listRecordStores 后的清理）对它发起 unlink，预检查拦截 → 返回
-   -1 → RMS 数据完整保留。这正是 v01.36 教训要的保护语义。
-3. **网络全链路健康**：DNS + connect 全部成功（fd 复用正常），此前的
-   4 条 net 错误未再出现。
-4. b195 复测遗留：模拟器长跑 Error 32、真机安装、6h 闪退（drawArc）。
+### 用户 vita3k.log 铁证（23:55:33）
+```
+|E| [remove_file]: Cannot remove file: .../rms/appdb_1A35/FFFFFFFF
+|E| [remove_file]: Error code: 32
+|W| [io_error_impl]: remove_file (sceIoRemove) returned 0x80010002
+```
+sceIoRemove **真的执行了** → 不可能来自 pcsl_file_unlink（v01.43 预检查
+拦截时不发 syscall）。穷举全部 7 个 sceIoRemove 调用点后锁定：
+**pcsl_file_truncate 的 remove+create 换file**（pcsl_file_open 的 O_TRUNC
+仿真同款问题）。此前的"b195 不会再有 Error 32"判断是错的。
 
-### 关键结论
-- "Error 32" 场景下我们的 stderr 面包屑 `[pcsl] unlink blocked` 是**良性**
-  证据（预检查拦截），与 Vita3K io_error 的 Error 32 三连是两回事。
-- 裸 FFFFFFFF 文件（无后缀）在 per-game appdb_XXXX/ 下 = 空 record store
-  名的 RMS db，**不要**当成异常产物去删。
+### 根因：空名 store 的 db/idx 孪生句柄同路径
+- `buildSuiteFilename`（rms.c）只在 store 名非空时追加 `.db/.idx` 后缀；
+  nameLen==0 时**忽略 extension 参数** → db 句柄和 idx 句柄打开的是
+  **同一条路径** `appdb_XXXX/FFFFFFFF`（RecordStoreImpl 构造 dbFile 后
+  立即构造 RecordStoreIndex → idx 文件；POSIX 下同文件双开合法）。
+- truncate 换file流程只关自己的 fd → sceIoRemove → **孪生 idx 句柄仍
+  锚定名字** → Vita3K（_wfopen 无 FILE_SHARE_DELETE）拒绝 → Error 32。
+- v01.41 的后验检查已把 swap 判失败返回 -1（fd 落回旧文件），syscall
+  却已发出 → 日志噪音；且面包屑去重只按路径 → 该路径启动时已报过
+  "unlink blocked"，23:55 的 "truncate blocked" 被**静默吞掉**，
+  stderr 与 vita3k.log 对不上号。
+
+### v01.45 修复（71a6ce0）
+1. 新增 `vita_handles_held_ex(path, self)`（排除自己的 held 检查）：
+   `pcsl_file_truncate` 与 O_TRUNC 仿真在换file**前**预检查，孪生句柄
+   存在 → 直接 -1 + 面包屑，不发注定失败的 syscall，不再空关 fd。
+2. `vita_report_held` 去重键改为 **op+path**（原只按 path，会吞掉
+   同路径不同操作的证据）。
+- 对调用者返回值与 v01.41~44 一致（-1）；真机 POSIX 语义下该 swap 本可
+  成功，现被预检查拦下属保守策略——真机实测若有 truncate 失败再议。
+
+### 教训（防再犯）
+- **"不会再有 Error 32" 类断言前必须穷举 syscall 出口**：预检查只护住
+  pcsl_file_unlink，truncate 换file / O_TRUNC 仿真两处直发 sceIoRemove。
+- 面包屑去重维度必须包含操作类型，否则吞掉后续不同操作的证据。
+- stderr 面包屑与 vita3k.log 时间线**对不上号本身就是线索**（本案：
+  23:55 有 syscall 无面包屑 → 去重吞了或来源未埋点 → 两样都查）。
