@@ -214,7 +214,21 @@ set(VITA_TITLEID  "J2ME00001")
 #   cleanup loop unlinking the appdb/FFFFFFFF DIRECTORY itself (it
 #   matched the iterator's prefix and was handed back as a file).
 #   Directories are skipped now (same filter getsizeoffilelist uses).
-set(VITA_VERSION  "01.44")
+# v01.45: the b195 stderr/vita3k pair exposed TWO residual issues.
+#   (a) Root cause of the 23:55 Error-32: an EMPTY-NAMED record store
+#       gets NO .db/.idx suffix (buildSuiteFilename ignores the
+#       extension when nameLen==0), so its db handle AND idx handle sit
+#       on the SAME path (legal on POSIX). pcsl_file_truncate's
+#       remove+create swap closes only its own fd - the twin handle
+#       still anchors the name, Vita3K refuses the remove, and the
+#       swap must be aborted. Same guard added to pcsl_file_open's
+#       O_TRUNC emulation. Both now check vita_handles_held BEFORE
+#       touching the name and fail fast (no doomed sceIoRemove).
+#   (b) vita_report_held deduped breadcrumbs by PATH only, so the
+#       later "truncate blocked" for a path already reported as "unlink
+#       blocked" was swallowed and the stderr trail went cold. Dedup
+#       key is now op+path.
+set(VITA_VERSION  "01.45")
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar

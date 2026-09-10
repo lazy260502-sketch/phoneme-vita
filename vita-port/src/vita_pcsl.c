@@ -680,6 +680,24 @@ static int vita_handles_held(const char *abs_path) {
     return 0;
 }
 
+/* v01.45: held-by-ANOTHER-handle variant for the truncate/O_TRUNC
+ * swap paths. pcsl_file_truncate legitimately holds its own handle
+ * on the path it is about to swap - the question there is whether a
+ * TWIN handle (e.g. the idx handle of an empty-named record store,
+ * which shares the db's suffix-less path) would anchor the name
+ * through the remove. Same registry walk, one exclusion. */
+static int vita_handles_held_ex(const char *abs_path, VitaFileHandle *self) {
+    int i;
+    for (i = 0; i < VITA_MAX_OPEN_FILES; i++) {
+        VitaFileHandle *vf = g_open_handles[i];
+        if (vf != NULL && vf != self && vf->fd >= 0 &&
+            strcmp(vf->path, abs_path) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Relative-path resolution for raw sceIo* calls.
  * The VM class loader opens classpath jars via newlib stdio
  * (OsFile_vita.cpp -> jvm_fopen), which resolves relative paths
@@ -800,6 +818,17 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
          * of the file exists in-process. */
         SceOff sz = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
         if (sz > 0) {
+            /* v01.45: same twin-handle pre-check as pcsl_file_truncate -
+             * if another live handle holds this path, the swap's
+             * sceIoRemove is doomed (Error 32). Fail the open honestly
+             * instead of feeding the emulator a doomed syscall. */
+            if (vita_handles_held_ex(abs_path, vf)) {
+                vita_report_held("open(O_TRUNC)", abs_path);
+                sceIoClose(vf->fd);
+                vf->fd = -1;
+                free(vf);
+                return -1;
+            }
             sceIoClose(vf->fd);
             sceIoRemove(abs_path);
             vf->fd = sceIoOpen(abs_path, SCE_O_RDWR | SCE_O_CREAT, 0777);
@@ -914,17 +943,21 @@ int pcsl_file_write(void *handle, unsigned char *buf, long size) {
  * without hardcoding the code: probe with sceIoGetstat - if the path no
  * longer exists the unlink is considered done. */
 static void vita_report_held(const char *op, const char *path) {
-    static char seen[8][160];
+    /* v01.45: dedup key is op+path, not path alone. Path-only dedup
+     * swallowed the 23:55 "truncate blocked" for a path already
+     * reported as "unlink blocked" at startup, and the stderr trail
+     * could no longer be matched against Vita3K's remove_file lines. */
+    static char seen[8][176];
     static int seen_n = 0;
     int i;
     for (i = 0; i < seen_n; i++) {
-        if (strncmp(seen[i], path, sizeof(seen[0])) == 0) {
+        if (strncmp(seen[i], op, 15) == 0 &&
+            strncmp(seen[i] + 16, path, sizeof(seen[0]) - 17) == 0) {
             return;
         }
     }
     if (seen_n < 8) {
-        strncpy(seen[seen_n], path, sizeof(seen[0]) - 1);
-        seen[seen_n][sizeof(seen[0]) - 1] = '\0';
+        snprintf(seen[seen_n], sizeof(seen[0]), "%-15s %s", op, path);
         seen_n++;
     }
     fprintf(stderr, "[pcsl] %s blocked, file open elsewhere: %s\n",
@@ -1061,6 +1094,19 @@ int pcsl_file_truncate(void *handle, long size) {
             return -1;
         }
         got += n;
+    }
+
+    /* v01.45: same-path pre-check BEFORE the swap (see unlink). An
+     * empty-named record store gets no .db/.idx suffix, so its db AND
+     * idx handles sit on the SAME path. This truncate only closes its
+     * own fd - a live twin handle anchors the name, the sceIoRemove
+     * below can only fail (Vita3K Error 32), and we would have closed
+     * the fd for nothing. Fail fast with the caller's usual -1. */
+    if (vita_handles_held_ex(vf->path, vf)) {
+        vita_report_held("truncate", vf->path);
+        free(buf);
+        sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
+        return -1;
     }
 
     /* Swap the file via remove+create (O_TRUNC is dead on Vita3K,
