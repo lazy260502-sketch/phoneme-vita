@@ -228,7 +228,7 @@ set(VITA_TITLEID  "J2ME00001")
 #       later "truncate blocked" for a path already reported as "unlink
 #       blocked" was swallowed and the stderr trail went cold. Dedup
 #       key is now op+path.
-set(VITA_VERSION  "01.47")
+set(VITA_VERSION  "01.48")
 # 01.46 (2026-09-10, phoneme-midp 6525f4a): Second-launch UC crash (JIT)
 #   isolated. PC=0x85f05fd8 was inside the heap compiler_area (JIT code
 #   cache); the faulting ldr r4,[r5,#0x404] is the standard JIT prologue
