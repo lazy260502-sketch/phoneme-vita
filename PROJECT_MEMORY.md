@@ -1,5 +1,46 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-09
+> Last Updated: 2026-09-10
+
+## 2026-09-10 v01.49：UC 书签保存 23 秒无响应 + PC=0x0 崩溃——calculateBlockSize 负块大小无界循环（phoneme-midp 提交 5eea6a1、vita-port 提交 508ae93）
+
+### 用户报告（v01.48 实测）
+- UC 浏览器保存书签时界面很卡（约 23 秒无响应），随后退出；再次启动 UC 后 Vita3K 崩溃刷屏（EXCEPTION_ACCESS_VIOLATION PC=0x85f05fd8 → PC=0x0 循环）。
+- **用户已先删除 `ux0:/data/J2ME00001/rms/appdb_1A35` 再测**（日志 `Creating new dir rms/appdb_1A35` 佐证）——排除存量脏数据假设，根因在代码路径自身。
+
+### 日志全量定位（vita3k.log，642,731 行二分）
+- 10:58:54 新建 rms/appdb_1A35 → 10:59:58 书签写入本身很快（fd 0x11D 写 2863B，~2ms，**保存动作不卡**）。
+- 10:59:58 起 fd 0x12E 反复 open→`seek_file 0x80010051` 失败（同 fd write 8B 正常 → fd 是好的，是偏移量错）。
+- 11:00:13.6→11:00:36.9 **23 秒无 IO 空窗** = 用户感知的"很卡"；11:00:37 UC 退出。
+- 11:01:16 第二次启动 UC，boot 部署阶段 11:01:16.302 首异常（**崩溃发生在第二次启动，非保存时**）。
+
+### 根因机制（本轮定案）
+- `RecordStoreUtil.calculateBlockSize`：remainder==0 时返回 `dataSize+8`，否则 `dataSize+(8-remainder)+8`。垃圾 dataSize 为 8 的负倍数（如 -16）→ 返回 -8；dataSize=-8 → 返回 0。
+- 块大小 ≤0 → `currentOffset` 不前进/倒退 → `compactRecords`/`getRecordIDs`/`getRecordHeader_SearchFromTo`/`getFreeBlock` 块循环无界空转（23 秒）→ 算出垃圾 offset → seek 失败链 → 进程状态破坏。
+- Vita3K 对垃圾/负偏移 `sceIoLseek` 报 0x80010051 且**文件位置保持不变**，后续操作在陈旧偏移上进行，进一步放大损坏。
+
+### 修复（phoneme-midp 5eea6a1 + vita-port 508ae93）
+- **Java 4 处守卫**（守卫失败契约与坏 header 读一致）：
+  - `RecordStoreImpl.compactRecords`：`currentSize <= 0` → throw IOException
+  - `RecordStoreIndex.getRecordIDs`：break
+  - `RecordStoreIndex.getRecordHeader_SearchFromTo`：return INVALID_OFFSET
+  - `RecordStoreIndex.getFreeBlock`：throw IOException
+- **C 层拦截**（`vita-port/src/vita_pcsl.c`）：`pcsl_file_seek` 对 `offset < 0` 记一次 stderr（去重）并返回 -1，借 storagePosition 既有 -1→getLastError 链路上抛到 Java。
+- 版本 `CMakeLists.txt` 01.48→01.49。
+
+### ROM 重生成链路（Java 系统类改动必须走全，否则白改）
+- phoneme-midp 的 `ROMImage.cpp: $(MIDP_CLASSES_ZIP) $(ROMGEN_CMD) rom.config` 规则（`build/common/makefiles/cldc_vm.gmk:227`）会自动级联：改 .java（比 classes.zip 新）→ 重编该类 → 更新 classes.zip → `romgen -romize`（phoneme-cldc/build/vita_arm/dist/bin/romgen，32 位 x86 宿主工具）→ 重新生成 ROMImage_*.cpp → 重编 ROMImage.o 进 libobj.a。
+- **增量构建即可**，无需 rm classes.zip；验证法：`classes/` 下改动类 .class 时间戳 == 本次构建时间 + `grep "RecordStoreImpl.java" alljavalist.txt` 命中。
+- `libmidp.so` 链接失败（`_rom_linkcheck_mffd_false`）已知无害，VPK 走 libobj.a。
+- vita-port 构建需 JDK：`export PATH=/home/zyb/tools/jdk8u502-b07/bin:$PATH`（build_jar.sh 要 javac；MIDP 构建本身已带）。
+- 版本缓存陷阱复现：v01.49 时 `vita_version.h` 仍是旧值，需 `rm build/cmake/vita_version.h` 再 cmake；验证 `strings midp_vita | grep "version: J2ME"`。
+
+### 验证
+- MIDP 构建 EXIT=0，ROM 15.43s 重新生成（20,195 对象），RecordStoreIndex/Impl .class 均为本次构建产物，libobj.a/ROMImage.o 15:41 同批。
+- VPK：`vita-port/build/cmake/midp_vita.vpk`（14.4MB，15:53），`strings midp_vita` 确认 `v01.49 b207`。
+- 待用户实测：删 appdb_1A35 后 UC 保存书签应快速返回（守卫触发时该次保存抛 IOException 而非卡死）；二次启动不再崩溃。
+
+### 遗留（观察项）
+- 崩溃 PC=0x85f05fd8 落在堆内 JIT 区与 `-int` 纯解释器矛盾——推测进程级状态污染延续或 LR 巧合；Java 守卫落地后大概率消失，若复现需单独排查。
 
 ## 2026-09-09 v01.43：消除残留的「占用」日志三连——unlink 前查注册表跳过注定失败的 remove（vita-port 提交 547a471）
 
