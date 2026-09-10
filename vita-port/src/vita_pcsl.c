@@ -1393,6 +1393,24 @@ long pcsl_file_seek(void *handle, long offset, long position) {
         return -1;
     }
 
+    /* VITA FIX (v01.49): a negative offset reaching sceIoLseek is
+     * always garbage (corrupt RMS block arithmetic upstream); Vita3K
+     * on the Windows host reports it as 0x80010051 for EVERY such
+     * seek, and real hardware may do worse. Reject it here with the
+     * same -1 contract storagePosition already handles, leaving one
+     * breadcrumb with the offending offset so the caller is
+     * identifiable from the logs. */
+    if (offset < 0) {
+        static long reported_offset = -1;
+        if (reported_offset != offset) {
+            reported_offset = offset;
+            fprintf(stderr,
+                    "[pcsl] seek with negative offset %ld on '%s'\n",
+                    offset, vf->path);
+        }
+        return -1;
+    }
+
     {
         /* v01.47: clamp a SEEK_END / large absolute seek to the
          * pending logical size, mirroring the read clamp. */
