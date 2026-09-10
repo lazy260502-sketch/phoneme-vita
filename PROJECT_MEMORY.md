@@ -2090,3 +2090,8 @@ UC 多 store 并存（空名设置库 FFFFFFFF + 书签库 + 缓存库），open
 ### 遗留
 - JIT 二次启动根因未修（-int 掩盖中）
 - 物理尾巴字节留盘（v01.47 定案，可接受）
+
+### 修正（同日）
+- 首次 VPK 重编未触发 gen_version（版本头缓存 b203 d841b85），重建后
+  正确：**v01.48 b206 (eb9b719)**，14458185 B。装 VPK 前先核对
+  `strings midp_vita | grep version`。
