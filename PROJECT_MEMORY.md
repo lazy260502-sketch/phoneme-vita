@@ -1953,3 +1953,44 @@ sceIoRemove **真的执行了** → 不可能来自 pcsl_file_unlink（v01.43 �
 - 面包屑去重维度必须包含操作类型，否则吞掉后续不同操作的证据。
 - stderr 面包屑与 vita3k.log 时间线**对不上号本身就是线索**（本案：
   23:55 有 syscall 无面包屑 → 去重吞了或来源未埋点 → 两样都查）。
+
+## 2026-09-10 v01.45 后续：第二次进 UC 崩溃定案（JIT 二次启动，-int 隔离）
+
+### 崩溃现场（用户装 b200 复测，11:01:16.302）
+第一次进 UC 正常，退出回菜单后**第二次进** → Vita3K
+`EXCEPTION_ACCESS_VIOLATION 0xC0000005, Read 0x4E5060004`（35 位地址），
+PC=0x85f05fd8（**JIT 代码缓存区 = Java 堆 compiler_area**），fault 指令
+`ldr r4,[r5,#0x404]`；随后 PC=0x0 无限刷屏 → 闪退。
+
+### 指令链解析（全部坐实，非猜测）
+- r5=0x813b17d4=`gp_base_label`（nm 直读运行时地址），+0x404=
+  `_compiler_stack_limit`(0x813b1bd8，合法地址)。
+- `ldr r4,[r5,#0x404]` 出自 `CodeGenerator_arm.cpp:1190` JIT 序言
+  "stack overflow + timer tick" 检查；GP 访问宏在
+  `SourceAssembler_arm.hpp`（`ldr_gp_base`→`ldr_label("gp_base_label")`）。
+- **fault 地址 0x4E5060004 ≠ r5+0x404** → 寄存器转储是损坏后状态；
+  真相是执行流已跳进坏代码（垃圾字节把自己解码成同样的 ldr 形态）。
+- JIT 编译代码不是独立 code heap：`Compiler::allocate_and_compile` →
+  `Universe::new_compiled_method` 分配在**堆内 compiler_area**
+  （`Compiler.cpp:1073` reserve_compiler_area），PC=0x85f05fd8 落在
+  堆范围完全吻合 → "跳进已失效/被覆盖的 JIT 代码"。
+
+### 跨轮状态排查结论
+- `Universe::apocalypse()` 不复位 Compiler 静态状态，但每轮
+  `Universe::bootstrap()` 会 `CompiledMethodCache::init()` +
+  `Compiler::initialize()`（memset 全部 _state），跨轮复位基本完整。
+- 第二轮 JIT 代码是新编译的，PC 指向第二轮的堆——所以不是"第一轮
+  悬空缓存被复用"，而是 JIT 代码在堆里**被 GC/压缩搬移后失效**或
+  二次启动时序触发的堆状态异常（未最终定论，属 VM 深水区）。
+
+### 处置（phoneme-midp 6525f4a）：-int 纯解释器隔离
+`runMidlet.c` 在 `JVM_Initialize()` 后注入
+`JVM_ParseOneArg(1, {"-int"})` → `Arguments.cpp: UseCompiler=false`
+（进程级静态，覆盖所有后续轮次）。标准 VM 选项，零新平台代码，
+ phoneme-midp 改动规模 +1 文件。**性能换稳定；根因（JIT 代码在
+二次启动场景下的失效机制）未修，待 UC 流程跑通后回头深挖。**
+- 重编：`phoneme-midp/build_vita.sh`（增量，runMidlet.o 重编成功；
+  尾部 libmidp.so multiple definition 仍为已知无害失败）→
+  `vita-port/build/cmake` cmake --build 重打 VPK。
+- 验证手段：`arm-vita-eabi-objdump -d runMidlet.o | grep -c JVM_ParseOneArg`
+  = 3（原 2 + 新 1）。

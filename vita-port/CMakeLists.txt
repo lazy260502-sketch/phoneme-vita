@@ -228,7 +228,16 @@ set(VITA_TITLEID  "J2ME00001")
 #       later "truncate blocked" for a path already reported as "unlink
 #       blocked" was swallowed and the stderr trail went cold. Dedup
 #       key is now op+path.
-set(VITA_VERSION  "01.45")
+set(VITA_VERSION  "01.46")
+# 01.46 (2026-09-10, phoneme-midp 6525f4a): Second-launch UC crash (JIT)
+#   isolated. PC=0x85f05fd8 was inside the heap compiler_area (JIT code
+#   cache); the faulting ldr r4,[r5,#0x404] is the standard JIT prologue
+#   GP read of _compiler_stack_limit, but the fault address (0x4E5060004)
+#   did not match r5+0x404 -> execution had already jumped into bad code.
+#   runMidlet now passes the standard "-int" VM option on every round
+#   (UseCompiler=false, process-global) so the whole JIT path is off
+#   while the in-process-restart JIT issue is investigated. Perf trade,
+#   root cause still open.
 
 find_program(Java_JAR_EXECUTABLE
     NAMES jar
