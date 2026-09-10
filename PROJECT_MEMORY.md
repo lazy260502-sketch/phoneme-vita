@@ -1994,3 +1994,47 @@ PC=0x85f05fd8（**JIT 代码缓存区 = Java 堆 compiler_area**），fault 指�
   `vita-port/build/cmake` cmake --build 重打 VPK。
 - 验证手段：`arm-vita-eabi-objdump -d runMidlet.o | grep -c JVM_ParseOneArg`
   = 3（原 2 + 新 1）。
+
+## 2026-09-10 v01.47：truncate 改惰性逻辑截断（-int 隔离生效后的根修）
+
+### 用户双测试结论（b201）
+1. 退出 UC 再进**不再闪退** → v01.46 的 -int JIT 隔离有效
+   （JIT 崩溃未再复现；根因仍在深水区，暂不回头）。
+2. 删 rms/appdb_1A35 → UC 可进；**退出 Vita3K 重进 UC 卡初始化**。
+   第二轮 stderr 在 `created+registered OK` 后零输出（无 [NET]、
+   无任何 [pcsl] 面包屑）；第一轮出现过 `truncate blocked`。
+
+### 根因链（v01.45 拦截 → compact 半途而废 → 脏数据 → 下轮卡死）
+- compactRecords（RecordStoreImpl.java:782）先把数据块前移、更新
+  header 的 RS6_DATA_SIZE（此时新大小已写盘），最后才 dbFile.truncate。
+- v01.45 的预检查让 truncate 永远返回 -1 → IOException → compact
+  中止，但 header 已改。物理文件仍保留旧尾块。
+- 下一轮（新进程也一样）按 header 的新 DATA_SIZE 遍历，块边界与
+  物理内容错位 → 读到垃圾 record 头 → UC 初始化流程卡死。
+  与 v01.41 记载的 "first launch OK, every launch after broken"
+  是同一数据破坏类。
+
+### 根修：lazy logical truncation（vita_pcsl.c，j2me 658f744）
+- Vita 无 ftruncate syscall；Vita3K 丢弃 SCE_O_TRUNC；物理截断只剩
+  remove+create 换file，而空名 store（FFFFFFFF）的 db/idx 孪生句柄
+  同路径锚定 → 换file必败。此路彻底放弃。
+- VitaFileHandle 加 `logical_size`（-1=无钳制）。truncate(size) 只记
+  钳制（多次截断取小者）；`pcsl_file_read` 过界返 0（EOF）、
+  `pcsl_file_seek` 结果钳到 logical_size、`pcsl_file_sizeofopenfile`
+  报逻辑大小；`pcsl_file_write` 写过界即解除钳制（文件重新变大）。
+- 契约依据：phoneME RMS 全部读边界来自 db header（RS6_DATA_SIZE，
+  RecordStoreImpl:799 `while (currentOffset < getSize())`）与 idx
+  offset 表（RecordStoreIndex.getRecordHeader），**从不依赖物理
+  EOF** → 逻辑截断对上层完全透明。
+- O_TRUNC 仿真（storage_open 的 temp 文件路径）同改：打开即置
+  logical_size=0，不再 remove+create，不再有"remove 被孪生句柄挡住
+  → create 落在旧文件 → 交出内容矛盾句柄"的坑。
+- v01.45 的 truncate/O_TRUNC 两处 vita_handles_held_ex 预检查随之
+  移除（换file本身不存在了）；held_ex 函数保留备用。
+
+### 遗留
+- 物理尾巴字节留在盘上（RMS 库 KB 级，可接受）；真机可换真 ftruncate。
+- JIT 二次启动根因未修（被 -int 掩盖）；若后续恢复 JIT 需先复现并
+  定位"JIT 代码在堆内被失效"的机制。
+- 验证入口：`strings midp_vita | grep "version: J2ME"` 应显示
+  v01.47 b202 (658f744)。
