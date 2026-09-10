@@ -606,6 +606,20 @@ typedef struct {
      * left fd=-1, and every later seek/read on the still-live handle
      * returned EBADFD (0x80010051) - UC could no longer read its local
      * cache and fell back to full network reloads ("too slow"). */
+    /* v01.47: lazy logical truncation. Vita has no ftruncate syscall
+     * and Vita3K's dropped SCE_O_TRUNC makes the old remove+create
+     * swap the ONLY way to physically shrink a file - but that swap
+     * is impossible while a TWIN handle holds the name (empty-named
+     * record stores share ONE path between db and idx handles), so
+     * every RMS compact failed and left stale data past the new
+     * logical size ("second launch stuck on init"). Instead of
+     * swapping the file we just REMEMBER the new size here and clamp
+     * reads/seeks/size reports to it. phoneME's RMS never relies on
+     * the physical EOF (all bounds come from the db header and the
+     * idx offset table), so a logical truncate is fully transparent.
+     * -1 = no truncation pending (or the clamp was lifted by a write
+     * that grew the file again). */
+    long logical_size;
 } VitaFileHandle;
 
 /* Open-handle registry: POSIX allows unlinking an open file (the name
@@ -685,7 +699,10 @@ static int vita_handles_held(const char *abs_path) {
  * on the path it is about to swap - the question there is whether a
  * TWIN handle (e.g. the idx handle of an empty-named record store,
  * which shares the db's suffix-less path) would anchor the name
- * through the remove. Same registry walk, one exclusion. */
+ * through the remove. Same registry walk, one exclusion.
+ * v01.47: the swap itself is gone (lazy logical truncation), but the
+ * helper is kept for possible future swap-style operations. */
+__attribute__((unused))
 static int vita_handles_held_ex(const char *abs_path, VitaFileHandle *self) {
     int i;
     for (i = 0; i < VITA_MAX_OPEN_FILES; i++) {
@@ -805,49 +822,23 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
 
     /* Try to open the file using Vita IO */
     vf->fd = sceIoOpen(abs_path, oflags, 0777);
+    vf->logical_size = -1; /* v01.47: no truncation pending */
     if (vf->fd >= 0 && (oflags & SCE_O_TRUNC)) {
         /* Vita3K's translate_open_mode() has no SCE_O_TRUNC branch -
          * every open maps to "rb+" and the flag is silently dropped,
          * so a pre-existing file keeps its old length (see
-         * pcsl_file_truncate for the full story). Emulate truncation
-         * here for the OPEN_READ_WRITE_TRUNCATE path (storage_open
-         * uses it for suite temp files): remove+create is the only
-         * sequence that empties the file on BOTH Vita3K and a real
-         * device. The just-opened fd is closed first: Vita3K's
-         * remove_file fails with a sharing violation while any FILE*
-         * of the file exists in-process. */
+         * pcsl_file_truncate for the full story). v01.47: emulate the
+         * truncation LOGICALLY instead of via the remove+create swap:
+         * the swap cannot work while a twin handle holds the name
+         * (empty-named record stores share ONE path between db and
+         * idx handles), and a failed swap used to hand out a handle
+         * whose contents contradict the requested O_TRUNC. A pending
+         * logical_size == 0 gives the caller an empty file from the
+         * first read/size query on, which is all O_TRUNC promises. */
         SceOff sz = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
         if (sz > 0) {
-            /* v01.45: same twin-handle pre-check as pcsl_file_truncate -
-             * if another live handle holds this path, the swap's
-             * sceIoRemove is doomed (Error 32). Fail the open honestly
-             * instead of feeding the emulator a doomed syscall. */
-            if (vita_handles_held_ex(abs_path, vf)) {
-                vita_report_held("open(O_TRUNC)", abs_path);
-                sceIoClose(vf->fd);
-                vf->fd = -1;
-                free(vf);
-                return -1;
-            }
-            sceIoClose(vf->fd);
-            sceIoRemove(abs_path);
-            vf->fd = sceIoOpen(abs_path, SCE_O_RDWR | SCE_O_CREAT, 0777);
-            if (vf->fd < 0 || sceIoLseek(vf->fd, 0, SCE_SEEK_END) != 0) {
-                /* Either the create-open failed, or the remove was
-                 * blocked by another in-process handle and the open
-                 * silently landed on the OLD non-empty file ("rb+"
-                 * never truncates - same corruption class the
-                 * truncate rewrite fixed). Do NOT hand out a handle
-                 * whose contents contradict the requested O_TRUNC:
-                 * close, report and fail the open honestly. */
-                vita_report_held("open(O_TRUNC)", abs_path);
-                if (vf->fd >= 0) {
-                    sceIoClose(vf->fd);
-                    vf->fd = -1;
-                }
-                free(vf);
-                return -1;
-            }
+            vf->logical_size = 0;
+            sceIoLseek(vf->fd, 0, SCE_SEEK_SET);
         }
     }
     if (vf->fd < 0) {
@@ -916,6 +907,15 @@ int pcsl_file_read(void *handle, unsigned char *buf, long size) {
     if (vf->fd < 0) {
         return -1; /* dead handle - fail fast (see pcsl_file_seek) */
     }
+    {
+        /* v01.47: honor a pending logical truncation. The caller sees
+         * EOF at the logical size even though the physical file still
+         * carries the stale tail. */
+        long pos = (long)sceIoLseek(vf->fd, 0, SCE_SEEK_CUR);
+        if (vf->logical_size >= 0 && pos >= vf->logical_size) {
+            return 0; /* EOF at the logical size */
+        }
+    }
     return sceIoRead(vf->fd, buf, size);
 }
 
@@ -928,7 +928,19 @@ int pcsl_file_write(void *handle, unsigned char *buf, long size) {
     if (vf->fd < 0) {
         return -1; /* dead handle - fail fast (see pcsl_file_seek) */
     }
-    return sceIoWrite(vf->fd, buf, size);
+    {
+        int n = (int)sceIoWrite(vf->fd, buf, size);
+        /* v01.47: a write past the logical size means the file is
+         * growing again (RMS record append after a compact); the
+         * clamp no longer matches reality, lift it. -1 = no clamp. */
+        if (n > 0 && vf->logical_size >= 0) {
+            long end = (long)sceIoLseek(vf->fd, 0, SCE_SEEK_CUR);
+            if (end > vf->logical_size) {
+                vf->logical_size = -1;
+            }
+        }
+        return n;
+    }
 }
 
 /* Degraded-noise helper for unlink: Vita3K maps SCE errno values onto
@@ -1055,6 +1067,26 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
  * RecordStoreImpl.compactRecords left stale blocks past the new
  * logical size - the second launch then walked garbage record
  * headers ("first launch OK, every launch after broken"). */
+/* v01.47: LAZY LOGICAL TRUNCATION. Vita has no ftruncate syscall, and
+ * Vita3K silently drops SCE_O_TRUNC (translate_open_mode has no branch
+ * for it), so the only physical way to shrink a file was the
+ * remove+create swap. That swap CANNOT work while a twin handle holds
+ * the name: an empty-named record store gets no .db/.idx suffix, so
+ * its db AND idx handles share ONE path and the surviving handle keeps
+ * the name anchored - the remove fails (Vita3K Error 32) and, worse,
+ * the create-open then lands on the OLD non-empty file ("rb+" never
+ * truncates) leaving stale record blocks past the new logical size.
+ * The next launch walks that garbage ("first launch OK, every launch
+ * after broken/stuck on init").
+ *
+ * phoneME's RMS never reads past what the db header (RS6_DATA_SIZE)
+ * and the idx offset table authorize, so the physical tail is dead
+ * weight only: we just remember the new size in the handle and clamp
+ * reads/seeks/size reports to it (see VitaFileHandle.logical_size).
+ * No syscall can fail, compact succeeds, no stale tail is ever
+ * exposed. The physical bytes stay on disk until the store is next
+ * deleted or rewritten - acceptable (RMS dbs are small); a real
+ * device build could switch to a true ftruncate later. */
 int pcsl_file_truncate(void *handle, long size) {
     if (handle == NULL || size < 0) {
         return -1;
@@ -1065,97 +1097,29 @@ int pcsl_file_truncate(void *handle, long size) {
         return -1;
     }
 
-    SceOff cur_pos = sceIoLseek(vf->fd, 0, SCE_SEEK_CUR);
-    SceOff file_size = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
-    if (cur_pos < 0 || file_size < 0) {
-        return -1;
-    }
+    {
+        SceOff file_size = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
+        SceOff cur_pos = sceIoLseek(vf->fd, 0, SCE_SEEK_CUR);
+        if (file_size < 0) {
+            return -1;
+        }
 
-    if (size >= file_size) {
-        /* Growing (or unchanged): RMS never does this; just restore
-         * the position and report success. */
-        sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
+        if ((long)file_size <= size && vf->logical_size < 0) {
+            /* Growing (or unchanged) physical file and no pending
+             * clamp: RMS never does this; nothing to do. */
+            if (cur_pos >= 0) {
+                sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
+            }
+            return 0;
+        }
+
+        /* Record the clamp. If a previous clamp exists, the smaller
+         * value wins (two shrinks in a row must not un-shrink). */
+        if (vf->logical_size < 0 || size < vf->logical_size) {
+            vf->logical_size = size;
+        }
         return 0;
     }
-
-    /* Save the bytes that must survive. */
-    unsigned char *buf = (unsigned char *)malloc((size_t)size > 0 ? (size_t)size : 1);
-    if (buf == NULL) {
-        return -1;
-    }
-
-    sceIoLseek(vf->fd, 0, SCE_SEEK_SET);
-    long got = 0;
-    while (got < size) {
-        int n = sceIoRead(vf->fd, buf + got, size - got);
-        if (n <= 0) {
-            free(buf);
-            sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
-            return -1;
-        }
-        got += n;
-    }
-
-    /* v01.45: same-path pre-check BEFORE the swap (see unlink). An
-     * empty-named record store gets no .db/.idx suffix, so its db AND
-     * idx handles sit on the SAME path. This truncate only closes its
-     * own fd - a live twin handle anchors the name, the sceIoRemove
-     * below can only fail (Vita3K Error 32), and we would have closed
-     * the fd for nothing. Fail fast with the caller's usual -1. */
-    if (vita_handles_held_ex(vf->path, vf)) {
-        vita_report_held("truncate", vf->path);
-        free(buf);
-        sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
-        return -1;
-    }
-
-    /* Swap the file via remove+create (O_TRUNC is dead on Vita3K,
-     * see the function header). vf->path always holds the resolved
-     * absolute path that opened successfully. */
-    sceIoClose(vf->fd);
-    int removed = (sceIoRemove(vf->path) >= 0);
-    vf->fd = sceIoOpen(vf->path, SCE_O_RDWR | SCE_O_CREAT, 0777);
-    if (vf->fd < 0) {
-        /* Recovery attempt without O_CREAT (covers the case where the
-         * remove failed and the old file is still there). If this also
-         * fails the handle stays fd=-1 and every later
-         * pcsl_file_seek hits EBADFD - unavoidable at this point, but
-         * nothing was written so the on-disk state is consistent. */
-        vf->fd = sceIoOpen(vf->path, SCE_O_RDWR, 0777);
-        free(buf);
-        return -1;
-    }
-
-    /* Verify the swap really produced an empty file. If the remove
-     * failed (e.g. Windows sharing violation: some other FILE* still
-     * holds this file inside Vita3K), the create-open silently lands
-     * on the OLD file ("rb+" - no truncation in the emulator) and
-     * writing the prefix back would leave the stale tail again. That
-     * is exactly the silent RMS corruption class this rewrite fixes;
-     * fail honestly and let the caller see the error instead. */
-    SceOff check = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
-    if (!removed || check != 0) {
-        vita_report_held("truncate", vf->path);
-        free(buf);
-        return -1;
-    }
-
-    long put = 0;
-    while (put < size) {
-        int n = sceIoWrite(vf->fd, buf + put, size - put);
-        if (n <= 0) {
-            free(buf);
-            return -1;
-        }
-        put += n;
-    }
-    free(buf);
-
-    if (cur_pos > size) {
-        cur_pos = size;
-    }
-    sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
-    return 0;
 }
 
 int pcsl_file_exist(const pcsl_string *fileName) {
@@ -1428,8 +1392,16 @@ long pcsl_file_seek(void *handle, long offset, long position) {
         }
         return -1;
     }
-    
-    return sceIoLseek(vf->fd, offset, whence);
+
+    {
+        /* v01.47: clamp a SEEK_END / large absolute seek to the
+         * pending logical size, mirroring the read clamp. */
+        long rv = (long)sceIoLseek(vf->fd, offset, whence);
+        if (vf->logical_size >= 0 && rv > vf->logical_size) {
+            rv = vf->logical_size;
+        }
+        return rv;
+    }
 }
 
 long pcsl_file_sizeofopenfile(void *handle) {
@@ -1441,10 +1413,16 @@ long pcsl_file_sizeofopenfile(void *handle) {
     if (vf->fd < 0) {
         return -1; /* dead handle - fail fast (see pcsl_file_seek) */
     }
-    SceOff current = sceIoLseek(vf->fd, 0, SCE_SEEK_CUR);
-    SceOff size = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
-    sceIoLseek(vf->fd, current, SCE_SEEK_SET);
-    return (long)size;
+    {
+        SceOff current = sceIoLseek(vf->fd, 0, SCE_SEEK_CUR);
+        SceOff size = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
+        sceIoLseek(vf->fd, current, SCE_SEEK_SET);
+        /* v01.47: report the logical size while a clamp is pending. */
+        if (vf->logical_size >= 0 && (long)size > vf->logical_size) {
+            return vf->logical_size;
+        }
+        return (long)size;
+    }
 }
 
 long pcsl_file_sizeof(const pcsl_string *fileName) {
