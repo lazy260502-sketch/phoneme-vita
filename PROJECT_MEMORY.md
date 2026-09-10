@@ -1912,3 +1912,30 @@ Vita3K 日志位置:
 - 判定设备二进制版本：看菜单右上角 `vXX.XX bNN (hash)`，或 vita3k.log 中
   有无 per-open `debug_log.txt` 写入（有 = pre-v01.38）。
 - b194 产物验证：`strings build/cmake/midp_vita | grep debug_log.txt` = 0。
+
+## 2026-09-10 b195 首份用户 stderr 复盘：一切符合预期
+
+### 用户 midp_stderr.log（v01.44 b195, c8191bc）逐条解释
+1. **版本指纹滞后是构建时序问题，不是装错包**：`version:` 行读的是
+   GenVersion.cmake 在构建时刻的 git HEAD。b195 VPK 构建于 09-09 11:56，
+   而 v01.44 提交 22f5ffc 在 11:58 才打 → hash 停在上一个 c8191bc。
+   **代码确认是 v01.44**：日志里 `[pcsl] unlink blocked` 面包屑 v01.43
+   才引入，且 APP_VER 01.44 来自手动 VITA_VERSION。教训：VPK 要在提交
+   后再构建，否则指纹滞后一代（本次已重建为 b197/de6e6f7 对齐）。
+2. **`[pcsl] unlink blocked, file open elsewhere: .../rms/appdb_1A35/FFFFFFFF`
+   是预检查在工作，不是 Error 32**：sceIoRemove 根本没执行，Vita3K 日志
+   干净。被拦目标是**文件**（2616B，`midp-rms` 魔数完好，1 条活记录）——
+   internal suite（id=-1→hex FFFFFFFF）的合法 RMS db，record store 名为
+   空 → 路径 = root + suiteHex + ""（buildSuiteFilename nameLen=0 分支），
+   没有 .db 后缀是**正常形态**。UC 启动时 RMS 句柄持有它，MIDP 框架某处
+   （可能是 listRecordStores 后的清理）对它发起 unlink，预检查拦截 → 返回
+   -1 → RMS 数据完整保留。这正是 v01.36 教训要的保护语义。
+3. **网络全链路健康**：DNS + connect 全部成功（fd 复用正常），此前的
+   4 条 net 错误未再出现。
+4. b195 复测遗留：模拟器长跑 Error 32、真机安装、6h 闪退（drawArc）。
+
+### 关键结论
+- "Error 32" 场景下我们的 stderr 面包屑 `[pcsl] unlink blocked` 是**良性**
+  证据（预检查拦截），与 Vita3K io_error 的 Error 32 三连是两回事。
+- 裸 FFFFFFFF 文件（无后缀）在 per-game appdb_XXXX/ 下 = 空 record store
+  名的 RMS db，**不要**当成异常产物去删。
