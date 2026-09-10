@@ -2038,3 +2038,55 @@ PC=0x85f05fd8（**JIT 代码缓存区 = Java 堆 compiler_area**），fault 指�
   定位"JIT 代码在堆内被失效"的机制。
 - 验证入口：`strings midp_vita | grep "version: J2ME"` 应显示
   v01.47 b202 (658f744)。
+
+## 2026-09-10 v01.48：RMS 文件缓存悬空句柄根修（数据不持久 + 书签卡死）
+
+### 用户现象（b203 复测反馈）
+- 二次进入 UC 正常（v01.47 生效）、`truncate blocked` 消失
+- **但数据不持久化：每次启动都是全新开始**
+- **保存书签直接卡死，无法操作**
+
+### 根因：midp_file_cache.c 单例缓存悬空句柄（phoneme-midp f979b68）
+`mFileCache` 是进程级单例，缓存"当前文件"的 handle。close 时只 flush
+不释放单例，`mFileCache->handle` 永久指向已 free 的 VitaFileHandle。
+UC 多 store 并存（空名设置库 FFFFFFFF + 书签库 + 缓存库），open/close
+交错后：下次 `midp_file_cache_open` malloc 大概率复用同一块内存（新
+文件合法 fd 占住了 fd 字段），走 else 分支对悬空 handle 执行
+`finalize(stayOpen=TRUE)` → `storagePosition(悬空handle, 旧cachedPos)`
+→ **把新文件 seek 到旧文件残留偏移**：
+- 新开 store 读 db header 错位 → DB_SIGNATURE 校验失败 →
+  "invalid record store contents" → UC 视为损坏重置（每次全新开始）
+- 写路径位置污染 → 书签保存流程死循环卡死
+
+### 排除项（本轮分析定案）
+- **`unlink blocked .../FFFFFFFF` 良性**：FFFFFFFF = INTERNAL_SUITE_ID(-1)
+  的 8 位 hex 目录名，UC 的空名设置库 db/idx 共用同一路径。退出时的
+  unlink 来自 UC 自身清理逻辑，被 v01.43 held 预检查挡住反而保护数据。
+  Windows/Vita3K 共享语义下打开的文件不可删，不存在"句柄先关则误删"。
+- **v01.47 逻辑截断无涉**：写路径 sceIoWrite 直写落盘 ✔，commitWrite
+  → flush → 真实写穿 ✔，读边界/sizeof 钳制正确 ✔。数据其实一直在盘上，
+  坏在读回时的 header 校验。
+- **RMS 文件锁未启用**：TARGET_VM=cldc_vm 时 lib.gmk 不编译
+  rms_file_lock.c，RecordStoreLock 用 no-op stub，无死锁嫌疑。
+- 空间计算正常：getusedspace 真实现（v01.34+）+ jam_space=100MB。
+
+### 修复（最小 diff，16 行）
+`midp_file_cache_close`：finalize 后 `midpFree(mFileCache); mFileCache
+= NULL;`，恢复上游不变量"mFileCache->handle 必须指向打开中的文件"。
+
+### 构建/产物
+- 重编：`rm build/vita_arm/obj/arm/midp_file_cache.o && ./build_vita.sh`
+  （exit=0，尾部 libmidp.so `_rom_linkcheck` 链接失败为已知无害项，
+  VPK 走 libobj.a 不受影响；libobj.a 已含新对象）
+- VPK：vita-port/build/cmake/midp_vita.vpk = **v01.48** (f53174e)
+  14458298 B
+- 提交：phoneme-midp f979b68（+16）；j2me 主仓 8f512a0 + f53174e
+
+### 验证入口
+- `strings midp_vita | grep "version: J2ME"` 应显示 v01.48
+- 复测预期：UC 二次启动数据仍在（书签/设置保留）、保存书签不卡死、
+  `unlink blocked .../FFFFFFFF` 仍会出现（预期，良性）
+
+### 遗留
+- JIT 二次启动根因未修（-int 掩盖中）
+- 物理尾巴字节留盘（v01.47 定案，可接受）
