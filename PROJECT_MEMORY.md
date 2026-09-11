@@ -1,5 +1,49 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-10
+> Last Updated: 2026-09-11
+
+## 2026-09-11 v01.50：RMS 存储砖死定案与自愈——data_size 负值头部被写盘（phoneme-midp 提交 a3fee44、vita-port 提交 60a2947）
+
+### 用户报告（v01.49 实测）
+1. UC 记录（历史/书签）没保存或无法恢复，第二次进和第一次一样。
+2. 书签卡顿应该与 IO 无关，可能是网页加载中造成的。
+
+### 法证闭环（用户提供 FFFFFFFF 文件 hexdump 3104B + midp_stderr.log + vita3k.log）
+头部逐字段解析（布局见 AbstractRecordStoreImpl.java:48-87）：
+- sig `midp-rms` ✅ / next_id=2 / **num_live=0**（零存活记录=用户看到"全丢"）/ version=4 / last_modified 2026-09 合法 / **data_size=0xFFFFFED8=-296** ❌ / free_size=0
+- 偏移40 块头：id=-1(空闲), size=0xB38=2880 → 算术铁证：**compact 前 data_size=2584，2584-2880=-296 分毫不差**
+- 第二次启动 `getSize()=40+(-296)=-256` = stderr 里 `[pcsl] seek with negative offset -256`（v01.49 拦截生效：仅 1 条、无崩溃、三次启动 MAIN_EXIT=2001 干净退出、23 秒空转消失）
+- addBlock 走 `blockOffset=getSize()=-256` → 保存全部静默失败 → 报告#1 完全解释
+
+### 坏文件产生机制（回答"每次装新版都删 rms 为什么还会坏"）
+删 rms 是对的——坏文件不是旧版带入，是**本次会话运行时自己写坏的**：
+1. Vita3K 丢 `O_TRUNC`（v01.41 实锤）→ compact 的 truncate 从不物理收缩 → 陈旧尾巴永存
+2. 空白名 store 的 db/idx **共用一个文件**（buildSuiteFilename: nameLen>0 才加 .db/.idx 后缀）→ 互相踩
+3. compactRecords 走块把垃圾字节当成 2880B 空闲块（`currentId<0 && currentSize>0`，v01.49 的 `<=0` 守卫拦不住）
+4. 走完**无条件**执行 `data_size -= moveUpNumBytes` 并写回头部 → -296 上盘 → store 永久砖死
+5. 用户每次删 rms 后 UC 一保存书签又确定性复现同一链条
+
+### 修复（双守卫，phoneme-midp a3fee44）
+- **compactRecords 写回前**：`compactedSize < 0` → 直接 return 放弃本次 compact（绝不写不可能的头部）；下次打开由开盖自愈兜底
+- **openRecordStore(exists 路径)**：next_id<1 / num_live<0 / data_size<0 / free_size<0 任一命中 → 重置为干净空库（putInt 1/0/1/0 + 写回 DB_HEADER_SIZE）→ 曾砖死的文件复活，MIDlet 恢复保存能力；尾巴垃圾留在盘上但 data_size=0 不可见，首次 append 即覆盖
+
+### 构建（Java 变更 → ROM 重生成链再次验证）
+- `./build_vita.sh` EXIT=0，RecordStoreImpl.class 10490B 与 libobj.a 同批 04:24；`libmidp.so` _rom_linkcheck 失败照旧无害
+- vita-port：需 `export PATH=/home/zyb/tools/jdk8u502-b07/bin:$PATH`（javac）+ `rm build/cmake/vita_version.h` 破版本缓存
+- 产物 `midp_vita.vpk`，`strings` 验证 `v01.50 b209`
+
+### 实测预期
+- 第一次启动 UC：开盖自愈把 -296 头部重置为空库（日志可观察 seek -256 不再出现）
+- 保存书签/历史后退出重进：**数据应存活**（compact 守卫阻断 -296 再产生）
+- 若仍复现：抓 `rms/appdb_1A35/FFFFFFFF` hexdump 头 64B + midp_stderr.log，重点看 data_size 是否再次为负（若为负说明还有第三条写坏路径）
+
+### 教训
+- "打开时校验"防不了"运行时写坏"——**写回前的变量必须与写盘值同源校验**（本例 compactedSize 先算后判，而不是先 putInt 再读回判断）
+- RMS 砖死的三要素齐了：物理 truncate 缺失（模拟器）+ 路径共用（空白名 store）+ 无守卫的减法（上游代码假设存储栈可靠）
+- v01.49 守卫只挡 `<=0` 的**块循环**，挡不住 `>0` 的**幻影空闲块**——守卫要覆盖"值合法但内容是垃圾"的情况，只能靠算术不变量（data_size ≥ 0）
+
+### 遗留
+- 幻影 2880B 空闲块的精确写入者未定位（0x6D393001 掩码在代码中无来源，疑为 db/idx 同文件互踩的 idx 写入）；开盖自愈使其失去危害性，观察优先
+- 报告#2（书签卡顿疑为网页加载）：本次 stderr 全程无 seek 风暴无空转，v01.49 已解决 IO 侧；网页加载卡顿属 UC 自身单线程解释器性能范畴，暂不动
 
 ## 2026-09-10 v01.49：UC 书签保存 23 秒无响应 + PC=0x0 崩溃——calculateBlockSize 负块大小无界循环（phoneme-midp 提交 5eea6a1、vita-port 提交 508ae93）
 
