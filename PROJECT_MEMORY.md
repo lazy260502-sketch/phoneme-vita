@@ -1,6 +1,42 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-13
 
+## 2026-09-13 v01.56：真机安装 0x8010113D 定案——sce_sys PNG 必须是索引色（vita-port `assets/sce_sys/`）
+
+### 定案过程（12 包 A/B 矩阵，真机实测）
+
+历时三轮的排查矩阵（A–Q 包，全在 `build/test_vpks/` 生成后 FTP 实测）：
+
+| 包 | 变量 | 真机结果 |
+|---|---|---|
+| A 无data / C 完整换ID / D 未压缩SELF / E 修template | 我们 sfo + **RGB PNG** | ❌ 全败（88–99% 漂移） |
+| H hello eboot + 我们壳 | **RGB PNG** + 手写 gate template | ❌ |
+| F hello+2MB填充 / G hello+16MB填充 / J python重打包hello | 纯 hello + python zipfile 打包 | ✅ 全过 |
+| I 我们的 eboot + hello 壳 | eboot 变量 | ✅（eboot 洗清） |
+| N 我们的完整 sfo + hello 资源 | sfo/TITLE_ID 变量 | ✅（sfo 洗清，含数字前缀 J2ME） |
+| O hello + 仅 TITLE_ID=JMEE00002 | 数字前缀理论 | ✅（该理论作废） |
+| Q 我们 RGB PNG + hello 原版 template | **PNG 单变量** | ❌ **定罪** |
+| P 我们全内容 + **索引色 PNG** | 修复验证 | ✅ **定案** |
+
+### 根因
+
+- **SceShell/promoter 拒绝真彩色（color-type 2）PNG**，只接受索引色（color-type 3）。hello_world 三个资源全是 palette 型（bg 甚至是 1-bit），我们的全是 8-bit RGB——尺寸合规（128×128/840×500/280×158）但编码不对。
+- **Vita3K 不校验** → 模拟器永远能装，掩盖问题。
+- 失败点漂移（88/92/99%）= promoter 收尾逐个解码资源，死点随包内内容变化——"固定字段错误失败点应稳定"的反向推理是关键突破口。
+
+### 修复（vita-port 提交 f43ff34）
+
+- `icon0.png`/`bg.png`/`startup.png`：RGB → 8-bit palette 重编码（纯 Python zlib 手写 PNG 编解码，无 Pillow/ImageMagick 可用；与真机验证过的 P 包逐字节同源）。
+- `template.xml`：`content-ver="01.00"` → `content-rev="1"`；startup 从 frame2/liveitem 移到标准 `<gate><startup-image>` 写法。
+- 正式包重建核验：三 PNG ctype=3、template 含 gate、191 条目 testzip OK（13,664,532 字节，MD5 a5ba9e64）。
+
+### 教训
+
+1. **对照样本要逐字节剖到编码层**——"PNG 尺寸合规"不等于"PNG 合法"，color-type 差异肉眼不可见。
+2. **A/B 矩阵是最后手段但极有效**——12 个包把 eboot/sfo/体积/传输/打包器/PNG 六个假设全部一次洗清。
+3. **失败点漂移是数据敏感错误的指纹**——固定字段错误失败点稳定，漂移意味着校验器在扫描内容流。
+4. 模拟器宽容性 = 排查盲区：Vita3K 不查的东西（MEMSIZE、PNG 编码）恰好都是真机雷区。
+
 ## 2026-09-13 v01.55：总根因定案——`pcsl_string` 桩违反上游 NUL 终止语义，所有 RMS 库共享同一个物理文件（vita-port `vita_pcsl.c`）
 
 ### 用户报告（v01.54 实测）
