@@ -1,5 +1,291 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-11
+> Last Updated: 2026-09-13
+
+## 2026-09-13 v01.55：总根因定案——`pcsl_string` 桩违反上游 NUL 终止语义，所有 RMS 库共享同一个物理文件（vita-port `vita_pcsl.c`）
+
+### 用户报告（v01.54 实测）
+> "第一次保存书签，提示保存成功，实际没有，退出的时候提示存储空间少。第二次进卡在初始化。"
+
+### 决定性证据（v01.54 的 `name=` 面包屑 + FFFFFFFF hexdump）
+```
+[rms] open name='coreA' suite=-1 exists=0 (new store)     ← 新建库，写全新头（signature+next=1+时间戳）
+[rms] open name='A'     suite=-1 exists=1 next=1 live=0 ver=0 data=0   ← A 读到的正是 coreA 刚写的头！
+[rms] open name='coreA' ... exists=1 next=2 live=1 ver=1 data=0        ← coreA 二开读到别人的写入结果
+[rms] open name='G2'/'B'/'P'/'CK'/'R' ... 全部 exists=1 next=2 live=1 ver=1 data=0
+[rms] SALVAGE ... scan_end=104  /  64 bytes preserved   ← 所有库完全相同
+FFFFFFFF 文件：next=2 live=1 ver=1 data=0 + offset40 一个空闲块(id=-1,size=0x38)，共 104 字节
+```
+**不同名字的库在读同一个物理文件 `appdb_1A35/FFFFFFFF`——库名与 .db 后缀根本没进路径。**
+
+### 根因（上游语义 vs 我们的桩）
+上游不变量（`phoneme_source/phoneME/pcsl/string/utf16/pcsl_string.c`，对读确认）：
+1. `pcsl_string.data` **永远以 NUL 结尾**，`->length` **计入这个 NUL**（`:110` "Do not count terminating '\0'" 是访问器的职责）
+2. `PCSL_STRING_EMPTY = {&zero_char, 1, 0}`（length=**1**，不是 0）
+3. 字面量宏 `PCSL_DEFINE_*_LITERAL`：`length = sizeof(arr)/sizeof(jchar)`（NUL 含在内）
+4. `pcsl_string_cat`（`:490`）**吃掉第一个串的结尾 NUL**（"Strip the terminating zero at the end of the first string"）再拼接
+5. `midp_suiteid2pcsl_string(-1)` 返回 `{L"FFFFFFFF\0", length=9}`（静态缓冲区，8 位 hex+NUL）
+
+我们的桩（`vita-port/src/vita_pcsl.c`）全部违反：
+- `PCSL_STRING_EMPTY = {NULL, 0, 0}`；`pcsl_string_length` 返回 `->length` 原值不减 1
+- `cat`/`append`/`append_buf`/`append_char` 原样拷贝 `->length` 个 jchar → **字面量的内嵌 NUL 被拼进路径中部**
+- `convert_to_utf8` 按 `->length` 逐字转换（含内嵌 NUL），`snprintf("%s")`/`sceIoOpen` 在第一个 NUL 截断
+
+于是 `root + "FFFFFFFF\0" + "A" + ".db"` 的 C 视图 = `…/rms/appdb_1A35/FFFFFFFF`——**全部库同文件**。这解释了一切症状：
+- "保存成功实际没有"：写到共享文件，下次开库 header 又被别的库覆盖
+- "二次进全丢"：每次开库都读到别的库的 header → bad chain → salvage
+- "存储空间少"：所有库的写入叠在一个文件里，反复 salvage/compact 把它搅成浆糊
+- `[pcsl] unlink blocked .../FFFFFFFF`：UC 删自己的库（路径=FFFFFFFF）时句柄还开着
+- 上游 `rms.c`/`suitestore_intern.c` **零 bug**（diff IDENTICAL 证实）——问题全在我们自己的 pcsl 桩
+
+### v01.55 修改（`vita-port/src/vita_pcsl.c`，全部标注 v01.55）
+1. `PCSL_STRING_EMPTY` → `{&static_zero, 1, 0}`（与上游一致）
+2. `pcsl_string_length`/`utf16_length`：末位是 NUL 则减 1
+3. `pcsl_string_utf8_length`/`convert_to_utf8`：只转换内容（停在终止零）——消除 C 串截断点
+4. `convert_from_utf8`/`from_utf16`：**剥掉全部尾部 NUL**（上游 `:315`"Strip trailing zero characters"）+ 存 `length+1`（含单个终止零）
+5. `pcsl_string_cat` 重写：吃掉首串结尾 NUL、保证结果恰好一个终止零、空结果返回 EMPTY 常量（**核心修复**）
+6. `pcsl_string_dup`：非堆（常量/字面量）直接结构体拷贝（上游语义，避免 free 静态数据）
+7. `append`/`append_char`/`append_buf`：全部改走 cat/convert_from_utf16
+8. `equals`/`compare`/`starts_with`/`ends_with`/`index_of*`/`convert_to_jint`/`substring`：全部改为内容长度语义（终止零不参与）
+9. `pcsl_file_open` 新增 `/rms/` 路径一次性面包屑 `[pcsl] open path=<abs> flags=0x.. size=<N>`（8 槽去重）——下一轮日志直接看到每个库映射到哪个物理文件
+
+### 构建验证（v01.55）
+- `./build.sh midp`：`Build successful`，VPK `build/cmake/midp_vita.vpk` 13,679,669 B，`vita_version.h`=01.55 b211（build 号没变是正常的，计数器按 git hash+配置）
+- ELF 内 ASCII 验证：`[pcsl] open path=`=1、`01.55`=2、`01.54`=0
+- `libmidp.so` 的 `collect2: error: ld returned 1 exit status`（`_rom_linkcheck_mffd_false` 未定义）是已知无害噪音（v01.53 起就有，最终 ELF 由 CMake 链接成功）
+- `git diff --stat`：`vita_pcsl.c` 本轮大幅修改（pcsl_string 系列全量对齐上游）
+
+### 下一轮验证判据（v01.55 实测）
+1. **`[pcsl] open path=...` 应当出现多个不同路径**：`…/FFFFFFFF/A.db`、`…/FFFFFFFF/coreA.db`、`…/FFFFFFFF/G2.db`…——每个库一个文件，不再全是裸 `FFFFFFFF`
+2. `[rms] open name='X'` 各库头状态**互不相同**（不再全部 `next=2 live=1 ver=1 data=0`）
+3. `[rms] salvage` 不应再对每个库反复触发；书签保存后二次进入仍在
+4. 旧数据：共享文件 `FFFFFFFF` 里只有 104 字节垃圾（空闲块），无有效数据可救——**首次进 v01.55 后各库从零开始是预期行为**，之后才是真持久化
+5. 注意：v01.54 的 `SALVAGE skipped ... 64 bytes preserved` 保护了这个共享文件没被清零（v01.53 的零收获保护立功了）
+
+### 遗留 / 未做
+1. `pcsl_esc_attach_string` 仍是 dup 桩（非上游转义编码）。RMS 库名是 ASCII（A/B/G2/coreA）时 dup 与真转义等价；**中文名/特殊字符库名仍可能撞路径**——真转义实现留待需要时从 `phoneme_source/phoneME/pcsl/escfilenames/pcsl_esc.c` 移植
+2. `pcsl_string_convert_to_jlong` 仍是 jint 精度桩（无调用方受影响，观察）
+3. `[pcsl] unlink blocked .../FFFFFFFF` 调用方定位：v01.55 修复后该路径不再被构建，预计自然消失
+4. 上游 `pcsl_string.c` 还有 `pcsl_utf16_convert_to_utf8` 等转换助手未移植——目前手写转换已覆盖需求
+
+
+## 2026-09-12 v01.54：第二次进 UC 书签/历史全丢——三个真凶：db 头永不落盘、抢救把空闲块当 8 字节跨、抢救"零收获"时毁灭式重写（phoneme-midp `RecordStoreImpl.java` + vita-port `CMakeLists.txt` 版本号）
+
+### 用户报告（v01.53 实测）
+> "第二次进 uc，之前保存的书签，历史记录都没了。和首次进入一样。"
+
+v01.53 把"空间不足"压下去了，但**跨次启动持久化**这条线没修好：第一次进能存，第二次进就是空的。
+
+### 日志证据（用户提供的 v01.53 stderr）
+```
+[RMS] created appdb: ux0:/data/J2ME00001/rms/appdb_1A35
+[rms] salvage (bad chain) live=0 data_size=64
+[rms] SALVAGE live=1 max_id=1 old_data_size=64 scan_end=104
+[pcsl] unlink blocked, file open elsewhere: ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFF   (重复多次)
+[rms] salvage (bad chain) live=1 data_size=0
+[rms] SALVAGE live=0 max_id=0 old_data_size=0 scan_end=5280        ← 5KB 数据被就地抹掉
+第二次进 UC:
+[rms] salvage (bad chain) live=0 data_size=64        ← 与第一轮开头一字不差
+[rms] SALVAGE live=1 max_id=3 old_data_size=64 scan_end=5280
+[rms] salvage (empty header, live blocks present) data_size=0
+[rms] SALVAGE live=1 max_id=54307759 old_data_size=0 scan_end=6032  ← 垃圾块被收下
+[rms] compact skipped: block chain inconsistent
+```
+`FFFFFFFF` 文件 8464B 的 hexdump 显示 header 自洽（`next_id=0x033CABB0`、`live=1`、`data_size=5248`）但 **offset 40 起全是 0**——头和块对不上，人眼可见。
+
+### 三个根因（都能独立造成"数据看起来没保存"）
+
+**1. db 头的写入只进 `midp_file_cache`，永不落盘（持久化缺失）**
+- 上游 `RecordStoreImpl` 里 **10 处 `// dbFile.commitWrite();` 全是注释掉的**（`phoneme_source` 原样如此，见其 215/454/514/714/863/884/1040/1086/1118 行，只有 1228 行抢救路径是活的），上游靠"关库时 cache 落盘"。
+- **Vita 上库从不被关**：`vita_main.c` 的 launcher 主循环让 VM/MIDlet 常驻（`runMidlet` 返回后进程不退出），所以：
+  - `addRecord` 写的 db 头 = 4~20 B → 进 `midp_file_cache`（`RMS_CACHE_LIMIT=3072`）；
+  - 记录 payload 大 → **`uncachedWrite` 直接下盘**（超过 cache limit）。
+  - ⇒ 磁盘上出现"**payload 在，header 不在**"的结构：`next_id=1 live=0 data_size=0` 压着一个 5KB 块。这正是每次 `salvage (empty header, live blocks present)` 的形状，也是 MIDlet 每次都拿到"空库"的机制。
+- **修复**：在 MIDP 规范规定的**持久化提交点**上恢复 commit——`addRecord`（规范原文 "The record is written to persistent storage before the method returns."）、`deleteRecord`、`setRecord`。子步骤 `addBlock`/`freeBlock`/`writeBlock` 不各自提交（否则一次 addRecord 刷三次），`compactRecords` 末尾本来就有 `truncate()` 带刷。
+
+**2. 抢救扫描把空闲块当"跳过 8 字节 block header"处理（垃圾块的来源）**
+- 规范走法是 `currentOffset += currentSize`，**活块和空闲块一样按整块跨**（`RecordStoreIndex.getRecordIDs()` 与 `getFreeBlock()` 均如此，已对读确认）。
+- v01.52/v01.53 的 `salvageStore()` 只在"活块"分支 `offset += size`，**`else` 分支一律 `offset += BLOCK_HEADER_SIZE`**——于是扫描器踩进空闲块的 payload 里、按随机字节"重新同步"，把 payload 当成块头收下 → 日志里 `max_id=54307759` 就是这么来的（`1615147117` 同源）。随后按这个垃圾块致密重写 + 截断，**真实记录被覆盖/截掉** = 第二次进书签没了。
+- **修复**：新增分支 `id < 0 && dataSize >= 0 && size > 0 && blockFitsInFile(offset, size)` → `offset += size`（健康空闲块按整块跨）；只有真正坏头才走 `+= BLOCK_HEADER_SIZE` 重新同步。
+
+**3. 抢救"零收获"时是毁灭式的（v01.52 起就埋着）**
+- 原逻辑：`liveCount==0` → 照样致密重写（无内容）→ 把 `[40, scanEndOffset)` **整段零填** → 写一个 `data_size=0` 的空头 → `truncate(40)`。日志里的 `SALVAGE live=0 max_id=0 ... scan_end=5280` 就是**一个 5KB 库被物理抹掉**，不可恢复。
+- 若扫描器本身误判（根因 2 正是），这一步就把用户数据从"没读出来"变成"真没了"。
+- **修复**：`liveCount == 0 && scanEndOffset > DB_HEADER_SIZE` 时**直接 return，不写不填不截**，只打一行
+  `[rms] SALVAGE skipped name='<store>': no live block found, <N> bytes preserved`。
+  代价仅是该库这次仍以空库打开、下次还会再扫一遍；**任何情况下都不能因为"我读不懂"而销毁唯一一份数据**。
+
+### v01.54 修改
+**A. `phoneme-midp/src/rms/rms_api/reference/classes/com/sun/midp/rms/RecordStoreImpl.java`**
+1. `addRecord`/`deleteRecord`/`setRecord` 三处 `dbFile.commitWrite();` 恢复（带 VITA 说明注释）。
+2. `salvageStore(String storeName, byte[] dbHeaderData)` 签名加库名（构造器 3 个调用点同步），日志全部带 `name='...'`——**下一轮日志必须能直接看出是哪个库**。
+3. 扫描循环新增"健康空闲块按整块跨"分支（根因 2）。
+4. `liveCount==0` 且文件非空时提前 return（根因 3）。
+5. 构造器新增开库面包屑（`exists` 两分支各一条，含 `next/live/ver/data/free`）：
+   ```
+   [rms] open name='' suite=-1 exists=1 next=.. live=.. ver=.. data=.. free=..
+   [rms] open name='' suite=-1 exists=0 (new store)
+   ```
+   **每次开库头状态一次打全**，"上次存的数据这次还在不在盘上"一眼可判，不再靠猜。
+**B. `vita-port/CMakeLists.txt`**：`VITA_VERSION` 01.53 → 01.54。
+
+### 构建验证（本轮）
+- `./build.sh midp`：`Build successful`，VPK 13,678,862 B（`build/cmake/midp_vita.vpk`），`vita_version.h` = `01.54 b211`。
+- ROM 链验证（遵守 v01.53 教训 1，不看日志看字节）：ELF 内 **UTF-16LE** 计数
+  `SALVAGE skipped name=`=1、`open name='`=1、`salvage (bad chain) name=`=1、`salvage (empty header, live blocks present) name=`=1、`SALVAGE name='`=1（UTF-8 全 0，符合 Java 串规则）；`01.54` ASCII=2 / `01.53`=0。
+- `git diff --stat`（phoneme-midp）：`RecordStoreIndex.java` +13、`RecordStoreImpl.java` +663/-34（累计，含 v01.49~v01.53）。
+
+### 下一轮日志怎么看（v01.54 实测判据）
+1. 每个库开库一行 `[rms] open ...`：**第一轮写过数据后，第二轮开库时 `data`/`live` 是否与写入时一致**。
+   - 若一致、且没有 `[rms] salvage` ⇒ 持久化修好了（根因 1 成立）。
+   - 若 `exists=1` 但 `next=1 live=0 data=0` 压着非空文件 ⇒ header 仍然没落盘，继续查 `commitWrite` 之后的 cache 路径。
+2. 出现 `[rms] salvage (bad chain) name='X'` 时看 `X` 是谁——把 8464B 的 `FFFFFFFF` 和"书签库"对上号（空名库才是 `FFFFFFFF`）。
+3. `SALVAGE skipped ... bytes preserved` 出现即说明扫描器仍有盲区，**但数据没有被销毁**，可以再迭代抢救器。
+4. `max_id` 必须是正常量级（个位数/千位）；再出现 54307759 这种说明还有第二处垃圾来源。
+
+### 遗留 / 未做
+1. **`[pcsl] unlink blocked .../FFFFFFFF` 的调用方仍未定位**（候选：`rms.c:215 rmsdb_record_store_delete`、`fileCache.c`、`suitestore_task_manager.c`、`storageFile.c`、`components_storage_kni.c:173`）。若该路径是在"每次启动删库重建"，那它本身就是数据丢失的一环——v01.43 的"held 就拒删"保护了数据，但也可能让 MIDlet 的删除语义失败后走"当作新库"分支。**下一轮用 `name=` 面包屑对照 `unlink blocked` 的时序**。
+2. `midp_file_cache_truncate` 的记账仍未与钳后 `size` 对齐（v01.53 观察项，非本次根因）。
+3. `midp_file_cache` 仍是**单例且只缓存一个文件**：空名库的 db/idx 共用 `FFFFFFFF` 一条路径时，第二个句柄的 I/O 全部退化为非缓存路径，`cachedFileSize`/`cachedAvailableSpace` 与之无关——**长期项**，涉及共享 native 文件，改动要谨慎（最小 diff + 明确收益再动）。
+4. v01.54 **尚未在设备/Vita3K 实测**；上面判据是设计预期。
+
+## 2026-09-11 v01.53：UC 报"RMS 使用空间不足"——v01.52 抢救会接受垃圾块并把 data_size 写爆（phoneme-midp `RecordStoreImpl.java` + vita-port `vita_pcsl.c`）
+
+### 用户报告（v01.52 实测）
+> "uc 浏览器打开网页，提示 rms 使用空间不足。"
+
+v01.52 解决了"第二次进 UC 记录/书签丢失"（抢救成功、数据回来了），但引入新症状：**空间永远报不足**。方向一致——数据回来了，但库的账目被写坏了。
+
+### 根因定案（v01.52 的抢救缺少上界）
+v01.52 之前那条日志是关键证据：
+```
+[rms] SALVAGE live=1 max_id=1615147117 old_data_size=0
+```
+`max_id=1615147117` 是**垃圾块头被当成活块收下**了（`0x6040602D` 之类的随机字节被解析成 `id`）。v01.52 的接受条件是 `id>0 && dataSize>=0 && size>0`，**对 `size`/`dataSize` 没有任何上界**，于是：
+1. 致密重写按这个垃圾 `size` 推进 `writeOffset`（`writeOffset += size`，即使实读短了也照样加）；
+2. header 重算 `data_size = writeOffset - 40` → **`getSize()` 变成天文数字**；
+3. `getSizeAvailable()` = min(200000 − getSize(), storageFreeSpace) 的第一项变成**负数** → 钳到 0 → 每次 `addBlock()` 都抛 `RecordStoreFullException`；
+4. 同时 `truncate(writeOffset)` 记下一个巨大的 logical clamp → 该 store 之后所有 size/read 都被钳到一个虚假大小。
+
+**结论：不是磁盘真的满了，是 `data_size` 这一个 int 被垃圾块写爆，导致 200KB/每 suite 的额度恒为 0。** 这也解释了为什么 v01.52 之前"书签丢失"和 v01.53 "空间不足"会先后出现——同一处缺边界。
+
+### v01.53 修改
+
+**A. `phoneme-midp/src/rms/rms_api/reference/classes/com/sun/midp/rms/RecordStoreImpl.java`（抢救加边界 + 空间面包屑）**
+1. 新增常量 `SALVAGE_MAX_BLOCK = RMSConfig.STORAGE_SUITE_LIMIT + BLOCK_HEADER_SIZE`（即 200008）、`SALVAGE_MAX_SPAN = 2 * RMSConfig.STORAGE_SUITE_LIMIT`、`PROBE_BYTE[1]`。
+2. 新增 `blockFitsInFile(offset, size)`：`size<=0 || size>200008` 直接 false；否则 `seek(offset+size-1)` + `read(PROBE_BYTE,0,1)==1`（payload 末字节必须真实存在）。**垃圾 size 在第一道就被拒**。
+3. `physicalFileHasLiveBlocks()` 改用 `blockFitsInFile()`（去掉局部 `byte[] one`）。
+4. `salvageStore()` 扫描循环加跨度上界：`offset > DB_HEADER_SIZE + SALVAGE_MAX_SPAN` 即停（`scanEndOffset=offset; break;`），接受条件加 `blockFitsInFile(offset, size)`；日志补 `scan_end=`。
+5. `getSizeAvailable()` 新增一次性命中面包屑（`spaceReported` 字段，只打一次）：
+   ```
+   [rms] space low area=<storageAreaId> fileSpace=<..> limitSpace=<..> data_size=<..> rv=<..>
+   ```
+   **三项一次打全**，"空间不足"到底是 per-suite 额度负数、还是磁盘 free space 归零，日志直接给答案，不用再猜。
+6. 注意：`recordStoreName` 只是构造器**参数**、不是字段，面包屑里用 `RmsEnvironment.getStorageAreaId(suiteId)`（见下方构建陷阱）。
+
+**B. `vita-port/src/vita_pcsl.c`（把"逻辑截断"补成真的物理截断 + 让 used space 认逻辑大小）**
+1. 新增 `vita_logical_size_for(abs_path)`：在 `g_open_handles` 里找同路径、`logical_size >= 0` 的句柄，返回最小逻辑大小，否则 -1。
+2. 新增 `vita_physical_truncate(abs_path, size)`:先 `truncate(path, size)`（newlib 路径版，Vita 上是 `sceIoChstat` 包装），失败再 `open(O_WRONLY)`+`ftruncate(fd)`+`close`；`size<0` 或 `app0:` 前缀直接返回 -1。
+3. `pcsl_file_truncate()` 重写：
+   - **先取 `cur_pos` 再 `SEEK_END`**（旧代码先 SEEK_END，"恢复位置"实际是 seek 回 EOF，是潜伏 bug）；
+   - 已有 clamp 时取更小值（`size = min(size, logical_size)`），保证物理收缩永不落在给调用方看的大小之上；
+   - `!vita_handles_held_ex(path, vf)` 时才真收缩（空名 store 的 db/idx 共用一个路径，**twint handle** 情况下收缩会剪掉对方还相信的数据）；成功后若物理 EOF `<= size` 就清掉 clamp。
+4. `pcsl_file_close()`：关闭前取 `pending = logical_size`，`sceIoClose` 后若无人再持有该路径则 `vita_physical_truncate(path, pending)`——**clamp 在关文件时落地**，不留"逻辑小了但磁盘没回收"的尾巴。
+5. `pcsl_file_getusedspace()`：逐目录项拼 `abs_dir + "/" + d_name`，用 `vita_logical_size_for()` 取逻辑大小，按 `(logical>=0 && logical<physical) ? logical : physical` 计入；并加一次性诊断 `[pcsl] getusedspace <dir> = <N> bytes`（4 槽去重、`total>1MB` 才打）。**这是"物理 st_size 被当成 used space"的直接修复**：bloated 的物理文件不再把 free space 压到 0。
+6. `vita_handles_held_ex()` 去掉 `__attribute__((unused))`（重新被 `pcsl_file_truncate` 使用）。
+
+**C. `vita-port/CMakeLists.txt`**：`VITA_VERSION` 01.52 → 01.53。
+
+### 构建陷阱（本轮新增，务必记住）
+1. **javac 失败会静默跳过 ROM 重生成，而 `build.sh` 仍然打印 "Build successful"**：`./build.sh midp 2>&1 | grep ...` 里 `make` 的失败在管道中被吞掉。第一次改完 `RecordStoreImpl.java` 引用了不存在的 `recordStoreName`，`javac` 报 `cannot find symbol` → `classes.zip` / `ROMImage_05.cpp` / `ROMImage.o` / `libobj.a` **全部停在旧时间戳**（11:46），而 VPK 照样产出、脚本照样说成功。**改 Java 后必须用时间戳链证明 ROM 真的重生成**（见下）。
+2. **判断"Java 改动进产物没有"的时间戳链**：`build/vita_arm/classes/com/sun/midp/rms/RecordStoreImpl.class` → `classes.zip` → `ROMImage_05.cpp` → `obj/arm/ROMImage.o` → `obj/arm/libobj.a` → `vita-port/build/cmake/midp_vita`，必须**逐级晚于源文件**。本次实测：源 16:32 → class/classes.zip 16:52 → ROMImage_05.cpp/ROMImage.o/libobj.a 16:53 → ELF 16:53。日志中可见 `... searching updated .java files` / `... compiling 1 .java files` / `romgen -romconfig ... -romize`。
+3. **字符串验证一分为二**（v01.52 定的 UTF-16LE 规则只对 Java 串成立）：Java 串（`ROM_BL`，UTF-16LE）用 `data.count(s.encode('utf-16-le'))`；C 串（`vita_pcsl.c`）用 `data.count(s.encode())`。本次实测：`[rms] space low area=` utf16le=1 / `scan_end=` utf16le=1 / `[pcsl] getusedspace ` ascii=1。`.self` 是压缩的，查串只能查 `build/cmake/midp_vita`。
+4. **Vita newlib 的 truncate 家族（用 objdump 反汇编 `lib_a-truncate.o` 定案）**：`sceIoTruncate` 不存在；`truncate(path,size)` = `sceIoChstat(path, SceIoStat{st_size})` 纯路径版；`ftruncate(fd,size)` 走 `__vita_fd_grab(fd)`，而该函数只认 newlib 自己 fd 表里的 **1..255**，**`sceIoOpen` 拿到的 SceUID 不能直接喂给 `ftruncate`**。⇒ 路径版 `truncate()` 是唯一可靠路线，`ftruncate` 只作为 `open()` 得来句柄的备选。
+5. **`midp_file_cache` 是全局单例、且只缓存第一个文件**（`midp_file_cache_truncate` 里 `cachedAvailableSpace += cachedFileSize - size` 用的是调用方给的 `size`，不是 `pcsl_file_truncate` 实际生效的钳后值）。**本轮未改**：实测该差额只在"物理收缩失败（twin handle）"时才出现，方向是少记可用空间（保守），不足以解释本次症状；留作观察项，不再无凭据地动它。
+
+### 实测预期（v01.53）
+- 打开 UC 时 stdout 出现 `[rms] space low area=0 fileSpace=<N> limitSpace=<M> data_size=<K> rv=<R>`——**看这三项谁是 0/负数即可定案**：
+  - `limitSpace` 为负/0 且 `data_size` 巨大 ⇒ 库头被写爆（v01.52 的垃圾块），需要一次抢救把 `data_size` 收回真实值；
+  - `fileSpace` 为 0 ⇒ 磁盘账目问题，看同一轮的 `[pcsl] getusedspace <dir> = <N> bytes` 是否仍然偏大。
+- 坏库首次开库：`[rms] SALVAGE live=N max_id=M old_data_size=K scan_end=E`，`max_id` 应当是**正常量级**（不再出现 1615147117 这种）。
+- 正常库：无 `[rms]` 输出。
+
+### 遗留 / 未做
+1. **`midp_file_cache_truncate` 的记账未与钳后的 `size` 对齐**（见构建陷阱 5）——已评估，非本次根因，未改。
+2. **`[pcsl] unlink blocked, file open elsewhere: .../rms/appdb_1A35/FFFFFFFF` 的调用方仍未定位**（空名 store 的 db/idx 共用 `FFFFFFFF` 路径）。候选：`rms.c:215 rmsdb_record_store_delete`、`fileCache.c:84/259`、`suitestore_task_manager.c:452`、`storageFile.c:183`、`components_storage_kni.c:173`。
+3. **v01.53 尚未在设备/Vita3K 上实测**，上面"实测预期"是设计预期，不是观察结果。
+4. 顺手清理：`vita-port/build/cmake/midp_vita.vpk.out.0nUsn9`（v01.52 jar 自吞噬事故留下的 72GB 临时文件）已删除；`samples/j2me/09:20，理论上用户装的可能是`（误重定向产生的 63B 垃圾文件，09-09 09:58）仍在，待确认后删。
+
+## 2026-09-11 v01.52：v01.51 的"坏链重置"被证实抹掉用户数据——改为抢救（salvage）策略
+
+### 用户报告（v01.51 实测）
+> "还是存在问题，第二次进 uc 记录和书签都没了，和首次进入一样。"
+
+用户附的 `FFFFFFFF` hexdump 是决定性证据：`sig=midp-rms` / `next_id=1` / `num_live=0` / **`version=1`** / `data_size=0` / `free_size=0`，**物理文件 5856 字节**、偏移 40 起还有 `id=-1 size=168` 的自由块。`version=1` 只可能由 v01.51 重置块写入（`else` 初始化分支不写 version）⇒ **v01.51 的自愈在含 5856 字节活数据的库上触发了，把库抹成空**。
+
+### 根因定案（为什么"简单写入/seek 搞不好"）
+1. **`midp_file_cache` 的写缓存在内存**：小的 header 写（`data_size`/`num_live` 等 4~20 字节）走缓存，块数据大写直通磁盘。UC 退出若未走 `closeRecordStore()`（或进程被杀），磁盘留下"块数据新、header 旧"的错位文件——这就是链校验检测到的不一致来源。**块本身几乎总是完好的，坏的只是 header 的口径。**
+2. **v01.51 的应对（重置为空）方向性错误**：把 5856 字节的完好数据当成垃圾扔掉。正确策略是**按物理内容抢救**。
+3. `[pcsl] unlink blocked ... FFFFFFFF` 反复出现是框架清理循环（`rmsdb_remove_record_stores_for_suite` / `quietDeleteFile`）对空名 store 的删除尝试被预检挡住，**无害**（失败即保留活数据）。
+
+### v01.52 修改（`RecordStoreImpl.java` 单文件，+1 新方法群替换 2 个重置块）
+1. **`salvageStore(byte[] dbHeaderData)`（新）**：
+   - 扫描到**物理 EOF**（不信 header 的 data_size——它就是谎言来源；被 v01.51 抹过的库 data_size=0 但记录物理还在，照样能找回）；
+   - 坏块头按 8 字节滑步重同步；`id>0 && size>0` 收进活块表（上限 512）；
+   - **按 id 去重**（陈旧尾巴里是旧副本；compact 把数据下移 ⇒ 最低偏移处是最新副本，取第一个）；
+   - 活块**致密重写**到 `[DB_HEADER_SIZE, ...)`（边读边写、`n<=0` 即断尾丢弃该块及之后）；
+   - header 按实际保留内容重算：`next_id = max(旧next_id, maxId+1)`（不复用已删 id，符合 RMS 规范）、`num_live=kept`、`version+1`、`data_size=writeOffset-40`、`free_size=0`；
+   - **`commitWrite()` 后再 `truncate(writeOffset)`**（header 是 40 字节小写，会留在 midp_file_cache 里！必须先 flush 再钳制尾巴）。
+2. **`physicalFileHasLiveBlocks()`（新探针）**：header 声称空库（`num_live==0`）但物理文件里存在"payload 末字节可读"的活块 ⇒ 抢救。payload 校验防止垃圾头（声称越界 size）每次开库空触发。**用户当前这台设备上被 v01.51 抹掉的书签，装上 v01.52 后首次启动即被此探针救回。**
+3. **`isBlockChainConsistent()` 增强**：除原有检查外，交叉核对**扫描到的活块数 == header 的 num_live**（捕获"header 写丢失但块完好"的形态）。
+4. 构造器两个重置块 → 改调 `salvageStore()`；面包屑统一 `[rms] salvage (...)` / `[rms] SALVAGE live=N max_id=M old_data_size=K`。
+5. `compactRecords()` 的坏链早退（v01.51）保留不变。
+
+### 实测预期（v01.52）
+- **本机已被 v01.51 抹掉的书签**：首启 v01.52 时 stdout 出现 `[rms] salvage (empty header, live blocks present)` + `[rms] SALVAGE live=N ...`（N>0），书签应恢复。
+- 正常库：无 `[rms]` 输出（探针在第一个活块处即终止，代价可忽略）。
+- 若 `SALVAGE live=0` 且数据确实没了：行为等同 v01.51（空库重建），不会再更糟。
+
+### 构建事实（沿袭 v01.51 定案，v01.52 修正两条）
+1. ~~ROM 输入是 `classes.zip`~~（正确，保留）；~~`strings | grep` 可验证字符串常量~~（**v01.52 修正：错误**）。
+2. **romgen 把字符串常量编码为 UTF-16LE 的 `ROM_BL` 宏打包**（见 `ROMImage_00.cpp` 的 `_rom_text_block0`），**不是明文 ASCII** ⇒ `strings <ELF> | grep '<面包屑>'` 必然为 0，**不能**当"改动没进产物"的证据。正确验证方式：`python3 -c "open('midp_vita','rb').read().count('<字符串>'.encode('utf-16-le'))"`。
+3. `Logging.*` 编译期被剥（留痕只能 `System.out`）——仍然正确。
+4. ~~CMake 的 jar 依赖 glob `*.class`~~ —— 方向正确但**激活了潜伏的 jar 自吞噬**（见第 5 条）。
+5. **`MIDP_SYSTEM_JAR` 输出路径必须在 `classes/` 目录之外**：历史上它是 `${MIDP_BUILD}/classes/midp_system.jar` 而打包命令是 `jar cf <out> -C classes .`——输出在被打包目录内。旧 `DEPENDS` 盯目录 mtime 几乎不重跑（掩盖了 bug）；v01.51 glob `*.class` 让它**每次重跑**，每跑一次把上一代 jar 塞进自己 → 指数膨胀（实测 1.2MB → 138GB，`classes.zip` 又把怪兽打包 → 30GB）。**v01.52 已改为 `${MIDP_BUILD}/midp_system.jar`**。
+6. `libmidp.so` 的 `_rom_linkcheck_mffd_false` 报错无害（仍然正确）。
+7. 判"改动是否进产物"：时间戳单调链 + `javap -classpath classes.zip` + **UTF-16LE 字节串搜索**（第 2 条）。
+
+## 2026-09-11 v01.51：块链损坏定位 + Java 侧面包屑 + ROM 出货链取证（phoneme-midp / vita-port）
+
+### 用户报告（v01.50 实测）
+> "删除 rms，第一次进正常，保存书签，第二次进卡在初始化，进不去。"
+
+首启（空库）正常、存书签后二启卡死 ⇒ 差异只在**落盘的 RMS 内容**，与 v01.50 的"数据丢失"不同：这次头部合法，坏的是**数据区的块链**。
+
+### 定案：v01.50 的守卫维度不够
+- v01.49 挡 `calculateBlockSize <= 0`（块循环），v01.50 挡头部字段不可能值（data_size < 0 等），**都看不到"头部合法但数据区字节不是合法块头"**。
+- 数据区出现非法块头（Vita3K 丢 O_TRUNC + `pcsl_file_truncate` 只是随句柄消失的逻辑钳制 ⇒ 陈旧尾巴留在 live 区），任何一次行走（`getRecordIDs` / `getRecordHeader_SearchFromTo` / `getFreeBlock`）都会跳过数据区末尾 ⇒ 找不到任何记录 ⇒ MIDlet 恢复状态时永远等不到数据 = "卡在初始化"。
+- 更糟：CLOSE 时 `compactRecords()` 按"遇到的每个 8 字节头"搬数据并改写 data_size，遇到假头就搬垃圾并把 data_size 压小 ⇒ 首次启动还读得出的库被压成坏库。
+
+### v01.51 修改
+1. **`RecordStoreImpl.isBlockChainConsistent(byte[])`（新增，只读）**：按 `calculateBlockSize(getInt(header,4))` 走 `[DB_HEADER_SIZE, data_size+DB_HEADER_SIZE)`，每块必须 `size > 0` 且 `size <= 剩余`，最终必须**正好落在 dbSize**。只读，不写盘，只动文件位置。
+2. **`compactRecords()`**：链不一致 → 直接 return（绝不基于坏链搬数据/改 data_size）。
+3. **打开自愈（构造器 `if (exists)` 分支）**：链不一致 → 整店重置为 pristine 空店（next_id=1 / num_live=0 / version=1 / last_modified=now / data_size=0 / free_size=0）＝ 等价于用户手动"删 rms"，这是唯一验证过能让 UC 再启动的操作。
+4. **`RecordStoreIndex.getFreeBlock()`**：块越界（`currentSize > size - offset`）→ 打印 + `return 0`（追加到末尾），绝不返回越界偏移覆盖活数据。
+5. **`vita-port/src/vita_pcsl.c` `pcsl_file_seek()` 去掉位置钳制**：`storagePosition()` 只把 `-1` 当错误，v01.47 的"钳制到 logical_size 的正数返回值"会被当成成功 ⇒ file cache 位置与句柄位置静默分裂。
+6. **Java 侧面包屑（本轮新增，见下）**：`System.out.println("[rms] ...")`。
+
+### 本轮踩到并定案的构建事实（比修复本身更值钱）
+1. **ROM 的输入是 `classes.zip`，不是 `midp_system.jar`**：`Defs.gmk:114  MIDP_CLASSES_ZIP ?= $(MIDP_OUTPUT_DIR)/classes.zip`，romgen 规则 `cldc_vm.gmk:227  $(MIDP_OUTPUT_DIR)/ROMImage.cpp: $(MIDP_CLASSES_ZIP) ...`。`midp_system.jar` 只是被塞进 VPK 的数据副本（UseROM 下运行时不用它）。
+2. **romgen 去掉方法名**（ROMGEN_ARGS 含 `+EnableAllROMOptimizations`）⇒ 在 ROM/ELF 里 `strings | grep <方法名>` **必然为 0**，不能当"改动没进产物"的证据（本轮据此误判过一次，白白折腾）。可用的标记只能是**字符串常量**（`System.out.println` 的字面量一定进 ROM）。
+3. **`Logging.REPORT_LEVEL` 是编译期常量**：release ROM 里 `if (Logging.REPORT_LEVEL <= Logging.WARNING) { ... }` **整块被 javac 删除**（`javap -v classes.zip` 里搜不到该字符串，实测为 0）⇒ Java 侧若想留下痕迹，**只能用 `System.out`**（tty → `JVMSPI_PrintRaw` → stdout/`vm_output.log`）。现有 phoneME 的 `Logging.report` 全部是 no-op。
+4. **CMake 盯目录的依赖不可靠**：`add_custom_command(DEPENDS ${MIDP_BUILD}/classes)` —— javac **覆盖**已存在的 `.class` 不改目录 mtime ⇒ `midp_system.jar` 一直停留在 04:36 的旧货，v01.51 的类一度没进 VPK。已改为 `file(GLOB_RECURSE ... ${MIDP_BUILD}/classes/*.class)` + 资源文件作 `DEPENDS`。
+5. **`libmidp.so` 报 `undefined reference to '_rom_linkcheck_mffd_false'` 是无害的**：VM 库（`libcldc_vm.a` 的 `_MergedSrc005.o`/`Interpreter_arm.o`）期望 `..._mffd_false`，而 romgen 生成的是 `..._mffd_true`，`vita-port/src/vm_rom_stubs.c` 提供前者补齐；最终 ELF 用 `libobj_no_main.a`（含 `ROMImage.o`）链接，两者共存故能解析。**该错误发生在 ROM 重生成/`libobj.a` 归档之后**，所以 `./build.sh midp` 会在这一步 make 失败但产物齐全，脚本仍打印 "Build successful"（管道吞了非零退出码）。
+6. **判"改动是否进产物"的正确姿势**：时间戳单调链 `*.java → classes/*.class → classes.zip → ROMImage.cpp → ROMImage.o → libobj.a → libobj_no_main.a → midp_vita → midp_vita.vpk` + `javap -classpath classes.zip <类>` 看方法是否存在 + `strings <ELF> | grep <字符串常量>`。
+
+### 实测预期（v01.51）
+- 首启（空库）：无 `[rms]` 输出，正常。
+- 存书签 → 二启：若库坏 ⇒ `midp_stdout.log`/`vm_output.log` 出现 `[rms] RESET store (bad chain) ...`，UC **应能启动**（库被重置为空，书签丢失但不再卡死）。
+- 若二启**仍然卡初始化**且**没有** `[rms]` 输出 ⇒ 说明卡死与 RMS 块链无关，需要另抓 `midp_stderr.log` + `FFFFFFFF` 头 64B 重新定位。
 
 ## 2026-09-11 v01.50：RMS 存储砖死定案与自愈——data_size 负值头部被写盘（phoneme-midp 提交 a3fee44、vita-port 提交 60a2947）
 

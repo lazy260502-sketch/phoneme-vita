@@ -228,7 +228,61 @@ set(VITA_TITLEID  "J2ME00001")
 #       later "truncate blocked" for a path already reported as "unlink
 #       blocked" was swallowed and the stderr trail went cold. Dedup
 #       key is now op+path.
-set(VITA_VERSION  "01.50")
+# 01.51 (2026-09-11): "delete rms -> first launch fine, save a bookmark,
+#   second launch wedged in init". The damaged part is the record store's
+#   BLOCK CHAIN, not its header: bytes that are not a block header sit in
+#   the LIVE data region (a stale tail survives there because Vita3K drops
+#   SCE_O_TRUNC and pcsl_file_truncate is a logical clamp that dies with
+#   the handle), so every walk in the RMS index advances past the end of
+#   the data area and NO record is found - the MIDlet never finishes
+#   restoring its state. The header alone still passed the v01.50 check.
+#   (a) RecordStoreImpl.isBlockChainConsistent(): read-only chain check
+#       (every block positive, inside the data area, walk lands exactly on
+#       dbSize). compactRecords() now refuses to move data on an
+#       inconsistent chain - it used to relocate garbage and shrink
+#       data_size, the step that turned a readable store into a bricked one
+#       at CLOSE time, i.e. exactly between launch 1 and launch 2 - and the
+#       constructor resets a structurally broken store to a pristine empty
+#       one (the automatic equivalent of deleting the store, the only
+#       manual action that made the MIDlet start again).
+#   (b) RecordStoreIndex.getFreeBlock(): never return an offset inside a
+#       block that overruns the data area; report "no free block" so the
+#       record is appended at the end instead of overwriting live data.
+#   (c) vita_pcsl.c pcsl_file_seek(): report the REAL position again. The
+#       v01.47 clamp told the caller the file ended at the pending logical
+#       size while the fd had in fact moved past it, splitting the position
+#       the file cache tracks from the position the handle is at. Hiding a
+#       stale tail belongs to the read clamp and sizeofopenfile, which
+#       still do it.
+# 01.52 (2026-09-11): "second launch: records and bookmarks gone, same as
+#   first launch". The v01.51 chain-reset ERASED the user's data: the
+#   hexdump of the wiped store showed version=1 next_id=1 data_size=0 -
+#   the exact signature values of the v01.51 reset block - over a 5856
+#   byte file whose record blocks were still physically intact. Erasing
+#   was the wrong recovery: the mismatch the chain check detects is
+#   caused by the HEADER lagging the block writes (midp_file_cache holds
+#   small header writes in memory while the block data goes to disk;
+#   Vita3K drops SCE_O_TRUNC so a stale tail also survives), so the
+#   blocks themselves are almost always complete.
+#   (a) RecordStoreImpl.salvageStore() replaces BOTH reset blocks: scan
+#       the physical file to EOF block by block (NOT to the header's
+#       data_size - the header lies), dedupe by record id (a stale tail
+#       holds the OLD copy; compact moves data down so the lowest offset
+#       is newest), rewrite the live blocks densely from the top, rebuild
+#       the header from what was actually recovered (next_id never
+#       regresses), commitWrite() then truncate. A store with nothing
+#       salvageable ends up empty - identical to v01.51 - but everything
+#       recoverable is kept.
+#   (b) Third damage shape detected at open: header claims an EMPTY
+#       store while live blocks are physically present
+#       (physicalFileHasLiveBlocks probe, payload-verified so a garbage
+#       header past EOF cannot re-trigger it forever). This is exactly
+#       what a v01.51-wiped store looks like, so this very device's
+#       bookmarks are recoverable on the first launch of 01.52.
+#   (c) isBlockChainConsistent() now also cross-checks num_live (a lost
+#       header write after successful block writes made the old check
+#       pass while the index found no records).
+set(VITA_VERSION  "01.55")
 # 01.46 (2026-09-10, phoneme-midp 6525f4a): Second-launch UC crash (JIT)
 #   isolated. PC=0x85f05fd8 was inside the heap compiler_area (JIT code
 #   cache); the faulting ldr r4,[r5,#0x404] is the standard JIT prologue
@@ -444,13 +498,32 @@ target_link_libraries(${PROJECT_NAME}
 # fails with 0x8010113D (Vita3K never checks it).
 vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
 
-set(MIDP_SYSTEM_JAR ${MIDP_BUILD}/classes/midp_system.jar)
+# NOTE (v01.52): the jar output MUST live OUTSIDE the classes/ directory.
+# It used to be ${MIDP_BUILD}/classes/midp_system.jar while the package
+# command is "jar cf <out> -C classes ." - i.e. the output sat INSIDE the
+# tree being packaged. The old directory-mtime DEPENDS almost never
+# re-ran the rule, which hid the bug; the v01.51 glob-every-.class fix
+# made it re-run on every build, and each run swallowed the previous
+# jar into itself (exponential growth: 1.2 MB -> 138 GB observed, and
+# classes.zip then packaged that monster too - 30 GB more).
+set(MIDP_SYSTEM_JAR ${MIDP_BUILD}/midp_system.jar)
+
+# NOTE (v01.51): depending on the classes *directory* is not enough. Its
+# mtime only changes when an entry is added or removed, so recompiling an
+# existing .class file (javac overwrites in place) left a stale
+# midp_system.jar behind - which is how a v01.51 change managed to be
+# absent from the VPK while every step reported success. Depend on the
+# class files themselves instead.
+file(GLOB_RECURSE MIDP_SYSTEM_JAR_CLASSES ${MIDP_BUILD}/classes/*.class)
+file(GLOB_RECURSE MIDP_SYSTEM_JAR_RESOURCES
+    ${MIDP_DIR}/src/highlevelui/lcdlf/lfjava/resource/*)
 
 add_custom_command(
     OUTPUT  ${MIDP_SYSTEM_JAR}
     COMMAND ${Java_JAR_EXECUTABLE} cf ${MIDP_SYSTEM_JAR} -C ${MIDP_BUILD}/classes .
             -C ${MIDP_DIR}/src/highlevelui/lcdlf/lfjava/resource .
-    DEPENDS ${MIDP_BUILD}/classes
+    DEPENDS ${MIDP_SYSTEM_JAR_CLASSES} ${MIDP_SYSTEM_JAR_RESOURCES}
+            ${MIDP_BUILD}/classes
     COMMENT "Repackaging midp_system.jar with cldc + midp classes + chameleon skin resources"
     VERBATIM
 )

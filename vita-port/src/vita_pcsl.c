@@ -39,8 +39,27 @@
 #include <jvm.h>
 #include <midp_logging.h>
 
-/* PCSL string constants */
-const pcsl_string PCSL_STRING_EMPTY = { NULL, 0, 0 };
+/* PCSL string constants.
+ *
+ * v01.55 ROOT CAUSE FIX: upstream (pcsl/string/utf16/pcsl_string.c)
+ * defines the invariant "data is always zero-terminated and ->length
+ * COUNTS that terminating zero" - PCSL_STRING_EMPTY is {&zero_char, 1}
+ * and every literal built by PCSL_DEFINE_*_LITERAL macros carries
+ * sizeof(arr)/sizeof(jchar) (NUL included) as its length. Our old stubs
+ * treated ->length as "characters without the terminator" and copied
+ * ->length jchars verbatim in cat/append, so an embedded NUL traveled
+ * INSIDE the concatenated result: root + "FFFFFFFF\0" + "A.db\0"
+ * produced a pcsl_string whose C-view stopped at "…/FFFFFFFF". Every
+ * consumer that converts to a C string (snprintf/sceIoOpen) truncated
+ * there, so ALL record stores of the internal suite resolved to the
+ * same physical file "…/rms/appdb_1A35/FFFFFFFF" - store names and
+ * the .db extension were silently dropped ("first save says OK,
+ * second launch finds nothing"). The constants below and every
+ * length-aware function now follow the upstream convention exactly
+ * (see each fix point marked v01.55). */
+static jchar vita_empty_string_data = 0;
+
+const pcsl_string PCSL_STRING_EMPTY = { &vita_empty_string_data, 1, 0 };
 const pcsl_string PCSL_STRING_NULL  = { NULL, 0, 0 };
 
 /* ========================================================================
@@ -63,10 +82,17 @@ jsize pcsl_string_length(const pcsl_string *str) {
     if (str == NULL || str->data == NULL) {
         return 0;
     }
+    /* v01.55: upstream counts the terminating zero in ->length and
+     * subtracts it here ("Do not count terminating '\0'",
+     * pcsl_string.c:110). Callers build sizes/paths from this value. */
+    if (str->length > 0 && str->data[str->length - 1] == 0) {
+        return str->length - 1;
+    }
     return str->length;
 }
 
 jsize pcsl_string_utf16_length(const pcsl_string *str) {
+    /* v01.55: same upstream rule as pcsl_string_length(). */
     return pcsl_string_length(str);
 }
 
@@ -81,7 +107,10 @@ jsize pcsl_string_utf8_length(const pcsl_string *str) {
      * could never succeed, CD walk ran past the last entry). */
     jsize n = 0;
     jsize i;
-    for (i = 0; i < str->length; i++) {
+    /* v01.55: stop at the terminating zero (upstream length counts
+     * it; the UTF-8 view must not). */
+    jsize len = pcsl_string_length(str);
+    for (i = 0; i < len; i++) {
         jchar c = str->data[i];
         if (c < 0x80) {
             n += 1;
@@ -105,7 +134,13 @@ pcsl_string_status pcsl_string_convert_to_utf8(const pcsl_string *string,
      * included, NUL terminated) matching upstream semantics. */
     jsize o = 0;
     jsize i;
-    for (i = 0; i < string->length; i++) {
+    /* v01.55: convert the CONTENT only (upstream "->length" counts
+     * the terminating zero; the UTF-8 view stops before it). The old
+     * loop walked ->length jchars, so an embedded zero was copied
+     * into the middle of the result and every C-string consumer
+     * (snprintf %s, sceIoOpen) truncated at it. */
+    jsize len = pcsl_string_length(string);
+    for (i = 0; i < len; i++) {
         jchar c = string->data[i];
         jsize need;
         if (c < 0x80) {
@@ -143,14 +178,17 @@ pcsl_string_status pcsl_string_convert_to_utf16(const pcsl_string *str,
     if (str == NULL || buffer == NULL) {
         return PCSL_STRING_EINVAL;
     }
+    /* v01.55: upstream copies str->length jchars (terminator
+     * included) and reports length-1 as converted; the caller-side
+     * content is identical to before, only the reported count now
+     * excludes the zero. */
     jsize len = str->length;
-    if (buffer_length < len + 1) {
+    if (buffer_length < len) {
         return PCSL_STRING_BUFFER_OVERFLOW;
     }
     memcpy(buffer, str->data, len * sizeof(jchar));
-    buffer[len] = 0;
     if (converted_length != NULL) {
-        *converted_length = len;
+        *converted_length = len - 1;
     }
     return PCSL_STRING_OK;
 }
@@ -161,7 +199,11 @@ pcsl_string_status pcsl_string_convert_from_utf8(const jbyte *buffer,
     if (buffer == NULL || string == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    /* Allocate jchar array and copy */
+    /* v01.55: upstream strips trailing zeroes from the source and
+     * appends exactly ONE terminating zero; ->length counts it. */
+    while (buffer_length > 0 && buffer[buffer_length - 1] == 0) {
+        buffer_length--;
+    }
     jchar *data = (jchar *)malloc((buffer_length + 1) * sizeof(jchar));
     if (data == NULL) {
         return PCSL_STRING_ENOMEM;
@@ -172,7 +214,7 @@ pcsl_string_status pcsl_string_convert_from_utf8(const jbyte *buffer,
     }
     data[buffer_length] = 0;
     string->data = data;
-    string->length = buffer_length;
+    string->length = buffer_length + 1;
     string->flags = PCSL_STRING_IN_HEAP;
     return PCSL_STRING_OK;
 }
@@ -183,6 +225,12 @@ pcsl_string_status pcsl_string_convert_from_utf16(const jchar *buffer,
     if (buffer == NULL || string == NULL) {
         return PCSL_STRING_EINVAL;
     }
+    /* v01.55: upstream strips ALL trailing zeroes from the source
+     * (pcsl_string.c:315 "Strip trailing zero characters") and then
+     * appends exactly ONE terminating zero; ->length counts it. */
+    while (buffer_length > 0 && buffer[buffer_length - 1] == 0) {
+        buffer_length--;
+    }
     jchar *data = (jchar *)malloc((buffer_length + 1) * sizeof(jchar));
     if (data == NULL) {
         return PCSL_STRING_ENOMEM;
@@ -190,7 +238,7 @@ pcsl_string_status pcsl_string_convert_from_utf16(const jchar *buffer,
     memcpy(data, buffer, buffer_length * sizeof(jchar));
     data[buffer_length] = 0;
     string->data = data;
-    string->length = buffer_length;
+    string->length = buffer_length + 1;
     string->flags = PCSL_STRING_IN_HEAP;
     return PCSL_STRING_OK;
 }
@@ -202,10 +250,18 @@ jboolean pcsl_string_equals(const pcsl_string *str1, const pcsl_string *str2) {
     if (str1 == NULL || str2 == NULL) {
         return KNI_FALSE;
     }
-    if (str1->length != str2->length) {
+    /* v01.55: compare the CONTENT (terminator excluded) - a literal
+     * "A\0" (length 2) must equal a built "A\0" regardless of how
+     * each side was constructed. */
+    jsize len1 = pcsl_string_length(str1);
+    jsize len2 = pcsl_string_length(str2);
+    if (len1 != len2) {
         return KNI_FALSE;
     }
-    return memcmp(str1->data, str2->data, str1->length * sizeof(jchar)) == 0
+    if (len1 == 0) {
+        return KNI_TRUE;
+    }
+    return memcmp(str1->data, str2->data, len1 * sizeof(jchar)) == 0
         ? KNI_TRUE : KNI_FALSE;
 }
 
@@ -215,10 +271,16 @@ pcsl_string_status pcsl_string_compare(const pcsl_string *str1,
     if (str1 == NULL || str2 == NULL || comparison == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    jsize min_len = (str1->length < str2->length) ? str1->length : str2->length;
-    int cmp = memcmp(str1->data, str2->data, min_len * sizeof(jchar));
+    /* v01.55: content-only comparison, see pcsl_string_equals. */
+    jsize len1 = pcsl_string_length(str1);
+    jsize len2 = pcsl_string_length(str2);
+    jsize min_len = (len1 < len2) ? len1 : len2;
+    int cmp = 0;
+    if (min_len > 0) {
+        cmp = memcmp(str1->data, str2->data, min_len * sizeof(jchar));
+    }
     if (cmp == 0) {
-        cmp = str1->length - str2->length;
+        cmp = (int)len1 - (int)len2;
     }
     *comparison = (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0;
     return PCSL_STRING_OK;
@@ -230,23 +292,74 @@ pcsl_string_status pcsl_string_cat(const pcsl_string *str1,
     if (str1 == NULL || str2 == NULL || str == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    jsize total = str1->length + str2->length;
-    jchar *data = (jchar *)malloc((total + 1) * sizeof(jchar));
-    if (data == NULL) {
-        return PCSL_STRING_ENOMEM;
+    /* v01.55 ROOT CAUSE FIX: upstream pcsl_string_cat (pcsl_string.c
+     * :490) strips the terminating zero of the FIRST string before
+     * concatenating ("Strip the terminating zero at the end of the
+     * first string"), producing {content1 + content2 + '\0'} with
+     * ->length counting that single final zero. Our old version
+     * copied ->length jchars of BOTH inputs verbatim, so a literal
+     * like the suite-id path component "FFFFFFFF\0" (length 9)
+     * injected its embedded zero into the middle of every built path;
+     * all later C-string consumers truncated at it and every record
+     * store of the internal suite resolved to the same physical
+     * file "…/rms/appdb_1A35/FFFFFFFF" (store name and .db extension
+     * silently dropped - "save says OK, next launch finds nothing").
+     */
+    {
+        jsize len1 = str1->data != NULL ? str1->length : 0;
+        jsize len2 = str2->data != NULL ? str2->length : 0;
+        /* Treat NULL data as the empty string. */
+        if (len1 > 0 && str1->data[len1 - 1] == 0) {
+            len1--; /* drop the terminator of the first part */
+        }
+        jsize total = len1 + len2;
+        if (total == 0) {
+            /* both parts empty: keep the canonical EMPTY constant */
+            *str = PCSL_STRING_EMPTY;
+            return PCSL_STRING_OK;
+        }
+        jchar *data = (jchar *)malloc(total * sizeof(jchar));
+        if (data == NULL) {
+            *str = PCSL_STRING_NULL;
+            return PCSL_STRING_ENOMEM;
+        }
+        if (len1 > 0) {
+            memcpy(data, str1->data, len1 * sizeof(jchar));
+        }
+        if (len2 > 0) {
+            memcpy(data + len1, str2->data, len2 * sizeof(jchar));
+        }
+        /* str2 supplies the single terminating zero (it always ends
+         * with one); if a caller passed a zero-less buffer, add it. */
+        if (data[total - 1] != 0) {
+            /* grow by one to append the terminator */
+            jchar *grown = (jchar *)realloc(data, (total + 1) * sizeof(jchar));
+            if (grown == NULL) {
+                free(data);
+                *str = PCSL_STRING_NULL;
+                return PCSL_STRING_ENOMEM;
+            }
+            data = grown;
+            data[total] = 0;
+            total++;
+        }
+        str->data = data;
+        str->length = total;
+        str->flags = PCSL_STRING_IN_HEAP;
+        return PCSL_STRING_OK;
     }
-    memcpy(data, str1->data, str1->length * sizeof(jchar));
-    memcpy(data + str1->length, str2->data, str2->length * sizeof(jchar));
-    data[total] = 0;
-    str->data = data;
-    str->length = total;
-    str->flags = PCSL_STRING_IN_HEAP;
-    return PCSL_STRING_OK;
 }
 
 pcsl_string_status pcsl_string_dup(const pcsl_string *src, pcsl_string *dst) {
     if (src == NULL || dst == NULL) {
         return PCSL_STRING_EINVAL;
+    }
+    /* v01.55: upstream returns the SAME struct (not a heap copy) for
+     * constants (EMPTY/NULL/literals - flags lack IN_HEAP), so
+     * pcsl_string_free() on the duplicate never frees static data. */
+    if (!(src->flags & PCSL_STRING_IN_HEAP)) {
+        *dst = *src;
+        return PCSL_STRING_OK;
     }
     return pcsl_string_cat(src, &PCSL_STRING_EMPTY, dst);
 }
@@ -255,22 +368,15 @@ pcsl_string_status pcsl_string_append(pcsl_string *dst, const pcsl_string *src) 
     if (dst == NULL || src == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    jsize total = dst->length + src->length;
-    jchar *data = (jchar *)malloc((total + 1) * sizeof(jchar));
-    if (data == NULL) {
-        return PCSL_STRING_ENOMEM;
+    /* v01.55: cat() now handles the terminator; the old manual copy
+     * moved embedded zeroes into the middle of the result. */
+    pcsl_string tmp;
+    pcsl_string_status rc = pcsl_string_cat(dst, src, &tmp);
+    if (rc != PCSL_STRING_OK) {
+        return rc;
     }
-    if (dst->data != NULL && dst->length > 0) {
-        memcpy(data, dst->data, dst->length * sizeof(jchar));
-    }
-    memcpy(data + dst->length, src->data, src->length * sizeof(jchar));
-    data[total] = 0;
-    if (dst->flags & PCSL_STRING_IN_HEAP) {
-        free(dst->data);
-    }
-    dst->data = data;
-    dst->length = total;
-    dst->flags = PCSL_STRING_IN_HEAP;
+    pcsl_string_free(dst);
+    *dst = tmp;
     return PCSL_STRING_OK;
 }
 
@@ -278,23 +384,18 @@ pcsl_string_status pcsl_string_append_char(pcsl_string *dst, const jchar newchar
     if (dst == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    jsize total = dst->length + 1;
-    jchar *data = (jchar *)malloc((total + 1) * sizeof(jchar));
-    if (data == NULL) {
-        return PCSL_STRING_ENOMEM;
+    /* v01.55: build a proper terminated part and go through cat(). */
+    jchar part[2];
+    part[0] = newchar;
+    part[1] = 0;
+    pcsl_string part_str;
+    pcsl_string_status rc = pcsl_string_convert_from_utf16(part, 1, &part_str);
+    if (rc != PCSL_STRING_OK) {
+        return rc;
     }
-    if (dst->data != NULL && dst->length > 0) {
-        memcpy(data, dst->data, dst->length * sizeof(jchar));
-    }
-    data[dst->length] = newchar;
-    data[total] = 0;
-    if (dst->flags & PCSL_STRING_IN_HEAP) {
-        free(dst->data);
-    }
-    dst->data = data;
-    dst->length = total;
-    dst->flags = PCSL_STRING_IN_HEAP;
-    return PCSL_STRING_OK;
+    rc = pcsl_string_append(dst, &part_str);
+    pcsl_string_free(&part_str);
+    return rc;
 }
 
 pcsl_string_status pcsl_string_append_buf(pcsl_string *dst,
@@ -303,23 +404,17 @@ pcsl_string_status pcsl_string_append_buf(pcsl_string *dst,
     if (dst == NULL || newtext == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    jsize total = dst->length + textsize;
-    jchar *data = (jchar *)malloc((total + 1) * sizeof(jchar));
-    if (data == NULL) {
-        return PCSL_STRING_ENOMEM;
+    /* v01.55: same route as upstream - convert_from_utf16 (which
+     * strips trailing zeroes and terminates) then append. */
+    pcsl_string part;
+    pcsl_string_status rc =
+        pcsl_string_convert_from_utf16(newtext, textsize, &part);
+    if (rc != PCSL_STRING_OK) {
+        return rc;
     }
-    if (dst->data != NULL && dst->length > 0) {
-        memcpy(data, dst->data, dst->length * sizeof(jchar));
-    }
-    memcpy(data + dst->length, newtext, textsize * sizeof(jchar));
-    data[total] = 0;
-    if (dst->flags & PCSL_STRING_IN_HEAP) {
-        free(dst->data);
-    }
-    dst->data = data;
-    dst->length = total;
-    dst->flags = PCSL_STRING_IN_HEAP;
-    return PCSL_STRING_OK;
+    rc = pcsl_string_append(dst, &part);
+    pcsl_string_free(&part);
+    return rc;
 }
 
 void pcsl_string_predict_size(pcsl_string *str, jint size) {
@@ -333,10 +428,19 @@ pcsl_string_status pcsl_string_substring(const pcsl_string *str,
     if (str == NULL || dst == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    if (begin_index < 0 || end_index > str->length || begin_index > end_index) {
+    /* v01.55: end_index bounds against the CONTENT length (without
+     * the terminating zero), matching upstream pcsl_string_length()
+     * semantics; the produced ->length counts the new terminator. */
+    jsize content_len = pcsl_string_length(str);
+    if (begin_index < 0 || end_index > (jint)content_len ||
+            begin_index > end_index) {
         return PCSL_STRING_EINVAL;
     }
     jsize len = end_index - begin_index;
+    if (len == 0) {
+        *dst = PCSL_STRING_EMPTY;
+        return PCSL_STRING_OK;
+    }
     jchar *data = (jchar *)malloc((len + 1) * sizeof(jchar));
     if (data == NULL) {
         return PCSL_STRING_ENOMEM;
@@ -344,7 +448,8 @@ pcsl_string_status pcsl_string_substring(const pcsl_string *str,
     memcpy(data, str->data + begin_index, len * sizeof(jchar));
     data[len] = 0;
     dst->data = data;
-    dst->length = len;
+    /* v01.55: ->length counts the terminating zero (upstream). */
+    dst->length = len + 1;
     dst->flags = PCSL_STRING_IN_HEAP;
     return PCSL_STRING_OK;
 }
@@ -353,10 +458,15 @@ jboolean pcsl_string_starts_with(const pcsl_string *str, const pcsl_string *pref
     if (str == NULL || prefix == NULL) {
         return KNI_FALSE;
     }
-    if (prefix->length > str->length) {
+    /* v01.55: content lengths (terminator excluded). */
+    jsize plen = pcsl_string_length(prefix);
+    if (plen > pcsl_string_length(str)) {
         return KNI_FALSE;
     }
-    return memcmp(str->data, prefix->data, prefix->length * sizeof(jchar)) == 0
+    if (plen == 0) {
+        return KNI_TRUE;
+    }
+    return memcmp(str->data, prefix->data, plen * sizeof(jchar)) == 0
         ? KNI_TRUE : KNI_FALSE;
 }
 
@@ -364,11 +474,17 @@ jboolean pcsl_string_ends_with(const pcsl_string *str, const pcsl_string *suffix
     if (str == NULL || suffix == NULL) {
         return KNI_FALSE;
     }
-    if (suffix->length > str->length) {
+    /* v01.55: content lengths (terminator excluded). */
+    jsize slen = pcsl_string_length(suffix);
+    jsize tlen = pcsl_string_length(str);
+    if (slen > tlen) {
         return KNI_FALSE;
     }
-    return memcmp(str->data + (str->length - suffix->length),
-                  suffix->data, suffix->length * sizeof(jchar)) == 0
+    if (slen == 0) {
+        return KNI_TRUE;
+    }
+    return memcmp(str->data + (tlen - slen),
+                  suffix->data, slen * sizeof(jchar)) == 0
         ? KNI_TRUE : KNI_FALSE;
 }
 
@@ -376,8 +492,10 @@ jint pcsl_string_index_of(const pcsl_string *str, jint c) {
     if (str == NULL || str->data == NULL) {
         return -1;
     }
+    /* v01.55: search the content only. */
     jsize i;
-    for (i = 0; i < str->length; i++) {
+    jsize len = pcsl_string_length(str);
+    for (i = 0; i < len; i++) {
         if (str->data[i] == (jchar)c) {
             return i;
         }
@@ -389,8 +507,10 @@ jint pcsl_string_index_of_from(const pcsl_string *str, jint c, jint from_index) 
     if (str == NULL || str->data == NULL) {
         return -1;
     }
+    /* v01.55: search the content only. */
     jsize i;
-    for (i = from_index; i < str->length; i++) {
+    jsize len = pcsl_string_length(str);
+    for (i = from_index; i < len; i++) {
         if (str->data[i] == (jchar)c) {
             return i;
         }
@@ -402,8 +522,10 @@ jint pcsl_string_last_index_of(const pcsl_string *str, jint c) {
     if (str == NULL || str->data == NULL) {
         return -1;
     }
+    /* v01.55: search the content only (terminator excluded). */
     jint i;
-    for (i = str->length - 1; i >= 0; i--) {
+    jint len = (jint)pcsl_string_length(str);
+    for (i = len - 1; i >= 0; i--) {
         if (str->data[i] == (jchar)c) {
             return i;
         }
@@ -415,7 +537,9 @@ jint pcsl_string_last_index_of_from(const pcsl_string *str, jint c, jint from_in
     if (str == NULL || str->data == NULL) {
         return -1;
     }
-    jint start = (from_index < str->length) ? from_index : str->length - 1;
+    /* v01.55: content length bounds the start. */
+    jint len = (jint)pcsl_string_length(str);
+    jint start = (from_index < len) ? from_index : len - 1;
     jint i;
     for (i = start; i >= 0; i--) {
         if (str->data[i] == (jchar)c) {
@@ -446,7 +570,9 @@ pcsl_string_status pcsl_string_convert_to_jint(const pcsl_string *str, jint *val
     /* Simple ASCII atoi */
     jint result = 0;
     jsize i;
-    for (i = 0; i < str->length; i++) {
+    /* v01.55: parse the content only (terminator excluded). */
+    jsize len = pcsl_string_length(str);
+    for (i = 0; i < len; i++) {
         if (str->data[i] >= '0' && str->data[i] <= '9') {
             result = result * 10 + (str->data[i] - '0');
         } else {
@@ -694,6 +820,74 @@ static int vita_handles_held(const char *abs_path) {
     return 0;
 }
 
+/* v01.53: smallest pending logical clamp our own handles hold for
+ * abs_path, or -1 when the path carries no clamp.
+ *
+ * pcsl_file_getusedspace() sums PHYSICAL st_size, but pcsl_file_truncate
+ * only flips a flag in the handle, so a store whose physical file is
+ * bloated (the v01.52 salvage wrote its whole stale tail as zeros, up
+ * to whatever GB-sized offset a garbage block header claimed) keeps
+ * reporting that bloat as USED space for as long as the handle lives.
+ * storage_get_free_space() = totalSpace - usedSpace then answers 0,
+ * every RecordStore space query returns 0 and the MIDlet reports "not
+ * enough RMS space" - while the store itself is tiny.
+ * Reading the clamp back here makes the two views agree. */
+static long vita_logical_size_for(const char *abs_path) {
+    int i;
+    long best = -1;
+    for (i = 0; i < VITA_MAX_OPEN_FILES; i++) {
+        VitaFileHandle *vf = g_open_handles[i];
+        if (vf == NULL || vf->fd < 0 || vf->logical_size < 0) {
+            continue;
+        }
+        if (strcmp(vf->path, abs_path) != 0) {
+            continue;
+        }
+        if (best < 0 || vf->logical_size < best) {
+            best = vf->logical_size;
+        }
+    }
+    return best;
+}
+
+/* v01.53: best-effort PHYSICAL shrink of abs_path to `size`.
+ *
+ * Vita has no sceIoTruncate of its own; both routes below end up in
+ * sceIoChstat with the size field, so at least one of them works on a
+ * platform that implements the file-size metadata operation at all.
+ * The path may live in the read-only app0: VPK, which must never be
+ * opened for write.
+ * Every failure is silently tolerated: the caller's logical clamp
+ * already keeps reads/size reports honest, so this only decides whether
+ * the space also comes back to pcsl_file_getusedspace(). */
+static int vita_physical_truncate(const char *abs_path, long size) {
+    int fd;
+    int rv;
+
+    if (size < 0 || strncmp(abs_path, "app0:", 5) == 0) {
+        return -1;
+    }
+
+    /* Path-based first: newlib's truncate() is a thin sceIoChstat
+     * wrapper, so it needs no descriptor - which matters because our
+     * handles come from raw sceIoOpen and ftruncate() only resolves
+     * descriptors that went through newlib's own fd table. It also
+     * avoids a second handle on a file that is already open. */
+    if (truncate(abs_path, (off_t)size) == 0) {
+        return 0;
+    }
+
+    /* Fallback: a newlib descriptor on the same path is one that
+     * ftruncate() accepts. */
+    fd = open(abs_path, O_WRONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    rv = ftruncate(fd, (off_t)size);
+    close(fd);
+    return rv;
+}
+
 /* v01.45: held-by-ANOTHER-handle variant for the truncate/O_TRUNC
  * swap paths. pcsl_file_truncate legitimately holds its own handle
  * on the path it is about to swap - the question there is whether a
@@ -701,8 +895,10 @@ static int vita_handles_held(const char *abs_path) {
  * which shares the db's suffix-less path) would anchor the name
  * through the remove. Same registry walk, one exclusion.
  * v01.47: the swap itself is gone (lazy logical truncation), but the
- * helper is kept for possible future swap-style operations. */
-__attribute__((unused))
+ * helper is kept for possible future swap-style operations.
+ * v01.53: pcsl_file_truncate uses it again, to decide whether a
+ * physical shrink is safe (a twin handle sharing the path must not have
+ * the file clipped underneath it). */
 static int vita_handles_held_ex(const char *abs_path, VitaFileHandle *self) {
     int i;
     for (i = 0; i < VITA_MAX_OPEN_FILES; i++) {
@@ -800,6 +996,40 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
     char abs_path[600];
     vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
 
+    /* v01.55 diagnostic: one line per DISTINCT path+flags reaching the
+     * file layer. The v01.54 log proved every named record store
+     * (A/B/G2/P/CK/R/coreA) opened THE SAME 104-byte header and ran
+     * the same salvage - either they all resolve to one physical file
+     * (name lost in the path build) or every per-store file carries
+     * identical damage. This breadcrumb settles which one it is, and
+     * shows the exact file name each store maps to. rms/ paths only;
+     * 8 dedup slots keep the log bounded. */
+    if (strstr(abs_path, "/rms/") != NULL) {
+        static char seen[8][600];
+        static int seen_n = 0;
+        int i;
+        int dup = 0;
+        for (i = 0; i < seen_n; i++) {
+            if (strncmp(seen[i], abs_path, sizeof(seen[0]) - 1) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            SceIoStat probe;
+            long sz = -1;
+            if (sceIoGetstat(abs_path, &probe) >= 0) {
+                sz = (long)probe.st_size;
+            }
+            if (seen_n < 8) {
+                snprintf(seen[seen_n], sizeof(seen[0]), "%s", abs_path);
+                seen_n++;
+            }
+            fprintf(stderr, "[pcsl] open path=%s flags=0x%x size=%ld\n",
+                    abs_path, flags, sz);
+        }
+    }
+
     /* Convert PCSL flags to Vita/Unix flags - explicit mapping (bit values differ!) */
     int oflags = 0;
     switch (flags & 0x03) {  /* mask out access mode bits */
@@ -889,10 +1119,21 @@ int pcsl_file_close(void *handle) {
     }
     
     VitaFileHandle *vf = (VitaFileHandle *)handle;
+    long pending = vf->logical_size;
     vita_handle_unregister(vf);
     if (vf->fd >= 0) {
         sceIoClose(vf->fd);
         vf->fd = -1;
+    }
+    /* v01.53: make a pending logical truncation durable. Once this
+     * handle is gone the clamp is gone with it (no one remembers the
+     * logical size any more), so a physical tail would start counting
+     * as used space again on the next open. Best effort: the truncate
+     * may fail on a platform that cannot chstat-by-fd, and a twin
+     * handle still using the path must not have the file clipped
+     * underneath it. */
+    if (pending >= 0 && !vita_handles_held(vf->path)) {
+        vita_physical_truncate(vf->path, pending);
     }
     free(vf);
     return 0;
@@ -1084,9 +1325,16 @@ int pcsl_file_unlink(const pcsl_string *fileName) {
  * weight only: we just remember the new size in the handle and clamp
  * reads/seeks/size reports to it (see VitaFileHandle.logical_size).
  * No syscall can fail, compact succeeds, no stale tail is ever
- * exposed. The physical bytes stay on disk until the store is next
- * deleted or rewritten - acceptable (RMS dbs are small); a real
- * device build could switch to a true ftruncate later. */
+ * exposed.
+ * v01.53: the clamp alone turned out to be too weak - the physical
+ * bytes are what pcsl_file_getusedspace() counts, and v01.52's salvage
+ * could leave a GB-sized zero tail behind, so "used space" stayed
+ * above the suite budget forever and the MIDlet reported "not enough
+ * RMS space". The clamp is now only the FLOOR of the fix: after it is
+ * recorded we also try a real shrink (vita_physical_truncate), and if
+ * that is impossible (twin handle, no platform support, app0:) the
+ * stale tail is at least excluded from the used-space sum by
+ * vita_logical_size_for(). */
 int pcsl_file_truncate(void *handle, long size) {
     if (handle == NULL || size < 0) {
         return -1;
@@ -1098,8 +1346,11 @@ int pcsl_file_truncate(void *handle, long size) {
     }
 
     {
-        SceOff file_size = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
+        /* NOTE: capture the caller's position BEFORE probing the size.
+         * (Seeking to SEEK_END first made the old "restore cur_pos"
+         * a seek back to EOF, i.e. no restore at all.) */
         SceOff cur_pos = sceIoLseek(vf->fd, 0, SCE_SEEK_CUR);
+        SceOff file_size = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
         if (file_size < 0) {
             return -1;
         }
@@ -1114,9 +1365,37 @@ int pcsl_file_truncate(void *handle, long size) {
         }
 
         /* Record the clamp. If a previous clamp exists, the smaller
-         * value wins (two shrinks in a row must not un-shrink). */
+         * value wins (two shrinks in a row must not un-shrink). The
+         * effective target is that same minimum, so the physical
+         * shrink below can never land ABOVE what callers are shown. */
         if (vf->logical_size < 0 || size < vf->logical_size) {
             vf->logical_size = size;
+        } else {
+            size = vf->logical_size;
+        }
+
+        /* v01.53: now that the caller's view is consistent, try to make
+         * the FILE consistent too. Only a physical shrink returns the
+         * space: pcsl_file_getusedspace() sums real st_size, and
+         * storage_get_free_space() = totalSpace - usedSpace, so a store
+         * whose physical file stayed bloated (the v01.52 salvage wrote
+         * the whole stale tail as zeros before truncating) keeps the
+         * MIDlet's free-space figure at 0 and every RecordStore then
+         * reports "not enough RMS space" although the store itself is
+         * tiny. Skipped when a TWIN handle shares this exact path
+         * (empty-named record stores put db and idx on one path),
+         * because shrinking under its feet could clip data it still
+         * believes in - the logical clamp covers that case. */
+        if (!vita_handles_held_ex(vf->path, vf) &&
+            vita_physical_truncate(vf->path, size) == 0) {
+            SceOff after = sceIoLseek(vf->fd, 0, SCE_SEEK_END);
+            if (after >= 0 && (long)after <= size) {
+                vf->logical_size = -1; /* file and clamp agree again */
+            }
+        }
+
+        if (cur_pos >= 0) {
+            sceIoLseek(vf->fd, cur_pos, SCE_SEEK_SET);
         }
         return 0;
     }
@@ -1412,13 +1691,16 @@ long pcsl_file_seek(void *handle, long offset, long position) {
     }
 
     {
-        /* v01.47: clamp a SEEK_END / large absolute seek to the
-         * pending logical size, mirroring the read clamp. */
-        long rv = (long)sceIoLseek(vf->fd, offset, whence);
-        if (vf->logical_size >= 0 && rv > vf->logical_size) {
-            rv = vf->logical_size;
-        }
-        return rv;
+        /* v01.51: do NOT clamp the reported position here. The pending
+         * logical_size is a truncation request, and the fd really is at
+         * the requested offset (sceIoLseek already moved it), so
+         * reporting the clamped value made storagePosition() / the file
+         * cache believe the file ended at logical_size while the next
+         * write went to the un-clamped offset - a silent split between
+         * the position the caller thinks it has and the position the
+         * handle is at. Hiding a stale tail is the job of the read clamp
+         * and pcsl_file_sizeofopenfile(), which still do it. */
+        return (long)sceIoLseek(vf->fd, offset, whence);
     }
 }
 
@@ -1512,9 +1794,50 @@ long pcsl_file_getusedspace(const pcsl_string *dirName) {
         if (entry.d_stat.st_attr & SCE_SO_IFDIR) {
             continue; /* directories do not count */
         }
-        total += (long)entry.d_stat.st_size;
+        /* v01.53: prefer the LOGICAL size when one of our handles holds
+         * a pending truncation for this exact entry. A file whose
+         * physical tail is stale (see pcsl_file_truncate) is logically
+         * smaller than st_size, and reporting the physical number makes
+         * storage_get_free_space() answer 0 for the whole suite - which
+         * is exactly the "not enough RMS space" the MIDlet shows. */
+        {
+            char entry_path[900];
+            long physical = (long)entry.d_stat.st_size;
+            long logical;
+            snprintf(entry_path, sizeof(entry_path), "%s/%s",
+                     abs_dir, entry.d_name);
+            logical = vita_logical_size_for(entry_path);
+            total += (logical >= 0 && logical < physical) ? logical
+                                                          : physical;
+        }
     }
     sceIoDclose(dfd);
+
+    /* v01.53: one-shot breadcrumb when the used-space figure is big
+     * enough to zero out a suite's free space on its own. The MIDlet's
+     * "not enough space" only ever comes from this number, and after
+     * the v01.52 salvage incident a single leftover store could carry
+     * a multi-MB/Gb physical tail - so name the culprit directory and
+     * its (possibly inflated) total instead of leaving the next
+     * investigation to guess again. */
+    if (total > 1024 * 1024) {
+        static char reported[4][620];
+        static int reported_n = 0;
+        int i, seen = 0;
+        for (i = 0; i < reported_n; i++) {
+            if (strcmp(reported[i], abs_dir) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen && reported_n < 4) {
+            snprintf(reported[reported_n], sizeof(reported[0]), "%s",
+                     abs_dir);
+            reported_n++;
+            fprintf(stderr, "[pcsl] getusedspace %s = %ld bytes\n",
+                    abs_dir, total);
+        }
+    }
 
     return total;
 }
