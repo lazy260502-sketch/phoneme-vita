@@ -434,6 +434,18 @@ set(VITA_VERSION  "01.65")
 #   the Latin advance tables and the Latin bitmaps are byte identical to
 #   the v01.65 bank, so English is bit-for-bit the same.
 set(VITA_VERSION  "01.66")
+# 01.67 (2026-09-14): real-hardware boot crash fix - PIC veneers.
+#   Both real-hw coredumps (v01.65 and v01.66, fw 3.65 + plugins) died
+#   BEFORE main(): the loader slides the code segment (+0x72000 observed)
+#   and the RW segment (+0x120000) and applies the ELF relocations, but
+#   ld's default long-range ARM->Thumb interworking veneers carry an
+#   absolute literal with NO relocation entry (38 veneers, 0 relocs).
+#   The 4th .init_array ctor branches through ____aeabi_atexit_from_arm,
+#   jumps to the stale link-time address and data-aborts - which is why
+#   no log file (boot_log/crumb/net_log/vm_output) ever appeared.
+#   -Wl,--pic-veneer turns all 38 into pc-relative sequences; verified
+#   reloc count unchanged, Vita3K unaffected (it never slides segments).
+set(VITA_VERSION  "01.67")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
