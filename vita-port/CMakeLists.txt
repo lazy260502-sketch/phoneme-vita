@@ -648,6 +648,21 @@ target_link_libraries(${PROJECT_NAME}
     ${MIDP_OBJ_DIR}/runMidlet.o
     -Wl,--no-whole-archive
     -Wl,--allow-multiple-definition
+    # v01.67 REAL-HW BOOT CRASH FIX: on a real console the loader slides
+    # the code segment (observed +0x72000 on fw3.65, plugins present) and
+    # the RW segment independently (+0x120000), and it applies the ELF's
+    # relocation tables - EXCEPT that ld's default long-range ARM->Thumb
+    # interworking veneers (____X_from_arm, "ldr pc,[pc,#-4]; .word abs")
+    # carry NO relocation entry for their literal, verified on the v01.66
+    # ELF: 38 veneers, 0 relocs. The 4th .init_array ctor (the C++
+    # _GLOBAL__sub_I for Frame::_in_gc_state) ends in "b ____aeabi_atexit_
+    # from_arm", so at boot the jump lands on the stale link-time absolute
+    # address -> wild code -> data abort BEFORE main() (hence no boot_log/
+    # crumb/net_log/vm_output files ever appear; Vita3K loads at a fixed
+    # 0x81000000 so the emulator never reproduces it). --pic-veneer makes
+    # ld emit position-independent veneers ("adr/ldr pc-relative" or
+    # movw/movt pairs that DO get relocation records).
+    -Wl,--pic-veneer
     # v01.57 crash-hunt: intercept the pthread-emulation semaphore init
     # (the v01.56 coredump faulting PC). __wrap_pte_osSemaphoreCreate in
     # vita_crumb.c logs every create and refuses the NULL-pHandle call;
