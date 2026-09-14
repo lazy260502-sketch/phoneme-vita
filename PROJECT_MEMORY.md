@@ -1,6 +1,73 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-14
 
+## 2026-09-14 v01.60：JSR 75 (`javax.microedition.io.file`) 落地——独立子系统 `samples/j2me/jsr75`，单 root = `ux0:/data/J2ME00001`
+
+> 承接 v01.59 的"地基已备、Java 层下一轮做"。本轮把 Java 层 + native 层 + 构建接线一次做完，**不碰任何共享 phoneME 文件**（新增 `jsr75/` 树 + `build_vita.sh` 两处开关）。
+
+### 一、许可证 / 来源纪律（用户明确要求）
+
+- 上游 phoneME **没有 JSR 75 实现**（只有 `USE_JSR_75` 空钩子 + 权限/清理接口桩），所以只能参考外部实现。
+- 决定：**只取 JSR 75 规范的公开 API 签名**（`javax.microedition.io.file.*` 的 5 个类型，规范公开、签名本身不受版权保护），`com.sun.midp.*` 侧的一切 Impl（`FileConnectionImpl` / `FileStore` / `FileSystemRegistryImpl` / `Protocol`）**全部自己写**，写在现有 `pcsl_file_*` 之上。**没有从任何 GPL 项目复制代码**（`freej2me-plus` 的 `FileConnectionImpl.java` 是 GPL 系，只用于核对行为，未复制）。
+- `phoneme_source/` 全程只读查阅，未复制任何文件进工作副本。
+
+### 二、Root 策略（唯一 root，可读写）
+
+- 唯一暴露的根就是启动器 `chdir()` 的那个目录：`vita_main.c:63 #define DATA_DIR "ux0:/data/J2ME00001"`。
+- native 侧 `jsr75_root()` 用 `getcwd()` 取（fallback 硬编码同一字符串），因此**与 `vita_pcsl.c` 的 `vita_resolve_path()` 天然一致**，不需要重复 `#define`。
+- Java 侧 `FileSystemRegistryImpl.ROOT_NAME = "data"`、`ROOT_URL = "file:///data/"`；`FileStore.getRootPath()` 返回 `ux0:/data/J2ME00001/`，Java 把 `file:///data/<x>` 翻成 `ux0:/data/J2ME00001/<x>` 后下传，路径直接命中 `vita_resolve_path()`。
+
+### 三、关键机制发现（改之前必须知道）
+
+1. **native 绑定全自动**：`romgen` 侧 `SourceObjectWriter::put_c_function()` 直接为 `KNIDECL(m)` 生成 `extern "C" Java_<class>_<method>`，**不需要重生成 `NativesTable.cpp`**。所以新增 native 只要 C 侧函数名与 Java 侧 `native` 方法名对上即可（本轮 C 侧 21 个 ↔ Java 侧 21 个，`nm` 逐一核对）。
+2. **`pcsl_directory.h` 那一组（v01.59 补的 8 个）在 `libmidp.so` 里拿不到**——它们实现在**可执行文件**（`vita-port/src/vita_pcsl.c`），不在 MIDP 共享库链接的那套 PCSL 里。第一版 native 直接调 `pcsl_file_is_directory/mkdir/rmdir/get_time/getfreesize/gettotalsize`，链接期全部 undefined。**结论：`libmidp.so` 内的代码必须自洽**，目录/时间/容量这类事只能走 `sceIo*` / `sceAppMgrGetDevInfo`（`sceIo*` 与 `sceAppMgr*` 的 stub 在最终可执行文件链接里已由 CMake 提供）。
+   - 另注：`phoneme-midp/src/vita_stubs.c` 里的 `pcsl_file_*` 是**死代码**（v01.59 已定案，CMakeLists 注释：old vita_stubs.o is NOT linked），别照它写。
+3. **`preprocess_jpp.py` 的 DEFINES 为空**⇒ JSR 75 的 Java 文件是**普通 `.java`**，不能写 `#ifdef ENABLE_JSR_75`。
+4. 构建钩子（`Subsystems.gmk:240`）：`USE_JSR_75=true` → `JPP_DEFS += -DENABLE_JSR_75` + `include $(JSR_75_DIR)/build/cldc_application/subsystem.gmk`；`SubsystemDefs.gmk:390` 用 `$(SUBSYSTEM_JSR_75_JAVA_FILES)` 进 `classes.zip` 规则、`$(SUBSYSTEM_JSR_75_NATIVE_FILES)` 进 `JTWI_NATIVE_FILES`。**include 顺序是对的**（`SubsystemDefs.gmk:31` 先 include `Subsystems.gmk`），所以 `subsystem.gmk` 里的变量在被消费前就已定义，不需要 jsr120 那套 `subsystem_defs.gmk`/`subsystem_rules.gmk`。
+
+### 四、改动清单（全部新增，共享文件零改动）
+
+- **新增 `samples/j2me/jsr75/`**（Vita 本地子系统）
+  - `src/share/core/common/classes/javax/microedition/io/file/{FileConnection,FileSystemRegistry,FileSystemListener,ConnectionClosedException,IllegalModeException}.java`
+  - `src/share/core/common/classes/com/sun/midp/jsr075/{FileConnectionImpl,FileStore,FileSystemRegistryImpl}.java`
+  - `src/share/core/common/classes/com/sun/midp/io/j2me/file/Protocol.java`（GCF `file:` 协议，`Connector.open("file:///data/...")` 的入口）
+  - `src/share/native/jsr75_file.c`（21 个 native，646 行）
+  - `build/cldc_application/subsystem.gmk`（9 个 Java 文件绝对路径 + `vpath % $(JSR_75_NATIVE_DIR)` + `SUBSYSTEM_JSR_75_NATIVE_FILES = jsr75_file.c`）
+- **修改 `phoneme-midp/build_vita.sh`**（唯一改动的既有文件，+6/-2）：两处 `USE_JSR_75=false` → `true` + `JSR_75_DIR`/`PROJECT_JSR_75_DIR`。
+- **修改 `vita-port/CMakeLists.txt`**：`VITA_VERSION` 01.59 → **01.60** + 注释块。
+- **未改** `build/vita_arm/Options.gmk`（其 `USE_JSR_75 = false` 被命令行变量覆盖，GNU make 命令行优先）。
+- **`vita-port/CMakeLists.txt` 未加 `jsr75_file.c`**：它由 MIDP makefile 编进 `libobj.a`，CMake 只是复用该归档。
+
+### 五、语义决定（记录下来，避免以后推翻）
+
+- **filter**（`list(String filter, boolean includeHidden)`）：只按**条目名**做 `*` / `?` 通配匹配。目录在 native 侧带尾 `/` 上报，匹配前剥掉，所以 `list("*.txt", ...)` 不会因目录把 `dir.txt/` 也匹配进来造成歧义。
+- **隐藏语义**：本移植把**名字以 `.` 开头**定义为隐藏。原因：Vita 文件 API 没有"隐藏"属性位（`pcsl_file_get_attribute` 的 HIDDEN 只能恒 0），而 `.` 前缀是唯一**同时驱动** `isHidden()`、`setHidden()`（实现为加/去前导点的改名）和 `list(..., includeHidden)` 的约定，三者天然自洽。
+- **权限**：JSR 75 的 `javax.microedition.io.Connector.file.read/.write` 在 `domain: minimum,unsecured` 下**未授予**，因此 `Protocol` 刻意**不做 `AccessController` 检查**（否则 MIDlet 必然 SecurityException）。上游 MIDP 核心 `Connector` 不做 scheme 级权限检查（`grep Connector.file` 只命中 CDC 的 `Permissions.java`），所以这条路是通的——**但未上机验证**。
+
+### 六、踩坑记录（本轮新增）
+
+1. **`strncpy` 触发 `-Werror=stringop-truncation`**：MIDP 这套构建**默认 warnings-as-errors**（`build_vita.sh` 里那一串 `-Wno-error=...` 就是为此）。改成限长 `memcpy` + 手动补 NUL。
+2. **KNI 宏展开缺分号**：`JSR75_HANDLE_METHOD(name, body)` 第一版 `body` 后没分号，5 处展开全部 `expected ';' before '}'`。宏内部补 `;` 后调用点写起来像赋值语句。
+3. **KNI mangled 名手误**：`seekFile` 写成 `..._FileStore_seekFile` 之前错成 `jsr75` 而非 `jsr075`，链接期才暴露。**`arm-vita-eabi-nm <某个 .o> | grep " T "` 是最快的 KNI 名字自检**。
+4. **头注释里写了 `sceIo*/sceAppMgr*`，其中的 `*/` 提前结束块注释**，导致后面 30 行全变成代码，报了一串莫名其妙的 `unknown type name 'PCSL'` / `ptrdiff_t`。注释里不要出现 `*/` 字面量。
+5. **make 侧 `libmidp.so` 链接失败是既有无害项**：`_rom_linkcheck_mffd_false` undefined（`libobj.a(_MergedSrc005.o)`，与 JSR 75 无关，v01.48 条目已记录过），CMake 的真实可执行文件链接能解析它。所以判断 JSR 75 是否成功**不能看 `build_vita.sh` 的退出码**（它被 `| tee` 吞掉），必须看 `obj/arm/jsr75_file.o` + CMake 那一步。
+
+### 七、验证（已做）
+
+- `javac -source 1.3 -target 1.3`（bootclasspath = cldc_classes.zip，classpath = MIDP classes）**0 error**，产出 12 个 `.class`（含 `FileConnectionImpl$InnerInputStream/OutputStream`）。
+- `jar tf classes.zip`：`javax/microedition/io/file/*`、`com/sun/midp/jsr075/*`、`com/sun/midp/io/j2me/file/Protocol.class` 全在。
+- `obj/arm/jsr75_file.o` 编译通过；21 个 `Java_com_sun_midp_jsr075_FileStore_*`。
+- `grep -c jsr075 ROMImage_01.cpp` = 21；`nativeFunctionTable.cpp` 45 处。
+- `cmake --build build/cmake -j4` 链接通过；`arm-vita-eabi-nm build/cmake/midp_vita | grep -c Java_com_sun_midp_jsr075` = **21**。
+- 产物：`vita-port/build/cmake/midp_vita.vpk` 13,689,448 B（2026-09-14 07:29）。
+
+### 八、遗留 / 下一步
+
+- **完全未上机/未进 Vita3K**：`FileConnection` 的运行时行为（root 枚举、`list` 过滤、`setHidden` 改名、流读写、`availableSize`）全是设计预期，没有任何实测证据。
+- `com.sun.midp.jsr075.FileConnectionCleanupImpl` **不存在**：上游 `ams/.../Installer.java:1803` 会 `Class.forName` 它，会抛 `ClassNotFoundException`（该路径只在套件删除时走，暂判无害，待实测确认）。
+- `availableSize/totalSize` 走 `sceAppMgrGetDevInfo`：CMake 可执行文件链接能解析，但 make 侧 `libmidp.so` 那条线缺 `SceAppMgr_stub`——如果将来真要让 `libmidp.so` 独立链接，需要补 `LIBS += -lSceAppMgr_stub`。
+- 记忆里的"JIT 二次启动"、"物理尾巴字节留盘"等旧遗留不变。
+
 ## 2026-09-14 v01.59：JSR 75 地基——补齐 `pcsl_directory.h` 的 8 个 native
 
 > 承接 v01.58 的"文件操作能力盘点"结论：`pcsl_file.h` 的 21 个 API 已全实现，缺口在 JSR 75。本轮先补**它依赖的最后一层 native 空洞**，Java 层下一轮做。

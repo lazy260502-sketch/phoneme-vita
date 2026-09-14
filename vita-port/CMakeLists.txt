@@ -282,7 +282,36 @@ set(VITA_TITLEID  "J2ME00001")
 #   (c) isBlockChainConsistent() now also cross-checks num_live (a lost
 #       header write after successful block writes made the old check
 #       pass while the index found no records).
-set(VITA_VERSION  "01.59")
+# 01.60 (2026-09-14): JSR 75 (javax.microedition.io.file / FileConnection).
+#   A Vita-local subsystem under samples/j2me/jsr75 - the spec's interface
+#   signatures only, every line of implementation written here. 9 Java
+#   sources (5 public javax.microedition.io.file types, FileStore,
+#   FileConnectionImpl, FileSystemRegistryImpl, the "file" GCF Protocol)
+#   plus 21 natives in jsr75/src/share/native/jsr75_file.c, wired into the
+#   MIDP build by jsr75/build/cldc_application/subsystem.gmk and
+#   USE_JSR_75=true in phoneme-midp/build_vita.sh - no shared phoneME file
+#   was touched, ROMImage/nativeFunctionTable pick the natives up
+#   automatically because ROMGEN synthesises Java_<class>_<method>.
+#
+#   Root policy: one root only, the launcher's cwd ("ux0:/data/J2ME00001"),
+#   so JSR 75 and the PCSL layer resolve the same paths by construction.
+#   FileSystemRegistryImpl reports it as "file:///data/".
+#
+#   Byte I/O goes through the port's PCSL file API; the directory, time and
+#   volume natives go to sceIo* directly, because the pcsl_directory group
+#   v01.59 added lives in the executable (vita_pcsl.c) and is not in the
+#   PCSL set libmidp.so links against - the .so link reported them as
+#   undefined until they were replaced.  A missing second piece: the
+#   shared-object step of the makefile also fails on the pre-existing
+#   _rom_linkcheck_mffd_false, which the real (CMake) executable link
+#   resolves; JSR 75 does not change that state.
+#
+#   Verified: javac clean (source 1.3), classes.zip carries all 4 packages,
+#   ROMImage_01.cpp carries the 21 ROMized natives references,
+#   nativeFunctionTable.cpp 45 mentions, and nm on midp_vita shows the 21
+#   Java_com_sun_midp_jsr075_* symbols.  Not yet run on Vita3K/real
+#   hardware - the FileConnection runtime behaviour is untested.
+set(VITA_VERSION  "01.60")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
