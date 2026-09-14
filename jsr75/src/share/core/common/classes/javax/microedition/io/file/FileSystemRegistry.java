@@ -47,7 +47,10 @@ public class FileSystemRegistry {
     /**
      * Lists the currently mounted roots.
      *
-     * @return an enumeration of root URL strings, each ending with '/'
+     * <p>Each element is a root <em>name</em> ending with '/', suitable
+     * for concatenating with "file:///" to form a connection URL.</p>
+     *
+     * @return an enumeration of root names, each ending with '/'
      */
     public static Enumeration listRoots() {
         return com.sun.midp.jsr075.FileSystemRegistryImpl.listRoots();

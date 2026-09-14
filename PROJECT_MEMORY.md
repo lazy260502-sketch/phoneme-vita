@@ -1,6 +1,219 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-14
 
+## 2026-09-14 v01.63：MiniXplorer 目录打不开定案——`resolvePath()` 不认 `file://localhost/...`
+
+> 实测（Vita3K，v01.62 + `[ALERT]`/`[MIDLET]`/`[JSR75]` 诊断）后新的、明确的失败点。
+> 症状：MiniXplorer 能正常启动、UI 出现，但一进目录就失败。
+
+### 一、日志给出的完整证据链
+
+```
+[MIDLET] startApp: MiniXplorer
+[JSR75] listRoots -> data/                     <- listRoots 修好了（v01.61 的修复生效）
+[MIDLET] startApp returned: MiniXplorer
+[JSR75] open file://localhost/data/ mode=3     <- MiniXplorer 按规范拼 URL
+Uncaught exception: java.lang.IllegalArgumentException: not a file URL: file://localhost/data/
+  com.sun.midp.jsr075.FileSystemRegistryImpl.resolvePath(), bci=38
+  com.sun.midp.jsr075.FileConnectionImpl.<init>(), bci=76
+  com.sun.midp.io.j2me.file.Protocol.openPrim(), bci=130
+  javax.microedition.io.Connector.open() x3
+  MiniXplorer.OpenDir(), bci=73
+  MiniXplorer.traverseDirectory(), bci=116
+```
+
+之后是 `file://localhost/data/data/`、`/data/data/data/`……**无限级联**——那是 MiniXplorer
+自己的错误处理把 root 名反复追加，不是我们的 bug。
+
+### 二、根因：URL 语法只认一种写法
+
+- JSR 75 语法是 `file://<host>/<root>/<path>`，本机 host = `localhost`；空格权威
+  （`file:///data/`）是同一件事的公认简写。两种写法都在野外存在。
+- 原 `resolvePath()` 硬编码前缀 `"file:///"`，于是**规范的 `file://localhost/...` 一律被拒**。
+  MiniXplorer 用的正是 `"file://localhost/" + listRoots()` 这条文档推荐写法。
+- 讽刺的是 v01.61 刚把 `listRoots()` 改成返回 root **名**（`data/`），正是为了让调用方能拼出
+  `file://localhost/data/` —— 结果 `resolvePath()` 不认这个形式，两处假设没对上。
+
+### 三、修复（`jsr75/src/share/core/common/classes/com/sun/midp/jsr075/FileSystemRegistryImpl.java`）
+
+- `resolvePath()` 改为解析权威部分：`scheme = "file://"` → 取到下一个 `/` 之前作为 host，
+  **接受 `""` 与 `localhost`（大小写不敏感）**，其它 host 仍报 `unknown host`（本移植只暴露一个
+  root，不能假装认识别的设备）。`file:///data/x` 与 `file://localhost/data/x` 现在归一到同一路径。
+- 顺带更新类头注释与 javadoc（原文写"Accepted form: file:///data"）。
+- 其余路径全部未动：`getPath()` 仍返回 `/data[/...]`（规范要求含 root），`getURL()` 原样返回
+  打开时的 URL，`FileConnectionImpl.listEntries()` 已保证目录带尾 `/`（对应原生
+  `jsr75_file.c:listNext` 的 `SCE_S_ISDIR` 分支），`Connector` → `Protocol.openPrim` 未改。
+
+### 四、副产品：那块 "Done" 屏的最终解释
+
+- `[ALERT] new Alert title=null text=This application does not use the screen and runs in the
+  background.` 是 phoneME **自己的** `HeadlessAlert`（`ResourceConstants.LCDUI_DISPLAY_HEADLESS`）。
+- `CldcForegroundController.registerDisplay()` 把 `new HeadlessAlert(...)` 作为
+  `getCurrent()==null` 的**占位显示对象预先构造**——所以 MIDlet 一调 `Display.getDisplay()`
+  就会看到这条 `[ALERT]` 日志，**与是否真的弹屏无关**。
+- 真正弹屏的条件在 `CldcMIDletStateListener.midletActivated()`：`startApp` 返回后
+  `Display.getDisplay(midlet).getCurrent() == null` 才 `requestForegroundForDisplay()`。
+- 结论：之前的 "Done" 屏是 MIDlet **没留下任何可显示对象**的症状（当时 `startApp` 后半段
+  已经因为 JSR 75 抛异常而中断），不是病因。本次运行 MIDlet 正常留下 UI，故不再出现。
+
+### 五、产物与验证
+
+- `vita-port/build/cmake/midp_vita.vpk` = **v01.63**，13,692,084 B（10:46:50），
+  `strings midp_vita | grep "version: J2ME"` = `J2ME Player v01.63 b218 (cf48224)`，
+  `Java_com_sun_midp_jsr075*` 原生符号 21 个。
+- `classes.zip` 10:45:46、`ROMImage_01.cpp` 10:46:03、`obj/arm/ROMImage.o` 10:46:06（同代）。
+  **注意：本机没有 `unzip`**，验证类内容用 `python3 -c "import zipfile..."`；
+  已确认 `FileSystemRegistryImpl.class` 常量池含 `file://` / `localhost` /
+  `equalsIgnoreCase` / `unknown host: `。
+- romgen 通过（无 `illegal immediate` / `Error 133`）。
+
+### 遗留
+
+- 未实测：MiniXplorer 打开目录后的 `list()` 渲染、以及 `availableSize/totalSize`
+  （`libmidp.so` 链接仍报 `sceAppMgrGetDevInfo` 未定义——该符号只在旧 `libmidp.so` 路径上，
+  VPK 走 `libobj.a`，不影响；但 JSR 75 的 `availableSize()` 在真机/模拟器上可能返回失败）。
+- 诊断打印仍在（`[JSR75]` / `[MIDLET]` / `[ALERT]`），稳定后删除。
+
+### 六、实测结果：**通过** ✅
+
+用户装 v01.63 在 Vita3K 实测——**MiniXplorer 正常启动，目录可以打开了**。JSR 75
+（`javax.microedition.io.file`）在 PS Vita 上从零到可用，至此完成。
+
+## 2026-09-14 v01.64：JSR 75 收尾——诊断打印全部撤除（最小 diff 还原）
+
+> 承接 v01.63 的实测通过。功能已稳定，按最小 diff 原则把为定位而加的临时诊断全部删除。
+
+### 一、撤除内容（`git checkout --` 整体回退，均为纯诊断文件）
+
+| 文件 | 撤除内容 |
+|---|---|
+| `jsr75/.../com/sun/midp/io/j2me/file/Protocol.java` | `[JSR75] open file:... mode=` |
+| `jsr75/.../com/sun/midp/jsr075/FileConnectionImpl.java` | `[JSR75] connect ...`、`listEntries` 的 3 处 |
+| `phoneme-midp/.../MIDletStateHandler.java` | `[MIDLET]` 的 startApp / startApp returned / THREW / destroyApp / destroyed / state loop |
+| `phoneme-midp/.../Alert.java` | `[ALERT]` 的构造 + setString |
+
+- **重要澄清**：`MIDletStateHandler` 里 `[MIDLET] creating` / `created+registered OK` /
+  `FAILED(CNFE|IE|IAE|RE|Error)` / `startSuite` 这 8 处**不是临时诊断**，它们来自
+  **2026-08-31 的移植基线提交 `8a04358`**，是项目固有启动日志 → **保留**。
+  （用 `git log -S` 定位时注意：双引号里的 `\[` 会被当成字面反斜杠，要用
+  `git log -S'[MIDLET] creating'` 单引号写法，否则会搜不到而误判为"未提交"。）
+- `FileSystemRegistryImpl.java` 只删掉 `[JSR75] listRoots ->` 一行，**真实修复全部保留**。
+
+### 二、最终保留的真实改动（JSR 75 全部改动清单）
+
+| 文件 | 改动 | 版本 |
+|---|---|---|
+| `jsr75/.../FileSystemRegistryImpl.java` | `listRoots()` 返回 root **名**（`data/`）；`resolvePath()` 解析权威部分，接受 `""`/`localhost` | v01.61 / v01.63 |
+| `jsr75/.../javax/microedition/io/file/FileSystemRegistry.java` | javadoc：root 是**名**不是 URL | v01.61 |
+| `vita-port/config/system.config` | `microedition.io.file.FileConnection.version: 1.0` | v01.62 |
+| `phoneme-cldc/src/vm/cpu/arm/BinaryAssembler_arm.cpp` | 字面量池绑定复用窗口 off-by-8 修复 | v01.62 |
+| `rebuild_vm.sh` | `set -e` + `grep -c` 假失败修复（`\|\| true`） | v01.62 |
+
+（另有 v01.60 起新增的整棵 `jsr75/` 树与 native 层 `src/share/native/jsr75_file.c`。）
+
+### 三、产物与验证
+
+- `vita-port/build/cmake/midp_vita.vpk` = **v01.64**，13,690,011 B（10:52:39），
+  `version: J2ME Player v01.64 b218 (cf48224)`，jsr75 原生符号 21 个。
+- `classes.zip` 10:52:00 → `ROMImage_01.cpp` 10:52:18 → `obj/arm/ROMImage.o` 10:52:21（同代），
+  romgen 无 `illegal immediate` / `Error 133`。
+- 用 `python3` zipfile 逐类核验常量池：
+  - `FileSystemRegistryImpl.class` → 含 `localhost`、`unknown host`，**不含 `[JSR75]`** ✅
+  - `FileConnectionImpl.class`、`Protocol.class` → **不含 `[JSR75]`** ✅
+
+### 四、遗留（下一轮候选）
+
+- `availableSize()` / `totalSize()` 未在设备上验证（`sceAppMgrGetDevInfo`）。
+- `list()` 结果在 MiniXplorer 里的渲染、以及 >1 层的深层目录遍历未逐一验证。
+- 若要继续调试其他 MIDlet，可再次临时加诊断——**但务必避开 AOT 大方法**（见 v01.62 第六节）。
+
+## 2026-09-14 v01.62：romgen SIGTRAP 定案（ARM 字面量池 off-by-8，上游潜伏 bug）+ JSR75 属性补全
+
+> 承接 v01.61。给 `MIDletStateHandler.startSuite` 加 `[MIDLET]` 诊断 println 后，
+> romgen 变成 SIGTRAP(133)，构建阻断。本轮把根因查到"1 字节"级别并修掉。
+
+### 一、症状与定案过程（可复现）
+
+- `phoneme-midp/build_vita.sh` 在 `cldc_vm.gmk:234` 报 `Error 133`；手动跑 romgen
+  （只看 stdout）才见到真正的断言：`size 4096 too big for 12 bits` →
+  `assert(has_room_for_imm(imm, size), "illegal immediate value")`
+  （`phoneme-cldc/src/vm/cpu/arm/Assembler_arm.hpp:73`，`#ifndef PRODUCT` 下）。
+- gdb（romgen **未 strip、带 debug_info**）符号化栈：
+  `imm_index` ← `access_literal_pool (BinaryAssembler_arm.cpp:248)` ← `ldr_from` ←
+  `ldr_literal` ← `ldr_oop` ← `invoke` ← … ← `JVMCompiler::compile` ←
+  `JVMMethod::compile` ← `ROMOptimizer::precompile_methods (ROMOptimizer.cpp:3626)`。
+- 关键局部量：`#2 pos=7188, target=3100` ⇒ `target-(pos+8)` = **-4096**（12 位合法范围 ±4095）；
+  `#19 i=165, compiled_count=147, impossible_count=18, precompile_size=364` ⇒ 崩溃项 =
+  AOT 编译队列第 165 项（0 基）。对照上一次成功构建的 `ROMLog.txt` 的
+  `[AOT compilation report]` 第 165 项 = **`com/sun/midp/midlet/MIDletStateHandler.startSuite`**
+  —— 正是本轮加打印的那个大方法。
+
+### 二、根因：VFP 分支的绑定字面量复用窗口多 1 字节（上游 bug）
+
+- `write_literal()` 写池时 `literal->set_bci(position)` ⇒ `_bci` = 池在代码里的位置。
+- `access_literal_pool()` 用 `imm_index(pc, target - (pos + 8))` 生成 PC 相对偏移，
+  要求 `|offset| ≤ 4095` ⇒ 可复用字面量的**最远回距** = `pos - 4087`。
+- `find_literal()`（`ENABLE_ARM_VFP=1` 走的那支）：`offset = 4088 - 8`，
+  `min_offset = _code_offset - offset` = `pos - 4088`，判据 `ptr->_bci >= min_offset`
+  ⇒ **多接受 1 字节**（`_bci == pos-4088` → 偏移 -4096）。
+  debug 构建断言崩溃；**PRODUCT 构建会静默把 4096 截断成 0 → 载入错误地址**（潜在错码）。
+- 非 VFP 分支用 `ptr->_bci <= position` 本来就把该边界正确排除，所以这是 VFP 侧独有的
+  off-by-one，不是"设计如此"。
+- 触发条件：只有 AOT 大方法（`startSuite` 约 7.2KB 代码 + 大字面量池）才会出现
+  "恰好 4088 字节之前的绑定字面量"。普通方法永远碰不到，所以上游一直没暴露。
+
+### 三、修复
+
+- `phoneme-cldc/src/vm/cpu/arm/BinaryAssembler_arm.cpp`（VFP 分支 `find_literal`）：
+  `const int min_offset = _code_offset - offset + 1;` + 11 行推导注释。
+  **不做 VITA 条件编译**：这是跨平台真实 bug，`#if defined(VITA)` 反而会把它藏起来。
+- 重编宿主工具：`bash rebuild_vm.sh tools`（loopgen 需先建好；`-j` 下 romgen 会抢跑
+  半成品 loopgen → `Permission denied`/Error 127，**再跑一次即可**）。改 VM 代码后
+  **必须**重建 romgen，否则 ROM 生成物与源码不一致。产物
+  `phoneme-cldc/build/vita_arm/dist/bin/romgen`（重建后 6,421,100 B）。
+- 运行库同步：`bash rebuild_vm.sh build` ⇒ 只有含该文件的 `_MergedSrc003.o` 同代重编
+  （10:35:12）；重打包后 29 成员、`jvm_fast_globals` 唯一 `D`、无 C-interpreter 符号。
+  （运行期 JIT 关闭 `-int`，此修复对当前运行是惰性的，纯粹为源码/库一致。）
+
+### 四、两个排查/脚本陷阱（务必避免重复踩）
+
+1. **romgen 的两条输出链**：VM 崩溃报告走 **stdout**；`tty->print_cr` 诊断
+   （`ClassFileParser.cpp:2157` 的 `PRE_NATIVES/POST_NATIVES`，4 万余行）走 **stderr**。
+   用 `2>&1` 会把断言淹没 ⇒ 用 `> /tmp/out.txt`（或 `2>/dev/null`）。
+   另：`gdb -ex 'run > file'` 会破坏 romgen 的 argv（报 `class not specified`），
+   重定向必须在 shell 层做。
+2. **`rebuild_vm.sh` 的 `set -e` + `grep -c` 假失败**：`ccount=$(... | grep -cE ...)`
+   在 0 匹配时返回状态 1，`set -e` 让脚本在**重打包成功之后**静默 `exit 1`
+   （日志无 FAIL、库却已更新 ⇒ 极易误判为"半成品库"）。已在两处加 `|| true`
+   （2026-09-14）。若看到 `EXIT=1` 且最后一行是 `(full-generation repack...)`，就是它。
+
+### 五、v01.62 交付内容与状态
+
+- JSR75：`FileSystemRegistryImpl.listRoots()` 按规范返回**根名**
+  （`ROOT_LIST_NAME = ROOT_NAME + "/"`）；
+- `vita-port/config/system.config` 新增 `microedition.io.file.FileConnection.version: 1.0`
+  （属性系统只搜 `applicationProperties` = system.config，须随包分发）；
+- **临时**保留诊断打印用于 MiniXplorer 定位：`[ALERT]`（Alert 4 参构造 + setString）、
+  `[MIDLET]`（startSuite/startApp/destroyApp/state loop）、`[JSR75]`（Protocol/
+  FileConnectionImpl/FileSystemRegistryImpl）。**稳定后必须删除**（最小 diff 原则）。
+- 产物：`vita-port/build/cmake/midp_vita.vpk` = **v01.62**，13,691,870 B（10:37:12），
+  `arm-vita-eabi-nm midp_vita | grep -c Java_com_sun_midp_jsr075` = **21**；
+  `ROMImage_01.cpp` 10:36:54、`obj/arm/ROMImage.o` 10:36:57（含新诊断）。
+
+### 六、教训
+
+- **不要给 AOT 大方法加 println**：新增字符串常量 + 代码会移动字面量池布局，可能正好踩到
+  12 位边界（本例就是 10:18 那次 println 直接触发）。诊断打印优先放小方法，或用开关隔离；
+  修完 off-by-one 之后仍要遵守，因为边界是"位置敏感"而非"长度敏感"。
+- 编译脚本退出码不等于结果：先 grep 日志里的 `illegal immediate` / `VM Error` / `Error 133`。
+
+### 遗留风险
+
+- 字面量池**前向**窗口（`set_delayed_literal_write_threshold`）未审：按构造约有 15 字节余量，
+  本轮未触发；`BinaryAssembler_thumb.cpp:497` 的同名函数未审（Thumb 路径未启用）。
+- `microedition.io.file.FileConnection.version` 是否被运行期 `System.getProperty` 读到，
+  待 MiniXplorer 实测确认。
+
 ## 2026-09-14 v01.60：JSR 75 (`javax.microedition.io.file`) 落地——独立子系统 `samples/j2me/jsr75`，单 root = `ux0:/data/J2ME00001`
 
 > 承接 v01.59 的"地基已备、Java 层下一轮做"。本轮把 Java 层 + native 层 + 构建接线一次做完，**不碰任何共享 phoneME 文件**（新增 `jsr75/` 树 + `build_vita.sh` 两处开关）。

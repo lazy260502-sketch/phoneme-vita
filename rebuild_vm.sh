@@ -144,9 +144,13 @@ pack_lib() {
     [ "$sz" -gt 1000 ] || die "Interpreter_arm.o member is empty ($sz bytes)"
 
     # 2026-09-04: hard guards against the double-definition regression.
-    local dcount; dcount=$(/home/zyb/.local/vitasdk/bin/arm-vita-eabi-nm $L 2>/dev/null | grep -c " D jvm_fast_globals")
+    # 2026-09-14: "|| true" is load-bearing.  "grep -c" exits 1 when it
+    # matches nothing, so under "set -e" the ccount assignment aborted the
+    # script *after* a perfectly good repack (exit 1, no message) and the
+    # library looked half-built.  Guard the counters, not the script.
+    local dcount; dcount=$(/home/zyb/.local/vitasdk/bin/arm-vita-eabi-nm $L 2>/dev/null | grep -c " D jvm_fast_globals" || true)
     [ "$dcount" -eq 1 ] || die "jvm_fast_globals: expected exactly 1 D definition, got $dcount"
-    local ccount; ccount=$(/home/zyb/.local/vitasdk/bin/arm-vita-eabi-nm $L 2>/dev/null | grep -cE "g_jpc|g_jsp|interpreter_dispatch_table")
+    local ccount; ccount=$(/home/zyb/.local/vitasdk/bin/arm-vita-eabi-nm $L 2>/dev/null | grep -cE "g_jpc|g_jsp|interpreter_dispatch_table" || true)
     [ "$ccount" -eq 0 ] || die "C-interpreter symbols leaked into library ($ccount)"
 
     local cnt; cnt=$($AR t $L | wc -l)

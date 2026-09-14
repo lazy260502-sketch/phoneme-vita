@@ -4,8 +4,9 @@
  * Vita-local subsystem, original implementation.
  *
  * Root model: exactly one root, named ROOT_NAME, whose URL is
- * "file:///data/".  It maps onto the application data directory the
- * launcher chdir()s into, i.e. the same directory
+ * "file:///data/" (equivalently "file://localhost/data/", both are
+ * accepted by resolvePath()).  It maps onto the application data
+ * directory the launcher chdir()s into, i.e. the same directory
  * FileStore.getRootPath() reports.  No other root (ux0: elsewhere,
  * imc0:, uma0:, ...) is exposed.
  */
@@ -21,11 +22,22 @@ import javax.microedition.io.file.FileSystemListener;
  */
 public class FileSystemRegistryImpl {
 
-    /** Name of the only exposed root. */
+    /** Name of the only exposed root, without the trailing '/'. */
     public static final String ROOT_NAME = "data";
 
+    /**
+     * The root name as handed out by {@link #listRoots()}.
+     *
+     * <p>JSR 75 hands out root <em>names</em>, not URLs: the name may be
+     * appended to "file:///" to form a URL, so it carries the trailing
+     * '/'.  Handing out ROOT_URL here instead makes every caller that
+     * does the documented <code>"file:///" + root</code> build
+     * "file:///file:///data/" and fail.</p>
+     */
+    public static final String ROOT_LIST_NAME = ROOT_NAME + "/";
+
     /** URL of the only exposed root. */
-    public static final String ROOT_URL = "file:///data/";
+    public static final String ROOT_URL = "file:///" + ROOT_LIST_NAME;
 
     /** Registered listeners; never fired on this platform. */
     private static final Vector listeners = new Vector();
@@ -37,11 +49,11 @@ public class FileSystemRegistryImpl {
     /**
      * Lists the roots.
      *
-     * @return an enumeration holding the single root URL
+     * @return an enumeration holding the single root name
      */
     public static Enumeration listRoots() {
         Vector roots = new Vector(1);
-        roots.addElement(ROOT_URL);
+        roots.addElement(ROOT_LIST_NAME);
         return roots.elements();
     }
 
@@ -88,9 +100,10 @@ public class FileSystemRegistryImpl {
      * Translates a JSR 75 URL into the absolute path handed to the native
      * layer.
      *
-     * <p>Accepted form: <code>file:///data[/rest]</code>.  The returned
-     * path is the root reported by {@link FileStore#getRootPath()}
-     * followed by the remainder, so the two never diverge.</p>
+     * <p>Accepted form: <code>file://[localhost]/data[/rest]</code>.  The
+     * returned path is the root reported by
+     * {@link FileStore#getRootPath()} followed by the remainder, so the
+     * two never diverge.</p>
      *
      * @param url the connection URL
      * @return the absolute path, no trailing slash except for the root
@@ -98,13 +111,28 @@ public class FileSystemRegistryImpl {
      *              for the exposed root or tries to escape it
      */
     public static String resolvePath(String url) {
-        final String prefix = "file:///";
+        final String scheme = "file://";
 
-        if (url == null || !url.startsWith(prefix)) {
+        if (url == null || !url.startsWith(scheme)) {
             throw new IllegalArgumentException("not a file URL: " + url);
         }
 
-        String rest = url.substring(prefix.length());   // "data/foo.txt"
+        /* JSR 75 URL syntax is file://<host>/<root>/<path>.  The host of the
+         * local device is "localhost"; the empty authority ("file:///data")
+         * is the accepted abbreviation of the same thing.  Both spellings
+         * are in the wild, and a MIDlet that does the documented
+         * "file://localhost/" + root build of a name from listRoots() --
+         * MiniXplorer does exactly that -- must reach the same root as one
+         * that uses "file:///".  Any other host names a device this
+         * single-root port does not expose. */
+        String rest = url.substring(scheme.length());   // "localhost/data/x"
+        int hostEnd = rest.indexOf('/');
+        String host = (hostEnd == -1) ? rest : rest.substring(0, hostEnd);
+        if (host.length() != 0 && !host.equalsIgnoreCase("localhost")) {
+            throw new IllegalArgumentException(
+                    "unknown host: " + host + " in " + url);
+        }
+        rest = (hostEnd == -1) ? "" : rest.substring(hostEnd + 1);
         String root = FileStore.getRootPath();          // "ux0:/data/J2ME00001/"
 
         if (rest.length() == 0) {

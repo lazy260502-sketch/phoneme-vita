@@ -312,6 +312,86 @@ set(VITA_TITLEID  "J2ME00001")
 #   Java_com_sun_midp_jsr075_* symbols.  Not yet run on Vita3K/real
 #   hardware - the FileConnection runtime behaviour is untested.
 set(VITA_VERSION  "01.60")
+# 01.61 (2026-09-14): JSR 75 - listRoots() handed out a URL instead of a
+#   root name.  JSR 75 says a root is "a root name ending with '/'" that
+#   the caller concatenates with "file:///" to build a URL; returning
+#   "file:///data/" made every caller that follows the documented recipe
+#   ask for "file:///file:///data/", which resolvePath() rightly rejects
+#   (root name != "data") - the MIDlet sees an Alert and exits, i.e. the
+#   "launched then immediately done" symptom, before it ever opens a
+#   connection.  FileSystemRegistryImpl now returns "data/" and keeps
+#   ROOT_URL ("file:///data/") for the protocol layer; no other JSR 75
+#   path changed.
+#
+#   Same version, diagnostic-only: System.out tracing on the three JSR 75
+#   entry points (listRoots, Protocol.openPrim, FileConnectionImpl's
+#   constructor/listEntries) plus startApp enter/return/throw in
+#   MIDletStateHandler.  startApp exceptions are re-thrown into
+#   handleException(), which calls printStackTrace() on System.err - and
+#   CLDC's System.err *is* System.out (System.java), so an exception can
+#   never be silent in ux0:/data/vm_output.log; when that log shows no
+#   trace the MIDlet ended normally and the tracing is what tells us how
+#   far it got.
+set(VITA_VERSION  "01.61")
+# 01.62 (2026-09-14): JSR 75 - the spec's own "is it there?" probe.
+#   microedition.io.file.FileConnection.version was never defined, and that
+#   is exactly how a file manager decides whether JSR 75 exists before
+#   calling into it.  MiniXplorer reaches startApp, returns from it
+#   normally, yet never issues a single Connector/FileConnection call - the
+#   [JSR75] tracing was live in the v01.61 run and stayed silent - and
+#   leaves a screen whose only soft key is "Done", which phoneME produces
+#   from AlertLFImpl alone, i.e. an Alert the MIDlet itself raised.  The
+#   property now comes from config/system.config, the port-owned
+#   application-property file: midp_properties_dynamic.c's
+#   getSystemProperty() searches only that set, which is also why
+#   internal.config's "PS Vita" does not shadow the "j2me" the Connector
+#   resolution needs.
+#
+#   Diagnostic-only: Alert title/text and the MIDlet state loop's destroy /
+#   exit paths now log, so the next run says both what is on screen and
+#   whether the MIDlet is still alive.  Both sets of tracing come back out
+#   later.
+set(VITA_VERSION  "01.62")
+# 01.63 (2026-09-14): JSR 75 - resolvePath() rejected the spec's own URL
+#   syntax.  JSR 75 spells a file URL "file://<host>/<root>/<path>", the
+#   host of the local device being "localhost", and a MIDlet that follows
+#   the documented "file://localhost/" + root recipe (MiniXplorer does
+#   exactly that with the name it just got from listRoots()) was answered
+#   with IllegalArgumentException "not a file URL" - the URL did not start
+#   with the hard-coded "file:///" prefix.  Every directory open then
+#   failed, and MiniXplorer's own error path appended the root name again
+#   and again, so the log shows an unbounded "file://localhost/data/data/
+#   data/..." cascade.  resolvePath() now parses the authority and accepts
+#   both "localhost" and the empty one; every other host still names a
+#   device this single-root port does not expose.  No other JSR 75 path
+#   changed.
+#
+#   The headless Alert seen in the same logs ("This application does not
+#   use the screen and runs in the background.", ResourceConstants
+#   LCDUI_DISPLAY_HEADLESS) is phoneME's own CldcMIDletStateListener /
+#   HeadlessAlert notification, not a MIDlet diagnostic: it is only
+#   brought to the foreground when startApp() returns with
+#   Display.getCurrent() == null, which is why the earlier run's "Done"
+#   screen was a symptom of the MIDlet dying, not its cause.
+set(VITA_VERSION  "01.63")
+# 01.64 (2026-09-14): JSR 75 - diagnostics out, fixes in.  v01.63 was
+#   verified in Vita3K: MiniXplorer starts, listRoots() is consumed, and the
+#   directories it could not open now open.  The temporary tracing that made
+#   that possible is gone - the [ALERT] lines in Alert, the [MIDLET]
+#   startApp/destroyApp/state-loop lines in MIDletStateHandler, the [JSR75]
+#   lines in Protocol / FileConnectionImpl / FileSystemRegistryImpl - so the
+#   only JSR 75 sources left modified are the two that carry real fixes:
+#   FileSystemRegistryImpl (root name from listRoots, authority parsed by
+#   resolvePath) and the javadoc of the javax FileSystemRegistry facade.
+#   Note that MIDletStateHandler's [MIDLET] creating/created/FAILED/startSuite
+#   lines are NOT tracing: they date from the 2026-08-31 baseline commit
+#   (8a04358) and stay.
+#
+#   Keep the lesson: adding printlns to a large AOT-compiled method moves its
+#   literal pool and can hit the 12-bit limit - that is what crashed romgen -
+#   so future diagnostics belong in small methods or on code paths romgen
+#   does not compile.
+set(VITA_VERSION  "01.64")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
