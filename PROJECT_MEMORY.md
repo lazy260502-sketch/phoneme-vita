@@ -1,6 +1,22 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-14
 
+## 2026-09-14 v01.67：真机启动即崩定案——ld 默认 ARM→Thumb 跳板无重定位（`--pic-veneer` 修复）
+
+> 用户回报 **"启动即崩,菜单都没显示出来，vm_output,vm_stderr,net_log 还没创建"**。
+
+- **症状**：真机（fw 3.65 + oclockvita/Framecounter 插件）一启动就崩，菜单不出现；`ux0:/data/J2ME00001/` 下**任何**日志文件（boot_log.txt / crumb.log / net_log.txt / vm_output.log / vm_stderr.log）都不存在。Vita3K 完全正常。两份 psp2dmp（v01.65 的 1789400876、v01.66 的 1789403835）现场完全相同。
+- **根因**（证据链全部闭环）：
+  1. THREAD_INFO 里崩溃线程 entry = 设备端 `_start+1`，对比本地 ELF 的 0x81001269 → **真机代码段被滑动 +0x72000**（插件注入量决定，两台机/两次启动可不同：v01.65 那份滑 +0x3d000）；RW 段独立滑动 **+0x120000**（本地 0x812e0018→设备 0x81400018、0x814a8170→0x815c8170，与转储 r2/r3 逐字吻合）。**Vita3K 恒按 0x81000000 装载，这就是模拟器永不复现的原因。**
+  2. 加载器确实应用了 ELF 重定位（否则 movw/movt 装的地址不可能全是正确滑移值），前 3 个 `.init_array` 构造函数都跑完了（栈上残留 `__sinit`/`_malloc_r`/`pte_osTlsAlloc` 帧）。
+  3. 但 ld 默认生成的**长距离 ARM→Thumb interworking 跳板**（`____X_from_arm`：`ldr pc,[pc,#-4]; .word 绝对地址`）的**字面量没有重定位记录**——readelf 验证 v01.66 ELF：38 个跳板、0 条重定位。
+  4. 第 4 个构造函数（`_GLOBAL__sub_I__ZN8JVMFrame12_in_gc_stateE`，Frame.cpp 的静态对象析构注册）尾部 `b ____aeabi_atexit_from_arm` → 跳到**过期的链接期绝对地址** → 野代码 → data abort。dmp1 的 PC 恰好 = `__aeabi_atexit` 的链接期地址 0x810be194（铁证）；dmp2 落到 `str r2,[r7,#4]`、r7=0（写 0x4）。**崩在 main() 之前**，所以没有任何日志文件。
+- **修复**：`CMakeLists.txt` 链接选项加 `-Wl,--pic-veneer`（提交 6b49df3）。38 个跳板全部变为 pc 相对序列（`ldr ip,[pc,#4]; add ip,pc,ip; bx ip`），随段滑动自适应；R_ARM 重定位总数不变（99653→99653），模拟器行为不受影响。
+- **教训**：
+  - 真机 coredump 符号化**必须先从 THREAD_INFO 的 entry 算出段滑动量再换算**，直接拿本地符号表解设备地址全盘皆错（这次先错解成 png/read_file/net 路径，浪费了一轮分析）。
+  - "日志文件一个都没有" 本身就是最强证据：说明崩在 `main()` 之前，只有静态构造/加载器层面的问题才会这样。
+  - 上游 CLDC 用 `-marm` 编 ARM 态代码、port 层是 Thumb，这种混合态在**段会被滑动的平台**上必须 `--pic-veneer`。
+
 ## 2026-09-14 v01.66：汉字的行盒适配（CJK 18px → 20px）
 
 > 用户回报 **"文件根目录修改成功了，但是字体，英文显示还行，中文显示效果反而不太好了"**。
