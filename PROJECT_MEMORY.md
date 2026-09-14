@@ -1,6 +1,91 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-14
 
+## 2026-09-14 v01.58：JIT 策略开关（`launch.cfg` 第 4 行 `jit=0|1|2`）+ 文件操作能力盘点
+
+> 真机问题按用户要求**只记录、不上机复测**（v01.57 诊断包已就位，见下一节）。
+> 本轮转向"补全 J2ME 功能"，先做能力盘点，再交付第一个可用开关：JIT。
+
+### 一、文件操作能力盘点（结论：**native 层无缺口**）
+
+- `vita-port/src/vita_pcsl.c` 中 `pcsl_file.h` 声明的 **21 个 API 全部已实现**：
+  `init / finalize / open / close / read / write / unlink / truncate / exist /
+  commitwrite / rename / openfilelist / closefilelist / getnextentry / seek /
+  sizeofopenfile / sizeof / getusedspace / getfreespace / getfileseparator /
+  getpathseparator`。
+  ⇒ MIDP 自身（RMS、jar/class 读取、资源加载）所需的文件操作**已经不缺**，
+  不需要新增 native 代码。
+- 缺口只在 **JSR 75 `javax.microedition.io.file.FileConnection`**，而它在
+  **上游 phoneME 里就不存在**：`phoneme_source/phoneME/` 无 `jsr75` 目录，
+  只有 `abstractions/` 下的 `FileConnectionPermission` 权限桩与
+  `ams_jsr_interface` 里的 `com.sun.midp.jsr075.FileConnectionCleanup`；
+  `phoneme-midp/build/vita_arm/Options.gmk` 中 `USE_JSR_75 = false`（与其它 JSR 一致）。
+  `phoneme-midp/src/protocol/file/` 是 `com.sun.midp.io.j2me.storage`（RMS 存储后端），
+  **不是** JSR75。
+  ⇒ 要做 JSR75 得**新写 Java API 类 + native 接线**（可架在现有 `pcsl_file_*` 之上），
+  属于新增特性而非补漏，**暂缓**（等真机可用再决策，见"遗留"）。
+
+### 二、JIT 现状调查（结论：JIT **一直在**二进制里，只是被无条件关掉）
+
+- `phoneme-cldc/src/vm/share/utilities/Globals.hpp:231`：
+  `product(bool, UseCompiler, true, ...)` ⇒ **默认开**；
+  VPK 里可见 29 个 `T .*Compiler` 符号；`Universe.cpp:532-533` 调用
+  `CompiledMethodCache::init()` 与 `Compiler::initialize()`。
+- 但 `phoneme-midp .../jams/native/runMidlet.c` 里有一句**无条件的**
+  `JVM_ParseOneArg("-int")` ⇒ `Arguments.cpp:129` `UseCompiler = false`，
+  自 v01.46 起 JIT 从未真正跑过。
+- 关掉的原因：**第 2 轮（UC）启用 JIT 会崩**，faulting PC 落在堆内
+  `compiler_area`（v01.45 章节），根因未定位。
+
+### 三、改动（最小 diff）
+
+1. `vita-port/src/vita_main.c`
+   - 新增 `#define VITA_JIT_DEFAULT 0` + `int vita_jit_policy = VITA_JIT_DEFAULT;`
+     （全局，供 MIDP 侧读取）+ 只读 `launch.cfg` 的 `read_jit_policy()`。
+   - `for(;;)` 轮循环增加 `int round` 计数，每轮开头重读 cfg 并折算：
+     `vita_jit_policy = (cfg_jit == 1 && round > 0) ? 0 : cfg_jit;`
+     （`jit=1` = 仅第 1 轮开 JIT），并 `crumb_printf("round %d: jit cfg=%d -> policy=%d", ...)`。
+   - `runMidlet` 前打印真实 VM 标志：
+     `crumb_printf("vm UseCompiler=%d (jit policy=%d)", ...)`（weak extern 读取
+     `UseCompiler`，无编译器子系统时也能链）。
+2. `phoneme-midp .../jams/native/runMidlet.c`
+   - 把无条件 `-int` 换成**经弱符号读取策略**后才注入：
+     ```c
+     extern int vita_jit_policy __attribute__((weak));
+     if (&vita_jit_policy == NULL || vita_jit_policy == 0) { "-int" }
+     ```
+     非 Vita 构建 / 独立 `libmidp.so` 链接里该弱符号为 NULL ⇒ 行为与旧版**完全一致**。
+3. `vita-port/CMakeLists.txt`：`VITA_VERSION` 01.57 → **01.58** + 注释块。
+4. `vita-port/README.md`：`launch.cfg` 说明补第 4 行 `jit=`，修正"默认 orientation"
+   描述（代码默认是 **portrait**，原文误写成 landscape），补全日志文件清单。
+
+### 四、关键机制（下次改 JIT 前重读）
+
+- `-int` → `Arguments.cpp:129` `UseCompiler = false`；`-comp` → `MixedMode=false; UseCompiler=true`。
+- `UseCompiler` 是**进程级全局**，`JVM.cpp:594-672` 只在**宿主 romization 期**
+  保存/恢复它 ⇒ 运行时一旦 `-int`，**后续所有轮次都保持解释器**——
+  这正是 `jit=1`（仅第 1 轮）自动变成"第 2 轮起解释器"的原因，无需额外代码。
+- `CompiledMethodCache::init()` 每轮由 `Universe::initialize()` 重做（清零
+  `Map/weights/upb/size/last_old`），所以 `jit=2`（每轮都开）不需要手工重置缓存。
+
+### 五、验证（二进制级已过）
+
+- 重编 `vita-port/build.sh midp`（触发 `runMidlet.o` 重编）→ **Build successful**。
+- `arm-vita-eabi-nm .../obj/arm/runMidlet.o | grep vita_jit_policy` → `w vita_jit_policy`
+  （弱未定义，符合预期）；VPK 里 → `812d2c48 B vita_jit_policy`（启动器强定义胜出）。
+- **反汇编确认判断没被优化掉**（`objdump -dr runMidlet.o`）：
+  `movw/movt r3, vita_jit_policy` → `cmp r3,#0` → `beq 注入-int` →
+  `ldr r3,[r3]` → `cmp r3,#0` → `beq 注入-int`：地址检查与值检查都在。
+- 产物：`vita-port/build/cmake/midp_vita.vpk` = **v01.58 b215 (143f5cd)**，
+  13666113 B，MD5 `a1ca93a299fbdce68595853d7a8bf8c2`。
+
+### 遗留
+
+- **第 2 轮 JIT 崩溃根因仍未修**（v01.45）。默认 `jit=0` 不改变 v01.46 以来的稳定性；
+  `jit=2` 是该崩溃的最小复现开关，`jit=1` 可拿回第 1 轮 JIT 性能——两者都**待真机**。
+- JSR 75 `FileConnection`：上游无实现，需新写 Java 类 + native 接线；
+  **需用户决策**后再动手（真机可用前建议暂缓）。
+
 ## 2026-09-14 v01.57：真机 core dump 取证——`pte_osSemaphoreCreate` 空 pHandle 落盘写空指针 + 全链路去 stdio 诊断包（vita-port `vita_crumb.c/.h`，phoneme-midp `midp_run.c`）
 
 ### 用户现象

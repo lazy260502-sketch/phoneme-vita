@@ -8,6 +8,8 @@
  *       line 1: absolute path of the game jar (default: Hello.jar)
  *       line 2: MIDlet class name        (default: HelloMIDlet)
  *       line 3: orientation portrait|landscape (default: portrait)
+ *       line 4: optional jit=0|1|2 (default 0 = interpreter only; see the
+ *               VITA_JIT_DEFAULT comment below)
  *   - matching internal.config (320x240 or 240x320) copied to ux0 at startup
  */
 
@@ -60,6 +62,44 @@ unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 
 #define DATA_DIR "ux0:/data/J2ME00001"
 #define CFG_PATH DATA_DIR "/launch.cfg"
+
+/* v01.58: JIT policy handed to the MIDP VM. runMidlet.c reads this through
+ * the weak symbol of the same name (see its "-int" block). launch.cfg may
+ * set it on line 4 as "jit=0|1|2":
+ *   0 = interpreter on every round   (default, the v01.46 behaviour)
+ *   1 = JIT on round 1 only, interpreter from round 2 on
+ *   2 = JIT on every round           (reproduces the round-2 crash)
+ * JIT on round 2+ is exactly what killed UC on device (faulting PC inside
+ * the heap compiler area, PROJECT_MEMORY v01.45 follow-up). Until that root
+ * cause is closed the default keeps the whole JIT path off; jit=1 recovers
+ * the round-1 performance that was the norm before v01.46. */
+#define VITA_JIT_DEFAULT 0
+int vita_jit_policy = VITA_JIT_DEFAULT;
+
+/* The VM's own flag (Globals.hpp:231, product(bool, UseCompiler, true)).
+ * It is a plain C++ global with an unmangled name; declared here as a byte
+ * purely so the launcher can log whether the JIT really is enabled this
+ * round. Weak, so a build without the compiler subsystem still links. */
+extern unsigned char UseCompiler __attribute__((weak));
+
+/* Read the optional "jit=N" setting from launch.cfg. Missing or malformed
+ * values leave the default in place. */
+static int read_jit_policy(void) {
+    int policy = VITA_JIT_DEFAULT;
+    SceUID fd = sceIoOpen(CFG_PATH, SCE_O_RDONLY, 0);
+    if (fd >= 0) {
+        static char buf[512];
+        memset(buf, 0, sizeof(buf));
+        if (sceIoRead(fd, buf, sizeof(buf) - 1) > 0) {
+            char *p = strstr(buf, "jit=");
+            if (p != NULL && p[4] >= '0' && p[4] <= '2') {
+                policy = p[4] - '0';
+            }
+        }
+        sceIoClose(fd);
+    }
+    return policy;
+}
 
 static FILE *g_log = NULL;
 
@@ -282,7 +322,18 @@ int main(int argc, char *argv[]) {
          *     crashes the emulator. Staying alive avoids it entirely.
          * Each round re-seeds config/appdb/heap parameters because
          * midpFinalize tears them down. */
+        int round = 0;
         for (;;) {
+            /* v01.58: pick the JIT policy for THIS round. "jit=1" means
+             * first round only, so from round 2 on it degrades to 0 and
+             * runMidlet.c passes "-int" again. */
+            {
+                int cfg_jit = read_jit_policy();
+                vita_jit_policy = (cfg_jit == 1 && round > 0) ? 0 : cfg_jit;
+                crumb_printf("round %d: jit cfg=%d -> policy=%d",
+                             round, cfg_jit, vita_jit_policy);
+            }
+
             snprintf(jar_path, sizeof(jar_path), "Hello.jar");
             /* AUDIO DEBUG: ToneTest (self-driving MMAPI smoke test) is the
              * default while the audio investigation is active. Switch back
@@ -425,6 +476,12 @@ int main(int argc, char *argv[]) {
             {
                 int status;
                 crumb_marker("runMidlet enter");
+                /* Read the VM flag AFTER the round: runMidlet.c has parsed
+                 * "-int" by then, so this is the mode the round actually
+                 * ran in (1 = JIT enabled, 0 = pure interpreter). */
+                crumb_printf("vm UseCompiler=%d (jit policy=%d)",
+                             (&UseCompiler == NULL) ? -1 : (int)UseCompiler,
+                             vita_jit_policy);
                 status = runMidlet(run_argc, run_argv);
                 crumb_printf("runMidlet returned %d", status);
                 crumb_marker("runMidlet exit");
@@ -437,6 +494,7 @@ int main(int argc, char *argv[]) {
                     dlog(msg);
                 }
             }
+            round++;
         } /* for(;;) - menu round loop: NEVER exits */
     }
 

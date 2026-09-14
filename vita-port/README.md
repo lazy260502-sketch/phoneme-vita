@@ -49,18 +49,27 @@ vita-port/
    - `CanvasTest` — 图元 + drawImage 渲染验证
    - `InputTest` — GameCanvas 按键验证
 3. 运行真实游戏：jar 放入 `ux0:/data/J2ME00001/`，写
-   `ux0:/data/J2ME00001/launch.cfg`（三行）：
+   `ux0:/data/J2ME00001/launch.cfg`（前三行必需，第四行可选）：
    ```
    ux0:/data/J2ME00001/<game>.jar
    <MIDletClassName>
-   portrait        ← 可选，第三行：portrait=竖屏240x320，landscape=横屏320x240
+   portrait        ← 可选，第三行：portrait=竖屏240x320（默认），landscape=横屏320x240
+   jit=0           ← 可选，第四行：0=纯解释器（默认）；1=仅第 1 轮开 JIT；2=每轮都开 JIT
    ```
-   默认（无 cfg 或无第三行）为 **landscape**——Vita 横持，320x240 画面近满屏。
+   默认（无 cfg 或无第三行）为 **portrait**（竖屏 240x320）。
+
+   `jit` 说明：JIT 编译器一直编进了 VPK，但第 2 轮起用 JIT 会触发
+   未定位尾的崩溃（PROJECT_MEMORY v01.45），因此默认全程关闭。`jit=1`
+   可拿回原先第 1 轮的 JIT 性能，`jit=2` 是复现该崩溃的最小开关；
+   两个值都只在有机器可调试时使用。
 
 键位：十字键=方向，✕=FIRE，○=SOFT1，□=SOFT2，△=GAME_A，L=GAME_B，R=GAME_C，
 START=`*`，SELECT=`#`。
 
-日志：`ux0:/data/J2ME00001/midp_stderr.log`、`boot_log.txt`。
+日志（均在 `ux0:/data/J2ME00001/`）：`midp_stderr.log`、`vm_output.log`
+（VM `tty->print`）、`vm_stderr.log`（pcsl_print_chars）、`crumb.log`
+（启动器/分阶段标记 + `--wrap` 信号量跟踪）、`boot_log.txt`。
+`ux0:/data/runmidlet_debug.log` 记录 runMidlet 入口阶段。
 
 ## 显示方向
 

@@ -282,7 +282,19 @@ set(VITA_TITLEID  "J2ME00001")
 #   (c) isBlockChainConsistent() now also cross-checks num_live (a lost
 #       header write after successful block writes made the old check
 #       pass while the index found no records).
-set(VITA_VERSION  "01.57")
+set(VITA_VERSION  "01.58")
+# 01.58 (2026-09-14): JIT policy knob. The compiler was always compiled into
+#   the VPK (Globals.hpp:231 product(bool, UseCompiler, true); 29 Compiler
+#   symbols in the binary) but runMidlet.c unconditionally passed "-int",
+#   so the JIT never ran after v01.46. Now launch.cfg line 4 accepts
+#   "jit=0|1|2" (default 0 = interpreter every round = v01.46 behaviour):
+#   1 = JIT on round 1 only, 2 = JIT on every round. vita_main.c owns the
+#   value in the global vita_jit_policy; runMidlet.c reads it through the
+#   weak symbol of the same name and injects "-int" only when the policy is
+#   0, so non-Vita builds and the standalone libmidp.so link keep the old
+#   behaviour. "-int" is sticky (UseCompiler is a process global,
+#   Arguments.cpp:129) which is why jit=1 yields interpreter from round 2 on.
+#   jit=2 is the minimal reproducer for the still-unfixed round-2 crash.
 # 01.57 (2026-09-14): Real-device coredump (psp2core-...-eboot.bin.psp2dmp)
 #   forensics: faulting PC 0x810bb25a = strge r3,[r5] inside
 #   pte_osSemaphoreCreate with r5 (the pHandle out-param) == NULL. That is
