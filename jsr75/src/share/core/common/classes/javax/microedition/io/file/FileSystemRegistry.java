@@ -11,9 +11,11 @@ import java.util.Enumeration;
 /**
  * Registry of the file system roots available to the application.
  *
- * <p>The Vita port registers a single root, the application data
- * directory.  See <code>com.sun.midp.jsr075.FileSystemRegistryImpl</code>
- * for the mapping to the physical path.</p>
+ * <p>The Vita port registers one root per mounted storage volume, named
+ * after the device it lives on: "ux0/" (main storage), "imc0/" and
+ * "uma0/" when a card is inserted, and "app0/" for the application's own
+ * package.  See <code>com.sun.midp.jsr075.FileSystemRegistryImpl</code>
+ * for the mapping to the physical paths.</p>
  */
 public class FileSystemRegistry {
 

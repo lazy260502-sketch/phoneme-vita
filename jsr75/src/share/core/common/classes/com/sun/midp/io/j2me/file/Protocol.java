@@ -3,7 +3,7 @@
  *
  * Vita-local subsystem, original implementation.
  *
- * Connector.open("file:///data/x") resolves, through
+ * Connector.open("file:///ux0/data/x") resolves, through
  * javax.microedition.io.Connector, to the class named by
  * "microedition.platform" (j2me) plus the protocol name (file):
  *
@@ -11,17 +11,18 @@
  *     -> com.sun.midp.io.j2me.file.Protocol
  *
  * The name handed to openPrim() is the URL with the scheme removed, i.e.
- * "///data/x" for "file:///data/x".  The "//" authority part is required
- * by JSR 75 (the host component is empty), the root name follows it.
+ * "///ux0/data/x" for "file:///ux0/data/x".  The "//" authority part is
+ * required by JSR 75 (the host component is empty), the root name - the
+ * name of a mounted volume - follows it.
  *
  * Access control: unlike the network protocols this handler performs no
  * AccessController check.  "javax.microedition.io.Connector.file.read"
  * and "...file.write" exist in the policy file, but they are only
  * reachable through alias groups that are not granted to the
  * minimum/unsecured domain, so no MIDlet could ever pass the check and
- * every JSR 75 call would fail.  The exposed root is the MIDlet suite's
- * own data directory, which is the same area the AMS already lets the
- * suite write through RMS/FileConnection internals.
+ * every JSR 75 call would fail.  The MIDlet gets the storage volumes the
+ * registry lists, which is what a file manager needs and what a suite
+ * could reach through the native layer anyway.
  */
 package com.sun.midp.io.j2me.file;
 
@@ -48,7 +49,7 @@ public class Protocol implements ConnectionBaseInterface {
     /**
      * Opens a FileConnection.
      *
-     * @param name the URL without its scheme, for example "///data/a.txt"
+     * @param name the URL without its scheme, for example "///ux0/data/a.txt"
      * @param mode Connector.READ or Connector.READ_WRITE
      * @param timeouts ignored; file access never blocks on the network
      * @return a FileConnection

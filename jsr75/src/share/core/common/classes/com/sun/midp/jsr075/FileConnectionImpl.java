@@ -4,11 +4,13 @@
  * Vita-local subsystem, original implementation.
  *
  * Path model: the connection keeps both the URL it was opened with and
- * the absolute path produced by FileSystemRegistryImpl.resolvePath().
- * The URL decides the "is a directory" intent (a trailing '/' is a
+ * the absolute path produced by FileSystemRegistryImpl.resolve().  The
+ * URL decides the "is a directory" intent (a trailing '/' is a
  * directory, per JSR 75), the absolute path is what the native layer
- * sees.  Nothing outside the root can be reached: resolvePath() rejects
- * ".." elements and the root name is fixed.
+ * sees.  Nothing outside the root can be reached: resolve() rejects
+ * ".." elements and only the roots listed by the registry are accepted,
+ * so the root name is fixed for the lifetime of the connection and only
+ * setFileConnection() moves the target downwards.
  *
  * Stream model: one native file handle per connection, reopened when the
  * open mode changes.  Each stream keeps its own position, so every
@@ -58,6 +60,9 @@ public class FileConnectionImpl implements FileConnection {
     /** The absolute path handed to the native layer. */
     private String absPath;
 
+    /** Name of the root the connection lives on, without a trailing '/'. */
+    private final String rootName;
+
     /** The root-relative path; empty for the root itself. */
     private String relPath;
 
@@ -86,7 +91,7 @@ public class FileConnectionImpl implements FileConnection {
     private boolean writable = true;
 
     /**
-     * Creates a connection for a URL of the exposed root.
+     * Creates a connection for a URL on one of the exposed roots.
      *
      * @param url the connection URL
      * @param accessMode Connector.READ or Connector.READ_WRITE
@@ -104,18 +109,15 @@ public class FileConnectionImpl implements FileConnection {
         this.dirUrl = url.length() > 0
                 && url.charAt(url.length() - 1) == '/';
 
-        String abs = FileSystemRegistryImpl.resolvePath(url);
-        String root = FileStore.getRootPath();
+        /* resolve() does the whole split: absolute device path, name of
+         * the root it belongs to and the remainder below that root.  The
+         * registry is the only place that knows how a root maps onto a
+         * device, so no prefix has to be recovered here. */
+        String[] parts = FileSystemRegistryImpl.resolve(url);
 
-        this.absPath = trimSlash(abs);
-        if ("".equals(this.absPath) || this.absPath.equals(trimSlash(root))) {
-            this.relPath = "";
-            this.absPath = trimSlash(root);
-        } else {
-            String r = trimSlash(root);
-            this.relPath = this.absPath.startsWith(r + "/")
-                    ? this.absPath.substring(r.length() + 1) : "";
-        }
+        this.absPath = parts[0];
+        this.rootName = parts[1];
+        this.relPath = parts[2];
     }
 
     /* ------------------------------------------------------------------ */
@@ -472,7 +474,7 @@ public class FileConnectionImpl implements FileConnection {
      * @return the total size in bytes
      */
     public long totalSize() {
-        return FileStore.totalSize();
+        return FileStore.totalSize(absPath);
     }
 
     /**
@@ -481,7 +483,7 @@ public class FileConnectionImpl implements FileConnection {
      * @return the available size in bytes
      */
     public long availableSize() {
-        return FileStore.availableSize();
+        return FileStore.availableSize(absPath);
     }
 
     /**
@@ -888,7 +890,7 @@ public class FileConnectionImpl implements FileConnection {
      * @return the path, starting with '/'
      */
     public String getPath() {
-        return "/" + FileSystemRegistryImpl.ROOT_NAME
+        return "/" + rootName
                 + (relPath.length() == 0 ? "/" : ("/" + relPath));
     }
 

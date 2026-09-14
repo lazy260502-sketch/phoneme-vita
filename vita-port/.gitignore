@@ -3,4 +3,6 @@ tools/fontbitmap.bin
 
 # Build assets required by CMake packaging - never ignore these
 !config/fontbitmap.bin
+# fontgen inputs: CJK face + Latin face
 !config/font.ttf
+!config/font-latin.ttf

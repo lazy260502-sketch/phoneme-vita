@@ -3,12 +3,20 @@
  *
  * Vita-local subsystem, original implementation.
  *
- * Root model: exactly one root, named ROOT_NAME, whose URL is
- * "file:///data/" (equivalently "file://localhost/data/", both are
- * accepted by resolvePath()).  It maps onto the application data
- * directory the launcher chdir()s into, i.e. the same directory
- * FileStore.getRootPath() reports.  No other root (ux0: elsewhere,
- * imc0:, uma0:, ...) is exposed.
+ * Root model: a root is the root directory of one of the Vita's mounted
+ * storage volumes, named after the device it lives on - "ux0/", "imc0/",
+ * "uma0/", "app0/" - which is the shape JSR 75 expects, since the other
+ * platforms that expose file systems hand out names like "C:/" and "E:/".
+ * The URL file:///ux0/data therefore maps onto the device absolute path
+ * ux0:/data, which is exactly what the native layer wants: PCSL's
+ * vita_resolve_path() passes any "<device>:" prefixed path straight
+ * through, and sceIo* wants it in that form too.
+ *
+ * The application data directory the launcher chdir()s into is no longer
+ * a root of its own: it is reachable as ux0/data/J2ME00001 like any other
+ * directory.  That is the point of this model - a file manager MIDlet
+ * lists the whole device instead of being locked into the directory the
+ * port happens to keep its jar and config in.
  */
 package com.sun.midp.jsr075;
 
@@ -18,26 +26,32 @@ import java.util.Vector;
 import javax.microedition.io.file.FileSystemListener;
 
 /**
- * Single-root implementation of the JSR 75 file system registry.
+ * Multi-root implementation of the JSR 75 file system registry.
  */
 public class FileSystemRegistryImpl {
 
-    /** Name of the only exposed root, without the trailing '/'. */
-    public static final String ROOT_NAME = "data";
+    /**
+     * Candidate roots, in list order, as device names without the ':'.
+     *
+     * <p>ux0 (main storage) and app0 (this application's own package) are
+     * mounted for the whole lifetime of the process; imc0 and uma0 are
+     * optional cards, so they are only listed when the volume answers a
+     * directory probe.</p>
+     */
+    private static final String[] ROOT_DEVS = {"ux0", "imc0", "uma0", "app0"};
+
+    /** True for the entries of ROOT_DEVS that need no existence probe. */
+    private static final boolean[] ROOT_ALWAYS = {true, false, false, true};
 
     /**
-     * The root name as handed out by {@link #listRoots()}.
+     * The roots actually exposed, as device names without ':'.
      *
-     * <p>JSR 75 hands out root <em>names</em>, not URLs: the name may be
-     * appended to "file:///" to form a URL, so it carries the trailing
-     * '/'.  Handing out ROOT_URL here instead makes every caller that
-     * does the documented <code>"file:///" + root</code> build
-     * "file:///file:///data/" and fail.</p>
+     * <p>Built on first use rather than in a static initialiser: the
+     * probe below is a native call, and class initialisation must not
+     * depend on native code (the ROMizer links these classes at build
+     * time).</p>
      */
-    public static final String ROOT_LIST_NAME = ROOT_NAME + "/";
-
-    /** URL of the only exposed root. */
-    public static final String ROOT_URL = "file:///" + ROOT_LIST_NAME;
+    private static Vector roots = null;
 
     /** Registered listeners; never fired on this platform. */
     private static final Vector listeners = new Vector();
@@ -47,14 +61,36 @@ public class FileSystemRegistryImpl {
     }
 
     /**
-     * Lists the roots.
+     * The exposed roots, probing the optional volumes the first time.
      *
-     * @return an enumeration holding the single root name
+     * @return the roots as device names without ':'
+     */
+    private static synchronized Vector availableRoots() {
+        if (roots == null) {
+            Vector found = new Vector(ROOT_DEVS.length);
+            for (int i = 0; i < ROOT_DEVS.length; i++) {
+                if (ROOT_ALWAYS[i]
+                        || FileStore.isDirectory(ROOT_DEVS[i] + ":/")) {
+                    found.addElement(ROOT_DEVS[i]);
+                }
+            }
+            roots = found;
+        }
+        return roots;
+    }
+
+    /**
+     * Lists the roots, i.e. the root directory of every mounted volume.
+     *
+     * @return an enumeration of root names, each with a trailing '/'
      */
     public static Enumeration listRoots() {
-        Vector roots = new Vector(1);
-        roots.addElement(ROOT_LIST_NAME);
-        return roots.elements();
+        Vector found = availableRoots();
+        Vector names = new Vector(found.size());
+        for (int i = 0; i < found.size(); i++) {
+            names.addElement(found.elementAt(i) + "/");
+        }
+        return names.elements();
     }
 
     /**
@@ -97,20 +133,36 @@ public class FileSystemRegistryImpl {
     }
 
     /**
-     * Translates a JSR 75 URL into the absolute path handed to the native
-     * layer.
+     * Device name of a root, when it is one of the exposed roots.
      *
-     * <p>Accepted form: <code>file://[localhost]/data[/rest]</code>.  The
-     * returned path is the root reported by
-     * {@link FileStore#getRootPath()} followed by the remainder, so the
-     * two never diverge.</p>
+     * @param rootName the root name from the URL, without a trailing '/'
+     * @return the device name ("ux0"), or null when unknown
+     */
+    private static String findRoot(String rootName) {
+        Vector found = availableRoots();
+        for (int i = 0; i < found.size(); i++) {
+            if (found.elementAt(i).equals(rootName)) {
+                return rootName;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Translates a JSR 75 URL into the paths the connection works with.
+     *
+     * <p>Accepted form: <code>file://[localhost]/&lt;root&gt;[/rest]</code>,
+     * where the root is one of the names
+     * {@link #listRoots()} hands out.  "<code>..</code>" elements are
+     * rejected outright: the Vita file API resolves them against the
+     * volume, so they could be used to climb out of the root.</p>
      *
      * @param url the connection URL
-     * @return the absolute path, no trailing slash except for the root
+     * @return {absolute device path, root name, root-relative path}
      * @exception IllegalArgumentException if the URL is not a JSR 75 URL
-     *              for the exposed root or tries to escape it
+     *              for an exposed root or tries to escape it
      */
-    public static String resolvePath(String url) {
+    public static String[] resolve(String url) {
         final String scheme = "file://";
 
         if (url == null || !url.startsWith(scheme)) {
@@ -118,14 +170,14 @@ public class FileSystemRegistryImpl {
         }
 
         /* JSR 75 URL syntax is file://<host>/<root>/<path>.  The host of the
-         * local device is "localhost"; the empty authority ("file:///data")
+         * local device is "localhost"; the empty authority ("file:///ux0")
          * is the accepted abbreviation of the same thing.  Both spellings
          * are in the wild, and a MIDlet that does the documented
          * "file://localhost/" + root build of a name from listRoots() --
          * MiniXplorer does exactly that -- must reach the same root as one
-         * that uses "file:///".  Any other host names a device this
-         * single-root port does not expose. */
-        String rest = url.substring(scheme.length());   // "localhost/data/x"
+         * that uses "file:///".  Any other host names a device this port
+         * does not expose. */
+        String rest = url.substring(scheme.length());   // "localhost/ux0/x"
         int hostEnd = rest.indexOf('/');
         String host = (hostEnd == -1) ? rest : rest.substring(0, hostEnd);
         if (host.length() != 0 && !host.equalsIgnoreCase("localhost")) {
@@ -133,7 +185,6 @@ public class FileSystemRegistryImpl {
                     "unknown host: " + host + " in " + url);
         }
         rest = (hostEnd == -1) ? "" : rest.substring(hostEnd + 1);
-        String root = FileStore.getRootPath();          // "ux0:/data/J2ME00001/"
 
         if (rest.length() == 0) {
             throw new IllegalArgumentException("missing root: " + url);
@@ -141,26 +192,51 @@ public class FileSystemRegistryImpl {
 
         int slash = rest.indexOf('/');
         String rootName = (slash == -1) ? rest : rest.substring(0, slash);
-        if (!rootName.equals(ROOT_NAME)) {
+        String dev = findRoot(rootName);
+        if (dev == null) {
             throw new IllegalArgumentException("unknown root: " + rootName);
         }
 
         String rel = (slash == -1) ? "" : rest.substring(slash + 1);
-        if (rel.length() == 0) {
-            return root;            /* a URL without a trailing slash */
-        }
-        if (rel.charAt(rel.length() - 1) == '/') {
+        while (rel.length() > 0 && rel.charAt(rel.length() - 1) == '/') {
             rel = rel.substring(0, rel.length() - 1);
-            if (rel.length() == 0) {
-                return root;
-            }
         }
-        checkRelative(rel);
+        if (rel.length() > 0) {
+            checkRelative(rel);
+        }
 
-        if (root.length() > 0 && root.charAt(root.length() - 1) == '/') {
-            return root + rel;
+        String abs = dev + ":/";                // "ux0:/"
+        if (rel.length() > 0) {
+            abs = abs + rel;                    // "ux0:/data/x"
         }
-        return root + "/" + rel;
+        return new String[] { trimSlash(abs), rootName, rel };
+    }
+
+    /**
+     * Translates a JSR 75 URL into the absolute path handed to the native
+     * layer.
+     *
+     * @param url the connection URL
+     * @return the absolute path, e.g. <code>ux0:/data/x</code> or
+     *         <code>ux0:</code> for the root of a volume
+     * @exception IllegalArgumentException if the URL is not a JSR 75 URL
+     *              for an exposed root or tries to escape it
+     */
+    public static String resolvePath(String url) {
+        return resolve(url)[0];
+    }
+
+    /**
+     * Removes a trailing '/' from a device path.
+     *
+     * @param s input path
+     * @return the path without a trailing '/'
+     */
+    private static String trimSlash(String s) {
+        if (s.length() > 1 && s.charAt(s.length() - 1) == '/') {
+            return s.substring(0, s.length() - 1);
+        }
+        return s;
     }
 
     /**

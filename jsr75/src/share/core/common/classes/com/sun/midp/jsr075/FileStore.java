@@ -10,10 +10,13 @@
  * them through the standard "Java_<class>_<method>" convention, so no
  * NativesTable regeneration is involved.
  *
- * Root policy: every path handled here is absolute and rooted at the
- * application data directory ("ux0:/data/J2ME00001/").  The Java layer
- * below never passes anything else, and getRootPath() is the single
- * source of that prefix.
+ * Root policy: every path handled here is absolute and starts with a Vita
+ * device prefix ("ux0:/", "imc0:/", ...), which is the form PCSL and the
+ * sceIo* calls want.  The Java layer above is the only producer of those
+ * paths: FileSystemRegistryImpl.resolve() turns a JSR 75 URL into
+ * "<device>:/<rest>".  getRootPath() is unrelated to that mapping - it
+ * reports the launcher's data directory, which is where the MIDlet store
+ * lives, not a JSR 75 root.
  */
 package com.sun.midp.jsr075;
 
@@ -27,9 +30,14 @@ public class FileStore {
     }
 
     /**
-     * Absolute path of the exposed root, always ending with '/'.
+     * Absolute path of the launcher's data directory, ending with '/'.
      *
-     * @return the root path, for example <code>ux0:/data/J2ME00001/</code>
+     * <p>Not a JSR 75 root: the roots are the volumes the registry lists.
+     * This is where the port keeps its configuration and the MIDlet
+     * store, and it is what the process chdir()ed into.</p>
+     *
+     * @return the data directory, for example
+     *         <code>ux0:/data/J2ME00001/</code>
      */
     public static native String getRootPath();
 
@@ -107,18 +115,20 @@ public class FileStore {
     public static native long lastModified(String path);
 
     /**
-     * Free space of the volume backing the root.
+     * Free space of the volume a path lives on.
      *
+     * @param path absolute path, used for its device prefix only
      * @return the available size in bytes, or -1 when unknown
      */
-    public static native long availableSize();
+    public static native long availableSize(String path);
 
     /**
-     * Capacity of the volume backing the root.
+     * Capacity of the volume a path lives on.
      *
+     * @param path absolute path, used for its device prefix only
      * @return the total size in bytes, or -1 when unknown
      */
-    public static native long totalSize();
+    public static native long totalSize(String path);
 
     /**
      * Opens a file, creating it when mode asks for write access.

@@ -23,21 +23,14 @@
  *     link time.  See the nm audit in PROJECT_MEMORY.md.
  *   - pcsl_file_exist()'s app0: fallback is wrong for a JSR 75 root.
  *
- * Root policy: the only exposed file system root is the application data
- * directory, i.e. the current working directory the launcher chdir()s to
- * ("ux0:/data/J2ME00001").  This is the exact same root that
- * vita_resolve_path() in vita_pcsl.c resolves relative PCSL paths against,
- * so the two stay consistent by construction instead of by a duplicated
- * #define.  Paths handed down from Java are therefore absolute
- * ("ux0:/data/J2ME00001/...") and pass straight through vita_resolve_path().
- *
- * Root policy: the only exposed file system root is the application data
- * directory, i.e. the current working directory the launcher chdir()s to
- * ("ux0:/data/J2ME00001").  This is the exact same root that
- * vita_resolve_path() in vita_pcsl.c resolves relative PCSL paths against,
- * so the two stay consistent by construction instead of by a duplicated
- * #define.  Paths handed down from Java are therefore absolute
- * ("ux0:/data/J2ME00001/...") and pass straight through vita_resolve_path().
+ * Root policy: a JSR 75 root is the root directory of one of the Vita's
+ * mounted volumes, and the absolute path Java hands down therefore starts
+ * with a device prefix ("ux0:/", "imc0:/", ...).  vita_resolve_path()
+ * in vita_pcsl.c passes any path containing ':' straight through, so those
+ * paths reach sceIo* unchanged.  The application data directory the
+ * launcher chdir()s to (jsr75_root() below) is only used by
+ * getRootPath(), which reports where the MIDlet store lives; it is not a
+ * root of its own any more, it is reachable as ux0/data/J2ME00001.
  *
  * KNI note: the ROM generator synthesises "Java_<class>_<method>" for any
  * native method it cannot resolve from its own NativesTable (see
@@ -117,6 +110,47 @@ static int jsr75_is_root_path(const char *path) {
         return 1;
     }
     return 0;
+}
+
+/* 1 when the path is the root directory of a volume ("ux0:" or "ux0:/").
+ * sceIoGetstat() does not reliably set IFDIR on a volume root either (same
+ * firmware quirk jsr75_is_root_path() works around), so ask the volume
+ * instead: a mounted volume lets its root be opened as a directory, an
+ * unmounted one does not.  This is what lets the Java layer probe for the
+ * optional cards before listing them as roots. */
+static int jsr75_is_dev_root(const char *path) {
+    char dir[JSR75_PATH_MAX];
+    size_t n = strlen(path);
+    size_t i;
+    SceUID fd;
+
+    if (n == 0 || n + 2 > sizeof(dir)) {
+        return 0;
+    }
+    if (path[n - 1] == '/') {
+        n--;
+    }
+    if (n < 2 || path[n - 1] != ':') {
+        return 0;
+    }
+    for (i = 0; i + 1 < n; i++) {
+        char c = path[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9') || c == '_')) {
+            return 0;
+        }
+    }
+
+    memcpy(dir, path, n);
+    dir[n] = '/';
+    dir[n + 1] = '\0';
+
+    fd = sceIoDopen(dir);
+    if (fd < 0) {
+        return 0;
+    }
+    sceIoDclose(fd);
+    return 1;
 }
 
 /* Device prefix of an absolute path, colon included ("ux0:").  Returns 0
@@ -222,8 +256,10 @@ static void jsr75_iter_reset(Jsr75Iter *it) {
 /* ------------------------------------------------------------------ */
 
 /*
- * Returns the exposed root as an absolute Vita path with a trailing '/'.
- * Java uses it to translate file:///data/<x> into ux0:/data/J2ME00001/<x>.
+ * Returns the launcher's data directory as an absolute Vita path with a
+ * trailing '/'.  This is where the port keeps its configuration and the
+ * MIDlet store; the JSR 75 roots are the volumes the registry lists, not
+ * this directory.
  */
 KNIEXPORT KNI_RETURNTYPE_OBJECT
 KNIDECL(com_sun_midp_jsr075_FileStore_getRootPath) {
@@ -264,8 +300,8 @@ JSR75_HANDLE_METHOD(com_sun_midp_jsr075_FileStore_exists,
     rc = (pcsl_file_exist(&path) == 1) ? KNI_TRUE : KNI_FALSE)
 
 JSR75_HANDLE_METHOD(com_sun_midp_jsr075_FileStore_isDirectory,
-    rc = (jsr75_is_root_path(cpath) || jsr75_stat_is_dir(cpath))
-         ? KNI_TRUE : KNI_FALSE)
+    rc = (jsr75_is_root_path(cpath) || jsr75_is_dev_root(cpath)
+          || jsr75_stat_is_dir(cpath)) ? KNI_TRUE : KNI_FALSE)
 
 /* create(): fail when the file already exists, otherwise create a zero
  * length file.  PCSL has no dedicated creat(), so open with
@@ -349,31 +385,47 @@ KNIDECL(com_sun_midp_jsr075_FileStore_lastModified) {
     KNI_ReturnLong(rc);
 }
 
-/* Free space of the volume the root lives on. -1 stands for "unknown". */
+/* Free space of the volume a path lives on. -1 stands for "unknown".  The
+ * device prefix is read from the path, so each root reports the capacity of
+ * its own card instead of that of the data directory. */
 KNIEXPORT KNI_RETURNTYPE_LONG
 KNIDECL(com_sun_midp_jsr075_FileStore_availableSize) {
-    char dev[32];
-    uint64_t max_size = 0;
-    uint64_t free_size = 0;
+    jlong rc = -1;
 
-    if (jsr75_dev_of(jsr75_root(), dev, sizeof(dev)) != 0
-            || sceAppMgrGetDevInfo(dev, &max_size, &free_size) < 0) {
-        KNI_ReturnLong((jlong)-1);
-    }
-    KNI_ReturnLong((jlong)free_size);
+    KNI_StartHandles(1);
+    GET_PARAMETER_AS_PCSL_STRING(1, path)
+        char cpath[JSR75_PATH_MAX];
+        char dev[32];
+        uint64_t max_size = 0;
+        uint64_t free_size = 0;
+        if (jsr75_cpath(&path, cpath) == 0
+                && jsr75_dev_of(cpath, dev, sizeof(dev)) == 0
+                && sceAppMgrGetDevInfo(dev, &max_size, &free_size) >= 0) {
+            rc = (jlong)free_size;
+        }
+    RELEASE_PCSL_STRING_PARAMETER
+    KNI_EndHandles();
+    KNI_ReturnLong(rc);
 }
 
 KNIEXPORT KNI_RETURNTYPE_LONG
 KNIDECL(com_sun_midp_jsr075_FileStore_totalSize) {
-    char dev[32];
-    uint64_t max_size = 0;
-    uint64_t free_size = 0;
+    jlong rc = -1;
 
-    if (jsr75_dev_of(jsr75_root(), dev, sizeof(dev)) != 0
-            || sceAppMgrGetDevInfo(dev, &max_size, &free_size) < 0) {
-        KNI_ReturnLong((jlong)-1);
-    }
-    KNI_ReturnLong((jlong)max_size);
+    KNI_StartHandles(1);
+    GET_PARAMETER_AS_PCSL_STRING(1, path)
+        char cpath[JSR75_PATH_MAX];
+        char dev[32];
+        uint64_t max_size = 0;
+        uint64_t free_size = 0;
+        if (jsr75_cpath(&path, cpath) == 0
+                && jsr75_dev_of(cpath, dev, sizeof(dev)) == 0
+                && sceAppMgrGetDevInfo(dev, &max_size, &free_size) >= 0) {
+            rc = (jlong)max_size;
+        }
+    RELEASE_PCSL_STRING_PARAMETER
+    KNI_EndHandles();
+    KNI_ReturnLong(rc);
 }
 
 /*
