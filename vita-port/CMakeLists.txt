@@ -416,6 +416,24 @@ set(VITA_VERSION  "01.64")
 #   VPK: the 16 MB font.ttf the old build shipped is no longer needed, so
 #   the package went from 13.7 MB to 3.6 MB.
 set(VITA_VERSION  "01.65")
+# 01.66 (2026-09-14): ideographs are rasterised at 20 px too, not 18.
+#
+#   The v01.65 bank baked the CJK sections from DengXian at 18 px while
+#   the line box is 22 rows with the baseline 18 rows down.  An
+#   ideograph's ink is about 0.85 em, so 18 px gave only 15 rows of ink;
+#   placed on the baseline it covered rows 5..19 and left 5 blank rows
+#   above it.  Chinese therefore looked small and sat sunk at the bottom
+#   of the line, and the pen advanced the 18 px the face asks for, which
+#   is 2 px tighter than the cell.  Latin was unaffected - its ink hugs
+#   the baseline - which is why only Chinese looked wrong.
+#
+#   At 20 px the ink lands on rows 3..20 (inside the cell: the tallest
+#   ideographs reach row 20 and nothing is clipped), the section advance
+#   comes out at the 20 px cell width again, and the strokes survive the
+#   1-bit threshold better.  Only the CJK sections changed - the header,
+#   the Latin advance tables and the Latin bitmaps are byte identical to
+#   the v01.65 bank, so English is bit-for-bit the same.
+set(VITA_VERSION  "01.66")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling

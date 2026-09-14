@@ -32,9 +32,22 @@
 #define CH      22  /* cell height, px */
 #define ASCENT  18  /* baseline, rows below the cell top (== descent 4) */
 
-/* Em size handed to stbtt_ScaleForPixelHeight.  CJK_PX is the value the
- * previous single-font bank used, so ideograph size is unchanged. */
-#define CJK_PX   18
+/* Em size handed to stbtt_ScaleForPixelHeight.
+ *
+ * The two faces want different sizes because they are measured differently:
+ * an ideograph fills most of its em (about 0.85 em of ink), while DejaVu's
+ * Latin fills roughly a cap height plus descenders.  Both sit on the same
+ * baseline, so CJK_PX decides how much of the 22 row line box an ideograph
+ * occupies above it.
+ *
+ * At 18 px an ideograph's ink was only 15 rows tall, so with the ink on the
+ * baseline it covered rows 5..19 and left 5 blank rows above it: Chinese
+ * looked small and sunk to the bottom of the line, and the pen advanced the
+ * 18 px the face asks for, which also made it tighter than the 20 px cell.
+ * 20 px fills the box (ideograph ink lands on rows 3..20 of the 22 row cell,
+ * still inside it, and the section advance comes out at the 20 px cell width
+ * again) so Chinese reads like the rest of the UI. */
+#define CJK_PX   20
 #define LATIN_PX 20
 
 #define NSEC 11
