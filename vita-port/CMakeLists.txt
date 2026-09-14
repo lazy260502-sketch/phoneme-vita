@@ -282,7 +282,20 @@ set(VITA_TITLEID  "J2ME00001")
 #   (c) isBlockChainConsistent() now also cross-checks num_live (a lost
 #       header write after successful block writes made the old check
 #       pass while the index found no records).
-set(VITA_VERSION  "01.55")
+set(VITA_VERSION  "01.57")
+# 01.57 (2026-09-14): Real-device coredump (psp2core-...-eboot.bin.psp2dmp)
+#   forensics: faulting PC 0x810bb25a = strge r3,[r5] inside
+#   pte_osSemaphoreCreate with r5 (the pHandle out-param) == NULL. That is
+#   a NULL store AFTER a successful sceKernelCreateSema - i.e. a caller
+#   passed a NULL out-param, the classic newlib lazy FILE-lock init
+#   signature, hit from a VM worker thread's first stdio write. The
+#   JDWP/exception path was ruled out (_debugger_active is only set by
+#   connect_java_debugger, and USE_ON_DEVICE_DEBUG=0). Mitigations: every
+#   hot print path is now stdio-free (vita_crumb.c = sceIo append channel;
+#   JVMSPI_PrintRaw and pcsl_print_chars both route through crumb_append),
+#   and the linker --wrap=pte_osSemaphoreCreate logs EVERY create with its
+#   caller address and refuses the NULL-pHandle call, so the next device
+#   run names the culprit in ux0:/data/J2ME00001/crumb.log.
 # 01.46 (2026-09-10, phoneme-midp 6525f4a): Second-launch UC crash (JIT)
 #   isolated. PC=0x85f05fd8 was inside the heap compiler_area (JIT code
 #   cache); the faulting ldr r4,[r5,#0x404] is the standard JIT prologue
@@ -413,6 +426,7 @@ add_executable(${PROJECT_NAME}
     src/vita_media_notify.c
     src/vita_sms_javacall.c
     src/vita_checkevents.c
+    src/vita_crumb.c
 )
 
 # Size of the bundled jar, baked into the binary for the runtime
@@ -456,6 +470,14 @@ target_link_libraries(${PROJECT_NAME}
     ${MIDP_OBJ_DIR}/runMidlet.o
     -Wl,--no-whole-archive
     -Wl,--allow-multiple-definition
+    # v01.57 crash-hunt: intercept the pthread-emulation semaphore init
+    # (the v01.56 coredump faulting PC). __wrap_pte_osSemaphoreCreate in
+    # vita_crumb.c logs every create and refuses the NULL-pHandle call;
+    # references inside libpthread.a resolve to __real_*. NOTE: --wrap
+    # only affects references from objects linked into this executable -
+    # exactly the callers we care about (newlib FILE-lock init, VM/ANi
+    # pthread usage). Wrapper must come before -lpthread.
+    -Wl,--wrap=pte_osSemaphoreCreate
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm

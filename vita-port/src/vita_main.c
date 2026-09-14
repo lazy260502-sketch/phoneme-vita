@@ -34,6 +34,7 @@ extern int runMidlet(int argc, char **argv);
 #include "vita_menu.h"
 #include "vita_storage.h"
 #include "vita_version.h"
+#include "vita_crumb.h"
 
 /* Baked in by build_jar.sh -> cmake (HELLO_JAR_SIZE): size of the
  * Hello.jar bundled in the VPK, used for the runtime copy check. */
@@ -203,7 +204,14 @@ int main(int argc, char *argv[]) {
 
     dlog("vita-port J2ME launcher\n");
 
+    /* v01.57 crash-hunt: boot-phase anchors. Everything below runs before
+     * the VM starts; a crash in this window leaves crumb.log truncated at
+     * the last bar, which pins the failing subsystem without stdio. */
+    crumb_marker("launcher start");
+    crumb_printf("version: %s", VITA_PORT_VERSION_STRING);
+
     vita_net_early_init();
+    crumb_marker("net early init done");
     dlog("version: " VITA_PORT_VERSION_STRING "\n");
 
     /* CRITICAL: run from the data dir and keep ALL VM classpath entries
@@ -244,7 +252,9 @@ int main(int argc, char *argv[]) {
          * entering an ANI path crash. */
         {
             extern void ANI_Initialize(void);
+            crumb_marker("ANI_Initialize enter");
             ANI_Initialize();
+            crumb_marker("ANI_Initialize done");
             dlog("[ANI] thread pool initialized\n");
         }
         /* Media subsystem init: creates the dedicated tone player thread
@@ -254,7 +264,9 @@ int main(int argc, char *argv[]) {
          * no END_OF_MEDIA). */
         {
             extern int javacall_media_initialize(void);
+            crumb_marker("media init enter");
             javacall_media_initialize();
+            crumb_marker("media init done");
             dlog("[media] tone player thread created\n");
         }
 
@@ -387,6 +399,11 @@ int main(int argc, char *argv[]) {
             dlog_str("classpath: ", classpath);
             dlog_str("starting MIDlet: ", class_name);
 
+            /* v01.57 crash-hunt anchors: section bars around each VM round
+             * so a truncated crumb.log shows exactly which phase died. */
+            crumb_marker("round begin");
+            crumb_printf("launch: %s / %s", jar_path, class_name);
+
             /* Copy-integrity check: log the runtime jar size so a truncated
              * copy (shorter than the VPK original) is visible in the boot
              * log. The expected size is baked in at build time. */
@@ -405,13 +422,20 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            int status = runMidlet(run_argc, run_argv);
-
             {
-                char msg[64];
-                snprintf(msg, sizeof(msg),
-                         "runMidlet returned %d - back to menu\n", status);
-                dlog(msg);
+                int status;
+                crumb_marker("runMidlet enter");
+                status = runMidlet(run_argc, run_argv);
+                crumb_printf("runMidlet returned %d", status);
+                crumb_marker("runMidlet exit");
+                crumb_flush();
+
+                {
+                    char msg[64];
+                    snprintf(msg, sizeof(msg),
+                             "runMidlet returned %d - back to menu\n", status);
+                    dlog(msg);
+                }
             }
         } /* for(;;) - menu round loop: NEVER exits */
     }

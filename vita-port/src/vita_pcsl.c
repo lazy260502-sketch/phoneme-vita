@@ -34,6 +34,9 @@
 /* JavaCall memory */
 #include <javacall_memory.h>
 
+/* v01.57: stdio-free logging channel */
+#include "vita_crumb.h"
+
 /* JVM and KNI */
 #include <kni.h>
 #include <jvm.h>
@@ -1876,9 +1879,14 @@ jchar pcsl_file_getpathseparator(void) {
  * ======================================================================== */
 
 void pcsl_print_chars(const char *s, int length) {
+    /* v01.57: fprintf(stderr) is OFF LIMITS here. This runs per character
+     * from JVMSPI_PrintRaw on VM worker threads, and the FIRST stdio
+     * write from such a thread triggers newlib's lazy FILE-lock init -
+     * the pte_osSemaphoreCreate NULL-store crash site from the v01.56
+     * coredump. sceIo channel instead (vita_crumb.c). */
     (void)length;
     if (s != NULL) {
-        fprintf(stderr, "%s", s);
+        crumb_append("ux0:/data/vm_stderr.log", s, (int)strlen(s));
     }
 }
 

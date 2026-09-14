@@ -1,5 +1,96 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-13
+> Last Updated: 2026-09-14
+
+## 2026-09-14 v01.57：真机 core dump 取证——`pte_osSemaphoreCreate` 空 pHandle 落盘写空指针 + 全链路去 stdio 诊断包（vita-port `vita_crumb.c/.h`，phoneme-midp `midp_run.c`）
+
+### 用户现象
+
+真机跑一次后留下崩溃转储 `psp2core-1789319139-0x00001636c3-eboot.bin.psp2dmp`。
+**当前没有可用真机复测**，故本轮只做静态取证 + 交付一个"下一次上机就能指认凶手"的诊断包。
+
+### 取证（**纠正了第一版结论**）
+
+- 第一版结论（已作废）：把 fault 归到 JDWP `VMEvent::exception_event`。错因是拿栈上残留
+  地址当现场——SP±16B 与 saved r5 落在 `0x813c0f50/0x813c0f64` 的旧内容上是**陈旧栈残渣**。
+- **真实现场**：活动 PC = `0x810bb25a`，指令 `strge r3,[r5]`，`r5 = 0`。
+  该地址落在 `pte_osSemaphoreCreate` 内（函数首 `0x810bb234`）：
+  `push {r4,r5,lr}; mov r2,r0; sub sp,#12; movs r4,#0; movw r0,#0x1848; mov r5,r1;
+   movw r3,#0x7fff; mov r1,r4; mov r4,lr; str r4,[sp,#0]; movt r0,#0x812b;
+   blx sceKernelCreateSema; subs r3,r0,#0; itet ge; movge r0,r4; movlt r0,#2;
+   strge r3,[r5,#0]`
+  → `r5` 就是 `pHandle` 出参。`sceKernelCreateSema` **成功**（r0>=0 ⇒ ge 分支），
+  随后把句柄写回 `*pHandle` 时 `pHandle == NULL` ⇒ 空指针写。
+- **为什么不是 JDWP**：`_debugger_active` 只由 `JavaDebugger.cpp:1112`
+  (`connect_java_debugger`) 置位，而 `Frame.cpp:948` 的异常钩子以
+  `if (_debugger_active)` 门控；且 `USE_ON_DEVICE_DEBUG=false`，
+  `midp_run.c` 的 `midpInitializeDebugger` 不会自动注入 `-debugger -nosuspend`。
+  整条 JDWP 链是死的。
+- **主要假设**：某个**VM 工作线程的首次 stdio 写**触发 newlib 惰性 FILE 锁初始化，
+  该路径调用 `pte_osSemaphoreCreate` 时传了 NULL 出参。（Vita3K 对此宽容——与
+  之前 `g_caps_tone`、PNG 编码器同类的"模拟器盲区"。）
+
+### 修复（本轮 = 诊断包，不是根修）
+
+1. **新增 `vita-port/src/vita_crumb.{c,h}`**：完全绕开 stdio 的面包屑通道。
+   - `crumb_append(path, s, len)`：`__atomic_exchange_n` 门闩 + 按路径缓存句柄 +
+     `sceIoOpen(O_CREAT|O_WRONLY|O_APPEND)`/`sceIoWrite`，**不碰任何 FILE\***。
+   - `crumb_marker/printf/flush`，宏 `CRUMB(...)` / `CRUMB_SEC(l)`。
+   - `extern int __real_pte_osSemaphoreCreate(int, void**);` +
+     `int __wrap_pte_osSemaphoreCreate(int initialValue, void **pHandle)`：
+     每次创建都记 `[pte] sem create init=%d handle=%p -> %p rc=%d from %p`
+     （`__builtin_return_address(0)` = 调用者地址）；`pHandle == NULL` 时记
+     `[pte] BLOCKED NULL-pHandle sem create from %p` 并直接返回 2
+     （= 内核失败分支的同一 pte_osResult），不再走空指针写。
+2. **热打印路径全部去 stdio**（这就是"下一次不会再崩"的那一刀）：
+   - `phoneme-midp .../native/midp_run.c` 的 `JVMSPI_PrintRaw`：逐字符
+     `fopen/fwrite/fclose` → `crumb_append("ux0:/data/vm_output.log", s, length)`，
+     之后照旧 `pcsl_print_chars`。文件内加了 `crumb_append` 的 **weak no-op 兜底定义**
+     （保证独立链接 `libmidp.so` 时不因缺符号失败；VPK 链接里 `vita_crumb.c` 的强符号胜出）。
+   - `vita-port/src/vita_pcsl.c` 的 `pcsl_print_chars`：`fprintf(stderr,...)` →
+     `crumb_append("ux0:/data/vm_stderr.log", s, len)`。
+3. **启动器锚点** `vita-port/src/vita_main.c`：`crumb_marker` 打在
+   launcher start / net early init done / round begin / runMidlet enter / runMidlet exit，
+   外加 `crumb_printf("version: %s", ...)`、`crumb_printf("launch: %s / %s", jar, class)`、
+   `crumb_printf("runMidlet returned %d", status)` + `crumb_flush()`（块内声明保持 C89 合法）。
+4. **链接期拦截** `vita-port/CMakeLists.txt`：源列表加 `src/vita_crumb.c`；
+   链接块加 `-Wl,--wrap=pte_osSemaphoreCreate`（必须排在 `-lpthread` 之前）。
+
+### 构建/产物
+
+- 重编：`cd vita-port && export VITASDK=/home/zyb/.local/vitasdk && export PATH=$VITASDK/bin:/home/zyb/tools/jdk8u502-b07/bin:$PATH && rm -f build/cmake/vita_version.h && ./build.sh`
+  → **Build successful**（版本号同时 bump 01.55 → 01.57）。
+- 产物：`vita-port/build/cmake/midp_vita.vpk` = **v01.57 b214 (199c975)**，
+  13666575 B，MD5 `4a488fc550ce579a664e9a3bb22107ab`。
+
+### 验证入口（二进制级已过）
+
+- `strings midp_vita | grep "version: J2ME"` → `v01.57 b214`
+- `arm-vita-eabi-nm midp_vita | grep pte_osSemaphoreCreate` →
+  `__wrap_pte_osSemaphoreCreate @0x8100b4bc` + `pte_osSemaphoreCreate @0x810bb51c`
+  （重定向已生效：`pthread_mutex_init`/`sem_init` 走 wrapper，只有 wrapper 调真函数）
+- `nm | grep crumb` → `crumb_append/flush/marker/printf` 全在位。
+
+### 下次上机怎么做（**待真机验证**，本轮无机器）
+
+1. 先删 `ux0:/data/J2ME00001/crumb.log`（避免旧内容混淆）。
+2. 装上 v01.57 跑一遍。
+3. 打开 `ux0:/data/J2ME00001/crumb.log`：出现
+   `[pte] BLOCKED NULL-pHandle sem create from 0x<caller>` 那一行的 `<caller>` 就是凶手，
+   用**本次**构建的 `build/cmake/midp_vita`（含符号、`main` 在 `0x81000060`）
+   `arm-vita-eabi-addr2line -e midp_vita -f -C 0x<caller>` 即可定位。
+   （**注意**：dump 里的 `0x8105e099`/`0x810bb25a` 等地址来自**上一个**二进制，
+   重链后全部作废，别再拿旧数字对地址。）
+4. 若 `crumb.log` 里连 launcher 锚点都没有 ⇒ 崩在比 `vita_main` 更早的阶段。
+
+### 遗留
+
+- 根因（谁把 NULL 传进 `pte_osSemaphoreCreate`）本轮**未修**，只做了断路 + 取证；
+  真机日志到手后再收敛。
+- 已知无害项：`libmidp.so` 链接尾部报 `undefined reference to _rom_linkcheck_mffd_false`
+  （`MIDP.gmk` 给 ROMImage.o 硬编码 `-DMSW_FIRST_FOR_DOUBLE=1` 而 `libcldc_vm.a` 是 0）；
+  `phoneme-midp/build/vita_arm/bin/arm/` 从来没产出过 `libmidp.so`，VPK 走 `libobj.a`
+  + 启动器 `vm_rom_stubs.c`（其中已定义该符号），**VPK 链接不受影响**。
+- JIT 二次启动根因仍未修（`-int` 掩盖中）——见 v01.45 后续章节。
 
 ## 2026-09-13 v01.56：真机安装 0x8010113D 定案——sce_sys PNG 必须是索引色（vita-port `assets/sce_sys/`）
 
