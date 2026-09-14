@@ -1,6 +1,64 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-14
 
+## 2026-09-14 v01.65：JSR 75 根目录 = 设备存储卷（多 root）+ UI 字体换 J2FB v2
+
+> 两条用户需求一次做完：(1) **"希望文件管理根目录是 psvita 的根目录，而不是当前应用的 data 目录"**；
+> (2) **"字体能否换一个，现在的字体显示英文字母很奇怪，有些符号排版也很难看"**。
+> 改动全部在 `j2me/jsr75`（Java + native）与 `j2me/vita-port`（字体链路 + 打包），**未碰 `phoneme_source/`、未碰 `cldc/build/share/`**。
+
+### 一、多 root 模型（旧"单 root = data"彻底退役）
+
+| 位置 | 改动 |
+|---|---|
+| `FileSystemRegistryImpl.java` | `ROOT_DEVS = {ux0,imc0,uma0,app0}` + `ROOT_ALWAYS = {T,F,F,T}`；`availableRoots()`（惰性 + `synchronized`）；`findRoot()`；`resolve(String) → String[3]`；`resolvePath()` 变成 `resolve(url)[0]` 的一行包装；新增 `trimSlash()` |
+| `FileConnectionImpl.java` | 新增 `private final String rootName`，构造器改为 `String[] parts = resolve(url)` 一次拿三件；`getPath() = "/" + rootName + (relPath 空 ? "/" : "/" + relPath)`；`totalSize()/availableSize()` 改传 `absPath` |
+| `FileStore.java` | `availableSize(String)`/`totalSize(String)` 改签名；`getRootPath()` javadoc 改为"启动器数据目录，**不是** JSR 75 root" |
+| `jsr75_file.c` | 新增 `jsr75_is_dev_root()`；`isDirectory` 判定加一项；`availableSize/totalSize` 改为按参数路径取设备前缀；顶部"Root policy"重写（原有一段**重复粘贴**的段落，一并清掉） |
+| `FileSystemRegistry.java` / `Protocol.java` | 仅 javadoc：root 是"每个已挂载存储卷的根"，示例 URL 改 `file:///ux0/data/x` |
+
+- **root 名就是设备名**（`"ux0/"`、`"imc0/"`、`"uma0/"`、`"app0/"`），拿到就能直接拼 `file://localhost/" + root`，和 `C:/`、`E:/` 的既有平台习惯一致。
+- `file:///ux0/data`（与 `file://localhost/ux0/data`）→ `resolve()` 返回 `{"ux0:/data", "ux0", "data"}`；`{"ux0:", "ux0", ""}` 表示卷根。
+- **数据目录不再是 root，但它照常可达**：`ux0/data/J2ME00001`。这正是需求 1 的要点——文件管理器现在能浏览整机，而不是被锁进移植自己放 jar/config 的那个目录。
+- `availableRoots()` **必须惰性**，不能写成静态初始化块：探测是 native 调用，而 ROMizer 在**构建期**就链接这些类，类初始化不能依赖 native 代码。
+- 旧常量 `ROOT_NAME` / `ROOT_LIST_NAME` / `ROOT_URL` 全部删除（`grep` 已确认无残留引用；`FileConnectionImpl.class` 对 `getRootPath` 的引用数为 **0**，说明旧耦合真的断了）。
+
+### 二、native 两处关键点
+
+- **`jsr75_is_dev_root(path)`**：`sceIoGetstat()` 对**卷根**不保证置 `IFDIR`（和 `jsr75_is_root_path()` 早就在绕的是同一个固件怪癖），所以改为**直接开卷根**（`sceIoDopen("ux0:/")` 成功即存在且已挂载）。这同时回答了"卡插没插"，Java 层拿它决定 `imc0`/`uma0` 要不要列进 `listRoots()`。
+- **`availableSize`/`totalSize` 带路径**：`jsr75_dev_of(cpath)` 取设备前缀 → `sceAppMgrGetDevInfo(dev)`，于是每张卡报自己的容量，而不是永远报 data 目录所在卷的。
+- 卷根的绝对路径是 **`ux0:`（无尾斜杠）**，因为 `resolve()` 走 `trimSlash()`；这**安全**：`listOpen()` 本来就会把目录路径补成 `"dir/"` 再 `sceIoDopen`（`ux0:/`），而 `parentPath()` 的 `slash <= 0 → null` 分支正好吃掉无斜杠的情况（不会 `substring` 越界）。
+- `pending`：`jsr75_is_root_path()` 在多 root 模型下已成死代码，按最小 diff 原则**保留未删**。
+
+### 三、字体：J2FB v2（比例拉丁 + 抗锯齿 + 基线对齐）
+
+- **格式**：32 字节头（`"J2FB"`、version=2、`nsec`@8、`dataOff`@12、ascent/descent/leading@16/18/20、`nglyphs`@24）+ `nsec`×28 字节 section 记录（first/count/gw/gh/stride/bpp/advOff）+ advance 表（1 字节/字形，0 = 无字形）+ 4 字节对齐位图。stride：8bpp → `gw`，1bpp → `(gw+7)/8`。加载器仍兼容 v1。
+- **11 个 section / 21,653 码点**：Latin（`0x0020×95`、`0x00A0×96`、`0x0100×128`、`0x0386×56`、`0x2010×24`、`0x2460×40`）= **DejaVu Sans 20px 8bpp 比例宽度**；CJK（`0x3000×64`、`0xFF01×95`、`0xFF61×63`、`0x4E00×20902`、`0x9FA6×90`）= **等线 18px 1bpp**。字身 `CW20×CH22`，基线 `ASCENT 18`，descent 4。银行 **1,615,280 B**。
+- **坑 1：stb `yo` 是屏幕坐标（向下为正）**，必须 `cy = ASCENT + yo`。第一版按 `cy = yo` 摆，所有字形整体下移 24 行——回归时先看这个。
+- **坑 2：CJK 墨迹宽度会超过字面 advance**（全角框、`0xFF01` 组），section advance 归一到 `max(墨迹上限, adv 上限)`，否则字与字粘一起。
+- **坑 3：编译 `fontgen` 必须 `-B/usr/bin`**（`gen_font.sh` 已固化）——PATH 前面是 VitaSDK 的 ARM `as`/`ld`，会拒绝 x86 目标文件。
+- **打包瘦身**：`config/font.ttf`（16 MB 等线）**不再进 VPK**，只发 `fontbitmap.bin`。**VPK 13.7 MB → 3.6 MB**。`config/font-latin.ttf` = DejaVu Sans 副本 + `font-latin.LICENSE.txt`（保留来源与许可），`.gitignore` 对这两个新增文件做了白名单。
+
+### 四、构建与验证（本轮实际命令与结果）
+
+- MIDP：`bash phoneme-midp/build_vita.sh` → `EXIT=0`。尾部 `jsr75_file.c: undefined reference to 'sceAppMgrGetDevInfo'` 是**已知无害项**：只出现在 `libmidp.so` 的检查链接里（那条路径不含 `SceAppMgr_stub`），最终可执行文件链接 `libobj.a` 时符号齐全；而且这个调用**旧版 `availableSize` 就在用**，不是本次引入。
+- 级联确认（时间戳）：`FileSystemRegistryImpl.java` 11:13:13 → `.class` 11:14:19 → `classes.zip` 11:14:19 → `obj/arm/jsr75_file.o` + `obj/arm/ROMImage.o` → `libobj.a` 11:14:41。
+- **反汇编核验**（`arm-vita-eabi-objdump -dr .../jsr75_file.o`）：`FileStore_isDirectory` 内联了 `sceIoDopen`/`sceIoDclose`/`sceIoGetstat`——新的卷根探测确实编进去了。
+- **类/ROM 级核验**：`FileSystemRegistryImpl.class` 常量池含 `ux0`/`imc0`/`uma0`/`app0`/`unknown root: `/`localhost`；`FileConnectionImpl.class` 对 `getRootPath` **0** 引用；ELF 中 `imc0`/`uma0`/`unknown root: `/`localhost` 以 UTF-16LE ROM 字符串存在（1 个）；`Java_com_sun_midp_jsr075*` native 符号 **21** 个（未变）。
+- 产物：`vita-port/build/cmake/midp_vita.vpk` = **v01.65 b220 (c568dcc)**，3,534,892 B；VPK 内 `data/J2ME00001/fontbitmap.bin` 与 `config/fontbitmap.bin` **MD5 相同**（`af032dab2d62574dccc4e10d2f12acd8`），`font.ttf` 已不在包内；`version: J2ME Player v01.65 b220 (c568dcc)`。
+- 提交：`samples` 主仓 **c568dcc**（`phoneme-cldc`/`phoneme-midp` 本轮无改动）。
+- **提醒：版本号在 CMakeLists 里改完必须重打 VPK**，否则 `strings` 还是旧 build 号（v01.48 已踩过一次）。
+
+### 五、未实测 / 遗留风险
+
+- **Vita3K 未上机复测**（本轮用户未装包）：预期 `listRoots()` 给出 `ux0/`（插卡时另有 `imc0/`/`uma0/`）与 `app0/`，`file:///ux0/data/J2ME00001` 可进，`availableSize()`/`totalSize()` 随路径变卡。
+- **字体视觉未验收**：拉丁应为比例宽度 + 灰度抗锯齿，下伸部/标点落在基线上。`vita_menu.c` 里写死的 x 坐标（最大 908）在拉丁变窄后只会更宽松，不会溢出。
+- `FileConnectionImpl.open()` 对 `relPath == ""` 仍然拒绝（"Cannot open the root"）——**卷根同理**，若某 MIDlet 直接 `open()` 根目录会抛异常（与旧单 root 时代行为一致，未改）。
+- `getName()` 对卷根返回 `"ux0:"`（`lastElement()` 找不到 `/`），不是 `""`；设备名 root 的固有小事，无害。
+- `FileStore.exists()` 仍走 `pcsl_file_exist()`，其 `app0:` 兜底（`vita_pcsl.c:1408`）对不存在的路径可能报 true（v01.60 起已知）。
+- `usedSize()`/`directorySize()` 现在可能对整个卷递归（`MAX_DEPTH 12` 限深不限宽），在 `ux0:/` 上调会很慢——文件管理器真去算根目录体积时注意。
+- `jsr75_is_root_path()` 已成死代码（保留未删）。
+
 ## 2026-09-14 v01.63：MiniXplorer 目录打不开定案——`resolvePath()` 不认 `file://localhost/...`
 
 > 实测（Vita3K，v01.62 + `[ALERT]`/`[MIDLET]`/`[JSR75]` 诊断）后新的、明确的失败点。
