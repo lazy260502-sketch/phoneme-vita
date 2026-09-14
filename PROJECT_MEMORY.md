@@ -45,10 +45,14 @@ v01.65 给 CJK 用 `CJK_PX 18`，而行盒是 `CH 22` / `ASCENT 18`；汉字墨�
 
   英文部分**逐字节相同**——正是用户说"还行"的那一半。
 - 银行 **1,615,280 B 不变**（布局未动、只有内容变）：MD5 `af032dab…` → `1142aeab2860bb7c99b15f9db0c10aa9`。
-- VPK：`cd vita-port && cmake --build build/cmake -j4`（**不需重编 MIDP ROM**）→ **v01.66 b221**、3,634,476 B。
+- VPK：`cd vita-port && cmake --build build/cmake -j4`（**不需重编 MIDP ROM**）→ **v01.66 b222**、3,634,400 B。
   比 v01.65 大 ~100 KB 属正常：20px 汉字笔画更密、熵更高，压缩率下降。VPK 内
   `data/J2ME00001/fontbitmap.bin` 的 MD5 == `config/fontbitmap.bin` ✓。
-- `strings build/cmake/midp_vita | grep "version: J2ME"` → `version: J2ME Player v01.66 b221`。
+- `strings build/cmake/midp_vita | grep "version: J2ME"` → `version: J2ME Player v01.66 b222 (60959ac)`。
+- **`vita_version.h` 是 configure 时生成的**（`GenVersion.cmake`）：`VITA_PORT_BUILD` = 提交数、
+  `VITA_PORT_HASH` = 当前 HEAD。所以**先提交、再构建**，hash 才指向本版代码提交；
+  构建前的 HEAD 会滞后一拍（本版第一次构建得到的是 `b221 (5cc5a9c)`，touch `CMakeLists.txt`
+  重新 configure 后才是 `b222 (60959ac)`）。
 
 ### 三、遗留风险 / 待验收
 
