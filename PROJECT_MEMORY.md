@@ -1,6 +1,57 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-14
 
+## 2026-09-14 v01.59：JSR 75 地基——补齐 `pcsl_directory.h` 的 8 个 native
+
+> 承接 v01.58 的"文件操作能力盘点"结论：`pcsl_file.h` 的 21 个 API 已全实现，缺口在 JSR 75。本轮先补**它依赖的最后一层 native 空洞**，Java 层下一轮做。
+
+### 一、盘点修正：`vita_stubs.c` 是**死代码**
+
+- `phoneme-midp/src/vita_stubs.c`（1195 行，`pcsl_file_*`/`pcsl_socket_*` 桩、`[file_open]` 调试串、写 `debug_log.txt`）**没有进链接**：`vita-port/CMakeLists.txt` 第 11 行注释明写 "old vita_stubs.o is NOT linked (replaced by src/vita_pcsl.c)"。
+  ⇒ 查"某个 pcsl 函数有没有实现"**只能看 `vita_pcsl.c`**，改 `vita_stubs.c` 没有任何效果（本轮曾差点改错文件）。
+- `gen_stubs.py` 生成的 30 个 Java 桩类（chameleon / orientation / `com.sun.midp.main.MIDletSuiteLoader`/`Configuration`/`CommandState` / GCI / `javax.microedition.media.*`）**不含 JSR 75**，所以"JSR75 的打桩代码"并不存在，无从"补全"。
+
+### 二、真实缺口：`pcsl_directory.h` 8 个入口（`grep pcsl_directory_ vita_pcsl.c` = 0）
+
+`phoneme-midp/build/vita_arm/pcsl/vita_arm/inc/pcsl_directory.h` 声明、而本移植从未实现，任何调用都会**链接期失败**：
+
+| 函数 | Vita 实现 |
+|---|---|
+| `pcsl_file_is_directory` | `sceIoGetstat` + `SCE_S_ISDIR(st_mode)`，stat 失败返回 0，路径非法 -1 |
+| `pcsl_file_mkdir` | `sceIoMkdir(path, 0777)`（单级，与 POSIX mkdir 一致） |
+| `pcsl_file_rmdir` | `sceIoRmdir(path)` |
+| `pcsl_file_getfreesize` | `sceAppMgrGetDevInfo(dev, ...)` → `free_size` |
+| `pcsl_file_gettotalsize` | 同上 → `max_size` |
+| `pcsl_file_get_attribute` | READ/WRITE 恒 1（Vita 无 per-file 权限位），EXECUTE/HIDDEN 0，未知 type -1 |
+| `pcsl_file_set_attribute` | READ/WRITE 当成功 no-op，其余 -1 |
+| `pcsl_file_get_time` | `st_mtime` → epoch 秒（见下） |
+
+新增/复用的辅助：
+
+- `vita_dir_path()`：`pcsl_string` → UTF-8（512 缓冲）→ 去尾 `/`、`\` → 空判 → `vita_resolve_path()`（与其它 `pcsl_file_*` 同一条路径解析）。
+- `vita_stat_any()`：`sceIoGetstat` 失败时回退 `app0:` 形式——复刻 `pcsl_file_exist` 里 `ux0:/data/` → `app0:/` 的前缀置换，只有真实设备才需要。
+- `vita_device_of()`：从绝对路径抽出 `"ux0:"` 式卷前缀，让容量查询按卷走而不是硬编码 `ux0:`。
+- `vita_sce_datetime_to_epoch()`：**踩坑记录**——`SceIoStat::st_mtime` 不是 epoch 秒，而是 `SceDateTime` 结构体（`psp2common/types.h:195`：`unsigned short year, month, day, hour, minute, second; unsigned int microsecond;`）。第一版写 `(long)st.st_mtime` 直接编译不过（`aggregate value used where an integer was expected`）。改用 Howard Hinnant 的 `days_from_civil` **纯整数**换算，不引 `psp2/rtc.h`、不加 `SceRtc_stub`、不依赖 libc 时区，Vita3K 与真机结果一致。代价：RTC 按原值读，若主机时钟设的是本地时间，epoch 差一个 UTC 偏移——MIDlet 只做相互比较，无影响。
+
+### 三、改动（最小 diff，只动工作副本）
+
+1. `vita-port/src/vita_pcsl.c`
+   - `#include <pcsl_directory.h>`（紧随 `pcsl_file.h`）。
+   - 在 `pcsl_file_getpathseparator()` 与 `PCSL Print stubs` 横幅之间新增 "PCSL directory / attribute service (JSR 75 groundwork)" 一节：8 个 `pcsl_directory.h` 入口 + 4 个 static 辅助。
+2. `vita-port/CMakeLists.txt`：`VITA_VERSION` 01.58 → **01.59** + 注释块。
+
+### 四、验证
+
+- `cmake --build build/cmake -j4` 通过（无 error/warning）。
+- `arm-vita-eabi-nm build/cmake/midp_vita | grep -E " T pcsl_file_"`：**21 → 29**，新增 8 个正是上表函数（`81008788`..`810089f0`）。
+- 产物：`build/cmake/midp_vita.vpk` 13,667,710 B，md5 `a973d3f2516243bd591ccf49c0a20f30`。
+
+### 五、遗留 / 下一步
+
+- 这 8 个函数**目前无调用者**（JSR 75 Java 层还没写），因此 01.59 行为与 01.58 **完全等价**，纯地基。
+- JSR 75 上游 phoneME **无源码**（只有 `USE_JSR_75` 空钩子 + 权限/清理接口桩）；互联网可参考：`nikita36078/J2ME-Loader`（Apache-2.0，只有 5 个 API 接口）与 `TASEmulators/freej2me-plus`（含 `FileConnectionImpl.java`，许可证 GPL 系）。计划：按 Apache-2.0 那套**只取公开 API 签名**，Impl 自己写在现有 `pcsl_file_*` + 本轮 `pcsl_directory_*` 之上。
+- 待办（Java 层）：`javax.microedition.io.file.{FileConnection, FileSystemRegistry, FileSystemListener, ConnectionClosedException, IllegalModeException}` + Impl + `com.sun.midp.io.j2me.file.Protocol`，接到 `vita_overlay.mk` 或新子系统目录（**不改 `phoneme_source/`**），把 `ux0:/data/J2ME00001/` 注册成 root；任一 `.java` 变更会自动触发 romgen 级联重生成 `ROMImage_*.cpp`。
+
 ## 2026-09-14 v01.58：JIT 策略开关（`launch.cfg` 第 4 行 `jit=0|1|2`）+ 文件操作能力盘点
 
 > 真机问题按用户要求**只记录、不上机复测**（v01.57 诊断包已就位，见下一节）。

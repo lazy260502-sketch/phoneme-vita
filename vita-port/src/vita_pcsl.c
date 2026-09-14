@@ -26,6 +26,7 @@
 
 /* PCSL file/socket/network/datagram headers */
 #include <pcsl_file.h>
+#include <pcsl_directory.h>   /* JSR 75 directory/attribute service */
 #include <pcsl_socket.h>
 #include <pcsl_network.h>
 #include <pcsl_datagram.h>
@@ -1872,6 +1873,245 @@ jchar pcsl_file_getfileseparator(void) {
 
 jchar pcsl_file_getpathseparator(void) {
     return ':';
+}
+
+/* ========================================================================
+ * PCSL directory / attribute service (pcsl_directory.h)
+ *
+ * These are the natives JSR 75 (javax.microedition.io.file) is built on:
+ * "is this a directory", "create/remove a directory", "how much space is
+ * left", "read/write attributes", "last modified". Until now NOTHING
+ * defined them on Vita (pcsl_file.h's 21 entry points were complete, this
+ * header's 8 were not) - which is exactly why an "enable USE_JSR_75"
+ * build would fail to link, and why directory listing from Java was
+ * impossible (MIDP itself never enumerates).
+ *
+ * Everything below works on the same conventions as the pcsl_file_*
+ * family above: pcsl_string -> UTF-8 -> vita_resolve_path() (relative
+ * names land under the data root, device-prefixed names pass through)
+ * -> sceIo*, with the app0: (VPK) fallback for read paths.
+ * ======================================================================== */
+
+/* pcsl_string path -> absolute C path, trailing separators stripped.
+ * sceIoGetstat("ux0:/dir/") fails on a trailing slash, but JSR 75
+ * FileConnection URIs keep it (it is how a directory is addressed), so
+ * normalize here instead of at every call site. */
+static int vita_dir_path(const pcsl_string *s, char *out, size_t outsz) {
+    if (s == NULL || s->data == NULL) {
+        return -1;
+    }
+
+    char utf8[512];
+    if (pcsl_string_convert_to_utf8(s, (jbyte *)utf8, sizeof(utf8), NULL)
+            != PCSL_STRING_OK) {
+        return -1;
+    }
+
+    size_t len = strlen(utf8);
+    while (len > 1 && (utf8[len - 1] == '/' || utf8[len - 1] == '\\')) {
+        utf8[--len] = '\0';
+    }
+    if (len == 0) {
+        return -1;  /* the bare current directory is not addressable */
+    }
+
+    vita_resolve_path(utf8, out, outsz);
+    return 0;
+}
+
+/* sceIoGetstat with the same app0: (VPK) fallback pcsl_file_exist uses:
+ * system files may live inside the VPK while user files live on ux0:. */
+static int vita_stat_any(const char *abs_path, SceIoStat *st) {
+    if (sceIoGetstat(abs_path, st) >= 0) {
+        return 0;
+    }
+
+    char app0_path[600];
+    if (strncmp(abs_path, "ux0:/data/", 10) == 0) {
+        snprintf(app0_path, sizeof(app0_path), "app0:/%s", abs_path + 5);
+    } else {
+        snprintf(app0_path, sizeof(app0_path), "app0:%s", abs_path);
+    }
+    return sceIoGetstat(app0_path, st);
+}
+
+/* Extract "ux0:" style device prefix for the partition queries. */
+static int vita_device_of(const char *abs_path, char *dev, size_t devsz) {
+    const char *colon = strchr(abs_path, ':');
+    if (colon == NULL || (size_t)(colon - abs_path) + 2 > devsz) {
+        return -1;
+    }
+    size_t n = (size_t)(colon - abs_path) + 1;  /* keep the colon */
+    memcpy(dev, abs_path, n);
+    dev[n] = '\0';
+    return 0;
+}
+
+int pcsl_file_is_directory(const pcsl_string *path) {
+    char abs_path[600];
+    if (vita_dir_path(path, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+
+    SceIoStat st;
+    if (vita_stat_any(abs_path, &st) < 0) {
+        return 0;  /* does not exist (or not readable) - not a directory */
+    }
+    return SCE_S_ISDIR(st.st_mode) ? 1 : 0;
+}
+
+int pcsl_file_mkdir(const pcsl_string *dirName) {
+    char abs_path[600];
+    if (vita_dir_path(dirName, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+
+    /* Single level, like the upstream implementations: JSR 75's
+     * create() only ever asks for one new directory. */
+    if (sceIoMkdir(abs_path, 0777) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int pcsl_file_rmdir(const pcsl_string *dirName) {
+    char abs_path[600];
+    if (vita_dir_path(dirName, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+
+    if (sceIoRmdir(abs_path) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+jlong pcsl_file_getfreesize(const pcsl_string *path) {
+    char abs_path[600];
+    char dev[32];
+    uint64_t max_size = 0;
+    uint64_t free_size = 0;
+
+    if (vita_dir_path(path, abs_path, sizeof(abs_path)) != 0
+            || vita_device_of(abs_path, dev, sizeof(dev)) != 0) {
+        return -1;
+    }
+    if (sceAppMgrGetDevInfo(dev, &max_size, &free_size) < 0) {
+        return -1;
+    }
+    return (jlong)free_size;  /* jlong is 64-bit: no saturation needed */
+}
+
+jlong pcsl_file_gettotalsize(const pcsl_string *path) {
+    char abs_path[600];
+    char dev[32];
+    uint64_t max_size = 0;
+    uint64_t free_size = 0;
+
+    if (vita_dir_path(path, abs_path, sizeof(abs_path)) != 0
+            || vita_device_of(abs_path, dev, sizeof(dev)) != 0) {
+        return -1;
+    }
+    if (sceAppMgrGetDevInfo(dev, &max_size, &free_size) < 0) {
+        return -1;
+    }
+    return (jlong)max_size;
+}
+
+int pcsl_file_get_attribute(const pcsl_string *fileName, int type, int *result) {
+    char abs_path[600];
+    SceIoStat st;
+
+    if (result == NULL
+            || vita_dir_path(fileName, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+    if (vita_stat_any(abs_path, &st) < 0) {
+        return -1;
+    }
+
+    switch (type) {
+    case PCSL_FILE_ATTR_READ:
+    case PCSL_FILE_ATTR_WRITE:
+        /* ux0:/app0: have no per-file permission bits; a file that is
+         * there can be read and written (write failures surface as
+         * EROFS from sceIoOpen for VPK-backed paths). */
+        *result = 1;
+        return 0;
+
+    case PCSL_FILE_ATTR_EXECUTE:
+    case PCSL_FILE_ATTR_HIDDEN:
+        /* Not representable in the Vita filesystem. */
+        *result = 0;
+        return 0;
+
+    default:
+        return -1;
+    }
+}
+
+int pcsl_file_set_attribute(const pcsl_string *fileName, int type, int value) {
+    char abs_path[600];
+    SceIoStat st;
+
+    (void)value;
+    if (vita_dir_path(fileName, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+    if (vita_stat_any(abs_path, &st) < 0) {
+        return -1;
+    }
+
+    switch (type) {
+    case PCSL_FILE_ATTR_READ:
+    case PCSL_FILE_ATTR_WRITE:
+        /* Accepted as a no-op: nothing to change, nothing to fail. */
+        return 0;
+
+    default:
+        /* EXECUTE/HIDDEN cannot be set on ux0: - tell JSR 75 the truth
+         * so setHidden()/setReadable() throw instead of lying. */
+        return -1;
+    }
+}
+
+/* SceIoStat carries SceDateTime (broken down), JSR 75 wants seconds
+ * since 1970-01-01. days_from_civil (Hinnant) keeps it libc- and
+ * timezone-free, so Vita3K and real hardware agree. The console RTC is
+ * read as-is: on a device whose clock is local time the epoch shifts
+ * by the UTC offset, which MIDlets only ever compare with each other. */
+static long vita_sce_datetime_to_epoch(const SceDateTime *dt) {
+    long y = (long)dt->year;
+    long m = (long)dt->month;
+    long d = (long)dt->day;
+
+    y -= (m <= 2);
+    long era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (unsigned)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long days = era * 146097L + (long)doe - 719468L;
+
+    return days * 86400L + (long)dt->hour * 3600L + (long)dt->minute * 60L
+           + (long)dt->second;
+}
+
+int pcsl_file_get_time(const pcsl_string *fileName, int type, long *result) {
+    char abs_path[600];
+    SceIoStat st;
+
+    if (result == NULL
+            || vita_dir_path(fileName, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+    if (type != PCSL_FILE_TIME_LAST_MODIFIED) {
+        return -1;
+    }
+    if (vita_stat_any(abs_path, &st) < 0) {
+        return -1;
+    }
+    *result = vita_sce_datetime_to_epoch(&st.st_mtime);
+    return 0;
 }
 
 /* ========================================================================

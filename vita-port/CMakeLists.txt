@@ -282,7 +282,22 @@ set(VITA_TITLEID  "J2ME00001")
 #   (c) isBlockChainConsistent() now also cross-checks num_live (a lost
 #       header write after successful block writes made the old check
 #       pass while the index found no records).
-set(VITA_VERSION  "01.58")
+set(VITA_VERSION  "01.59")
+# 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
+#   pcsl_directory.h declares 8 entry points this port never implemented
+#   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
+#   is_directory/mkdir/rmdir/getfreesize/gettotalsize/get_attribute/
+#   set_attribute/get_time would have failed at link time. They are real
+#   now: sceIoGetstat/sceIoMkdir/sceIoRmdir with the same app0: fallback
+#   pcsl_file_exist uses, sceAppMgrGetDevInfo for the volume sizes (the
+#   "ux0:"-style prefix is extracted from the path so a per-volume query
+#   works), and a libc-free days_from_civil conversion for st_mtime -
+#   SceIoStat keeps a SceDateTime struct, not epoch seconds, so the first
+#   attempt did not even compile. READ/WRITE attributes answer 1 (Vita
+#   has no per-file permission bits), EXECUTE/HIDDEN answer 0, and
+#   set_attribute accepts READ/WRITE as a no-op. Nothing calls them yet -
+#   javax.microedition.io.file is the next step - so this build behaves
+#   exactly like 01.58.
 # 01.58 (2026-09-14): JIT policy knob. The compiler was always compiled into
 #   the VPK (Globals.hpp:231 product(bool, UseCompiler, true); 29 Compiler
 #   symbols in the binary) but runMidlet.c unconditionally passed "-int",
