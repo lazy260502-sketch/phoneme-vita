@@ -1,6 +1,23 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-15
 
+## 2026-09-15 v01.69：真机黑屏真根因定案——`SetFrameBuf(IMMEDIATE)` 被真机拒绝（0x80290006）
+
+> v01.68（CDRAM）后真机仍黑屏。**注意那两轮"还是黑屏"的 log 其实是 FTP 传输缓存了旧文件**（boot_log 显示 v01.67 b226、且无 crumb.log）——真机侧早已在跑 v01.68 b229。教训：**核对版本串，别信文件内容；取日志用改名法（复制成新文件名再拉）绕开 FTP 缓存**。
+
+- **crumb.log 心跳数据（b229 诊断版）一步定性**：
+  - `menu: fb=0x61000000 block=0x4001015f` → CDRAM 分配成功（0x61000000 正是 CDRAM 映射基址）；
+  - `menu hb: flips=60/120/179...` 每秒 +60 → 菜单循环完全健康；
+  - **`rc=0x80290006` 出现在每一次 flip** → `SCE_DISPLAY_ERROR_INVALID_UPDATETIMING`（psp2/display.h:24）。
+- **根因**：两个 flip 点（`vita_menu.c menu_flip`、`vita_display.c flip_to_display`）都用 `SCE_DISPLAY_SETBUF_IMMEDIATE`。真机 fw 3.65 拒绝该更新时机、面板从未拿到 framebuffer。**官方三个样例（debugScreen/camera/ime）全部用 `SCE_DISPLAY_SETBUF_NEXTFRAME`**；Vita3K 不校验 IMMEDIATE——模拟器正常的第三个理由。
+- **修复**（提交 a79ff3b）：两处统一改 `SCE_DISPLAY_SETBUF_NEXTFRAME`。菜单循环里每次 flip 后已有 `sceDisplayWaitVblankStart()`，NEXTFRAME 语义匹配。
+- **产物**：`midp_vita_v01.69.vpk`（v01.69 b230 (a79ff3b)，MD5 `601a7ece827246df5078b0a7fef81a32`）。
+- **真机四连坑（最终版）**：
+  1. 段滑动 → 跳板必须 PIC（v01.67 `--pic-veneer`）；
+  2. CPU 写/硬件读的缓冲必须非缓存（v01.68 CDRAM framebuffer）——**音频 ring buffer 是下一个待查点**；
+  3. `SetFrameBuf` 更新时机必须 NEXTFRAME（v01.69）；
+  4. **诊断日志是唯一可信源**：crumb 心跳 + 返回值记录一步定性；同时警惕 FTP 缓存伪造"修复无效"。
+
 ## 2026-09-15 v01.68：真机黑屏定案——framebuffer 用了缓存内存，显示控制器看不见（CDRAM 修复）
 
 > 用户回报 v01.67 真机 **"启动后黑屏"**；boot_log.txt 出现并停在 `[media] tone player thread created`——pic-veneer 修复已生效（静态构造活下来了、日志能写了），崩溃变成了显示问题。
