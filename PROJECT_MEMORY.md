@@ -1,6 +1,18 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-15
 
+## 2026-09-15 v01.70：真机闪烁定案——单缓冲直写扫描输出帧，双缓冲修复
+
+> 用户回报 v01.69 **"画面显示了，但是一直在闪烁，感觉像是一直在刷新，之前 Vita3K 偶尔会这样"**。
+
+- **根因**：菜单（每帧全屏重绘）和 LCDUI blit 都是**单缓冲**——直接画在显示控制器正在扫描输出的那块帧上，面板读到半成品帧 = 持续闪烁/撕裂。Vita3K 偶尔出现的同现象是同一个竞态（只是很少输）；v01.68 改 CDRAM 后写入变慢（非缓存），真机上竞态从"偶尔"变成"必然"。
+- **修复**（提交 d4fe4c8）：两处 framebuffer 各自改为**单 CDRAM 块双帧 ping-pong**——画后备帧 → NEXTFRAME 提交 → 交换指针：
+  - `vita_menu.c`：`menu_fb` 别名后备帧，`menu_flip()` 提交+交换；
+  - `vita_display.c`：`flip_to_display()` blit 进后备帧、提交、交换；`lfjport_ui_finalize` 释放整块。
+  - CDRAM 占用：菜单 4MB + 显示 4MB（256KB 粒度）。
+- **产物**：`midp_vita_v01.70.vpk`（b232 (d4fe4c8)，MD5 `086d50d8912751d542426faaa11e7d5f`）。
+- **真机五连坑（累计）**：PIC 跳板 / 非缓存 fb / NEXTFRAME / 双缓冲 / （诊断）crumb 心跳+防 FTP 缓存。下一个真机风险点不变：**音频 ring buffer 的缓存一致性**（"有画面没声音"就查它）。
+
 ## 2026-09-15 v01.69：真机黑屏真根因定案——`SetFrameBuf(IMMEDIATE)` 被真机拒绝（0x80290006）
 
 > v01.68（CDRAM）后真机仍黑屏。**注意那两轮"还是黑屏"的 log 其实是 FTP 传输缓存了旧文件**（boot_log 显示 v01.67 b226、且无 crumb.log）——真机侧早已在跑 v01.68 b229。教训：**核对版本串，别信文件内容；取日志用改名法（复制成新文件名再拉）绕开 FTP 缓存**。
