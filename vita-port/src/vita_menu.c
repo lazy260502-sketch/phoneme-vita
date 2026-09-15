@@ -40,6 +40,7 @@
 #include "vita_icon.h"
 #include "vita_version.h"
 #include "vita_fbmem.h"
+#include "vita_crumb.h"
 
 /* from vita_font.c: menu-side UTF-8 rendering over the shared CJK bank */
 int vita_menu_font_gw(void);
@@ -70,6 +71,11 @@ static uint32_t *menu_fb = NULL;
  * the display controller cannot see the CPU writes (see vita_fbmem.h).
  * Owns the CDRAM block behind menu_fb for the whole process. */
 static VitaFbMem menu_fb_blk = { -1, NULL };
+/* v01.68 diagnostics: flip counter + last sceDisplaySetFrameBuf rc. */
+static unsigned int menu_flip_count = 0;
+static int menu_last_flip_rc = 0x7FFFFFFF;
+/* heartbeat timestamp ( microseconds, sceKernelGetProcessTimeWide) */
+static unsigned long long menu_hb_us = 0;
 
 /* ------------------------------------------------------------------ */
 /* 5x7 ASCII font (public-domain glyph table)                          */
@@ -192,7 +198,10 @@ static void menu_flip(void) {
     fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
     fb.width = FB_W;
     fb.height = FB_H;
-    sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_IMMEDIATE);
+    /* v01.68 black-screen hunt: record the syscall result so a real-hw
+     * failure (instead of a silent black panel) is visible in crumb.log. */
+    menu_last_flip_rc = sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_IMMEDIATE);
+    menu_flip_count++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1408,8 +1417,14 @@ int vita_menu_run(VitaGameSel *out) {
         }
     }
     if (menu_fb == NULL) {
+        crumb_printf("menu: CDRAM alloc FAILED block=0x%08x",
+                     (unsigned)menu_fb_blk.block);
+        crumb_flush();
         return 0;
     }
+    crumb_printf("menu: fb=%p block=0x%08x", menu_fb,
+                 (unsigned)menu_fb_blk.block);
+    crumb_flush();
 
     if (!dir_exists(GAMES_DIR)) {
         sceIoMkdir(GAMES_DIR, 0777);
@@ -1422,6 +1437,24 @@ int vita_menu_run(VitaGameSel *out) {
         const int row_h = 30;
         const int lines = 12;
         int y;
+
+        /* v01.68 black-screen diagnostics: one heartbeat per second in
+         * crumb.log. If these appear, the menu LOOP is alive and the
+         * question narrows to the display path (flip rc / fb address);
+         * if they stop, the loop died and the last one printed marks
+         * the vicinity. Remove once the real-hw display issue is
+         * closed. */
+        {
+            unsigned long long now = sceKernelGetProcessTimeWide();
+            if (now - menu_hb_us > 1000000ULL) {
+                menu_hb_us = now;
+                crumb_printf("menu hb: flips=%u rc=0x%08x games=%d btn=0x%x",
+                             menu_flip_count,
+                             (unsigned)menu_last_flip_rc,
+                             game_count, btn);
+                crumb_flush();
+            }
+        }
 
         if (mode == 0) {
             if (btn & SCE_CTRL_UP) {
