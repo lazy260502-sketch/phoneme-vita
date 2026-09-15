@@ -199,8 +199,15 @@ static void menu_flip(void) {
     fb.width = FB_W;
     fb.height = FB_H;
     /* v01.68 black-screen hunt: record the syscall result so a real-hw
-     * failure (instead of a silent black panel) is visible in crumb.log. */
-    menu_last_flip_rc = sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_IMMEDIATE);
+     * failure (instead of a silent black panel) is visible in crumb.log.
+     * v01.69 fix: NEXTFRAME, not IMMEDIATE - on real fw 3.65
+     * sceDisplaySetFrameBuf(IMMEDIATE) returns
+     * SCE_DISPLAY_ERROR_INVALID_UPDATETIMING (0x80290006) and the panel
+     * stays black; every official SDK sample (debugScreen/camera/ime)
+     * uses NEXTFRAME. Vita3K accepts IMMEDIATE, so this only shows on
+     * real hardware. Confirmed by the crumb.log heartbeat:
+     * flips incremented 60/s but rc=0x80290006 on every flip. */
+    menu_last_flip_rc = sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
     menu_flip_count++;
 }
 

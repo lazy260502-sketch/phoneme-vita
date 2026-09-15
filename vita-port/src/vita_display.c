@@ -163,7 +163,9 @@ static void flip_to_display(void) {
     fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
     fb.width = VITA_PHYS_W;
     fb.height = VITA_PHYS_H;
-    sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_IMMEDIATE);
+    /* v01.69: NEXTFRAME - IMMEDIATE returns INVALID_UPDATETIMING
+     * (0x80290006) on real fw 3.65 (see vita_menu.c menu_flip). */
+    sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
 }
 
 /* ------------------------------------------------------------------ */
