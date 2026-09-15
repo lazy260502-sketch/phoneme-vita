@@ -1,5 +1,21 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-14
+> Last Updated: 2026-09-15
+
+## 2026-09-15 v01.68：真机黑屏定案——framebuffer 用了缓存内存，显示控制器看不见（CDRAM 修复）
+
+> 用户回报 v01.67 真机 **"启动后黑屏"**；boot_log.txt 出现并停在 `[media] tone player thread created`——pic-veneer 修复已生效（静态构造活下来了、日志能写了），崩溃变成了显示问题。
+
+- **日志解读**：`[media]` 之后 main() 的下一批 dlog 只会在**菜单做出选择之后**才写（菜单自身不写 boot_log），所以日志停在这里 ≠ 卡死，恰好说明执行流进入了 `vita_menu_run()`。黑屏 = 菜单在跑但画面上不去。
+- **根因**：`vita_menu.c` 的 `menu_fb` 和 `vita_display.c` 的 `vita_fb` 都是 `memalign()` 的**普通缓存堆内存**。真机上 Cortex-A9 的写回式 D-cache 把 CPU 的画面写留在缓存里，显示控制器扫描的是主存 → 面板永远黑。**Vita3K 不模拟缓存**（与 veneer 那次同类"模拟器专用正常"），所以模拟器一直 looks fine。全 port 层 grep 不到任何 Dcache 回写调用佐证。
+- **修复**（提交 fc0008e）：新 helper `src/vita_fbmem.h`——`sceKernelAllocMemBlock(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW)`（256KB 粒度向上取整）分配 framebuffer，CPU 侧**非缓存**映射，对显示控制器即时可见；这正是官方样例（common/debugScreen.c、camera、ime）的做法。两处替换：
+  - `vita_menu.c`：menu_fb 走 `menu_fb_blk`，块随进程存活（与旧所有权一致）。
+  - `vita_display.c`：vita_fb 走 `vita_fb_blk`，`lfjport_ui_finalize` 里释放。
+  - CMakeLists 链接 `SceSysmem_stub`（MemBlock API 属 SceSysmem 组）。
+- **产物**：`vita-port/build/cmake/midp_vita.vpk`，v01.68 b227 (fc0008e)，3,634,904 B。
+- **教训（真机三连坑，务必记住）**：
+  1. 段滑动 → 跳板必须 PIC（v01.67 `--pic-veneer`）；
+  2. 显示路径内存必须非缓存（CDRAM 或回写）；任何"CPU 写、其它硬件读"的缓冲（音频 ring、未来 GPU 纹理上传）同样适用——**下一步真机没声音的话先查 `vita_audio.c` 的 ring buffer 是不是同一类问题**；
+  3. Vita3K 不模拟缓存也不滑动段——"模拟器正常"不能作为任何真机结论的依据。
 
 ## 2026-09-14 v01.67：真机启动即崩定案——ld 默认 ARM→Thumb 跳板无重定位（`--pic-veneer` 修复）
 
