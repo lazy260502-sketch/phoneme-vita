@@ -458,7 +458,7 @@ set(VITA_VERSION  "01.67")
 #   from sceKernelAllocMemBlock(USER_CDRAM_RW) via the new
 #   vita_fbmem.h helper - the mapping is UNCACHED on the CPU side, the
 #   pattern every official SDK sample (debugScreen/camera/ime) uses.
-set(VITA_VERSION  "01.69")
+set(VITA_VERSION  "01.70")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling

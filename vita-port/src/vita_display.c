@@ -77,8 +77,14 @@ void vita_display_set_orientation(int landscape) {
 static uint32_t *vita_fb = NULL;
 /* v01.67 real-hw black-screen fix: CDRAM (uncached) block behind vita_fb.
  * A cached memalign buffer is invisible to the display controller on
- * real hardware - see vita_fbmem.h. */
+ * real hardware - see vita_fbmem.h.
+ * v01.70: DOUBLE BUFFERED - one CDRAM block holds two frames; the blit
+ * writes the back buffer and flip_to_display() submits it with
+ * NEXTFRAME and swaps. Single-buffered the blit raced the scanout
+ * (flicker/tearing). */
 static VitaFbMem vita_fb_blk = { -1, NULL };
+static uint32_t *vita_fb_front = NULL;
+static uint32_t *vita_fb_back = NULL;
 static int display_ready = 0;
 
 /* Computed scaling: virtual screen scaled to fit physical, centered. */
@@ -138,12 +144,13 @@ int vita_display_map_touch(int px, int py, int *vx, int *vy) {
 static void flip_to_display(void) {
     SceDisplayFrameBuf fb;
     int x, y;
+    uint32_t *tmp;
 
     if (vita_fb == NULL) {
         return;
     }
 
-    /* Blit scaled virtual screen into the physical framebuffer.
+    /* Blit scaled virtual screen into the BACK framebuffer.
      * Nearest neighbour via fixed point steps. */
     for (y = 0; y < dst_h; y++) {
         const gxj_pixel_type *src_row =
@@ -164,8 +171,14 @@ static void flip_to_display(void) {
     fb.width = VITA_PHYS_W;
     fb.height = VITA_PHYS_H;
     /* v01.69: NEXTFRAME - IMMEDIATE returns INVALID_UPDATETIMING
-     * (0x80290006) on real fw 3.65 (see vita_menu.c menu_flip). */
+     * (0x80290006) on real fw 3.65 (see vita_menu.c menu_flip).
+     * v01.70: submit the just-blitted back buffer, then swap; the next
+     * blit goes into the old front while the display scans the new
+     * one out. */
     sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
+    tmp = vita_fb_front;
+    vita_fb_front = vita_fb;
+    vita_fb = tmp;
 }
 
 /* ------------------------------------------------------------------ */
@@ -221,13 +234,16 @@ int lfjport_ui_init(void) {
 
     vita_fb = NULL;
     if (vita_fbmem_alloc(&vita_fb_blk,
-            VITA_PHYS_W * VITA_PHYS_H * sizeof(uint32_t)) == 0) {
-        vita_fb = (uint32_t *)vita_fb_blk.base;
+            VITA_PHYS_W * VITA_PHYS_H * sizeof(uint32_t) * 2) == 0) {
+        vita_fb_front = (uint32_t *)vita_fb_blk.base;
+        vita_fb = vita_fb_front + VITA_PHYS_W * VITA_PHYS_H;
+        vita_fb_back = vita_fb;
     }
     if (vita_fb == NULL) {
         return -1;
     }
-    /* Black letterbox background. */
+    /* Black letterbox background for BOTH buffers. */
+    memset(vita_fb_front, 0, VITA_PHYS_W * VITA_PHYS_H * sizeof(uint32_t));
     memset(vita_fb, 0, VITA_PHYS_W * VITA_PHYS_H * sizeof(uint32_t));
 
     display_ready = 1;
@@ -240,7 +256,9 @@ int lfjport_ui_init(void) {
 
 void lfjport_ui_finalize(void) {
     display_ready = 0;
-    if (vita_fb != NULL) {
+    if (vita_fb_front != NULL) {
+        vita_fb_front = NULL;
+        vita_fb_back = NULL;
         vita_fb = NULL;
         vita_fbmem_release(&vita_fb_blk);
     }

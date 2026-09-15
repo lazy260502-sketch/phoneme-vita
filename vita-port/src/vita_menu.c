@@ -69,8 +69,15 @@ int vita_menu_draw_utf8(uint32_t *fb, int w, int h,
 static uint32_t *menu_fb = NULL;
 /* v01.67 real-hw black-screen fix: the framebuffer must be UNCACHED or
  * the display controller cannot see the CPU writes (see vita_fbmem.h).
- * Owns the CDRAM block behind menu_fb for the whole process. */
+ * Owns the CDRAM block behind menu_fb for the whole process.
+ * v01.70: DOUBLE BUFFERED - one CDRAM block holds two frames; drawing
+ * goes to the back buffer and menu_flip() submits it with NEXTFRAME
+ * and swaps. Single-buffered rendering painted into the frame the
+ * display was scanning out -> constant flicker on real hw (and the
+ * occasional Vita3K tear - same race, just rarely lost). */
 static VitaFbMem menu_fb_blk = { -1, NULL };
+static uint32_t *menu_fb_front = NULL;   /* being scanned out   */
+static uint32_t *menu_fb_back = NULL;    /* being drawn into    */
 /* v01.68 diagnostics: flip counter + last sceDisplaySetFrameBuf rc. */
 static unsigned int menu_flip_count = 0;
 static int menu_last_flip_rc = 0x7FFFFFFF;
@@ -191,24 +198,31 @@ static void draw_textf(int x, int y, int scale, uint32_t color,
 
 static void menu_flip(void) {
     SceDisplayFrameBuf fb;
+    uint32_t *tmp;
     memset(&fb, 0, sizeof(fb));
     fb.size = sizeof(SceDisplayFrameBuf);
-    fb.base = menu_fb;
+    fb.base = menu_fb_back;
     fb.pitch = FB_W;
     fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
     fb.width = FB_W;
     fb.height = FB_H;
-    /* v01.68 black-screen hunt: record the syscall result so a real-hw
-     * failure (instead of a silent black panel) is visible in crumb.log.
-     * v01.69 fix: NEXTFRAME, not IMMEDIATE - on real fw 3.65
+    /* v01.69 fix: NEXTFRAME, not IMMEDIATE - on real fw 3.65
      * sceDisplaySetFrameBuf(IMMEDIATE) returns
      * SCE_DISPLAY_ERROR_INVALID_UPDATETIMING (0x80290006) and the panel
      * stays black; every official SDK sample (debugScreen/camera/ime)
      * uses NEXTFRAME. Vita3K accepts IMMEDIATE, so this only shows on
      * real hardware. Confirmed by the crumb.log heartbeat:
-     * flips incremented 60/s but rc=0x80290006 on every flip. */
+     * flips incremented 60/s but rc=0x80290006 on every flip.
+     * v01.70: submit the BACK buffer, then swap - the just-submitted
+     * frame becomes the one scanned out while drawing restarts into
+     * the old front (now free). */
     menu_last_flip_rc = sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
     menu_flip_count++;
+    tmp = menu_fb_front;
+    menu_fb_front = menu_fb_back;
+    menu_fb_back = tmp;
+    /* menu_fb aliases the drawing target for all fill/draw helpers. */
+    menu_fb = menu_fb_back;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1419,8 +1433,10 @@ int vita_menu_run(VitaGameSel *out) {
      * v01.67: CDRAM (uncached) instead of memalign - a cached heap
      * buffer is invisible to the display controller on real hw. */
     if (menu_fb == NULL) {
-        if (vita_fbmem_alloc(&menu_fb_blk, FB_W * FB_H * 4) == 0) {
-            menu_fb = (uint32_t *)menu_fb_blk.base;
+        if (vita_fbmem_alloc(&menu_fb_blk, FB_W * FB_H * 4 * 2) == 0) {
+            menu_fb_front = (uint32_t *)menu_fb_blk.base;
+            menu_fb_back = menu_fb_front + FB_W * FB_H;
+            menu_fb = menu_fb_back;
         }
     }
     if (menu_fb == NULL) {
@@ -1429,7 +1445,7 @@ int vita_menu_run(VitaGameSel *out) {
         crumb_flush();
         return 0;
     }
-    crumb_printf("menu: fb=%p block=0x%08x", menu_fb,
+    crumb_printf("menu: fb=%p/%p block=0x%08x", menu_fb_front, menu_fb_back,
                  (unsigned)menu_fb_blk.block);
     crumb_flush();
 
