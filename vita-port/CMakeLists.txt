@@ -446,6 +446,19 @@ set(VITA_VERSION  "01.66")
 #   -Wl,--pic-veneer turns all 38 into pc-relative sequences; verified
 #   reloc count unchanged, Vita3K unaffected (it never slides segments).
 set(VITA_VERSION  "01.67")
+# 01.68 (2026-09-15): real-hw black screen after boot fix - CDRAM fbs.
+#   The pic-veneer fix (01.67) got the app past static ctors on real hw
+#   (boot_log.txt now appears) but the screen stayed black: both the
+#   native menu framebuffer and the LCDUI vita_fb were memalign()ed
+#   heap buffers, i.e. normal CACHEABLE user memory. On real hardware
+#   the Cortex-A9 D-cache keeps the CPU writes in-cache while the
+#   display controller scans main memory, so the panel never sees a
+#   single pixel. Vita3K does not emulate caches (same class of
+#   emulator-only success as the veneer bug). Both buffers now come
+#   from sceKernelAllocMemBlock(USER_CDRAM_RW) via the new
+#   vita_fbmem.h helper - the mapping is UNCACHED on the CPU side, the
+#   pattern every official SDK sample (debugScreen/camera/ime) uses.
+set(VITA_VERSION  "01.68")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
@@ -713,6 +726,9 @@ target_link_libraries(${PROJECT_NAME}
     SceAppMgr_stub
     SceGxm_stub
     SceAudio_stub
+    # v01.67: sceKernelAllocMemBlock/GetMemBlockBase for the CDRAM
+    # framebuffers (vita_fbmem.h)
+    SceSysmem_stub
     m
 )
 

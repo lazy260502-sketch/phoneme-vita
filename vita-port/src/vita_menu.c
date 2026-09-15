@@ -39,6 +39,7 @@
 #include "vita_menu.h"
 #include "vita_icon.h"
 #include "vita_version.h"
+#include "vita_fbmem.h"
 
 /* from vita_font.c: menu-side UTF-8 rendering over the shared CJK bank */
 int vita_menu_font_gw(void);
@@ -65,6 +66,10 @@ int vita_menu_draw_utf8(uint32_t *fb, int w, int h,
 #define C_WARN  0xFF5050E0u
 
 static uint32_t *menu_fb = NULL;
+/* v01.67 real-hw black-screen fix: the framebuffer must be UNCACHED or
+ * the display controller cannot see the CPU writes (see vita_fbmem.h).
+ * Owns the CDRAM block behind menu_fb for the whole process. */
+static VitaFbMem menu_fb_blk = { -1, NULL };
 
 /* ------------------------------------------------------------------ */
 /* 5x7 ASCII font (public-domain glyph table)                          */
@@ -1394,9 +1399,13 @@ int vita_menu_run(VitaGameSel *out) {
      * every round, leaking the old 2MB block (6h session with several
      * menu<->game rounds = tens of MB gone). The "no free on exit"
      * policy below only ever meant "don't hand the block back while
-     * the display still scans it out" - it never justified leaking. */
+     * the display still scans it out" - it never justified leaking.
+     * v01.67: CDRAM (uncached) instead of memalign - a cached heap
+     * buffer is invisible to the display controller on real hw. */
     if (menu_fb == NULL) {
-        menu_fb = (uint32_t *)memalign(0x100, FB_W * FB_H * 4);
+        if (vita_fbmem_alloc(&menu_fb_blk, FB_W * FB_H * 4) == 0) {
+            menu_fb = (uint32_t *)menu_fb_blk.base;
+        }
     }
     if (menu_fb == NULL) {
         return 0;

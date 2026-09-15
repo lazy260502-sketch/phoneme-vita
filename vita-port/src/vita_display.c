@@ -24,6 +24,8 @@
 #include <gxj_putpixel.h>
 #include <lfjport_export.h>
 
+#include "vita_fbmem.h"
+
 /* ------------------------------------------------------------------ */
 /* Virtual phone screen (what MIDP games see) vs Vita physical screen.
  *
@@ -73,6 +75,10 @@ void vita_display_set_orientation(int landscape) {
 
 /* Physical framebuffer (A8B8G8R8, 4 bytes/pixel), allocated in ui_init. */
 static uint32_t *vita_fb = NULL;
+/* v01.67 real-hw black-screen fix: CDRAM (uncached) block behind vita_fb.
+ * A cached memalign buffer is invisible to the display controller on
+ * real hardware - see vita_fbmem.h. */
+static VitaFbMem vita_fb_blk = { -1, NULL };
 static int display_ready = 0;
 
 /* Computed scaling: virtual screen scaled to fit physical, centered. */
@@ -211,8 +217,11 @@ int lfjport_ui_init(void) {
     }
     compute_scaling();
 
-    vita_fb = (uint32_t *)memalign(0x100,
-        VITA_PHYS_W * VITA_PHYS_H * sizeof(uint32_t));
+    vita_fb = NULL;
+    if (vita_fbmem_alloc(&vita_fb_blk,
+            VITA_PHYS_W * VITA_PHYS_H * sizeof(uint32_t)) == 0) {
+        vita_fb = (uint32_t *)vita_fb_blk.base;
+    }
     if (vita_fb == NULL) {
         return -1;
     }
@@ -230,8 +239,8 @@ int lfjport_ui_init(void) {
 void lfjport_ui_finalize(void) {
     display_ready = 0;
     if (vita_fb != NULL) {
-        free(vita_fb);
         vita_fb = NULL;
+        vita_fbmem_release(&vita_fb_blk);
     }
 }
 
