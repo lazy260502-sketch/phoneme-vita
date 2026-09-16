@@ -497,6 +497,21 @@ set(VITA_VERSION  "01.71")
 #   -> clock frozen -> H2 on the spot). One report per hang, appended
 #   to ux0:/data/J2ME00001/watchdog.log.
 set(VITA_VERSION  "01.72")
+# 01.73 (2026-09-16): watchdog v2 - log5 lesson. The v01.72 watchdog stayed
+#   SILENT while the pump froze with the exact log4 signature (ani_mark
+#   "OUT", pump dead after touch events). watchdog.log did not even exist.
+#   Two failure modes, both fixed:
+#   1. silent startup: thread-create failure returned without a trace, and
+#      nothing proved the thread ever ran. Now every outcome writes a line:
+#      "[WD] alive tid=... start rc=..." at startup, "[WD] create FAILED"
+#      on error.
+#   2. clock-blind detection: the 3 s stall threshold was measured with
+#      gettimeofday - if H2 (clock freeze) is real, the threshold can
+#      never be reached and the watchdog is blind to its own target
+#      scenario. Detection now counts poll ITERATIONS (12 x 250 ms),
+#      clock-free; the dual gettimeofday readings stay in the report as
+#      H2 evidence (d==0 -> frozen clock).
+set(VITA_VERSION  "01.73")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling

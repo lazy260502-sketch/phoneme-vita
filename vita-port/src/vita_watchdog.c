@@ -2,24 +2,17 @@
  * vita_watchdog.c - v01.72 hang forensics: snapshot what the VM thread
  * is doing when the event pump stops.
  *
- * v01.71 verdict (log4): the pump froze for good (last session CE #115
- * ~= 4.4 s after launch) with ani_mark = "OUT", i.e. the VM thread did
- * NOT die inside the ANI wait - it simply never came back to the pump.
- * Audio thread innocent (tone done chunks=38, math checks out). Clock
- * LOOKED alive but the heartbeat samples once per 1024 pump calls
- * (~40 s), way too coarse for a 2-10 s hang - H2 was never excluded.
- *
- * Two suspects remain, and ONE snapshot tells them apart:
- *   (a) VM thread blocked in a kernel wait (sceIo*, mutex, cond, delay)
- *       -> SceKernelThreadInfo.status == WAITING, waitType names the class
- *   (b) VM thread running hot (Java/GC/interpreter loop, no native block)
- *       -> status == RUNNING/READY, waitType 0
- *
- * How: a low-priority thread samples the pump counter (vita_ce_count
- * from vita_checkevents.c). When it stops advancing for >3 s AND a
- * MIDlet round is active, it snapshots VM + tone threads via
- * sceKernelGetThreadInfo and takes TWO gettimeofday readings 100 ms
- * apart (freeze = H2 confirmed on the spot). One report per hang.
+ * v01.73 revision (log5 lesson): the v01.72 watchdog stayed SILENT while
+ * the pump froze with the exact log4 signature (ani_mark = "OUT"). Two
+ * possible causes, both fixed here:
+ *   1. silent startup failure - thread creation error returned without
+ *      a trace. Now every outcome is logged (watchdog.log + crumb).
+ *   2. clock-dependent stall detection - the 3 s threshold was measured
+ *      with gettimeofday. If the clock itself is frozen (H2),
+ *      "now - last_ce_change" NEVER exceeds the threshold - the watchdog
+ *      is blind to the very scenario it hunts. Detection now counts
+ *      poll ITERATIONS (12 x 250 ms ~= 3 s), no clock involved; the dual
+ *      gettimeofday readings are kept in the REPORT for H2 evidence.
  */
 
 #include <psp2/kernel/threadmgr.h>
@@ -44,7 +37,7 @@ volatile SceUID vita_wd_vm_tid = -1;
 extern volatile SceUID vita_tone_tid;
 
 #define WD_LOG_PATH "ux0:/data/J2ME00001/watchdog.log"
-#define WD_STALL_MS 3000
+#define WD_STALL_POLLS 12   /* 12 x 250 ms ~= 3 s, CLOCK-FREE threshold */
 #define WD_POLL_MS  250
 
 static const char *wd_wait_type_name(SceUInt32 t) {
@@ -119,8 +112,8 @@ static void wd_dump_thread(const char *tag, SceUID tid) {
 
 static int wd_thread_routine(SceSize args, void *argp) {
     (void)args; (void)argp;
-    wd_jlong last_ce_change = 0;
     unsigned int last_ce = 0;
+    int stalled_polls = 0;
     int reported = 0;
 
     for (;;) {
@@ -129,22 +122,21 @@ static int wd_thread_routine(SceSize args, void *argp) {
         if (!vita_wd_round_active) {
             /* menu runs its own loop - only watch MIDlet rounds */
             last_ce = vita_ce_count;
-            last_ce_change = wd_now_ms();
+            stalled_polls = 0;
             reported = 0;
             continue;
         }
 
-        unsigned int ce = vita_ce_count;
-        wd_jlong now = wd_now_ms();
-
-        if (ce != last_ce) {
-            last_ce = ce;
-            last_ce_change = now;
-            continue;          /* pump moved - hang not present */
+        if (vita_ce_count != last_ce) {
+            last_ce = vita_ce_count;
+            stalled_polls = 0;   /* pump moved - hang not present */
+            continue;
         }
 
-        /* counter frozen; require WD_STALL_MS before declaring a hang */
-        if (now - last_ce_change < WD_STALL_MS) continue;
+        /* counter frozen; require WD_STALL_POLLS consecutive frozen
+         * polls before declaring a hang (iteration count, NOT clock -
+         * a frozen gettimeofday must not blind the watchdog). */
+        if (++stalled_polls < WD_STALL_POLLS) continue;
         if (reported) continue;  /* one report per hang */
 
         /* ---- hang detected: forensic snapshot ----
@@ -155,9 +147,9 @@ static int wd_thread_routine(SceSize args, void *argp) {
         {
             char buf[128];
             int n = snprintf(buf, sizeof(buf),
-                             "[WD] HANG ce=%u clock t0=%lld t1=%lld d=%lld\n",
-                             ce, (long long)t0, (long long)t1,
-                             (long long)(t1 - t0));
+                             "[WD] HANG ce=%u polls=%d clock t0=%lld t1=%lld d=%lld\n",
+                             last_ce, stalled_polls, (long long)t0,
+                             (long long)t1, (long long)(t1 - t0));
             wd_log(buf, n);
         }
 
@@ -174,6 +166,23 @@ static int wd_thread_routine(SceSize args, void *argp) {
 void vita_watchdog_start(void) {
     SceUID t = sceKernelCreateThread("j2me_watchdog", wd_thread_routine,
                                      0x10000300, 0x2000, 0, 0, NULL);
-    if (t < 0) return;
-    sceKernelStartThread(t, 0, NULL);
+    if (t < 0) {
+        /* log5 lesson: a silent return here is indistinguishable from
+         * "watchdog fired but found nothing". Every failure is visible. */
+        char buf[96];
+        int n = snprintf(buf, sizeof(buf),
+                         "[WD] create FAILED rc=0x%08x\n", (unsigned)t);
+        wd_log(buf, n);
+        return;
+    }
+    int rc = sceKernelStartThread(t, 0, NULL);
+    {
+        /* liveness proof: one line at startup so a missing watchdog.log
+         * can only mean "thread never ran", never "ran and saw nothing" */
+        char buf[96];
+        int n = snprintf(buf, sizeof(buf),
+                         "[WD] alive tid=%d start rc=0x%08x\n",
+                         (int)t, (unsigned)rc);
+        wd_log(buf, n);
+    }
 }
