@@ -1603,43 +1603,51 @@ int pcsl_file_getnextentry(void *handle, const pcsl_string *string,
         pcsl_string_free(&matchName);
     }
 
-    while (sceIoDread(it->dfd, &entry) > 0) {
-        const char *name = entry.d_name;
+    for (;;) {
+        /* v01.70: zero the whole dirent BEFORE every sceIoDread -
+         * d_private garbage derails real firmware (Vita3K ignores it). */
+        memset(&entry, 0, sizeof(entry));
+        if (sceIoDread(it->dfd, &entry) <= 0) {
+            return rv;
+        }
+        {
+            const char *name = entry.d_name;
 
-        if (name[0] == '\0' || strcmp(name, ".") == 0 ||
-            strcmp(name, "..") == 0) {
-            continue;
-        }
-        if (matchLen > 0 && strncmp(name, match_utf8, matchLen) != 0) {
-            continue;
-        }
-        /* v01.44: never return subdirectories. The upstream POSIX port
-         * relies on readdir()+stat; FFFFFFFF (suite id) directories
-         * under the appdb root matched the caller's match prefix, got
-         * handed back as "files", and midp_remove_suite's cleanup loop
-         * then passed them to pcsl_file_unlink. Removing a directory
-         * that an open RMS handle anchors is impossible on Windows
-         * (Vita3K logs it as the "Error code: 32" triplet) and pointless
-         * on a real device: the per-file iteration in
-         * rmsdb_remove_record_stores_for_suite + the storage iterator
-         * already delete every file inside first. Skip dirs so the
-         * cleanup loop only ever sees real files. */
-        if (entry.d_stat.st_attr & SCE_SO_IFDIR) {
-            continue;
-        }
+            if (name[0] == '\0' || strcmp(name, ".") == 0 ||
+                strcmp(name, "..") == 0) {
+                continue;
+            }
+            if (matchLen > 0 && strncmp(name, match_utf8, matchLen) != 0) {
+                continue;
+            }
+            /* v01.44: never return subdirectories. The upstream POSIX port
+             * relies on readdir()+stat; FFFFFFFF (suite id) directories
+             * under the appdb root matched the caller's match prefix, got
+             * handed back as "files", and midp_remove_suite's cleanup loop
+             * then passed them to pcsl_file_unlink. Removing a directory
+             * that an open RMS handle anchors is impossible on Windows
+             * (Vita3K logs it as the "Error code: 32" triplet) and pointless
+             * on a real device: the per-file iteration in
+             * rmsdb_remove_record_stores_for_suite + the storage iterator
+             * already delete every file inside first. Skip dirs so the
+             * cleanup loop only ever sees real files. */
+            if (entry.d_stat.st_attr & SCE_SO_IFDIR) {
+                continue;
+            }
 
-        /* Found one: result = string[0 .. rootLength) + name */
-        if (pcsl_string_substring(string, 0, it->rootLength, &rootpath)
-                != PCSL_STRING_OK ||
-            pcsl_string_convert_from_utf8((const jbyte *)name,
-                                          (jsize)strlen(name),
-                                          &returnVal) != PCSL_STRING_OK ||
-            pcsl_string_cat(&rootpath, &returnVal, result)
-                != PCSL_STRING_OK) {
+            /* Found one: result = string[0 .. rootLength) + name */
+            if (pcsl_string_substring(string, 0, it->rootLength, &rootpath)
+                    != PCSL_STRING_OK ||
+                pcsl_string_convert_from_utf8((const jbyte *)name,
+                                              (jsize)strlen(name),
+                                              &returnVal) != PCSL_STRING_OK ||
+                pcsl_string_cat(&rootpath, &returnVal, result)
+                    != PCSL_STRING_OK) {
+                break;
+            }
+            rv = 0;
             break;
         }
-        rv = 0;
-        break;
     }
 
     pcsl_string_free(&returnVal);
@@ -1794,7 +1802,12 @@ long pcsl_file_getusedspace(const pcsl_string *dirName) {
         return -1;
     }
 
-    while (sceIoDread(dfd, &entry) > 0) {
+    for (;;) {
+        /* v01.70: zero d_private before every sceIoDread (real fw) */
+        memset(&entry, 0, sizeof(entry));
+        if (sceIoDread(dfd, &entry) <= 0) {
+            break;
+        }
         if (entry.d_stat.st_attr & SCE_SO_IFDIR) {
             continue; /* directories do not count */
         }

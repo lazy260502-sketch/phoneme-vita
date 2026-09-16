@@ -54,6 +54,16 @@
 #include <psp2/io/stat.h>
 #include <psp2/appmgr.h>       /* sceAppMgrGetDevInfo() for free/total */
 
+/* v01.70 real-hw hang hunt: stdio-free breadcrumbs into crumb.log, same
+ * channel as the launcher (vita-port/src/vita_crumb.c). The real device
+ * hangs inside the file managers' JSR 75 enumeration (MiniXplorer dies
+ * in its ctor, FileManagerMIDlet after create) and UC whites out - all
+ * three first exercise THIS file's natives on real hardware. Weak: the
+ * standalone libmidp.so link still resolves its own no-op copy. */
+__attribute__((weak)) void crumb_printf(const char *fmt, ...);
+#define JSR75_TRACE(msg) \
+    do { if (crumb_printf != NULL) crumb_printf("[jsr75] %s", (msg)); } while (0)
+
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
@@ -621,7 +631,9 @@ KNIDECL(com_sun_midp_jsr075_FileStore_listOpen) {
             }
             for (i = 0; i < JSR75_MAX_ITERS; i++) {
                 if (!jsr75_iters[i].used) {
-                    SceUID fd = sceIoDopen(cpath);
+                    SceUID fd;
+                    JSR75_TRACE("listOpen enter");
+                    fd = sceIoDopen(cpath);
                     if (fd >= 0) {
                         size_t m = strlen(cpath);
                         if (m >= JSR75_PATH_MAX) {
@@ -632,6 +644,9 @@ KNIDECL(com_sun_midp_jsr075_FileStore_listOpen) {
                         memcpy(jsr75_iters[i].prefix, cpath, m);
                         jsr75_iters[i].prefix[m] = '\0';
                         rc = (jint)(i + 1);
+                    } else if (crumb_printf != NULL) {
+                        crumb_printf("[jsr75] listOpen Dopen FAILED 0x%08x '%s'",
+                                     (unsigned)fd, cpath);
                     }
                     break;
                 }
@@ -659,7 +674,16 @@ KNIDECL(com_sun_midp_jsr075_FileStore_listNext) {
     if (slot >= 0 && slot < JSR75_MAX_ITERS && jsr75_iters[slot].used) {
         SceIoDirent entry;
         int ok = 0;
+        int loops = 0;
         for (;;) {
+            loops++;
+            if (crumb_printf != NULL && (loops & 0x3F) == 1) {
+                crumb_printf("[jsr75] listNext loop #%d", loops);
+            }
+            /* Zero the whole struct every iteration: d_private is
+             * device-private state and real firmware walks it when it is
+             * non-NULL garbage (Vita3K ignores it). Official samples
+             * memset before every sceIoDread. */
             memset(&entry, 0, sizeof(entry));
             if (sceIoDread(jsr75_iters[slot].fd, &entry) <= 0) {
                 break;              /* end of directory or error */
@@ -703,6 +727,9 @@ KNIDECL(com_sun_midp_jsr075_FileStore_listClose) {
     jint rc = -1;
 
     if (slot >= 0 && slot < JSR75_MAX_ITERS && jsr75_iters[slot].used) {
+        if (crumb_printf != NULL) {
+            crumb_printf("[jsr75] listClose slot=%d", (int)slot);
+        }
         rc = (sceIoDclose(jsr75_iters[slot].fd) >= 0) ? 0 : -1;
         jsr75_iter_reset(&jsr75_iters[slot]);
     }

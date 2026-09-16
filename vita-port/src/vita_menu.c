@@ -1197,7 +1197,14 @@ static void scan_games(void) {
     if (d < 0) {
         return;
     }
-    while (sceIoDread(d, &ent) > 0 && game_count < MAX_GAMES) {
+    for (;;) {
+        /* v01.70: zero the whole dirent BEFORE every sceIoDread -
+         * d_private is device-private state and real firmware walks
+         * it when it holds garbage (Vita3K ignores it). */
+        memset(&ent, 0, sizeof(ent));
+        if (sceIoDread(d, &ent) <= 0 || game_count >= MAX_GAMES) {
+            break;
+        }
         GameEntry *g;
         char cfgpath[256];
         SceUID fd;
@@ -1369,7 +1376,12 @@ static void install_inbox(char *msg, size_t msg_sz) {
         snprintf(msg, msg_sz, "no inbox dir");
         return;
     }
-    while (sceIoDread(d, &ent) > 0) {
+    for (;;) {
+        /* v01.70: zero d_private before every sceIoDread (real fw) */
+        memset(&ent, 0, sizeof(ent));
+        if (sceIoDread(d, &ent) <= 0) {
+            break;
+        }
         char src[256], dstjar[256], dstdir[200];
         size_t blen;
         char base[128];
