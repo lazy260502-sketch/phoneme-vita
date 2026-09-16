@@ -1,0 +1,16 @@
+# 构建产物（不入库）
+out/
+debug/logs/
+vita-port/CMakeCache.txt
+vita-port/CMakeFiles/
+vita-port/Makefile
+vita-port/cmake_install.cmake
+vita-port/libobj_no_main.a
+vita-port/midp_vita
+vita-port/midp_vita.self
+vita-port/midp_vita.self.out
+vita-port/midp_vita.vpk
+vita-port/midp_vita.vpk.out
+vita-port/vita_version.h
+vita-port/build/
+*.bak
