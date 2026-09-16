@@ -27,6 +27,9 @@
 #include <jvmspi.h>
 #include <midp_check_events.h>
 #include <ani.h>
+#include <psp2/io/fcntl.h>
+#include <stdio.h>
+#include <sys/time.h>
 
 /* vita_net.c: select() over registered fds and wake Java threads
  * blocked in socket connect/read/write with NETWORK_*_SIGNAL. Lives at
@@ -35,9 +38,54 @@
  * form of user input. */
 extern void vita_net_poll(void);
 
+/* ---- v01.71 ToneTest-hang diagnostics ----
+ *
+ * The pump stopped after "stg1 returned" and every timed waiter
+ * (2.5 s stage timer, 1 Hz heartbeat, 60 s watchdog) died with it.
+ * Three mutually exclusive suspects:
+ *   H1: VM thread stuck in a blocking native BEFORE the ANI wait
+ *       (repaint -> sceDisplaySetFrameBuf, net_poll, ...)
+ *   H2: wall clock (gettimeofday, the source of Os::java_time_millis)
+ *       froze - pump alive, no timed waiter can ever expire
+ *   H3: stuck INSIDE ANI_WaitForThreadUnblocking (pthread_cond_timedwait)
+ *
+ * Counters below are sampled by the input heartbeat (vita_input.c);
+ * ani_mark.log is a watchdog slot: every ANI enter/leave OVERWRITES
+ * byte 0, so whatever the file ends with is the state the VM thread
+ * was last in. Read combined with the heartbeat:
+ *   heartbeat stopped + last mark "OUT" -> H1
+ *   heartbeat stopped + last mark "IN " -> H3
+ *   heartbeat alive + ms frozen        -> H2
+ */
+volatile unsigned int vita_ce_count = 0;      /* pump entries        */
+volatile unsigned int vita_ani_enter = 0;     /* ANI wait entries    */
+volatile unsigned int vita_ani_exit = 0;      /* ANI wait returns    */
+
+static SceUID ani_mark_fd = -2;
+
+static jlong diag_now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (jlong)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static void ani_mark(const char *state) {
+    if (ani_mark_fd == -2) {
+        ani_mark_fd = sceIoOpen("ux0:/data/J2ME00001/ani_mark.log",
+                                SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    }
+    if (ani_mark_fd < 0) return;
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "CE #%u ANI %s t=%lld\n",
+                     vita_ce_count, state, (long long)diag_now_ms());
+    sceIoPwrite(ani_mark_fd, buf, n, 0);
+}
+
 void JVMSPI_CheckEvents(JVMSPI_BlockedThreadInfo *blocked_threads,
                         int blocked_threads_count,
                         jlong timeout) {
+    vita_ce_count++;
+
     /* 0. Network readiness scan: wake any protocol thread blocked on a
      * socket before this cycle's MIDP pump runs, so a read that became
      * possible last cycle is not delayed by input/media work. */
@@ -55,6 +103,10 @@ void JVMSPI_CheckEvents(JVMSPI_BlockedThreadInfo *blocked_threads,
     if (timeout < 0 || timeout > 50) {
         timeout = 50;
     }
+    vita_ani_enter++;
+    ani_mark("IN ");
     ANI_WaitForThreadUnblocking(blocked_threads, blocked_threads_count,
                                 timeout);
+    vita_ani_exit++;
+    ani_mark("OUT");
 }

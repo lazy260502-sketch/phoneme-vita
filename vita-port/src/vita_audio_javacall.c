@@ -35,8 +35,12 @@ static void alog(const char *fmt, ...) {
     va_list ap;
     int n;
     if (alog_fd == -2) {
+        /* APPEND, not TRUNC: the launcher process survives across MIDlet
+         * rounds and users hard-restart between tests. TRUNC destroyed
+         * the ToneTest session's records when the next app (UC) started -
+         * the single most valuable piece of audio evidence was lost. */
         alog_fd = sceIoOpen("ux0:/data/J2ME00001/audio_debug.log",
-                            SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+                            SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
     }
     if (alog_fd < 0) return;
     while (lock) { sceKernelDelayThread(100); }
@@ -222,13 +226,17 @@ static int audio_out_open(void) {
  *  Aborts early when stop is requested or a newer tone supersedes. */
 static void output_tone_blocking(unsigned int my_seq) {
     int produced = 0;
+    int chunks = 0;
+    int rc;
     const int repeat = OUT_SAMPLE_RATE / TONE_SAMPLE_RATE; /* 3 */
 
     for (int i = 0; i < g_tone_len; i++) {
         if (g_tone_stop_requested || g_req_seq != my_seq) break;
         for (int r = 0; r < repeat; r++) {
             if (produced >= OUT_CHUNK_FRAMES) {
-                sceAudioOutOutput(g_audio_port, g_out_buffer);
+                rc = sceAudioOutOutput(g_audio_port, g_out_buffer);
+                if (rc < 0) alog("out chunk rc=0x%08x\n", rc);
+                chunks++;
                 produced = 0;
             }
             g_out_buffer[produced*2+0] = g_tone_buffer[i];
@@ -241,8 +249,11 @@ static void output_tone_blocking(unsigned int my_seq) {
             memset(&g_out_buffer[produced*2], 0,
                    (OUT_CHUNK_FRAMES-produced) * 2 * sizeof(int16_t));
         }
-        sceAudioOutOutput(g_audio_port, g_out_buffer);
+        rc = sceAudioOutOutput(g_audio_port, g_out_buffer);
+        if (rc < 0) alog("out tail rc=0x%08x\n", rc);
+        chunks++;
     }
+    alog("tone done: chunks=%d len=%d seq=%u\n", chunks, g_tone_len, my_seq);
 }
 
 /* ---------------------------------------------------------------------------
@@ -574,7 +585,12 @@ static int tone_player_thread(SceSize args, void *argp) {
         unsigned int my_seq = g_req_seq;
         g_played_seq = my_seq;
         g_tone_stop_requested = 0;
-        if (audio_out_open() != 0) continue; /* retry on next request */
+        alog("tone req: note=%ld dur=%ld vol=%ld seq=%u port=%d\n",
+             g_req_note, g_req_dur, g_req_vol, my_seq, g_audio_port);
+        if (audio_out_open() != 0) {
+            alog("audio_out_open FAILED\n");
+            continue; /* retry on next request */
+        }
         g_tone_len = generate_tone_pcm(midi_note_to_freq(g_req_note),
                                        (int)g_req_dur, g_req_vol);
         output_tone_blocking(my_seq);

@@ -1,6 +1,20 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-15
 
+## 2026-09-15 v01.71：ToneTest 挂死诊断版——三判定点探针 + 音频日志毁证据修复
+
+> 用户回报：**"运行 ToneTest 的时候，会发出一下声响后，就没反应了"**。vm_output.log 止于 `stg1: playTone returned`，之后 2.5s stage 定时、1Hz 心跳、60s 看门狗全灭；但另一会话挂死时仍有 `[INPUT] buttons=` 记录（泵可能还活着）。
+
+- **已排除**（静态取证结论）：playTone 本身（异步，bump `g_req_seq` 即返）；EOM 通知死锁（简单 playTone 路径不发 END_OF_MEDIA）；AudioBridge/vita_audio.c 路径（ROM 未用）；native 链接断链（ELF 符号全闭合）。
+- **三互斥假设**：H1=VM 主线程卡在 ANI 等待**之前**的阻塞 native（repaint→`sceDisplaySetFrameBuf` 等）；H2=墙上时钟（`gettimeofday`=`Os::java_time_millis` 源）冻结→所有定时等待者永不超时；H3=卡死在 `ANI_WaitForThreadUnblocking`（pthread_cond_timedwait）内。
+- **发现的独立 bug**：`vita_audio_javacall.c` 的 `alog()` 用 `SCE_O_TRUNC` 打开 audio_debug.log——每次进程启动截断，**上一会话（ToneTest）的音频记录被下一会话（UC）启动毁掉**。已改 `SCE_O_APPEND`。
+- **探针布局**（全在 `ux0:/data/J2ME00001/`，判读表见 CMakeLists v01.71 注释）：
+  1. `input_debug.log` 心跳行升级为 `#N ms=... d=... CE=n ani=e/x`——一行同时证明**泵活性**（N/CE 推进）与**时钟活性**（ms 推进）；ms 冻结+d 不变=H2。
+  2. `ani_mark.log` 是 watchdog 槽：ANI 进/出各 `sceIoPwrite` 覆写偏移 0——心跳停 + 末态 `OUT`=H1（卡泵前段）；末态 `IN`=H3。
+  3. `audio_debug.log`（追加式）+ tone 线程 `tone req`/`tone done: chunks=` 锚点 + `sceAudioOutOutput` 负返回码记录。
+- **改动文件**：`vita-port/src/{vita_audio_javacall.c, vita_input.c, vita_checkevents.c}` + CMakeLists 版本块。
+- **遗留疑点（未修，待判定后处理）**：`vita_pcsl.c:2169` `JVM_monotonicTimeMillis` 返回 0 stub——无法解释前 2.5s 时间正常，存疑。
+
 ## 2026-09-15 v01.70：真机闪烁定案——单缓冲直写扫描输出帧，双缓冲修复
 
 > 用户回报 v01.69 **"画面显示了，但是一直在闪烁，感觉像是一直在刷新，之前 Vita3K 偶尔会这样"**。

@@ -459,6 +459,27 @@ set(VITA_VERSION  "01.67")
 #   vita_fbmem.h helper - the mapping is UNCACHED on the CPU side, the
 #   pattern every official SDK sample (debugScreen/camera/ime) uses.
 set(VITA_VERSION  "01.70")
+# 01.71 (2026-09-15): ToneTest hang diagnostics - instrument the three
+#   decision points of the "one beep then dead" freeze. Facts so far:
+#   vm_output.log ends at "stg1: playTone returned" and every timed
+#   waiter after that (2.5 s stage timer, 1 Hz heartbeat, 60 s
+#   watchdog) never fires, yet an earlier session logged button
+#   samples while the app appeared hung - so the VM thread MIGHT still
+#   be pumping. Three suspects need separating:
+#   H1 stuck in a blocking native before the ANI wait (repaint path),
+#   H2 wall clock (gettimeofday == Os::java_time_millis source) froze,
+#   H3 stuck inside ANI_WaitForThreadUnblocking.
+#   Probes (all lightweight, all to ux0:/data/J2ME00001/):
+#   - input heartbeat now carries ms= + CE=/ani= counters, so one line
+#     proves pump liveness AND clock liveness at the same instant
+#   - ani_mark.log is a watchdog slot: every ANI enter/leave pwrites
+#     over byte 0; the last state written is where the VM thread sits
+#   - audio_debug.log now APPENDS (was TRUNC: every hard restart
+#     destroyed the previous session's tone records - the ToneTest
+#     audio evidence was erased by the next app's startup)
+#   - tone_player_thread logs req/done with chunk counts, and any
+#     sceAudioOutOutput error code
+set(VITA_VERSION  "01.71")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling

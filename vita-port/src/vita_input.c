@@ -37,6 +37,7 @@
 #include <psp2/io/fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h> /* v01.71 heartbeat clock sampling */
 
 #include <midp_logging.h>
 #include <midpServices.h>
@@ -365,11 +366,28 @@ void checkForSystemSignal(MidpReentryData *pNewSignal,
     /* DEBUG: heartbeat - logs every N-th call to prove the VM thread
      * still reaches the event pump. If this stops while a key press
      * still produces input_debug.log entries, the VM froze after
-     * sampling the pad (i.e. inside a blocked native call). */
+     * sampling the pad (i.e. inside a blocked native call).
+     * v01.71: also sample the wall clock (gettimeofday, the exact
+     * source behind Os::java_time_millis). If the count advances but
+     * the timestamp freezes, the time source itself died (H2) and no
+     * timed waiter on it can ever wake - which would freeze every
+     * Java thread while the pump keeps running. */
     static unsigned int hb = 0;
+    static jlong hb_last_ms = 0;
     if ((hb++ & 0x3FF) == 0) {
-        char dbg[64];
-        snprintf(dbg, sizeof(dbg), "[HEARTBEAT] checkForSystemSignal #%u\n", hb);
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        jlong ms = (jlong)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+        /* vita_checkevents.c diagnostics counters (v01.71) */
+        extern volatile unsigned int vita_ce_count;
+        extern volatile unsigned int vita_ani_enter;
+        extern volatile unsigned int vita_ani_exit;
+        char dbg[128];
+        snprintf(dbg, sizeof(dbg),
+                 "[HEARTBEAT] #%u ms=%lld d=%lld CE=%u ani=%u/%u\n",
+                 hb, (long long)ms, (long long)(ms - hb_last_ms),
+                 vita_ce_count, vita_ani_enter, vita_ani_exit);
+        hb_last_ms = ms;
         int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
                            SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
         if (fd >= 0) {
