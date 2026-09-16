@@ -480,6 +480,23 @@ set(VITA_VERSION  "01.70")
 #   - tone_player_thread logs req/done with chunk counts, and any
 #     sceAudioOutOutput error code
 set(VITA_VERSION  "01.71")
+# 01.72 (2026-09-16): hang forensics watchdog - v01.71 verdict first:
+#   log4 proved ani_mark ends "OUT" (not inside the ANI wait -> H3 out),
+#   the pump froze for good at CE #115 (~4.4 s) in the last round, and
+#   the tone thread finished every chunk (audio innocent). But the
+#   heartbeat samples only once per 1024 pump calls (~40 s), so H2
+#   (clock freeze) was never actually excluded - the hang lands at
+#   2-10 s, between samples. What remains: (a) VM thread blocked in a
+#   kernel wait, or (b) VM thread running hot (Java/GC loop, never
+#   blocks, never pumps). ONE snapshot tells them apart.
+#   New vita_watchdog.c: low-prio thread watches vita_ce_count; when it
+#   stalls >3 s during a MIDlet round it snapshots the VM and tone
+#   threads via sceKernelGetThreadInfo (status + waitType + waitId -
+#   the wait class names the blocking primitive: io/mutex/cond/delay/
+#   semaphore) and takes two gettimeofday readings 100 ms apart (d==0
+#   -> clock frozen -> H2 on the spot). One report per hang, appended
+#   to ux0:/data/J2ME00001/watchdog.log.
+set(VITA_VERSION  "01.72")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
@@ -650,6 +667,7 @@ add_executable(${PROJECT_NAME}
     src/vita_media_notify.c
     src/vita_sms_javacall.c
     src/vita_checkevents.c
+    src/vita_watchdog.c
     src/vita_crumb.c
 )
 

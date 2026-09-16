@@ -1,7 +1,18 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-15
+> Last Updated: 2026-09-16
 
-## 2026-09-15 v01.71：ToneTest 挂死诊断版——三判定点探针 + 音频日志毁证据修复
+## 2026-09-16 v01.72：挂死取证看门狗（v01.71 判定结果 + 新探针）
+
+> v01.71 (b235) 真机日志（debug/logs/log4/）判定结果：**H3 出局、音频无罪、泵彻底停转**。
+
+- **铁证**：`ani_mark.log` 末态 `CE #115 ANI OUT`——最后会话（封神榜）泵在启动 ~4.4s 后永久停转，且不在 ANI 等待内；`audio_debug.log` `tone done: chunks=38`（400ms×16k×3=19200 帧=37.5 块，数学吻合）——音频线程完整播完无错误。
+- **判读修正**：v01.71 心跳每 1024 次泵调用（≈40s）才采样一次，而挂死发生在 2~10s——**H2（时钟冻结）从未被真正排除**。
+- **剩余二选一**：(a) VM 线程阻塞在某内核等待（sceIo/互斥/cond/延迟）；(b) VM 线程满转（Java/GC 死循环，永不阻塞所以永不进泵）。
+- **v01.72 新增 `vita_watchdog.c`**：低优先级线程盯 `vita_ce_count`，MIDlet round 内停转 >3s 即快照 VM/tone 线程的 `sceKernelGetThreadInfo`（status+waitType+waitId——wait 类别直接点名阻塞原语）+ 双 gettimeofday 采样（d==0=时钟冻结实锤）。每次挂死只报一次，追加到 `watchdog.log`。
+- **接线**：`vita_tone_tid` 由 `vita_audio_javacall.c` 导出；`vita_main.c` 在 round begin/end 置 `vita_wd_round_active`、记录 `vita_wd_vm_tid = sceKernelGetThreadId()`（主线程即 VM 解释线程）。
+- **附带确认**：`vm_output.log` 链路（JVMSPI_PrintRaw→crumb_append）无缓冲崩溃安全，"最后一行=挂死点"前提成立；封神榜挂点在 `[pcsl] open NEZHA_DOWN.db` 入口行之后。
+
+## 2026-09-16 v01.71：ToneTest 挂死诊断版——三判定点探针 + 音频日志毁证据修复
 
 > 用户回报：**"运行 ToneTest 的时候，会发出一下声响后，就没反应了"**。vm_output.log 止于 `stg1: playTone returned`，之后 2.5s stage 定时、1Hz 心跳、60s 看门狗全灭；但另一会话挂死时仍有 `[INPUT] buttons=` 记录（泵可能还活着）。
 

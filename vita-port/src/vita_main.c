@@ -23,6 +23,9 @@
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h> /* v01.72: sceKernelGetThreadId */
+
+#include "vita_watchdog.h" /* v01.72: hang forensics */
 
 /* MIDP headers */
 #include <midpAMS.h>
@@ -310,6 +313,11 @@ int main(int argc, char *argv[]) {
             dlog("[media] tone player thread created\n");
         }
 
+        /* v01.72: hang-forensics watchdog - snapshots VM/tone thread
+         * wait states when the event pump stalls >3 s in a MIDlet
+         * round (see vita_watchdog.c). Started once, runs forever. */
+        vita_watchdog_start();
+
         /* Launcher main loop: menu -> run MIDlet -> back to menu.
          * The MIDlet exit only ends the VM round (runMidlet returns);
          * the PROCESS never exits. This is deliberate:
@@ -455,6 +463,12 @@ int main(int argc, char *argv[]) {
             crumb_marker("round begin");
             crumb_printf("launch: %s / %s", jar_path, class_name);
 
+            /* v01.72: mark the round active for the hang watchdog and
+             * record the VM thread id (this thread becomes the VM's main
+             * interpreter thread inside runMidlet). */
+            vita_wd_round_active = 1;
+            vita_wd_vm_tid = sceKernelGetThreadId();
+
             /* Copy-integrity check: log the runtime jar size so a truncated
              * copy (shorter than the VPK original) is visible in the boot
              * log. The expected size is baked in at build time. */
@@ -486,6 +500,8 @@ int main(int argc, char *argv[]) {
                 crumb_printf("runMidlet returned %d", status);
                 crumb_marker("runMidlet exit");
                 crumb_flush();
+
+                vita_wd_round_active = 0; /* v01.72: round over, stand by */
 
                 {
                     char msg[64];

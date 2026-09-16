@@ -527,6 +527,10 @@ static long jts_total_duration(const jts_event *evs, long n) {
     return total;
 }
 
+/* v01.72: the tone player thread's id, published for the hang
+ * watchdog (vita_watchdog.c). -1 until javacall_media_initialize runs. */
+volatile SceUID vita_tone_tid = -1;
+
 /* Dedicated tone player thread: waits for requests, streams them out.
  * Handles both simple playTone requests and JTS sequence playback. */
 static int tone_player_thread(SceSize args, void *argp) {
@@ -618,6 +622,9 @@ javacall_result javacall_media_initialize(void) {
         if (tid >= 0) {
             sceKernelStartThread(tid, 0, NULL);
         }
+        /* v01.72: publish the tid for the hang watchdog
+         * (vita_watchdog.c snapshots this thread on a pump stall) */
+        vita_tone_tid = tid;
         /* Without the player thread the VM would stay silent rather than
          * hang - acceptable degraded mode. */
     }

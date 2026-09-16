@@ -12,7 +12,7 @@ samples/j2me/
 └── ...
 ```
 
-### 规则
+### 规则z
 
 1. **VPK 交付**：构建产物一律拷贝到 `out/vpk/`，命名 `midp_vita_v<版本>[_<标签>].vpk`
    （如 `midp_vita_v01.71_tonediag.vpk`）。`vita-port/` 下的 `midp_vita.vpk` 只是构建输出，不算交付物；不要在别处再放第二份。
@@ -38,6 +38,7 @@ samples/j2me/
 | `input_debug.log` | vita_input.c | 追加 | 事件泵心跳（v01.71 起：`#N ms= d= CE= ani=`）、按键/触摸 |
 | `audio_debug.log` | vita_audio_javacall.c | **追加**（v01.71 前 TRUNC，历史数据已毁） | tone req/done、AudioOut 错误码 |
 | `ani_mark.log` | vita_checkevents.c | **覆写槽**（watchdog 用途，故意 TRUNC） | ANI 等待进/出最后状态：`IN `=卡在等待内，`OUT`=卡在等待前 |
+| `watchdog.log` | vita_watchdog.c (v01.72) | 追加 | 泵停转 >3s 时的取证快照：VM/tone 线程的内核等待类别（io/mutex/cond/delay/semaphore）+ 双时钟采样 |
 
 ### 使用守则
 
