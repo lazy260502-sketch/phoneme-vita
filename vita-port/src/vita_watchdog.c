@@ -164,8 +164,13 @@ static int wd_thread_routine(SceSize args, void *argp) {
 }
 
 void vita_watchdog_start(void) {
+    /* log6 lesson: priority 0x10000300 -> SCE_KERNEL_ERROR_ILLEGAL_PRIORITY
+     * (0x80028023) on EVERY boot on real hardware. The verified-legal
+     * band in this project is 0x10000100 (cldc_ticker, j2me_tone both run
+     * it for months). 0x10000150 = slightly LOWER priority than those
+     * (higher numeric = lower prio), inside the known-good band. */
     SceUID t = sceKernelCreateThread("j2me_watchdog", wd_thread_routine,
-                                     0x10000300, 0x2000, 0, 0, NULL);
+                                     0x10000150, 0x2000, 0, 0, NULL);
     if (t < 0) {
         /* log5 lesson: a silent return here is indistinguishable from
          * "watchdog fired but found nothing". Every failure is visible. */

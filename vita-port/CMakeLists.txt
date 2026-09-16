@@ -512,6 +512,14 @@ set(VITA_VERSION  "01.72")
 #      clock-free; the dual gettimeofday readings stay in the report as
 #      H2 evidence (d==0 -> frozen clock).
 set(VITA_VERSION  "01.73")
+# 01.74 (2026-09-16): log6 verdict - [WD] create FAILED rc=0x80028023 on
+#   every boot: SCE_KERNEL_ERROR_ILLEGAL_PRIORITY. Real hardware rejects
+#   0x10000300 (Vita3K accepted it - emulator gap, again). Watchdog
+#   priority lowered to 0x10000150, inside the band this project has
+#   verified on hardware for months (cldc_ticker / j2me_tone at
+#   0x10000100; numeric higher = lower priority, so the watchdog stays
+#   the most pre-emptable thread in the process).
+set(VITA_VERSION  "01.74")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
