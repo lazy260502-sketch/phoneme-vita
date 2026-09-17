@@ -1,6 +1,21 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-17
 
+## 2026-09-17 v01.78：TV 风格标签菜单——五标签 + 触摸 + 文件浏览器（未上机）
+
+> 用户需求："菜单界面做下优化…类似 TV 样式，左侧标签栏、右侧内容栏，点击或按不同标签显示不同内容；标签：已安装（单列表/网格可切换）、未安装（自动扫描+缓存记录）、文件（文件管理）、设置、退出"。`vita_menu.c` 主循环重写（+661/-55），扫描/安装/对话框内部逻辑不动。
+
+- **布局**：顶栏 52px（标题+版本+计数）+ 左栏 220px 五标签（中文，选中高亮+竖条）+ 右侧内容区。`TAB_N 5`，L/R 肩键或点左栏切标签；点"退出"标签直接退出。
+- **已安装**：SQUARE 列表↔4×3 网格（84px 图标），选择持久化 `ux0:/data/J2ME00001/menu.cfg`（单字符 'l'/'g'）；网格方向键按行移动（上下 ±cols），tap 格子=选中+开对话框；对话框索引前先 `sel=gsel` 同步（对话框用 `games[sel]`）。
+- **未安装**：`inbox_scan()` 菜单启动+每次安装后重扫（dopen 遍历很轻，"缓存"就是磁盘上的 jar 本身）；X 全装（`install_inbox`），tap 单装（`install_jar`）。
+- **文件**：沙盒根 `ux0:/data/J2ME00001`，`fe_insert` 插入排序保持".."→目录→.jar→其他文件分组序；X/tap 目录=进入、jar=安装（与 inbox 同一 rename+cfg 路径）；O 回上级（".." 条目也覆盖，冗余保留）；SELECT 刷新。
+- **设置**：游戏视图切换（X/tap，持久化）+ `sceAppMgrGetDevInfo` 的 ux0 容量 + games/inbox 计数 + JIT 提示 + 数据目录。
+- **触摸**：`menu_touch_init()` 开采样（`sceTouchSetSamplingState START`，不开则 reportNum 恒 0）+ `sceTouchGetPanelInfo` 动态 max（真机 1920×1088 / Vita3K 960×544），`poll_tap` down→up 沿触发；归一化同 `vita_input.c`。
+- **消息**：4 秒自动过期（`msg_us` + `sceKernelGetProcessTimeWide`），不再永久驻留。
+- **自查修复 5 缺陷**：网格对话框光标不同步；网格滚动单位混用（gtop 行单位独立 clamp）；".." 只画不可选（改为 fe_scan 虚拟槽 0 真条目）；inbox tap 误全装改单装；DATA_ROOT 宏序 + fe_parent 前向声明。**另修两次编辑事故**：tab2 CROSS 体误删（恢复 X=打开/安装）；旧变量声明块残留（重定义编译错）；`fe_scan` 首尾双向填充紧缩循环目录/文件交错序（重写为 `fe_insert` 插入排序）。
+- 交付：`out/vpk/midp_vita_v01.78_tabui.vpk`（v01.78 b247→e4b8440, md5 13a622d9b41a3a56dc409375e2b2903f）。**未上机**——触摸归一化已按 PanelInfo 动态适配，但真机手感（tap 命中区、网格格子大小）待验。
+- 遗留小疵：网格名称超宽不截断（画到下一格）；对话框无 tap 操作（仅按键）；`vita_menu.c` 内有几处 `-Wformat-truncation` 警告（snprintf 截断安全，非错误）。
+
 ## 2026-09-17 v01.77：内存/输入/图形审查轮——display flip 补 vblank 同步（未上机）
 
 > 规范审查第二轮（内存+输入+图形）。**内存全绿**：每函数 malloc/free 扫描 7 处失衡命中逐一复核，全部是契约式返回（pcsl_string 三兄弟由上游 `pcsl_string_free` 释放、`javacall_malloc` 配 `javacall_free`、`openfilelist` 配 closefilelist、`addrToString` 调用方释放、`fb_load` 错误路径全走 `fb_fail`（free+NULL）成功路径进程持有）。CDRAM 块（menu 2MB + display 4MB）分配/粒度/释放路径全合规。**输入合规**（DIGITAL 采样模式合法、触摸归一化正确、主指单点符合 MIDP）；input_debug.log 每条 open/write/close 保留不动——挂死取证还要用。
