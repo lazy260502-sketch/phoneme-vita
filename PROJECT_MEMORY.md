@@ -1,6 +1,15 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-17
 
+## 2026-09-17 v01.77：内存/输入/图形审查轮——display flip 补 vblank 同步（未上机）
+
+> 规范审查第二轮（内存+输入+图形）。**内存全绿**：每函数 malloc/free 扫描 7 处失衡命中逐一复核，全部是契约式返回（pcsl_string 三兄弟由上游 `pcsl_string_free` 释放、`javacall_malloc` 配 `javacall_free`、`openfilelist` 配 closefilelist、`addrToString` 调用方释放、`fb_load` 错误路径全走 `fb_fail`（free+NULL）成功路径进程持有）。CDRAM 块（menu 2MB + display 4MB）分配/粒度/释放路径全合规。**输入合规**（DIGITAL 采样模式合法、触摸归一化正确、主指单点符合 MIDP）；input_debug.log 每条 open/write/close 保留不动——挂死取证还要用。
+
+- **`flip_to_display()` 补 `sceDisplayWaitVblankStart()`**（vita_display.c）：NEXTFRAME 要到下个 vblank 才生效，此前扫描输出仍读旧前台；Java 快速连环 repaint 时下一次 blit 可能在换页落地前写完刚交换的后备帧 → 撕裂。menu 侧 `menu_flip()` 一直有成对等待，display 侧没有。顺带把刷新率规约到 60Hz（软件 blit 无所谓）。
+- **`sceDisplaySetFrameBuf` 返回码记账**：失败打一次 stderr（`static int reported` 限流）——v01.69 就是靠 menu 侧这个 rc 发现 IMMEDIATE 在真机 3.65 报 0x80290006 的；失败时不交换缓冲（旧前台继续显示）。
+- 注释两处（不动代码）：`lfjport_ui_finalize` 释放 CDRAM 块的至多一帧扫描输出窗口（只在 VM 关机时发生，可接受）；`ring_push` 写死 SPSC 前提（生产者=消费者=VM 线程，加第二个生产者必须改临界区）。
+- 交付：`out/vpk/midp_vita_v01.77_gfxsync.vpk`（v01.77 b245, a0d153e, md5 89f8d3d6c1c187d758666afe08bbe519）。**未上机**——下次真机会话直接用这版（覆盖 v01.75/76 的验证计划不变）。
+
 ## 2026-09-17 v01.76：音频路径审查修复（未上机，与 v01.75 一并等真机验）
 
 > 全端口 SDK 规范审查（每函数 fd 配对扫描 + 人工复核）后的 3 处修复。fd 审计结论：全部配对（持久 fd 是设计，pcsl 句柄走 closefile 收尾）。
