@@ -561,6 +561,29 @@ set(VITA_VERSION  "01.76")
 #   - vita_input.c ring_push: comment nailing down the SPSC invariant
 #     (exactly one producer AND one consumer, both the VM thread today).
 set(VITA_VERSION  "01.77")
+# 01.78 (2026-09-17): TV-style tab menu (vita_menu.c rewrite of the
+#   main loop; scan/install/dialog internals untouched).
+#   Left tab column (已安装/未安装/文件/设置/退出) + right content area.
+#   - 已安装: classic list OR 4x3 icon grid (SQUARE or 设置 tab
+#     toggles; persisted in ux0:/data/J2ME00001/menu.cfg, one byte
+#     'l'/'g'). Grid supports dpad left/right/up/down-by-row and taps.
+#   - 未安装: scans inbox/ at menu start and after every install
+#     (this IS the "auto scan + cache" - the jars stay on disk, the
+#     scan is a cheap dopen walk). X installs all, tap installs one.
+#   - 文件: sandboxed browser rooted at ux0:/data/J2ME00001 (dirs
+#     first with a virtual "..", .jar rows highlighted; X/tap on a
+#     jar installs it via the same rename+cfg path as inbox).
+#   - 设置: game view toggle + ux0 free/total (sceAppMgrGetDevInfo) +
+#     games/inbox counts + JIT hint + data dir.
+#   - 退出: X or tap quits to launch.cfg/bundled tests (TRIANGLE on
+#     the games tab still works).
+#   - Tabs switch with L/R shoulder or by tapping the tab column;
+#     touch normalized via sceTouchGetPanelInfo exactly like
+#     vita_input.c (real hw 1920x1088 -> 960x544).
+#   - Messages auto-expire after 4 s instead of sticking forever.
+#   Untouched on purpose: game scan/cache/dialog, install_inbox,
+#   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
+set(VITA_VERSION  "01.78")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling

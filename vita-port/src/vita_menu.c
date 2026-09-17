@@ -33,6 +33,8 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/rtc.h>
+#include <psp2/touch.h>
+#include <psp2/appmgr.h>
 
 #include <zlib.h>
 
@@ -253,6 +255,54 @@ static unsigned int poll_buttons(void) {
     }
     prev_btn = cur;
     return pressed;
+}
+
+/* ------------------------------------------------------------------
+ * Touch: front panel, normalised to the 960x544 menu coordinate space.
+ * Same panel-info-driven scaling as vita_input.c (real hw reports in
+ * a 1920x1088 grid, Vita3K in 960x544 - read the active area instead
+ * of hardcoding). Menu taps only; drag/zoom are not needed here.
+ * ------------------------------------------------------------------ */
+static int touch_max_x = 1919, touch_max_y = 1087;
+static int touch_prev_down = 0;
+
+static void menu_touch_init(void) {
+    SceTouchSamplingState ss = SCE_TOUCH_SAMPLING_STATE_STOP;
+    if (sceTouchGetSamplingState(SCE_TOUCH_PORT_FRONT, &ss) < 0 ||
+        ss != SCE_TOUCH_SAMPLING_STATE_START) {
+        sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT,
+                                 SCE_TOUCH_SAMPLING_STATE_START);
+    }
+    {
+        SceTouchPanelInfo panel;
+        memset(&panel, 0, sizeof(panel));
+        if (sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &panel) == 0 &&
+            panel.maxAaX > 0 && panel.maxAaY > 0) {
+            touch_max_x = panel.maxAaX;
+            touch_max_y = panel.maxAaY;
+        }
+    }
+}
+
+/* Poll for a finger release ("tap"). Returns 1 and fills *x/*y with the
+ * release position in menu coordinates when the panel transitioned
+ * down->up since the last poll. */
+static int poll_tap(int *x, int *y) {
+    SceTouchData td;
+    int down;
+    memset(&td, 0, sizeof(td));
+    sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
+    down = (td.reportNum > 0);
+    if (down) {
+        *x = td.report[0].x * FB_W / (touch_max_x + 1);
+        *y = td.report[0].y * FB_H / (touch_max_y + 1);
+    }
+    if (touch_prev_down && !down) {
+        touch_prev_down = down;
+        return 1;
+    }
+    touch_prev_down = down;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1427,15 +1477,228 @@ static void install_inbox(char *msg, size_t msg_sz) {
 
 enum { DLG_LAUNCH = 0, DLG_ORIENT, DLG_UNINSTALL, DLG_BACK, DLG_N };
 
-int vita_menu_run(VitaGameSel *out) {
-    int sel = 0;
-    int top = 0;
-    int mode = 0;      /* 0 = list, 1 = dialog */
-    int dlg_sel = DLG_LAUNCH;
-    int confirm_del = 0;
-    int have_selection = 0;
-    char msg[120] = "";
+/* ==================================================================
+ * v01.78: TV-style tab UI.
+ *   [已安装] games installed under games/ (list view / grid view)
+ *   [未安装] jars found in inbox/ waiting for install
+ *   [文件]   minimal file browser (ux0:/data/J2ME00001 sandbox)
+ *   [设置]   view-only info + game view toggle, persisted in menu.cfg
+ *   [退出]   quit the menu (fallback to launch.cfg / bundled tests)
+ * Tabs switch with L/R shoulder buttons or by tapping the tab column.
+ * ================================================================== */
+#define TAB_N        5
+#define TABBAR_W     220
+#define TAB_H        72
+#define TAB_ROWMODE  0
+#define TAB_GRIDMODE 1
 
+/* everything the menu shows lives under this sandbox root */
+#define DATA_ROOT "ux0:/data/J2ME00001"
+
+enum { FE_DIR = 0, FE_JAR, FE_FILE, FE_N };
+
+typedef struct {
+    char name[64];       /* display name (UTF-8) */
+    char full[256];      /* absolute path */
+    int type;            /* FE_* */
+} FileEntry;
+
+static FileEntry fes[MAX_GAMES];
+static int fe_count = 0;
+static char fe_cwd[256] = DATA_ROOT;
+static const char *fe_root = DATA_ROOT;
+
+/* ---- settings (menu.cfg) ---- */
+#define MENU_CFG DATA_ROOT "/menu.cfg"
+static int set_list_grid = 0;      /* 0 = list, 1 = grid */
+
+static void settings_load(void) {
+    SceUID fd = sceIoOpen(MENU_CFG, SCE_O_RDONLY, 0);
+    if (fd >= 0) {
+        char buf[64];
+        int n = sceIoRead(fd, buf, sizeof(buf) - 1);
+        sceIoClose(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            if (buf[0] == 'g') {
+                set_list_grid = 1;
+            } else {
+                set_list_grid = 0;
+            }
+        }
+    }
+}
+
+static void settings_save(void) {
+    SceUID fd = sceIoOpen(MENU_CFG,
+                          SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd >= 0) {
+        char c = set_list_grid ? 'g' : 'l';
+        sceIoWrite(fd, &c, 1);
+        sceIoClose(fd);
+    }
+}
+
+/* ---- file browser ---- */
+static int fe_parent(char *out, size_t outsz);
+
+/* Insert one entry keeping the invariant: ".." first, then dirs, then
+ * files, each group alphabetically (lists are <= MAX_GAMES, insertion
+ * sort is plenty). */
+static void fe_insert(const char *name, const char *full, int type) {
+    int i, j;
+    if (fe_count >= MAX_GAMES) {
+        return;
+    }
+    /* find the insertion slot: skip the parent, then dirs while this
+     * is a dir and name sorts after, then files */
+    i = (fe_count > 0 && strcmp(fes[0].name, "..") == 0) ? 1 : 0;
+    if (type != FE_FILE) {
+        while (i < fe_count && fes[i].type != FE_FILE &&
+               strcmp(fes[i].name, name) < 0) {
+            i++;
+        }
+    } else {
+        i = fe_count;
+    }
+    /* shift up */
+    for (j = fe_count; j > i; j--) {
+        fes[j] = fes[j - 1];
+    }
+    snprintf(fes[i].name, sizeof(fes[i].name), "%s", name);
+    snprintf(fes[i].full, sizeof(fes[i].full), "%s", full);
+    fes[i].type = type;
+    fe_count++;
+}
+
+static void fe_scan(const char *path) {
+    SceUID d;
+    SceIoDirent ent;
+
+    snprintf(fe_cwd, sizeof(fe_cwd), "%s", path);
+    fe_count = 0;
+    /* virtual ".." parent (except at the sandbox root) so up/down/tap
+     * all treat going up like opening any other directory */
+    if (strcmp(path, fe_root) != 0) {
+        char parent[256];
+        fe_parent(parent, sizeof(parent));
+        fe_insert("..", parent, FE_DIR);
+    }
+    d = sceIoDopen(path);
+    if (d < 0) {
+        return;
+    }
+    for (;;) {
+        int type;
+        char full[256];
+        memset(&ent, 0, sizeof(ent));
+        if (sceIoDread(d, &ent) <= 0) {
+            break;
+        }
+        if (strcmp(ent.d_name, ".") == 0 || strcmp(ent.d_name, "..") == 0) {
+            continue;
+        }
+        snprintf(full, sizeof(full), "%s/%s", path, ent.d_name);
+        if (SCE_S_ISDIR(ent.d_stat.st_mode)) {
+            type = FE_DIR;
+        } else {
+            type = (strstr(ent.d_name, ".jar") != NULL) ? FE_JAR : FE_FILE;
+        }
+        fe_insert(ent.d_name, full, type);
+    }
+    sceIoDclose(d);
+}
+
+static int fe_parent(char *out, size_t outsz) {
+    char *slash;
+    if (strcmp(fe_cwd, fe_root) == 0) {
+        return 0; /* sandbox root - no parent */
+    }
+    snprintf(out, outsz, "%s", fe_cwd);
+    slash = strrchr(out, '/');
+    if (slash == NULL) {
+        return 0;
+    }
+    if (slash == out) {
+        slash[1] = '\0'; /* keep "ux0:" */
+    } else {
+        *slash = '\0';
+    }
+    return 1;
+}
+
+/* install a jar picked from the inbox tab or the file browser by
+ * moving it into games/<base>/game.jar (same procedure install_inbox
+ * uses) and returning 1 when it was installed */
+static int install_jar(const char *jarpath, char *msg, size_t msg_sz) {
+    char base[128], dstdir[200], dstjar[256];
+    const char *bn;
+    size_t blen;
+
+    bn = strrchr(jarpath, '/');
+    bn = (bn != NULL) ? bn + 1 : jarpath;
+    blen = strlen(bn);
+    if (blen < 5 || strcmp(bn + blen - 4, ".jar") != 0) {
+        snprintf(msg, msg_sz, "not a .jar");
+        return 0;
+    }
+    snprintf(base, sizeof(base), "%s", bn);
+    base[blen - 4] = '\0';
+    snprintf(dstdir, sizeof(dstdir), GAMES_DIR "/%s", base);
+    sceIoMkdir(dstdir, 0777);
+    snprintf(dstjar, sizeof(dstjar), "%s/" JAR_NAME, dstdir);
+    if (sceIoRename(jarpath, dstjar) < 0) {
+        snprintf(msg, msg_sz, "install failed");
+        return 0;
+    }
+    {
+        GameEntry tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        snprintf(tmp.dir, sizeof(tmp.dir), "%s", dstdir);
+        snprintf(tmp.jar, sizeof(tmp.jar), "%s/" JAR_NAME, dstdir);
+        parse_manifest_class(tmp.jar, tmp.cls, sizeof(tmp.cls));
+        validate_game_class(&tmp, 1);
+        save_cfg(&tmp);
+    }
+    snprintf(msg, msg_sz, "installed: %s", base);
+    return 1;
+}
+
+/* inbox scan for the "未安装" tab: list .jar files in inbox/ */
+static char inbox_names[MAX_GAMES][104];
+static int inbox_count = 0;
+
+static void inbox_scan(void) {
+    SceUID d;
+    SceIoDirent ent;
+    inbox_count = 0;
+    if (!dir_exists(INBOX_DIR)) {
+        sceIoMkdir(INBOX_DIR, 0777);
+    }
+    d = sceIoDopen(INBOX_DIR);
+    if (d < 0) {
+        return;
+    }
+    for (;;) {
+        size_t blen;
+        memset(&ent, 0, sizeof(ent));
+        if (sceIoDread(d, &ent) <= 0 || inbox_count >= MAX_GAMES) {
+            break;
+        }
+        if (SCE_S_ISDIR(ent.d_stat.st_mode)) {
+            continue;
+        }
+        blen = strlen(ent.d_name);
+        if (blen < 5 || blen > 100 || strcmp(ent.d_name + blen - 4, ".jar") != 0) {
+            continue;
+        }
+        snprintf(inbox_names[inbox_count], 104, "%s", ent.d_name);
+        inbox_count++;
+    }
+    sceIoDclose(d);
+}
+
+int vita_menu_run(VitaGameSel *out) {
     /* Allocate ONCE per process and reuse across rounds: menu_fb is a
      * static, so a plain memalign here used to overwrite the pointer
      * every round, leaking the old 2MB block (6h session with several
@@ -1464,13 +1727,35 @@ int vita_menu_run(VitaGameSel *out) {
     if (!dir_exists(GAMES_DIR)) {
         sceIoMkdir(GAMES_DIR, 0777);
     }
+    settings_load();
+    menu_touch_init();
     scan_games();
+    inbox_scan();
+    fe_scan(fe_root);
+
+    /* tab 0=已安装 1=未安装 2=文件 3=设置 4=退出 */
+    int tab = 0;
+    int sel = 0, top = 0;          /* installed tab cursor/scroll */
+    int gsel = 0, gtop = 0;        /* grid cursor/scroll */
+    int isel = 0, itop = 0;        /* inbox cursor/scroll */
+    int fsel = 0, ftop = 0;        /* file browser cursor/scroll */
+    int mode = 0;                  /* 0 = normal, 1 = dialog */
+    int dlg_sel = DLG_LAUNCH;
+    int confirm_del = 0;
+    int have_selection = 0;
+    char msg[120] = "";
+    unsigned long long msg_us = 0;
 
     for (;;) {
         unsigned int btn = poll_buttons();
+        int tap_x = 0, tap_y = 0;
+        int tapped = poll_tap(&tap_x, &tap_y);
         int i;
         const int row_h = 30;
-        const int lines = 12;
+        const int lines = 13;
+        const int cols = 4;
+        const int cell_w = 170, cell_h = 150;
+        const int grid_rows = 3;
         int y;
 
         /* v01.68 black-screen diagnostics: one heartbeat per second in
@@ -1491,38 +1776,221 @@ int vita_menu_run(VitaGameSel *out) {
             }
         }
 
+        /* ---- tab switching: L/R or tap the tab column ---- */
         if (mode == 0) {
+            if (btn & SCE_CTRL_LTRIGGER) {
+                if (tab > 0) tab--;
+                msg[0] = '\0';
+            }
+            if (btn & SCE_CTRL_RTRIGGER) {
+                if (tab < TAB_N - 1) tab++;
+                msg[0] = '\0';
+            }
+            if (tapped && tap_x < TABBAR_W) {
+                int ntab = tap_y / TAB_H;
+                if (ntab >= 0 && ntab < TAB_N) {
+                    if (ntab == TAB_N - 1) {
+                        break; /* tap 退出 = quit */
+                    }
+                    tab = ntab;
+                    msg[0] = '\0';
+                }
+            }
+        }
+
+        if (mode == 0) {
+            int *psel = &sel, *ptop = &top;
+            int nent = game_count;
+            if (tab == 0 && set_list_grid == TAB_GRIDMODE) {
+                psel = &gsel; ptop = &gtop;
+                nent = game_count;
+            } else if (tab == 1) {
+                psel = &isel; ptop = &itop;
+                nent = inbox_count;
+            } else if (tab == 2) {
+                psel = &fsel; ptop = &ftop;
+                nent = fe_count;
+            }
+
             if (btn & SCE_CTRL_UP) {
-                if (sel > 0) sel--;
+                if (tab == 0 && set_list_grid == TAB_GRIDMODE && gsel >= cols) {
+                    gsel -= cols;
+                } else if (*psel > 0) {
+                    (*psel)--;
+                }
             }
             if (btn & SCE_CTRL_DOWN) {
-                if (sel < game_count - 1) sel++;
+                if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
+                    gsel + cols < nent) {
+                    gsel += cols;
+                } else if (*psel < nent - 1) {
+                    (*psel)++;
+                }
             }
-            if (sel < top) top = sel;
-            if (sel >= top + lines) top = sel - lines + 1;
+            if (btn & SCE_CTRL_LEFT) {
+                if (tab == 0 && set_list_grid == TAB_GRIDMODE && gsel > 0) {
+                    gsel--;
+                }
+            }
+            if (btn & SCE_CTRL_RIGHT) {
+                if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
+                    gsel < nent - 1) {
+                    gsel++;
+                }
+            }
+            /* scroll clamp: list rows use item units, the grid keeps
+             * gtop in ROW units (gsel stays item units) */
+            if (tab == 0 && set_list_grid == TAB_GRIDMODE) {
+                if (gsel < gtop * cols) gtop = gsel / cols;
+                if (gsel >= (gtop + grid_rows) * cols) {
+                    gtop = gsel / cols - grid_rows + 1;
+                }
+            } else {
+                if (*psel < *ptop) *ptop = *psel;
+                if (*psel >= *ptop + lines) *ptop = *psel - lines + 1;
+            }
 
-            if (btn & SCE_CTRL_START) {
-                install_inbox(msg, sizeof(msg));
-                scan_games();
-                if (sel >= game_count) sel = game_count - 1;
-                if (sel < 0) sel = 0;
-            }
             if (btn & SCE_CTRL_SELECT) {
-                scan_games();
-                snprintf(msg, sizeof(msg), "rescanned: %d game(s)", game_count);
+                if (tab == 0) {
+                    scan_games();
+                    inbox_scan();
+                    snprintf(msg, sizeof(msg), "rescanned: %d game(s)",
+                             game_count);
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (tab == 2) {
+                    fe_scan(fe_cwd);
+                    snprintf(msg, sizeof(msg), "refreshed");
+                    msg_us = sceKernelGetProcessTimeWide();
+                }
             }
-            if ((btn & SCE_CTRL_CROSS) && game_count > 0) {
-                mode = 1;
-                dlg_sel = DLG_LAUNCH;
-                confirm_del = 0;
+
+            if (tab == 0) { /* ---- 已安装 ---- */
+                if ((btn & SCE_CTRL_SQUARE) && game_count > 0) {
+                    /* toggle view mode lazily; persisted on change */
+                    set_list_grid = !set_list_grid;
+                    settings_save();
+                    gsel = sel; /* keep the cursor near the same game */
+                    gtop = 0;
+                }
+                if ((btn & SCE_CTRL_CROSS) && game_count > 0) {
+                    if (set_list_grid == TAB_GRIDMODE) {
+                        sel = gsel; /* the dialog indexes games[sel] */
+                    }
+                    mode = 1;
+                    dlg_sel = DLG_LAUNCH;
+                    confirm_del = 0;
+                }
+                if ((btn & SCE_CTRL_CROSS) && game_count == 0) {
+                    break; /* fall back to launch.cfg / Hello */
+                }
+                if (tapped && tap_x >= TABBAR_W && set_list_grid == TAB_GRIDMODE) {
+                    int cx = (tap_x - TABBAR_W) / cell_w;
+                    int cy = (tap_y - 64) / cell_h;
+                    int idx = (gtop + cy) * cols + cx;
+                    if (cy >= 0 && cy < grid_rows && cx >= 0 && cx < cols &&
+                        idx >= 0 && idx < game_count) {
+                        gsel = idx;
+                        sel = gsel;
+                        mode = 1;
+                        dlg_sel = DLG_LAUNCH;
+                        confirm_del = 0;
+                    }
+                }
+                if (btn & SCE_CTRL_TRIANGLE) {
+                    /* Always allow falling back to launch.cfg / bundled
+                     * tests even with games installed (needed to run
+                     * ToneTest etc. for bring-up). */
+                    break;
+                }
+            } else if (tab == 1) { /* ---- 未安装 ---- */
+                if ((btn & SCE_CTRL_START) || (btn & SCE_CTRL_CROSS)) {
+                    install_inbox(msg, sizeof(msg));
+                    msg_us = sceKernelGetProcessTimeWide();
+                    scan_games();
+                    inbox_scan();
+                    if (isel >= inbox_count) isel = inbox_count - 1;
+                    if (isel < 0) isel = 0;
+                }
+                if (tapped && tap_x >= TABBAR_W && inbox_count > 0) {
+                    int row = (tap_y - 64) / row_h;
+                    int idx = itop + row;
+                    if (row >= 0 && idx >= 0 && idx < inbox_count) {
+                        char jp[256];
+                        isel = idx;
+                        /* install JUST the tapped jar (X installs all) */
+                        snprintf(jp, sizeof(jp), "%s/%s", INBOX_DIR,
+                                 inbox_names[idx]);
+                        install_jar(jp, msg, sizeof(msg));
+                        msg_us = sceKernelGetProcessTimeWide();
+                        scan_games();
+                        inbox_scan();
+                        if (isel >= inbox_count) isel = inbox_count - 1;
+                        if (isel < 0) isel = 0;
+                    }
+                }
+            } else if (tab == 2) { /* ---- 文件 ---- */
+                if (btn & SCE_CTRL_CIRCLE) {
+                    char parent[256];
+                    if (fe_parent(parent, sizeof(parent))) {
+                        fe_scan(parent);
+                        fsel = ftop = 0;
+                    }
+                }
+                if (btn & SCE_CTRL_CROSS && fe_count > 0) {
+                    FileEntry *e = &fes[fsel];
+                    if (e->type == FE_DIR) {
+                        fe_scan(e->full);
+                        fsel = ftop = 0;
+                    } else if (e->type == FE_JAR) {
+                        if (install_jar(e->full, msg, sizeof(msg))) {
+                            msg_us = sceKernelGetProcessTimeWide();
+                            scan_games();
+                            fe_scan(fe_cwd);
+                            if (fsel >= fe_count) fsel = fe_count - 1;
+                            if (fsel < 0) fsel = 0;
+                        }
+                    }
+                }
+                if (tapped && tap_x >= TABBAR_W && fe_count > 0) {
+                    int row = (tap_y - 64) / row_h;
+                    int idx = ftop + row;
+                    if (row >= 0 && idx >= 0 && idx < fe_count) {
+                        FileEntry *e = &fes[idx];
+                        if (e->type == FE_DIR) {
+                            fe_scan(e->full);
+                            fsel = ftop = 0;
+                        } else if (e->type == FE_JAR) {
+                            if (install_jar(e->full, msg, sizeof(msg))) {
+                                msg_us = sceKernelGetProcessTimeWide();
+                                scan_games();
+                                fe_scan(fe_cwd);
+                                if (fsel >= fe_count) fsel = fe_count - 1;
+                                if (fsel < 0) fsel = 0;
+                            }
+                        }
+                    }
+                }
+            } else if (tab == 3) { /* ---- 设置 ---- */
+                if (btn & SCE_CTRL_CROSS) {
+                    set_list_grid = !set_list_grid;
+                    settings_save();
+                    snprintf(msg, sizeof(msg), "games view: %s",
+                             set_list_grid ? "grid" : "list");
+                    msg_us = sceKernelGetProcessTimeWide();
+                }
+                if (tapped && tap_x >= TABBAR_W && tap_y >= 64 &&
+                    tap_y < 64 + row_h) {
+                    set_list_grid = !set_list_grid;
+                    settings_save();
+                    snprintf(msg, sizeof(msg), "games view: %s",
+                             set_list_grid ? "grid" : "list");
+                    msg_us = sceKernelGetProcessTimeWide();
+                }
             }
-            if ((btn & SCE_CTRL_CROSS) && game_count == 0) {
-                break; /* fall back to launch.cfg / Hello */
-            }
-            if (btn & SCE_CTRL_TRIANGLE) {
-                /* Always allow falling back to launch.cfg / bundled
-                 * tests even with games installed (needed to run
-                 * ToneTest etc. for bring-up). */
+            /* tab 4 (退出) unreachable: tapping it breaks the loop and
+             * no d-pad navigation enters it (R stops at TAB_N-2 via tap,
+             * but RTRIGGER can land on it) */
+            if (tab == TAB_N - 1 && (btn & SCE_CTRL_CROSS)) {
                 break;
             }
         } else {
@@ -1544,12 +2012,14 @@ int vita_menu_run(VitaGameSel *out) {
                     save_cfg(g);
                     snprintf(msg, sizeof(msg), "%s: %s", g->name,
                              g->landscape ? "landscape" : "portrait");
+                    msg_us = sceKernelGetProcessTimeWide();
                 } else if (dlg_sel == DLG_UNINSTALL) {
                     if (!confirm_del) {
                         confirm_del = 1;
                     } else {
                         uninstall_game(g);
                         snprintf(msg, sizeof(msg), "deleted");
+                        msg_us = sceKernelGetProcessTimeWide();
                         confirm_del = 0;
                         mode = 0;
                         scan_games();
@@ -1562,6 +2032,7 @@ int vita_menu_run(VitaGameSel *out) {
                 } else if (dlg_sel == DLG_LAUNCH) {
                     if (g->cls[0] == '\0') {
                         snprintf(msg, sizeof(msg), "no MIDlet class in jar");
+                        msg_us = sceKernelGetProcessTimeWide();
                     } else {
                         save_cfg(g);
                         memset(out, 0, sizeof(*out));
@@ -1583,30 +2054,133 @@ int vita_menu_run(VitaGameSel *out) {
         draw_textf(300, 22, 2, C_HINT, "%s", VITA_PORT_VERSION_STRING);
         draw_textf(760, 20, 2, C_HINT, "%d game(s)", game_count);
 
-        y = 64;
-        for (i = top; i < game_count && i < top + lines; i++) {
-            if (i == sel) {
-                fill_rect(16, y - 4, FB_W - 32, row_h, C_SEL);
+        /* left tab column */
+        fill_rect(0, 52, TABBAR_W, FB_H - 52, C_PANEL);
+        for (i = 0; i < TAB_N; i++) {
+            int ty = 52 + 12 + i * TAB_H;
+            const char *label =
+                (i == 0) ? "已安装" :
+                (i == 1) ? "未安装" :
+                (i == 2) ? "文件" :
+                (i == 3) ? "设置" : "退出";
+            if (i == tab) {
+                fill_rect(0, ty, TABBAR_W, TAB_H - 8, C_SEL);
+                fill_rect(0, ty, 4, TAB_H - 8, C_TITLE);
             }
-            draw_icon_scaled(28, y, &games[i], row_h - 8);
-            draw_text(60, y, games[i].name, 2,
-                      games[i].cls[0] ? C_FG : C_WARN);
-            draw_text(880, y, games[i].landscape ? "L" : "P", 2, C_HINT);
-            if (games[i].cls[0] == '\0') {
-                draw_text(908, y, "?", 2, C_WARN);
-            }
-            y += row_h;
+            draw_text(24, ty + 22, label, 3, (i == tab) ? C_FG : C_HINT);
         }
-        if (game_count == 0) {
-            draw_text(28, y + 16, "no games installed", 2, C_WARN);
-            draw_text(28, y + 52, "copy .jar files with VitaShell to:", 2, C_WARN);
-            draw_text(28, y + 84, INBOX_DIR, 2, C_FG);
-            draw_text(28, y + 116, "then press START to install", 2, C_WARN);
-            draw_text(28, y + 148, "press X to run bundled Hello", 2, C_HINT);
+        draw_text(12, FB_H - 20, "L/R switch tab", 1, C_HINT);
+
+        /* ---- content area per tab ---- */
+        y = 64;
+        if (tab == 0 && set_list_grid == TAB_ROWMODE) {
+            /* list view (the classic v01.30 layout) */
+            for (i = top; i < game_count && i < top + lines; i++) {
+                if (i == sel) {
+                    fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
+                              row_h, C_SEL);
+                }
+                draw_icon_scaled(TABBAR_W + 20, y, &games[i], row_h - 8);
+                draw_text(TABBAR_W + 52, y, games[i].name, 2,
+                          games[i].cls[0] ? C_FG : C_WARN);
+                draw_text(FB_W - 60, y, games[i].landscape ? "L" : "P",
+                          2, C_HINT);
+                y += row_h;
+            }
+            if (game_count == 0) {
+                draw_text(TABBAR_W + 20, y + 16, "no games installed", 2, C_WARN);
+                draw_text(TABBAR_W + 20, y + 52,
+                          "copy .jar files with VitaShell to:", 2, C_WARN);
+                draw_text(TABBAR_W + 20, y + 84, INBOX_DIR, 2, C_FG);
+                draw_text(TABBAR_W + 20, y + 116,
+                          "then open the 未安装 tab and press X", 2, C_WARN);
+            }
+        } else if (tab == 0) {
+            /* grid view: 4 cols x 3 rows of icon+name cells */
+            for (i = gtop * cols;
+                 i < game_count && i < (gtop + grid_rows) * cols; i++) {
+                int cx = (i - gtop * cols) % cols;
+                int cy = (i - gtop * cols) / cols;
+                int bx = TABBAR_W + 12 + cx * cell_w;
+                int by = 64 + cy * cell_h;
+                if (i == gsel) {
+                    fill_rect(bx, by, cell_w - 8, cell_h - 10, C_SEL);
+                }
+                draw_icon_scaled(bx + (cell_w - 8 - 84) / 2, by + 8,
+                                 &games[i], 84);
+                /* name: up to ~7 CJK glyphs, single line */
+                draw_text(bx + 8, by + 104, games[i].name, 2,
+                          games[i].cls[0] ? C_FG : C_WARN);
+            }
+            if (game_count == 0) {
+                draw_text(TABBAR_W + 20, 84, "no games installed", 2, C_WARN);
+                draw_text(TABBAR_W + 20, 120,
+                          "install from the 未安装 or 文件 tab", 2, C_HINT);
+            }
+        } else if (tab == 1) {
+            for (i = itop; i < inbox_count && i < itop + lines; i++) {
+                if (i == isel) {
+                    fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
+                              row_h, C_SEL);
+                }
+                draw_text(TABBAR_W + 20, y, inbox_names[i], 2, C_FG);
+                y += row_h;
+            }
+            if (inbox_count == 0) {
+                draw_text(TABBAR_W + 20, y + 16,
+                          "inbox empty - copy .jar files with VitaShell to:",
+                          2, C_WARN);
+                draw_text(TABBAR_W + 20, y + 52, INBOX_DIR, 2, C_FG);
+            }
+        } else if (tab == 2) {
+            draw_text(TABBAR_W + 12, 56, fe_cwd, 1, C_HINT);
+            y = 80;
+            {
+                int shown = 0;
+                for (i = ftop; i < fe_count && shown < lines; i++) {
+                    if (i == fsel) {
+                        fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
+                                  row_h, C_SEL);
+                    }
+                    draw_text(TABBAR_W + 20, y, fes[i].name, 2,
+                              fes[i].type == FE_DIR ? C_TITLE :
+                              (fes[i].type == FE_JAR ? C_FG : C_HINT));
+                    y += row_h;
+                    shown++;
+                }
+            }
+        } else if (tab == 3) {
+            uint64_t maxb = 0, freeb = 0;
+            draw_text(TABBAR_W + 20, 76, "游戏视图:", 2, C_FG);
+            draw_text(TABBAR_W + 150, 76,
+                      set_list_grid ? "网格" : "列表", 2, C_TITLE);
+            draw_text(TABBAR_W + 20, 120, "按 X 或点击切换", 2, C_HINT);
+            if (sceAppMgrGetDevInfo("ux0:", &maxb, &freeb) == 0) {
+                draw_textf(TABBAR_W + 20, 170, 2, C_FG,
+                           "ux0: free %llu MB / %llu MB",
+                           (unsigned long long)(freeb >> 20),
+                           (unsigned long long)(maxb >> 20));
+            }
+            draw_textf(TABBAR_W + 20, 210, 2, C_FG, "games: %d  inbox: %d",
+                       game_count, inbox_count);
+            draw_text(TABBAR_W + 20, 250,
+                      "JIT: launch.cfg line4 jit=0|1|2", 2, C_HINT);
+            draw_text(TABBAR_W + 20, 290,
+                      "数据目录: ux0:/data/J2ME00001", 2, C_HINT);
+        } else {
+            /* tab 4 退出 content */
+            draw_text(TABBAR_W + 20, 100, "按 X 或点击 退出 离开菜单", 2, C_FG);
+            draw_text(TABBAR_W + 20, 140,
+                      "(回退到 launch.cfg / 内置测试)", 2, C_HINT);
         }
 
         if (msg[0] != '\0') {
-            draw_text(20, 470, msg, 2, C_FG);
+            unsigned long long now = sceKernelGetProcessTimeWide();
+            if (msg_us != 0 && now - msg_us > 4000000ULL) {
+                msg[0] = '\0'; /* auto-expire after 4 s */
+            } else {
+                draw_text(TABBAR_W + 20, FB_H - 40, msg, 2, C_FG);
+            }
         }
 
         if (mode == 1 && game_count > 0) {
@@ -1633,13 +2207,22 @@ int vita_menu_run(VitaGameSel *out) {
                 }
                 draw_text(306, iy, label, 2, (i == dlg_sel) ? C_FG : C_HINT);
             }
-        } else {
-            draw_text(20, 512,
-                      "UP/DOWN select  X open  START install inbox  SEL rescan",
+        } else if (tab == 0) {
+            draw_text(TABBAR_W + 12, FB_H - 36,
+                      "UP/DOWN sel  X menu  SQUARE list/grid  SEL rescan",
                       1, C_HINT);
-            draw_text(20, 530,
-                      "TRIANGLE: run launch.cfg / bundled tests",
+            draw_text(TABBAR_W + 12, FB_H - 18,
+                      "TRIANGLE: launch.cfg / bundled tests",
                       1, C_HINT);
+        } else if (tab == 1) {
+            draw_text(TABBAR_W + 12, FB_H - 36,
+                      "X install all  SEL refresh", 1, C_HINT);
+        } else if (tab == 2) {
+            draw_text(TABBAR_W + 12, FB_H - 36,
+                      "X open/install  O parent  SEL refresh", 1, C_HINT);
+        } else if (tab == 3) {
+            draw_text(TABBAR_W + 12, FB_H - 36,
+                      "X toggle game view", 1, C_HINT);
         }
 
         menu_flip();
