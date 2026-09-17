@@ -30,6 +30,11 @@
 #include <stdarg.h>
 static SceUID alog_fd = -2;
 static void alog(const char *fmt, ...) {
+    /* v01.76: atomic test-and-set spinlock. The old "while (lock) ...; 
+     * lock = 1;" was check-then-set - NOT atomic on the Vita's 3 user
+     * cores, and alog IS called concurrently (VM thread logs play_tone,
+     * tone thread logs req/done). A garbled line in audio_debug.log
+     * would poison the very evidence the hang hunt depends on. */
     static volatile int lock = 0;
     char buf[192];
     va_list ap;
@@ -43,13 +48,14 @@ static void alog(const char *fmt, ...) {
                             SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
     }
     if (alog_fd < 0) return;
-    while (lock) { sceKernelDelayThread(100); }
-    lock = 1;
+    while (__sync_lock_test_and_set(&lock, 1)) {
+        sceKernelDelayThread(100);
+    }
     va_start(ap, fmt);
     n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     if (n > 0) sceIoWrite(alog_fd, buf, n);
-    lock = 0;
+    __sync_lock_release(&lock);
 }
 #define ALOG(name) alog("[IN ] %s\n", name)
 
@@ -618,7 +624,9 @@ javacall_result javacall_media_initialize(void) {
      * Re-enable only if ANI-related crashes reappear. */
     {
         SceUID tid = sceKernelCreateThread("j2me_tone", tone_player_thread,
-                                           0x10000100, 0x4000, 0, 0, NULL);
+                                           0x10000100, 0x4000, 0,
+                                           SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
+                                           NULL);
         if (tid >= 0) {
             sceKernelStartThread(tid, 0, NULL);
         }

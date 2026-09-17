@@ -531,6 +531,18 @@ set(VITA_VERSION  "01.74")
 #   - cpuAffinityMask uses SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT
 #   - dropped unused <psp2/kernel/processmgr.h> include
 set(VITA_VERSION  "01.75")
+# 01.76 (2026-09-17): code-review pass on the audio path + dead-file purge:
+#   - alog() spinlock is now ATOMIC: the old "while (lock)...; lock = 1;"
+#     was check-then-set, racy on the Vita's 3 user cores - and alog IS
+#     called concurrently (VM thread + tone thread). A garbled line in
+#     audio_debug.log would poison the hang-hunt evidence. Now
+#     __sync_lock_test_and_set/__sync_lock_release (ARMv7 ldrex/strex).
+#   - j2me_tone thread: bare-0 affinity ->
+#     SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT (matches watchdog).
+#   - DELETED src/vita_audio.c: dead file, never in the build; its
+#     sceAudioOutOpenPort call misused param 2 as "channel count" (it is
+#     samples-per-call) - a landmine if anyone ever compiled it in.
+set(VITA_VERSION  "01.76")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
