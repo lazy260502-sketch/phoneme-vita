@@ -62,6 +62,7 @@ int vita_menu_draw_utf8(uint32_t *fb, int w, int h,
 /* colors 0xAABBGGRR (matches SCE_DISPLAY_PIXELFORMAT_A8B8G8R8) */
 #define C_BG    0xFF201810u
 #define C_PANEL 0xFF2C3440u
+#define C_PANEL2 0xFF3A4250u   /* current tab, focus elsewhere */
 #define C_FG    0xFFF0F0F0u
 #define C_SEL   0xFF3050A0u
 #define C_TITLE 0xFF40B0E0u
@@ -1484,9 +1485,11 @@ enum { DLG_LAUNCH = 0, DLG_ORIENT, DLG_UNINSTALL, DLG_BACK, DLG_N };
  *   [文件]   minimal file browser (ux0:/data/J2ME00001 sandbox)
  *   [设置]   view-only info + game view toggle, persisted in menu.cfg
  *   [退出]   quit the menu (fallback to launch.cfg / bundled tests)
- * Tabs switch with L/R shoulder buttons, dpad left/right (lists switch
- * directly; the grid steps within a row and switches at the edge column)
- * or by tapping the tab column.
+ * Tabs switch with L/R shoulder buttons, by tapping the tab column,
+ * or with the dpad two-focus model: LEFT from the content pulls the
+ * focus into the tab column (UP/DOWN then walk the tabs, RIGHT/X goes
+ * back). In the installed grid LEFT only exits on the edge column so
+ * in-row navigation is never hijacked.
  * ================================================================== */
 #define TAB_N        5
 #define TABBAR_W     220
@@ -1737,6 +1740,7 @@ int vita_menu_run(VitaGameSel *out) {
 
     /* tab 0=已安装 1=未安装 2=文件 3=设置 4=退出 */
     int tab = 0;
+    int focus = 0;                 /* 0 = content area, 1 = tab column */
     int sel = 0, top = 0;          /* installed tab cursor/scroll */
     int gsel = 0, gtop = 0;        /* grid cursor/scroll */
     int isel = 0, itop = 0;        /* inbox cursor/scroll */
@@ -1778,7 +1782,13 @@ int vita_menu_run(VitaGameSel *out) {
             }
         }
 
-        /* ---- tab switching: L/R or tap the tab column ---- */
+        /* ---- tab switching: L/R, dpad left/right, or tap the column ----
+         * Two-focus model: the cursor lives in the content area; LEFT
+         * pulls it out to the tab column (UP/DOWN then walk the tabs),
+         * RIGHT goes back in. The grid only reacts to LEFT when the
+         * cursor is already on the edge column, so in-row navigation
+         * is never hijacked. L/R remain global shortcuts from either
+         * focus (focus stays where it is). */
         if (mode == 0) {
             if (btn & SCE_CTRL_LTRIGGER) {
                 if (tab > 0) tab--;
@@ -1788,6 +1798,20 @@ int vita_menu_run(VitaGameSel *out) {
                 if (tab < TAB_N - 1) tab++;
                 msg[0] = '\0';
             }
+            if (focus == 1) {
+                if (btn & SCE_CTRL_UP) {
+                    if (tab > 0) tab--;
+                    msg[0] = '\0';
+                }
+                if (btn & SCE_CTRL_DOWN) {
+                    if (tab < TAB_N - 1) tab++;
+                    msg[0] = '\0';
+                }
+                if (btn & SCE_CTRL_RIGHT || btn & SCE_CTRL_CROSS) {
+                    focus = 0; /* go back into the content */
+                    msg[0] = '\0';
+                }
+            }
             if (tapped && tap_x < TABBAR_W) {
                 int ntab = tap_y / TAB_H;
                 if (ntab >= 0 && ntab < TAB_N) {
@@ -1795,6 +1819,7 @@ int vita_menu_run(VitaGameSel *out) {
                         break; /* tap 退出 = quit */
                     }
                     tab = ntab;
+                    focus = 0;
                     msg[0] = '\0';
                 }
             }
@@ -1803,6 +1828,8 @@ int vita_menu_run(VitaGameSel *out) {
         if (mode == 0) {
             int *psel = &sel, *ptop = &top;
             int nent = game_count;
+            int in_content = (focus == 0); /* dpad drives the cursor */
+
             if (tab == 0 && set_list_grid == TAB_GRIDMODE) {
                 psel = &gsel; ptop = &gtop;
                 nent = game_count;
@@ -1814,14 +1841,14 @@ int vita_menu_run(VitaGameSel *out) {
                 nent = fe_count;
             }
 
-            if (btn & SCE_CTRL_UP) {
+            if (in_content && (btn & SCE_CTRL_UP)) {
                 if (tab == 0 && set_list_grid == TAB_GRIDMODE && gsel >= cols) {
                     gsel -= cols;
                 } else if (*psel > 0) {
                     (*psel)--;
                 }
             }
-            if (btn & SCE_CTRL_DOWN) {
+            if (in_content && (btn & SCE_CTRL_DOWN)) {
                 if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
                     gsel + cols < nent) {
                     gsel += cols;
@@ -1830,22 +1857,27 @@ int vita_menu_run(VitaGameSel *out) {
                 }
             }
             if (btn & SCE_CTRL_LEFT) {
-                if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
-                    (gsel % cols) != 0) {
+                if (!in_content) {
+                    /* tab column focus: L/R edge already handled; LEFT
+                     * here is a no-op (already at the edge) */
+                } else if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
+                           (gsel % cols) != 0) {
                     gsel--;        /* grid: step within the row */
-                } else if (tab > 0) {
-                    tab--;         /* leftmost column / any list */
+                } else {
+                    focus = 1;     /* list view / edge column: out to tabs */
                     msg[0] = '\0';
                 }
             }
             if (btn & SCE_CTRL_RIGHT) {
-                if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
-                    gsel < nent - 1 && (gsel % cols) != cols - 1) {
-                    gsel++;        /* grid: step within the row */
-                } else if (tab < TAB_N - 1) {
-                    tab++;         /* rightmost column / any list */
+                if (!in_content) {
+                    focus = 0;     /* back into the content */
                     msg[0] = '\0';
+                } else if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
+                           gsel < nent - 1 && (gsel % cols) != cols - 1) {
+                    gsel++;        /* grid: step within the row */
                 }
+                /* list view: RIGHT in content is a no-op (already at
+                 * the right edge; LEFT is the only way out) */
             }
             /* scroll clamp: list rows use item units, the grid keeps
              * gtop in ROW units (gsel stays item units) */
@@ -2073,12 +2105,22 @@ int vita_menu_run(VitaGameSel *out) {
                 (i == 2) ? "文件" :
                 (i == 3) ? "设置" : "退出";
             if (i == tab) {
-                fill_rect(0, ty, TABBAR_W, TAB_H - 8, C_SEL);
-                fill_rect(0, ty, 4, TAB_H - 8, C_TITLE);
+                if (focus == 1) {
+                    /* active focus: full highlight + accent bar */
+                    fill_rect(0, ty, TABBAR_W, TAB_H - 8, C_SEL);
+                    fill_rect(0, ty, 4, TAB_H - 8, C_TITLE);
+                } else {
+                    /* current tab, focus is in the content area */
+                    fill_rect(0, ty, TABBAR_W, TAB_H - 8, C_PANEL2);
+                    fill_rect(0, ty, 4, TAB_H - 8, C_HINT);
+                }
             }
-            draw_text(24, ty + 22, label, 3, (i == tab) ? C_FG : C_HINT);
+            draw_text(24, ty + 22, label, 3,
+                      (i == tab) ? ((focus == 1) ? C_FG : C_HINT) : C_HINT);
         }
-        draw_text(12, FB_H - 20, "L/R or dpad switch tab", 1, C_HINT);
+        draw_text(12, FB_H - 20,
+                  (focus == 1) ? "dpad walk tabs, RIGHT back"
+                               : "L/R or LEFT to tabs", 1, C_HINT);
 
         /* ---- content area per tab ---- */
         y = 64;
@@ -2087,7 +2129,7 @@ int vita_menu_run(VitaGameSel *out) {
             for (i = top; i < game_count && i < top + lines; i++) {
                 if (i == sel) {
                     fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
-                              row_h, C_SEL);
+                              row_h, (focus == 1) ? C_PANEL2 : C_SEL);
                 }
                 draw_icon_scaled(TABBAR_W + 20, y, &games[i], row_h - 8);
                 draw_text(TABBAR_W + 52, y, games[i].name, 2,
@@ -2113,7 +2155,8 @@ int vita_menu_run(VitaGameSel *out) {
                 int bx = TABBAR_W + 12 + cx * cell_w;
                 int by = 64 + cy * cell_h;
                 if (i == gsel) {
-                    fill_rect(bx, by, cell_w - 8, cell_h - 10, C_SEL);
+                    fill_rect(bx, by, cell_w - 8, cell_h - 10,
+                              (focus == 1) ? C_PANEL2 : C_SEL);
                 }
                 draw_icon_scaled(bx + (cell_w - 8 - 84) / 2, by + 8,
                                  &games[i], 84);
@@ -2130,7 +2173,7 @@ int vita_menu_run(VitaGameSel *out) {
             for (i = itop; i < inbox_count && i < itop + lines; i++) {
                 if (i == isel) {
                     fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
-                              row_h, C_SEL);
+                              row_h, (focus == 1) ? C_PANEL2 : C_SEL);
                 }
                 draw_text(TABBAR_W + 20, y, inbox_names[i], 2, C_FG);
                 y += row_h;
@@ -2149,7 +2192,7 @@ int vita_menu_run(VitaGameSel *out) {
                 for (i = ftop; i < fe_count && shown < lines; i++) {
                     if (i == fsel) {
                         fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
-                                  row_h, C_SEL);
+                                  row_h, (focus == 1) ? C_PANEL2 : C_SEL);
                     }
                     draw_text(TABBAR_W + 20, y, fes[i].name, 2,
                               fes[i].type == FE_DIR ? C_TITLE :

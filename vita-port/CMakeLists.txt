@@ -584,10 +584,16 @@ set(VITA_VERSION  "01.77")
 #   Untouched on purpose: game scan/cache/dialog, install_inbox,
 #   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
 set(VITA_VERSION  "01.78")
-# 01.78b (2026-09-17): dpad left/right now also switch tabs (user
-#   request). Lists switch directly; the installed grid steps within
-#   the row and only switches tab at the edge columns (TV convention,
-#   so grid navigation is not hijacked). Hint line updated.
+# 01.78c (2026-09-17): two-focus dpad navigation (user request #2:
+#   "LEFT/RIGHT moves the focus between the tab column and the
+#   content", not just tab cycling).
+#   - focus lives in the content area; LEFT pulls it out to the tab
+#     column (UP/DOWN walk the tabs there, RIGHT/X goes back in)
+#   - the installed grid only gives LEFT up at the edge column
+#   - L/R shoulders stay global tab shortcuts from either focus
+#   - visual state: focused tab = C_SEL + accent bar, current tab
+#     with focus elsewhere = C_PANEL2; content selection dims the
+#     same way while the tabs hold the focus; hint line is dynamic
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
