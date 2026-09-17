@@ -1,5 +1,15 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-16
+> Last Updated: 2026-09-17
+
+## 2026-09-17 v01.75：看门狗规范审查版（未上机，等真机一并验）
+
+> 对照 vitasdk 头文件 + 本项目真机已验证实践的 code review，4 处修复，正常路径无行为变化。
+
+- **栈 0x2000 → 0x4000**：dump 链路（栈上 SceKernelThreadInfo ~200B + snprintf + sceIo*）8KB 偏紧；溢出 = 内核杀线程 = 看门狗无声消失。0x4000 对齐 `j2me_tone`（项目验证过的下限）。
+- **双时钟取证**：HANG 报告同时采 `gettimeofday` 与 `sceKernelGetSystemTimeWide()`——若 H2（时钟冻结）为真，**哪一个冻住**直接点名故障层（newlib/sceRtc 链 vs 内核时间子系统）。新格式：`[WD] HANG ce= polls= clock t0/t1/d= | kclock k0/k1/kd=`（kd≈100000us=内核钟健康）。
+- **亲和掩码用宏**：`SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT` 替代裸 0。
+- **删死包含**：`<psp2/kernel/processmgr.h>` 无对应调用。
+- 交付：`out/vpk/midp_vita_v01.75_watchdog4.vpk`（v01.75 b242, 2792319）。**未上机**——下次真机会话直接用这版，watchdog.log 预期：`[WD] alive` 首行 + 挂死后 HANG 行 + vm/tone/wd 三线程 wait 快照。
 
 ## 2026-09-16 v01.74：看门狗优先级非法——真机与 Vita3K 的又一差距
 
