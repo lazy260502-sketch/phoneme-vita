@@ -89,6 +89,18 @@ int vita_icon_decode_png(const unsigned char *data, unsigned long len,
     png_set_filler(png, 0xFF, PNG_FILLER_AFTER); /* RGB -> RGBA */
     png_read_update_info(png, info);
 
+    /* The row stride has to come from libpng, not from the assumption
+     * "always RGBA": png_set_filler() is ignored for images that already
+     * carry alpha, and palette/tRNS/16-bit combinations can end up with a
+     * different channel count. Assuming w*4 made png_read_image() write
+     * past `pixels` and smash the malloc arena (v01.78g: the damage only
+     * showed up later, inside free(), when the menu exited). Everything is
+     * normalized to RGBA above, so anything else is refused. */
+    if (png_get_rowbytes(png, info) != (png_uint_32)w * 4) {
+        png_destroy_read_struct(&png, &info, NULL);
+        return -1;
+    }
+
     pixels = (uint32_t *)malloc((size_t)w * h * 4);
     rows = (png_bytep *)malloc((size_t)h * sizeof(png_bytep));
     if (pixels == NULL || rows == NULL) {

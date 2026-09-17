@@ -1,6 +1,39 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-17
 
+## 2026-09-17 v01.78g：**退出标签闪退定案**——PNG 行距假设砸堆 + 退出路径批量 free（重要！）
+
+> 用户报告："分区显示了，点击退出标签，出异常了，vita3k 闪退"。前序 v01.78b~f 均为菜单 UX 迭代（双焦点模型、文件根目录/分区、设置项持久化），本条是**回归缺陷**，根因在 v01.78f 的图标缓存改动里。
+
+### 崩溃现场取证
+- Vita3K 日志（Windows 宿主）：`PC: 0x00000000  SP: 0x80000328  LR: 0x81006a09`，`r4-r11` 全 0，`r2=0x3F(63)`；同一帧反复报 `Invalid read of uint32_t at address: 0x0, 0x4, 0x8, ... 0x1774`。
+- `LR=0x81006a09` ⇒ 反汇编 `0x81006a04: bl 0x81002dd4 <icon_cache_restore_kept>` ⇒ **崩溃在菜单退出收尾的图标缓存释放序列里**（不是 main、不是 VM）。
+- 非法读地址从 0x0 线性递增 ⇒ `free()` 在**已损坏的 malloc 链表**上追垃圾指针；`PC=0` 是链表里取到空函数指针/非法跳转的结果。**先有堆损坏，退出时才爆**。
+
+### 根因（两处叠加）
+1. **`vita_icon.c` 假定 libpng 输出恒为 RGBA**：`pixels = malloc(w*h*4)` 且 `rows[y] = pixels + y*w`，但 `png_set_filler()` 对**已经带 alpha 的 PNG 会被 libpng 忽略**，调色板/tRNS/16bit 组合也可能得到别的通道数。rowbytes 与假设不符时 `png_read_image()` 按 libpng 的真实行距写 ⇒ **每行越界、砸坏 malloc arena**，损坏很久之后才在 `free()` 里爆（典型的"退出才崩"）。
+   - **修法**：`png_read_update_info()` 后用 `png_get_rowbytes(png, info)` 校验 `== w*4`，不符**直接拒绝**（返回 -1，图标退化为纯文本行），绝不按假设写。目前所有归一化路径（palette/tRNS/gray/filler）都应收敛到 RGBA，因此正常图标不受影响。
+2. **v01.78f 的 park/restore 让退出路径去 free 64 个纹理槽**：`icon_cache_clear()` + `icon_cache_restore_kept()` 在退出时批量 free。堆已被 VM 折腾过，这里就是崩溃点（`r2=0x3F` 正是 `ICON_CACHE_MAX-1` 的循环常量）。
+   - **修法（本版核心）**：**退出路径完全不动堆**——删掉 `icon_cache_keep()`/`icon_cache_restore_kept()` 与 `cache_hit_pix/w/h[]` 三个数组；释放改到 **`scan_games()` 开头**（每次扫描先把 64 槽全释放再重填），保证槽位永不留悬垂指针，且释放点与 VM/堆活动完全隔离。park/restore 本来也买不到什么：`cache.bin` 已经缓存了 PNG **字节**，重扫走内存解码，不需要"续命纹理"。
+
+### 顺带修掉的真缺陷
+- `icon_load()` 里 `if (!vita_icon_decode_png(...))` **判断反了**（该函数 0=成功、-1=失败）⇒ 真失败不打印、每次成功反而打一条 `png decode FAILED`。改为 `!= 0`。
+- `install_inbox()` / `install_jar()` 的 `base[blen - 4] = '\0'` **无界下标写**：`ent.d_name`/basename 可长于 `base[128]`，`snprintf` 截断后仍按原长索引 ⇒ 栈越界。改为用**拷贝后** `strlen(base)` 重新判断并截断。
+
+### 新增退出埋点（保险）
+- 退出收尾加 `crumb_marker("menu exit")` + `crumb_printf("menu exit: have_sel=%d games=%d")` + `crumb_flush()`。下次若仍崩，`ux0:/data/J2ME00001/crumb.log` 直接说明死在"退出前"还是"退出后"，不用再猜。
+- 注意 crumb 走自己的 sceIo 通道，不进 midp_stderr.log。
+
+### 交付 / 验证
+- `out/vpk/midp_vita_v01.78g_tabui.vpk`（v01.78 **b255**，hash `aca83cc`，md5 `63893f77362e8cabde3fb29155e74cab`，3640913 B）。
+- 复测要点（Vita3K）：① 点"退出"标签；② 焦点在标签栏对"退出"按 X；③ 退出后重启游戏确认菜单可重入；④ 图标仍正常显示（若某图标变纯文本，看 midp_stderr.log 的 `[icon] png decode FAILED`，说明该 PNG 行距不是 w*4，属预期防御）。
+
+### 工具链经验（本轮新增，务必记住）
+- `midp_vita.velf` **已剥符号且无 DWARF** ⇒ `addr2line` 全 `??:0`、`nm` 为空。必须用同目录**未剥离**的 `midp_vita` 配 `arm-vita-eabi-nm -n midp_vita`；反汇编必须 `arm-vita-eabi-objdump -D -M force-thumb`（默认按 ARM 解码 Thumb 出乱码）。
+- `vita_version.h` **未被 git 跟踪**，构建前必须 `rm -f vita_version.h && touch CMakeLists.txt`，否则版本号/ hash 与提交不符。
+- **崩溃日志在 Windows 宿主 `C:\Users\zyb\Downloads\windows-latest\vita3k.log`，容器内无法访问（`/mnt/c` 不存在）** ⇒ 取证要么让用户粘贴日志，要么在代码里自证（`crumb.log` / `midp_stdout.log` / `midp_stderr.log`）。日志链路：`tty->print*` → stdout → midp_stdout.log；`fprintf(stderr)` → midp_stderr.log。
+- 教训：**"退出瞬间崩"优先怀疑堆损坏**（越界写把 arena 砸了，触发点在很久之后的某个 free），而不是"退出路径本身写错了"。
+
 ## 2026-09-17 v01.78：TV 风格标签菜单——五标签 + 触摸 + 文件浏览器（未上机）
 
 > 用户需求："菜单界面做下优化…类似 TV 样式，左侧标签栏、右侧内容栏，点击或按不同标签显示不同内容；标签：已安装（单列表/网格可切换）、未安装（自动扫描+缓存记录）、文件（文件管理）、设置、退出"。`vita_menu.c` 主循环重写（+661/-55），扫描/安装/对话框内部逻辑不动。

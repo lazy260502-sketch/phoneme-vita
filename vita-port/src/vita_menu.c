@@ -1104,45 +1104,21 @@ static void cache_save(const GameEntry *g, const unsigned char *icon_png,
 #define ICON_CACHE_MAX MAX_GAMES
 static uint32_t *icon_pix[ICON_CACHE_MAX];
 static int icon_w[ICON_CACHE_MAX], icon_h[ICON_CACHE_MAX];
-/* decoded-texture reuse: cache_hit_pix[i] mirrors icon_pix[i] ownership so
- * scan_games() can keep the texture of an unchanged game without re-decode */
-static uint32_t *cache_hit_pix[ICON_CACHE_MAX];
-static int cache_hit_w[ICON_CACHE_MAX], cache_hit_h[ICON_CACHE_MAX];
 
+/* Release every decoded texture. Only ever called at the START of
+ * scan_games(): the menu-exit path must not touch the malloc arena
+ * (v01.78g quit-tab crash), and a fresh scan is the one point where no
+ * texture can still be referenced by a drawn frame or by the slots
+ * themselves. The v01.78f park/restore scheme (cache_hit_pix[]) that
+ * tried to survive the exit is gone: it was the only code that freed a
+ * pointer it did not own, and it bought nothing - cache.bin already
+ * keeps the PNG *bytes*, so a re-scan decodes from RAM, not from the jar. */
 static void icon_cache_clear(void) {
     int i;
     for (i = 0; i < ICON_CACHE_MAX; i++) {
         free(icon_pix[i]);
         icon_pix[i] = NULL;
         icon_w[i] = icon_h[i] = 0;
-    }
-}
-
-/* keep the decoded texture of game idx for the next scan (no re-decode) */
-static void icon_cache_keep(int idx) {
-    if (idx < 0 || idx >= ICON_CACHE_MAX) {
-        return;
-    }
-    cache_hit_pix[idx] = icon_pix[idx];
-    cache_hit_w[idx] = icon_w[idx];
-    cache_hit_h[idx] = icon_h[idx];
-    /* ownership moved; clear so icon_cache_clear won't double-free */
-    icon_pix[idx] = NULL;
-    icon_w[idx] = icon_h[idx] = 0;
-}
-
-/* restore textures kept by icon_cache_keep() into the active slot */
-static void icon_cache_restore_kept(void) {
-    int i;
-    for (i = 0; i < ICON_CACHE_MAX; i++) {
-        if (cache_hit_pix[i] != NULL) {
-            free(icon_pix[i]);
-            icon_pix[i] = cache_hit_pix[i];
-            icon_w[i] = cache_hit_w[i];
-            icon_h[i] = cache_hit_h[i];
-            cache_hit_pix[i] = NULL;
-            cache_hit_w[i] = cache_hit_h[i] = 0;
-        }
     }
 }
 
@@ -1166,8 +1142,11 @@ static void icon_load(const GameEntry *g, int idx) {
         fflush(stderr);
         return; /* declared but missing: menu shows text-only row */
     }
-    if (!vita_icon_decode_png(buf, (unsigned long)n,
-                              &icon_pix[idx], &icon_w[idx], &icon_h[idx])) {
+    /* the decoder returns 0 on success, -1 on failure (the sense of this
+     * test was inverted until v01.78g: real failures went unlogged while
+     * every success printed a spurious FAILED line) */
+    if (vita_icon_decode_png(buf, (unsigned long)n,
+                             &icon_pix[idx], &icon_w[idx], &icon_h[idx]) != 0) {
         fprintf(stderr, "[icon] png decode FAILED: '%s' size=%ld\n",
                 path, n);
         fflush(stderr);
@@ -1243,6 +1222,11 @@ static void scan_games(void) {
     SceIoDirent ent;
     game_count = 0;
     memset(games, 0, sizeof(games));
+    /* v01.78g: drop the previous scan's textures HERE. Freeing them on the
+     * menu-exit path is what crashed; releasing them at scan start is
+     * equivalent (every slot is about to be rewritten) and guarantees the
+     * slots never hold a stale pointer while the VM owns the heap. */
+    icon_cache_clear();
 
     d = sceIoDopen(GAMES_DIR);
     if (d < 0) {
@@ -1315,17 +1299,13 @@ static void scan_games(void) {
             }
             /* decode icon from the cached PNG bytes (cheap, no jar IO) */
             if (icon_png_len_c > 0 && icon_png != NULL) {
-                /* restore_kept() may have parked last round's texture
-                 * here: free it before decode overwrites the pointer
-                 * (leaks one icon per game per round otherwise). */
-                free(icon_pix[game_count]);
-                icon_pix[game_count] = NULL;
-                icon_w[game_count] = icon_h[game_count] = 0;
+                /* the slot is NULL here (icon_cache_clear() ran at scan
+                 * start), so the decode can hand its buffer over directly */
                 if (vita_icon_decode_png(icon_png,
                                          (unsigned long)icon_png_len_c,
                                          &icon_pix[game_count],
                                          &icon_w[game_count],
-                                         &icon_h[game_count])) {
+                                         &icon_h[game_count]) != 0) {
                     fprintf(stderr,
                             "[icon] cached png decode FAILED\n");
                     fflush(stderr);
@@ -1372,17 +1352,9 @@ static void scan_games(void) {
              * directory and fall back to the best MIDlet-ish class;
              * persist the fix in game.cfg */
             validate_game_class(g, 1);
-            /* cache-miss path decodes straight into icon_pix[idx]:
-             * same overwrite-leak guard as the cache-hit path above
-             * (restore_kept() parks old textures in these slots). */
-            free(icon_pix[game_count]);
-            icon_pix[game_count] = NULL;
-            icon_w[game_count] = icon_h[game_count] = 0;
+            /* cache-miss path decodes straight into icon_pix[idx]; the slot
+             * is NULL because icon_cache_clear() ran at scan start */
             icon_load(g, game_count);
-
-            /* keep this scan's decoded texture alive across the rescan
-             * (icon_cache_clear would otherwise free it) */
-            icon_cache_keep(game_count);
 
             /* persist for next boot: name/cls/icon path + icon PNG
              * source bytes so next boot skips every jar open */
@@ -1402,7 +1374,9 @@ static void scan_games(void) {
         game_count++;
     }
     sceIoDclose(d);
-    icon_cache_restore_kept();
+    /* (v01.78g: no icon-cache bookkeeping here - the textures decoded by
+     * this scan are owned by icon_pix[0..game_count-1] until the next
+     * scan_games() releases them) */
 }
 
 static void uninstall_game(GameEntry *g) {
@@ -1444,7 +1418,13 @@ static void install_inbox(char *msg, size_t msg_sz) {
             continue;
         }
         snprintf(base, sizeof(base), "%s", ent.d_name);
-        base[blen - 4] = '\0';
+        /* v01.78g: re-derive the length from the *copied* name. ent.d_name
+         * can be longer than base[128], and base[blen-4] then wrote past
+         * the end of the buffer (a stack smash, not just a wrong name). */
+        blen = strlen(base);
+        if (blen >= 5 && strcmp(base + blen - 4, ".jar") == 0) {
+            base[blen - 4] = '\0';
+        }
 
         snprintf(dstdir, sizeof(dstdir), GAMES_DIR "/%s", base);
         sceIoMkdir(dstdir, 0777);
@@ -1819,7 +1799,12 @@ static int install_jar(const char *jarpath, char *msg, size_t msg_sz) {
         return 0;
     }
     snprintf(base, sizeof(base), "%s", bn);
-    base[blen - 4] = '\0';
+    /* v01.78g: use the length that actually landed in base[] - a path with
+     * a basename longer than the buffer made base[blen-4] write past it. */
+    blen = strlen(base);
+    if (blen >= 5 && strcmp(base + blen - 4, ".jar") == 0) {
+        base[blen - 4] = '\0';
+    }
     snprintf(dstdir, sizeof(dstdir), GAMES_DIR "/%s", base);
     sceIoMkdir(dstdir, 0777);
     snprintf(dstjar, sizeof(dstjar), "%s/" JAR_NAME, dstdir);
@@ -2499,8 +2484,17 @@ int vita_menu_run(VitaGameSel *out) {
         sceDisplayWaitVblankStart(); /* 60 Hz, no flicker */
     }
 
-    icon_cache_clear();
-    icon_cache_restore_kept();
+    /* v01.78g: deliberately NO icon-cache release here. Freeing the cached
+     * textures on the way out of the menu walked the malloc arena with
+     * state the VM had already churned and took the emulator down right at
+     * the return (PC=0, LR pointing just after the old restore_kept() call)
+     * - the same symptom the user hit on the quit tab. scan_games()
+     * releases the blocks at a safe point instead, and the resident set is
+     * only what the menu already held while it was up. */
+    crumb_marker("menu exit");
+    crumb_printf("menu exit: have_sel=%d games=%d", have_selection,
+                 game_count);
+    crumb_flush();
 
     /* Keep menu_fb allocated after the menu exits (no free): the display
      * still scans it out until the VM installs its own framebuffer, and
