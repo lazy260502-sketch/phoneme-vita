@@ -584,6 +584,23 @@ set(VITA_VERSION  "01.77")
 #   Untouched on purpose: game scan/cache/dialog, install_inbox,
 #   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
 set(VITA_VERSION  "01.78")
+# 01.78h (2026-09-17): quit STILL hung on v01.78g. New forensics on the
+#   unstripped binary (nm + objdump) nailed the crash site: PC was
+#   vita_menu_run's EPILOGUE `ldmia.w sp!, {r4,r5,r7,r8,r9,sl,fp,pc}`
+#   (0x8100682a in b255), SP=0x80000328 = entrySP-32 = the saved-register
+#   block itself, and EVERY popped register read 0 while crumb.log showed
+#   30000+ healthy heartbeats and the exit breadcrumbs written fine. So
+#   the block was zeroed sometime DURING the session and only gets read
+#   by that final pop - patching the exit path can never help. Also
+#   disproven: stack overflow (main thread stack is 0x18000 = 96 KB in
+#   the module params; usage ~3 KB) and the v01.78g "PNG rowbytes +
+#   batch free" theory. Fix: the menu now leaves via
+#   longjmp(vita_menu_escape, 1); main arms it with setjmp before the
+#   call (jmp_buf in .bss, out of the walker's reach) and reads the
+#   answer from vita_menu_result - no epilogue pop executes at all.
+#   Forensics kept: a volatile sentinel array in the frame checked by
+#   the 1 s heartbeat prints "menu sen BAD" the moment any similar
+#   zero-writer strikes again, bracketing it to one heartbeat window.
 # 01.78f (2026-09-17): fixed the 设置 tab stealing the games cursor
 #   (user report: "on 设置 the UP/DOWN keys do nothing, they actually
 #   move the installed-games list").

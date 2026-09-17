@@ -22,6 +22,7 @@
  */
 
 #include <stdarg.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1864,6 +1865,12 @@ static void inbox_scan(void) {
     sceIoDclose(d);
 }
 
+/* v01.78h exit-via-longjmp state (see vita_menu.h for the rationale).
+ * Defined here so the jmp_buf lives in .bss: whatever zeroes the top
+ * of the menu frame cannot touch it. */
+jmp_buf vita_menu_escape;
+int vita_menu_result = 0;
+
 int vita_menu_run(VitaGameSel *out) {
     /* Allocate ONCE per process and reuse across rounds: menu_fb is a
      * static, so a plain memalign here used to overwrite the pointer
@@ -1884,7 +1891,9 @@ int vita_menu_run(VitaGameSel *out) {
         crumb_printf("menu: CDRAM alloc FAILED block=0x%08x",
                      (unsigned)menu_fb_blk.block);
         crumb_flush();
-        return 0;
+        vita_menu_result = 0;
+        longjmp(vita_menu_escape, 1);
+        return 0; /* not reached */
     }
     crumb_printf("menu: fb=%p/%p block=0x%08x", menu_fb_front, menu_fb_back,
                  (unsigned)menu_fb_blk.block);
@@ -1914,6 +1923,15 @@ int vita_menu_run(VitaGameSel *out) {
     int have_selection = 0;
     char msg[120] = "";
     unsigned long long msg_us = 0;
+    /* v01.78h forensics: the mystery zero-writer that cleared the old
+     * saved-register block may strike this frame again. A known pattern
+     * checked by the 1 s heartbeat brackets any corruption to a single
+     * second - the "menu sen BAD" line names the exact heartbeat.
+     * volatile: without it GCC may fold the checks away (sen never has
+     * its address taken, so alias analysis assumes calls can't touch it). */
+    volatile unsigned sen[8];
+    int k;
+    for (k = 0; k < 8; k++) sen[k] = 0xC0DE0000u + (unsigned)k;
 
     for (;;) {
         unsigned int btn = poll_buttons();
@@ -1941,6 +1959,14 @@ int vita_menu_run(VitaGameSel *out) {
                              menu_flip_count,
                              (unsigned)menu_last_flip_rc,
                              game_count, btn);
+                /* v01.78h: sentinel check (see sen[] above) */
+                for (k = 0; k < 8; k++) {
+                    if (sen[k] != 0xC0DE0000u + (unsigned)k) {
+                        crumb_printf("menu sen BAD i=%d w=%08x want=%08x",
+                                     k, sen[k], 0xC0DE0000u + (unsigned)k);
+                        break;
+                    }
+                }
                 crumb_flush();
             }
         }
@@ -2492,15 +2518,22 @@ int vita_menu_run(VitaGameSel *out) {
      * releases the blocks at a safe point instead, and the resident set is
      * only what the menu already held while it was up. */
     crumb_marker("menu exit");
-    crumb_printf("menu exit: have_sel=%d games=%d", have_selection,
-                 game_count);
+    crumb_printf("menu exit: have_sel=%d games=%d sen0=%08x",
+                 have_selection, game_count, sen[0]);
     crumb_flush();
 
-    /* Keep menu_fb allocated after the menu exits (no free): the display
-     * still scans it out until the VM installs its own framebuffer, and
-     * handing those pages back to malloc let the VM heap overwrite them -
-     * garbage on screen during startup (v01.27 "no picture" symptom).
-     * The block itself lives for the whole process now (see the alloc
-     * above): nothing is leaked per round anymore. */
-    return have_selection;
+    /* v01.78h: leave via longjmp, NOT via the epilogue. Forensics on the
+     * v01.78g crash (nm + objdump on the unstripped binary): the crash PC
+     * was the epilogue `ldmia.w sp!, {r4,r5,r7,r8,r9,sl,fp,pc}` of this
+     * function; the crash SP (0x80000328) equals entrySP-32, i.e. the
+     * saved-register block itself, and EVERY popped register read as 0
+     * while the loop above had been healthy for 20000+ flips and the
+     * breadcrumbs just above these lines wrote out fine. So the block was
+     * zeroed sometime during the session and only gets read here. Jumping
+     * out restores the registers from the .bss jmp_buf instead - main
+     * arms it with setjmp(vita_menu_escape) before the call and never
+     * returns itself (for(;;)), so no epilogue pop executes at all. */
+    vita_menu_result = have_selection;
+    longjmp(vita_menu_escape, 1);
+    return have_selection; /* not reached */
 }

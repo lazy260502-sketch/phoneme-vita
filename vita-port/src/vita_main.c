@@ -271,7 +271,11 @@ int main(int argc, char *argv[]) {
      * launch.cfg lines: <jar path> / <class> / [portrait|landscape] */
     copy_file("app0:/data/J2ME00001/Hello.jar", DATA_DIR "/Hello.jar");
     {
-        VitaGameSel sel;
+        /* v01.78h: static (not stack) + never written between setjmp and
+         * longjmp EXCEPT via the menu's out-pointer - both keep the
+         * longjmp read below on the defined side of C99 7.13.2.1p3 and
+         * put the struct out of reach of the stack zero-writer. */
+        static VitaGameSel sel;
         sceIoMkdir(DATA_DIR "/games", 0777);
         sceIoMkdir(DATA_DIR "/inbox", 0777);
 
@@ -351,8 +355,18 @@ int main(int argc, char *argv[]) {
 
             /* Native game menu: pick an installed game (see vita_menu.c
              * for the games/ + inbox/ layout). Falls through to
-             * launch.cfg / Hello when the user quits without a selection. */
-            if (vita_menu_run(&sel)) {
+             * launch.cfg / Hello when the user quits without a selection.
+             * v01.78h: the menu exits via longjmp (see vita_menu.h) -
+             * never through its epilogue pop, which read a zeroed
+             * saved-register block on quit in v01.78g. main never
+             * returns either (for(;;)), so the jmp lands in a frame
+             * that stays valid for the whole process. */
+            vita_menu_result = 0;
+            if (setjmp(vita_menu_escape) == 0) {
+                vita_menu_run(&sel);
+                /* not reached: the menu always longjmps */
+            }
+            if (vita_menu_result) {
                 snprintf(jar_path, sizeof(jar_path), "%s", sel.jar);
                 snprintf(class_name, sizeof(class_name), "%s", sel.cls);
                 snprintf(orient, sizeof(orient), "%s", sel.orient);
