@@ -1484,7 +1484,9 @@ enum { DLG_LAUNCH = 0, DLG_ORIENT, DLG_UNINSTALL, DLG_BACK, DLG_N };
  *   [文件]   minimal file browser (ux0:/data/J2ME00001 sandbox)
  *   [设置]   view-only info + game view toggle, persisted in menu.cfg
  *   [退出]   quit the menu (fallback to launch.cfg / bundled tests)
- * Tabs switch with L/R shoulder buttons or by tapping the tab column.
+ * Tabs switch with L/R shoulder buttons, dpad left/right (lists switch
+ * directly; the grid steps within a row and switches at the edge column)
+ * or by tapping the tab column.
  * ================================================================== */
 #define TAB_N        5
 #define TABBAR_W     220
@@ -1828,14 +1830,21 @@ int vita_menu_run(VitaGameSel *out) {
                 }
             }
             if (btn & SCE_CTRL_LEFT) {
-                if (tab == 0 && set_list_grid == TAB_GRIDMODE && gsel > 0) {
-                    gsel--;
+                if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
+                    (gsel % cols) != 0) {
+                    gsel--;        /* grid: step within the row */
+                } else if (tab > 0) {
+                    tab--;         /* leftmost column / any list */
+                    msg[0] = '\0';
                 }
             }
             if (btn & SCE_CTRL_RIGHT) {
                 if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
-                    gsel < nent - 1) {
-                    gsel++;
+                    gsel < nent - 1 && (gsel % cols) != cols - 1) {
+                    gsel++;        /* grid: step within the row */
+                } else if (tab < TAB_N - 1) {
+                    tab++;         /* rightmost column / any list */
+                    msg[0] = '\0';
                 }
             }
             /* scroll clamp: list rows use item units, the grid keeps
@@ -2069,7 +2078,7 @@ int vita_menu_run(VitaGameSel *out) {
             }
             draw_text(24, ty + 22, label, 3, (i == tab) ? C_FG : C_HINT);
         }
-        draw_text(12, FB_H - 20, "L/R switch tab", 1, C_HINT);
+        draw_text(12, FB_H - 20, "L/R or dpad switch tab", 1, C_HINT);
 
         /* ---- content area per tab ---- */
         y = 64;

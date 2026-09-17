@@ -584,6 +584,10 @@ set(VITA_VERSION  "01.77")
 #   Untouched on purpose: game scan/cache/dialog, install_inbox,
 #   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
 set(VITA_VERSION  "01.78")
+# 01.78b (2026-09-17): dpad left/right now also switch tabs (user
+#   request). Lists switch directly; the installed grid steps within
+#   the row and only switches tab at the edge columns (TV convention,
+#   so grid navigation is not hijacked). Hint line updated.
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
