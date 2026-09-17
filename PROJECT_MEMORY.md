@@ -25,7 +25,9 @@
 - 注意 crumb 走自己的 sceIo 通道，不进 midp_stderr.log。
 
 ### 交付 / 验证
-- `out/vpk/midp_vita_v01.78g_tabui.vpk`（v01.78 **b255**，hash `aca83cc`，md5 `63893f77362e8cabde3fb29155e74cab`，3640913 B）。
+- `out/vpk/midp_vita_v01.78g_tabui.vpk`（v01.78 **b255**，内嵌 hash `aca83cc`，md5 `63893f77362e8cabde3fb29155e74cab`，3640913 B）。
+  - 内嵌 hash 是**构建时的树状态**（提交前）：本版改动先提交为 `aca83cc`，随后因补录本条记忆 `--amend` 成 `8f5ea66`——VPK 里的 hash 与最终提交号不一致是 amend 的正常副作用（同 v01.78e/`1d39c08` 的情形），代码内容一致。
+  - 注意 `--amend` 会改提交号：**若在乎内嵌 hash 与提交号一致，就"先提交、再构建、不 amend"**（本次教训）。
 - 复测要点（Vita3K）：① 点"退出"标签；② 焦点在标签栏对"退出"按 X；③ 退出后重启游戏确认菜单可重入；④ 图标仍正常显示（若某图标变纯文本，看 midp_stderr.log 的 `[icon] png decode FAILED`，说明该 PNG 行距不是 w*4，属预期防御）。
 
 ### 工具链经验（本轮新增，务必记住）
