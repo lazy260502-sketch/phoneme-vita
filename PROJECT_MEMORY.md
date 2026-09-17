@@ -1,9 +1,36 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-17
 
-## 2026-09-17 v01.78g：**退出标签闪退定案**——PNG 行距假设砸堆 + 退出路径批量 free（重要！）
+## 2026-09-17 v01.78h：**退出卡死真定案**——保存寄存器块被会话中途清零，退出改走 longjmp（治标+取证）
 
-> 用户报告："分区显示了，点击退出标签，出异常了，vita3k 闪退"。前序 v01.78b~f 均为菜单 UX 迭代（双焦点模型、文件根目录/分区、设置项持久化），本条是**回归缺陷**，根因在 v01.78f 的图标缓存改动里。
+> 用户复测 v01.78g："退出，依然卡死"。本轮用 nm/objdump/readelf/od 取证**推翻 v01.78g 的全部归因**（PNG 行距砸堆 + 退出批量 free——那些修复本身没错，但不是本次崩溃的原因），锁定真正崩溃帧并给出确定性修复。
+
+### 取证链（全部实测，非推测）
+1. **崩溃 PC = `vita_menu_run` 尾声 `ldmia.w sp!, {r4,r5,r7,r8,r9,sl,fp,pc}`（0x8100682a @ b255）**：`nm -n` 界定函数边界 `0x810048b2..0x8100682d`，objdump 序言 `stmdb sp!,{…lr}` + `sub.w sp,#800`、尾声 `add.w r7,#776; mov sp,r7; ldmia.w sp!,{…,pc}` 全平衡。
+2. **崩溃 `SP=0x80000328` = 入口 SP−32 = 保存寄存器块本身**；pop 出的 `r4..r11` 全 0、PC=0 ⇒ **保存块被零填充**。
+3. **`LR=0x81010a3b` 是陈旧值**（`crumb_flush` 内 `blx sceIoClose` 的返回地址，落在函数边界之外）——**不可作归因依据**，上轮误用。
+4. **栈溢出被推翻**：VELF 文件偏移 0x2d65a0 的模块参数区 `od` 读出 `main_thread_stacksize=0x18000`（96 KB），实际用 ~3 KB。
+5. **crumb.log 决定性证据**：心跳健康跑到 30000+ flips（约 8 分钟），`==== menu exit ====`、`menu exit: have_sel=0 games=8` 全部写出，**然后** pop 才读到全零 ⇒ 零写在会话中途某刻发生，pop 只是唯一读点。**只改退出路径永远无效。**
+
+### 根因状态
+- **谁写的零未定**（帧内无局部数组能到保存块：`msg[120]` 在帧中下部，帧顶 528..776 全是 4 字节标量槽；所有 memset/memcpy/snprintf 均有界）。嫌疑面：另一线程或 HLE 钉住的钉子（如 `sceAppMgrGetDevInfo` 的 HLE 实现写内存）宜用哨兵下次会话夹逼。
+- 崩溃签名口诀（新教训）：**崩溃寄存器全 0 + PC=0 + SP 恰为某函数帧的入口SP−(保存块大小) ⇒ 优先怀疑该函数帧被异步清零，而非调用链下游。LR 须先用 nm 验证是否落在函数边界内，陈旧 LR 不可归因。**
+
+### 修复（确定性，不再依赖找到写者）
+- **退出不走尾声 pop**：`vita_menu_run` 所有出口改 `longjmp(vita_menu_escape, 1)`；`main` 调用前 `setjmp(vita_menu_escape)`，返回后读 `.bss` 的 `vita_menu_result`。jmp_buf 在 `.bss`（0x812f6338），清零者够不到；反汇编验证：退出路径 `crumb_flush → str vita_menu_result → bl longjmp`，**无任何 `ldmia …,pc`**。
+- **`sel` 改 static**（C99 7.13.2.1p3：setjmp 后经指针修改的非 volatile 自动变量 longjmp 后读取是 UB；同时彻底免疫栈清零）。
+- **取证哨兵保留**：帧内 `volatile unsigned sen[8]`（0xC0DE0000+k 图案），心跳每秒校验，一旦被清零打 `menu sen BAD i=… w=… want=…`，下次会话即把清零时刻夹逼到 1 秒窗口，再结合 tab/动作定位写者。
+
+### 交付 / 验证
+- `out/vpk/midp_vita_v01.78h_longjmp.vpk`（v01.78 **b257**，内嵌 hash `5ecf5aa`，md5 `7b49312290b132c5b1ab5e1bd98e65c5`，3641291 B）。提交 `5ecf5aa`。
+- 复测要点（Vita3K）：① 点"退出"标签；② 焦点在标签栏对"退出"按 X；③ 选游戏→退出→再进菜单循环；④ 若仍异常，看 crumb.log 有无 `menu sen BAD`（有 ⇒ 帧内哨兵被碰，把那 1 秒内的操作告诉开发者；无 ⇒ 写者目标不是本帧，另查）。
+
+### 上轮结论更正
+- v01.78g 节的"PNG 行距砸堆 + 退出批量 free ⇒ 退出闪退"归因**不成立**（修复保留，但与本崩溃无关）；`LR=0x81006a04 bl icon_cache_restore_kept` 的归因当时就未验证函数边界。
+
+## 2026-09-17 v01.78g：退出闪退第一轮（归因已在 v01.78h 更正）
+
+> ⚠️ 本节归因已被 v01.78h 取证推翻（崩溃帧实为尾声 pop，与图标释放无关），但 PNG rowbytes 校验、退出不动堆、install 路径越界修复本身正确，全部保留。
 
 ### 崩溃现场取证
 - Vita3K 日志（Windows 宿主）：`PC: 0x00000000  SP: 0x80000328  LR: 0x81006a09`，`r4-r11` 全 0，`r2=0x3F(63)`；同一帧反复报 `Invalid read of uint32_t at address: 0x0, 0x4, 0x8, ... 0x1774`。
@@ -34,7 +61,7 @@
 - `midp_vita.velf` **已剥符号且无 DWARF** ⇒ `addr2line` 全 `??:0`、`nm` 为空。必须用同目录**未剥离**的 `midp_vita` 配 `arm-vita-eabi-nm -n midp_vita`；反汇编必须 `arm-vita-eabi-objdump -D -M force-thumb`（默认按 ARM 解码 Thumb 出乱码）。
 - `vita_version.h` **未被 git 跟踪**，构建前必须 `rm -f vita_version.h && touch CMakeLists.txt`，否则版本号/ hash 与提交不符。
 - **崩溃日志在 Windows 宿主 `C:\Users\zyb\Downloads\windows-latest\vita3k.log`，容器内无法访问（`/mnt/c` 不存在）** ⇒ 取证要么让用户粘贴日志，要么在代码里自证（`crumb.log` / `midp_stdout.log` / `midp_stderr.log`）。日志链路：`tty->print*` → stdout → midp_stdout.log；`fprintf(stderr)` → midp_stderr.log。
-- 教训：**"退出瞬间崩"优先怀疑堆损坏**（越界写把 arena 砸了，触发点在很久之后的某个 free），而不是"退出路径本身写错了"。
+- 教训：**"退出瞬间崩"优先怀疑堆损坏**（越界写把 arena 砸了，触发点在很久之后的某个 free），而不是"退出路径本身写错了"。**（v01.78h 补注：本条对本菜单纯退出场景不成立——实测是尾声 pop 读到被清零的保存块；但结论对 free 序列崩溃场景仍有效。）**
 
 ## 2026-09-17 v01.78：TV 风格标签菜单——五标签 + 触摸 + 文件浏览器（未上机）
 
