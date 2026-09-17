@@ -52,7 +52,12 @@
  * Exported by vita_display.c. Returns 0 on hit, -1 in the letterbox. */
 extern int vita_display_map_touch(int px, int py, int *vx, int *vy);
 
-/* ---- SPSC ring: producer fills events, VM thread consumes them ---- */
+/* ---- SPSC ring: producer fills events, VM thread consumes them ----
+ * Lock-free correctness relies on there being exactly ONE producer
+ * AND one consumer thread (both are the VM thread today: the pump
+ * produces in checkForSystemSignal, the scheduler drains it). A
+ * second producer would race ring_head; if one is ever added this
+ * must become a critical-section ring. */
 static MidpEvent event_ring[VITA_INPUT_RING_SIZE];
 static volatile int ring_head = 0; /* written by producer */
 static volatile int ring_tail = 0; /* written by consumer */

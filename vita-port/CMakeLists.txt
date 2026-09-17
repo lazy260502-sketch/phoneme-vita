@@ -543,6 +543,24 @@ set(VITA_VERSION  "01.75")
 #     sceAudioOutOpenPort call misused param 2 as "channel count" (it is
 #     samples-per-call) - a landmine if anyone ever compiled it in.
 set(VITA_VERSION  "01.76")
+# 01.77 (2026-09-17): Graphics/input review round (no IO round - that was
+#   01.76; memory audit came back clean, no code change needed there).
+#   - vita_display.c flip_to_display: after the NEXTFRAME submit it now
+#     calls sceDisplayWaitVblankStart() before handing the buffer back
+#     as the new back buffer. NEXTFRAME only takes effect at the next
+#     vblank; until then scanout still reads the old front, so a fast
+#     repaint loop could blit into the just-swapped buffer before the
+#     flip landed and tear the frame. menu_flip() always paired the two;
+#     display side now matches. Also caps refresh at 60 Hz (fine for a
+#     software blit).
+#   - flip_to_display now checks sceDisplaySetFrameBuf's return code and
+#     logs it once per process to stderr (menu_flip already did; this is
+#     how the 01.69 IMMEDIATE 0x80290006 on fw 3.65 was found).
+#   - lfjport_ui_finalize: comment documenting the one-frame scanout
+#     window on release (left as-is; runs only at VM shutdown).
+#   - vita_input.c ring_push: comment nailing down the SPSC invariant
+#     (exactly one producer AND one consumer, both the VM thread today).
+set(VITA_VERSION  "01.77")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling

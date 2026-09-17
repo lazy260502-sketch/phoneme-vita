@@ -144,6 +144,7 @@ int vita_display_map_touch(int px, int py, int *vx, int *vy) {
 static void flip_to_display(void) {
     SceDisplayFrameBuf fb;
     int x, y;
+    int rc;
     uint32_t *tmp;
 
     if (vita_fb == NULL) {
@@ -174,8 +175,26 @@ static void flip_to_display(void) {
      * (0x80290006) on real fw 3.65 (see vita_menu.c menu_flip).
      * v01.70: submit the just-blitted back buffer, then swap; the next
      * blit goes into the old front while the display scans the new
-     * one out. */
-    sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
+     * one out.
+     * v01.77: NEXTFRAME only takes effect at the NEXT vblank; until
+     * then scanout still reads the old front buffer. Without a wait
+     * here a fast repaint loop could finish blitting into the (just
+     * swapped) new back buffer before the flip lands and tear the
+     * frame - menu_flip() has always paired the submit with
+     * sceDisplayWaitVblankStart(), this side now does the same. It
+     * also caps the refresh rate at 60 Hz, which a software blit
+     * cannot exceed anyway. */
+    rc = sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
+    if (rc < 0) {
+        /* once per process: a persistent error would spam 60 lines/s */
+        static int reported = 0;
+        if (!reported) {
+            reported = 1;
+            fprintf(stderr, "vita_display: SetFrameBuf rc=0x%08x\n", rc);
+        }
+        return;
+    }
+    sceDisplayWaitVblankStart();
     tmp = vita_fb_front;
     vita_fb_front = vita_fb;
     vita_fb = tmp;
@@ -260,6 +279,12 @@ void lfjport_ui_finalize(void) {
         vita_fb_front = NULL;
         vita_fb_back = NULL;
         vita_fb = NULL;
+        /* NOTE (review v01.77, left as-is): the display may still be
+         * scanning this block out for up to one more frame when we
+         * hand it back - the same window vita_menu.c avoids by keeping
+         * its fb allocated. Accepted here because finalize only runs
+         * at VM shutdown, right before the menu reclaims the display,
+         * so the worst case is a single garbage frame. */
         vita_fbmem_release(&vita_fb_blk);
     }
 }
