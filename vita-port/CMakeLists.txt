@@ -584,6 +584,15 @@ set(VITA_VERSION  "01.77")
 #   Untouched on purpose: game scan/cache/dialog, install_inbox,
 #   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
 set(VITA_VERSION  "01.78")
+# 01.78e (2026-09-17): fixed the empty 文件 tab (user report: "the Vita
+#   root and partitions show nothing"). Root cause: fe_scan called
+#   sceIoDopen("/") and returned EARLY when it failed, so the partition
+#   probe that was supposed to be the fallback never ran. Now the root
+#   list is built by probing fe_devices[] (ux0:/ur0:/uma0:/imc0:/
+#   grw0:/xmc0:/xmc1:) with dir_exists first, then merging whatever
+#   sceIoDopen("/") does enumerate (deduped via fe_has) - the tab can
+#   no longer end up empty. Root rows also show "<free> / <total> MB"
+#   per partition via sceAppMgrGetDevInfo.
 # 01.78d (2026-09-17): user request round 3.
 #   - 文件 tab now browses from the Vita pseudo-root ("/" lists
 #     ux0:, ur0:, uma0:, ...) instead of the data dir sandbox; ".."

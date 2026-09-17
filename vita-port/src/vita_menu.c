@@ -1516,6 +1516,14 @@ static int fe_count = 0;
 static char fe_cwd[256] = "/";
 static const char *fe_root = "/";
 
+/* Candidate partitions probed when building the pseudo-root list.
+ * sceIoDopen("/") is NOT reliable (some firmware/emulator builds fail
+ * it outright), so the device list is built by probing these names and
+ * then merging whatever sceIoDopen("/") happens to return. */
+static const char *fe_devices[] = {
+    "ux0:", "ur0:", "uma0:", "imc0:", "grw0:", "xmc0:", "xmc1:"
+};
+
 /* ---- settings (menu.cfg + launch.cfg line 4) ---- */
 #define MENU_CFG DATA_ROOT "/menu.cfg"
 #define LAUNCH_CFG DATA_ROOT "/launch.cfg"
@@ -1630,6 +1638,16 @@ static int fe_parent(char *out, size_t outsz);
 /* Insert one entry keeping the invariant: ".." first, then dirs, then
  * files, each group alphabetically (lists are <= MAX_GAMES, insertion
  * sort is plenty). */
+static int fe_has(const char *name) {
+    int i;
+    for (i = 0; i < fe_count; i++) {
+        if (strcmp(fes[i].name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void fe_insert(const char *name, const char *full, int type) {
     int i, j;
     if (fe_count >= MAX_GAMES) {
@@ -1669,6 +1687,44 @@ static void fe_scan(const char *path) {
         fe_parent(parent, sizeof(parent));
         fe_insert("..", parent, FE_DIR);
     }
+    if (strcmp(path, "/") == 0) {
+        /* Root: build the partition list by probing (see fe_devices),
+         * then merge anything sceIoDopen("/") returns that we did not
+         * already add. The old code early-returned when sceIoDopen
+         * failed, which skipped the fallback and left the tab empty. */
+        int i;
+        for (i = 0; i < (int)(sizeof(fe_devices) / sizeof(fe_devices[0]));
+             i++) {
+            if (dir_exists(fe_devices[i])) {
+                fe_insert(fe_devices[i], fe_devices[i], FE_DIR);
+            }
+        }
+        d = sceIoDopen("/");
+        if (d >= 0) {
+            for (;;) {
+                memset(&ent, 0, sizeof(ent));
+                if (sceIoDread(d, &ent) <= 0) {
+                    break;
+                }
+                if (ent.d_name[0] == '\0' || ent.d_name[0] == '.' ||
+                    fe_has(ent.d_name)) {
+                    continue;
+                }
+                fe_insert(ent.d_name, ent.d_name, FE_DIR);
+            }
+            sceIoDclose(d);
+        }
+        if (fe_count == 0) {
+            /* last resort: neither the probe nor the enumeration
+             * answered (both should be impossible on a real Vita).
+             * ux0: is where the data dir lives, so list it verbatim so
+             * the tab is never blank and the user sees a device name
+             * to work from. */
+            fe_insert("ux0:", "ux0:", FE_DIR);
+            fe_insert("ur0:", "ur0:", FE_DIR);
+        }
+        return;
+    }
     d = sceIoDopen(path);
     if (d < 0) {
         return;
@@ -1683,13 +1739,8 @@ static void fe_scan(const char *path) {
         if (strcmp(ent.d_name, ".") == 0 || strcmp(ent.d_name, "..") == 0) {
             continue;
         }
-        if (strcmp(path, "/") == 0) {
-            /* root children are device names ("ux0:") - keep them as
-             * their own absolute path, no leading slash */
-            snprintf(full, sizeof(full), "%s", ent.d_name);
-        } else {
-            const char *sep =
-                (path[strlen(path) - 1] == '/') ? "" : "/";
+        {
+            const char *sep = (path[strlen(path) - 1] == '/') ? "" : "/";
             snprintf(full, sizeof(full), "%s%s%s", path, sep, ent.d_name);
         }
         if (SCE_S_ISDIR(ent.d_stat.st_mode)) {
@@ -1700,19 +1751,6 @@ static void fe_scan(const char *path) {
         fe_insert(ent.d_name, full, type);
     }
     sceIoDclose(d);
-    /* fallback: if the pseudo-root did not enumerate (fw difference),
-     * probe the well-known partitions so the tab is never empty */
-    if (fe_count == 0 && strcmp(path, "/") == 0) {
-        static const char *parts[] = {
-            "ux0:", "ur0:", "uma0:", "imc0:", "grw0:", "xmc0:"
-        };
-        int i;
-        for (i = 0; i < (int)(sizeof(parts) / sizeof(parts[0])); i++) {
-            if (dir_exists(parts[i])) {
-                fe_insert(parts[i], parts[i], FE_DIR);
-            }
-        }
-    }
 }
 
 static int fe_parent(char *out, size_t outsz) {
@@ -2329,6 +2367,7 @@ int vita_menu_run(VitaGameSel *out) {
                       1, C_HINT);
             y = 80;
             {
+                int root_view = (fe_cwd[0] == '/' && fe_cwd[1] == '\0');
                 int shown = 0;
                 for (i = ftop; i < fe_count && shown < lines; i++) {
                     if (i == fsel) {
@@ -2338,6 +2377,16 @@ int vita_menu_run(VitaGameSel *out) {
                     draw_text(TABBAR_W + 20, y, fes[i].name, 2,
                               fes[i].type == FE_DIR ? C_TITLE :
                               (fes[i].type == FE_JAR ? C_FG : C_HINT));
+                    if (root_view && fes[i].type == FE_DIR) {
+                        uint64_t mx = 0, fr = 0;
+                        if (sceAppMgrGetDevInfo(fes[i].name, &mx, &fr) == 0 &&
+                            mx > 0) {
+                            draw_textf(FB_W - 250, y, 1, C_HINT,
+                                       "%llu / %llu MB",
+                                       (unsigned long long)(fr >> 20),
+                                       (unsigned long long)(mx >> 20));
+                        }
+                    }
                     y += row_h;
                     shown++;
                 }
