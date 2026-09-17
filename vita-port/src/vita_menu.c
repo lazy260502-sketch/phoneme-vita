@@ -1510,12 +1510,22 @@ typedef struct {
 
 static FileEntry fes[MAX_GAMES];
 static int fe_count = 0;
-static char fe_cwd[256] = DATA_ROOT;
-static const char *fe_root = DATA_ROOT;
+/* v01.78d: browse from the Vita pseudo-root ("/" lists ux0:, ur0:,
+ * uma0:, ...) so jars on any partition can be installed; the data
+ * dir is still where installs land. */
+static char fe_cwd[256] = "/";
+static const char *fe_root = "/";
 
-/* ---- settings (menu.cfg) ---- */
+/* ---- settings (menu.cfg + launch.cfg line 4) ---- */
 #define MENU_CFG DATA_ROOT "/menu.cfg"
+#define LAUNCH_CFG DATA_ROOT "/launch.cfg"
+enum { SET_VIEW = 0, SET_JIT, SET_N };
 static int set_list_grid = 0;      /* 0 = list, 1 = grid */
+static int set_jit = 0;            /* 0/1/2, mirrors launch.cfg "jit=" */
+
+static const char *jit_name(int j) {
+    return (j == 0) ? "关闭" : (j == 1) ? "仅首轮" : "每轮";
+}
 
 static void settings_load(void) {
     SceUID fd = sceIoOpen(MENU_CFG, SCE_O_RDONLY, 0);
@@ -1524,23 +1534,93 @@ static void settings_load(void) {
         int n = sceIoRead(fd, buf, sizeof(buf) - 1);
         sceIoClose(fd);
         if (n > 0) {
+            char *p, *nl;
             buf[n] = '\0';
-            if (buf[0] == 'g') {
-                set_list_grid = 1;
-            } else {
-                set_list_grid = 0;
+            for (p = buf; p != NULL; p = (nl != NULL) ? nl + 1 : NULL) {
+                nl = strpbrk(p, "\r\n");
+                if (nl != NULL) {
+                    *nl = '\0';
+                }
+                if (strncmp(p, "view=", 5) == 0) {
+                    set_list_grid = (p[5] == 'g');
+                } else if (strncmp(p, "jit=", 4) == 0 &&
+                           p[4] >= '0' && p[4] <= '2') {
+                    set_jit = p[4] - '0';
+                } else if (p[0] == 'g' || p[0] == 'l') {
+                    /* v01.78 single-char format */
+                    set_list_grid = (p[0] == 'g');
+                }
             }
         }
     }
 }
 
 static void settings_save(void) {
-    SceUID fd = sceIoOpen(MENU_CFG,
-                          SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    char buf[32];
+    int len;
+    SceUID fd;
+    sceIoRemove(MENU_CFG); /* Vita3K ignores O_TRUNC (v01.16 lesson) */
+    fd = sceIoOpen(MENU_CFG, SCE_O_WRONLY | SCE_O_CREAT, 0777);
     if (fd >= 0) {
-        char c = set_list_grid ? 'g' : 'l';
-        sceIoWrite(fd, &c, 1);
+        len = snprintf(buf, sizeof(buf), "view=%c\njit=%d\n",
+                       set_list_grid ? 'g' : 'l', set_jit);
+        sceIoWrite(fd, buf, len);
         sceIoClose(fd);
+    }
+}
+
+/* Persist the JIT policy as launch.cfg line 4. The first 3 lines
+ * (jar/class/orientation) are preserved; a missing launch.cfg gets a
+ * jit-only file, which read_launch_cfg rejects (empty jar/class) so
+ * the bundled defaults still win - only read_jit_policy sees it. */
+static void write_jit_to_launch_cfg(int jit) {
+    static char buf[512];
+    char keep[3][160];
+    int nkeep = 0, i, off = 0;
+    SceUID fd;
+    char *p, *nl;
+
+    memset(keep, 0, sizeof(keep));
+    fd = sceIoOpen(LAUNCH_CFG, SCE_O_RDONLY, 0);
+    if (fd >= 0) {
+        memset(buf, 0, sizeof(buf));
+        (void)sceIoRead(fd, buf, sizeof(buf) - 1);
+        sceIoClose(fd);
+        for (p = buf; p != NULL && nkeep < 3;
+             p = (nl != NULL) ? nl + 1 : NULL) {
+            nl = strpbrk(p, "\r\n");
+            if (nl != NULL) {
+                *nl = '\0';
+            }
+            if (p[0] != '\0' && strncmp(p, "jit=", 4) != 0) {
+                snprintf(keep[nkeep++], sizeof(keep[0]), "%s", p);
+            }
+        }
+    }
+    memset(buf, 0, sizeof(buf));
+    for (i = 0; i < nkeep; i++) {
+        off += snprintf(buf + off, sizeof(buf) - off, "%s\n", keep[i]);
+    }
+    snprintf(buf + off, sizeof(buf) - off, "jit=%d\n", jit);
+    sceIoRemove(LAUNCH_CFG);
+    fd = sceIoOpen(LAUNCH_CFG, SCE_O_WRONLY | SCE_O_CREAT, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, buf, strlen(buf));
+        sceIoClose(fd);
+    }
+}
+
+static void settings_toggle(int item, char *msg, size_t msg_sz) {
+    if (item == SET_VIEW) {
+        set_list_grid = !set_list_grid;
+        settings_save();
+        snprintf(msg, msg_sz, "游戏视图: %s",
+                 set_list_grid ? "网格" : "列表");
+    } else if (item == SET_JIT) {
+        set_jit = (set_jit + 1) % 3;
+        settings_save();
+        write_jit_to_launch_cfg(set_jit);
+        snprintf(msg, msg_sz, "JIT: %s", jit_name(set_jit));
     }
 }
 
@@ -1603,7 +1683,15 @@ static void fe_scan(const char *path) {
         if (strcmp(ent.d_name, ".") == 0 || strcmp(ent.d_name, "..") == 0) {
             continue;
         }
-        snprintf(full, sizeof(full), "%s/%s", path, ent.d_name);
+        if (strcmp(path, "/") == 0) {
+            /* root children are device names ("ux0:") - keep them as
+             * their own absolute path, no leading slash */
+            snprintf(full, sizeof(full), "%s", ent.d_name);
+        } else {
+            const char *sep =
+                (path[strlen(path) - 1] == '/') ? "" : "/";
+            snprintf(full, sizeof(full), "%s%s%s", path, sep, ent.d_name);
+        }
         if (SCE_S_ISDIR(ent.d_stat.st_mode)) {
             type = FE_DIR;
         } else {
@@ -1612,24 +1700,69 @@ static void fe_scan(const char *path) {
         fe_insert(ent.d_name, full, type);
     }
     sceIoDclose(d);
+    /* fallback: if the pseudo-root did not enumerate (fw difference),
+     * probe the well-known partitions so the tab is never empty */
+    if (fe_count == 0 && strcmp(path, "/") == 0) {
+        static const char *parts[] = {
+            "ux0:", "ur0:", "uma0:", "imc0:", "grw0:", "xmc0:"
+        };
+        int i;
+        for (i = 0; i < (int)(sizeof(parts) / sizeof(parts[0])); i++) {
+            if (dir_exists(parts[i])) {
+                fe_insert(parts[i], parts[i], FE_DIR);
+            }
+        }
+    }
 }
 
 static int fe_parent(char *out, size_t outsz) {
     char *slash;
-    if (strcmp(fe_cwd, fe_root) == 0) {
-        return 0; /* sandbox root - no parent */
+    if (fe_cwd[0] == '\0' || strcmp(fe_cwd, "/") == 0) {
+        return 0; /* Vita pseudo-root - no parent */
     }
     snprintf(out, outsz, "%s", fe_cwd);
     slash = strrchr(out, '/');
     if (slash == NULL) {
-        return 0;
+        snprintf(out, outsz, "/"); /* "ux0:" -> "/" */
+        return 1;
     }
     if (slash == out) {
-        slash[1] = '\0'; /* keep "ux0:" */
+        slash[1] = '\0'; /* "/ux0:" -> "/" */
     } else {
         *slash = '\0';
     }
     return 1;
+}
+
+/* Copy a jar across partitions (sceIoRename fails EXDEV there).
+ * Removes the destination first - Vita3K ignores O_TRUNC (v01.16). */
+static int copy_jar(const char *src, const char *dst) {
+    SceUID in = sceIoOpen(src, SCE_O_RDONLY, 0);
+    SceUID out;
+    static char buf[8192];
+    if (in < 0) {
+        return -1;
+    }
+    sceIoRemove(dst);
+    out = sceIoOpen(dst, SCE_O_WRONLY | SCE_O_CREAT, 0777);
+    if (out < 0) {
+        sceIoClose(in);
+        return -1;
+    }
+    for (;;) {
+        ssize_t n = sceIoRead(in, buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+        if (sceIoWrite(out, buf, n) < 0) {
+            sceIoClose(in);
+            sceIoClose(out);
+            return -1;
+        }
+    }
+    sceIoClose(in);
+    sceIoClose(out);
+    return 0;
 }
 
 /* install a jar picked from the inbox tab or the file browser by
@@ -1653,8 +1786,13 @@ static int install_jar(const char *jarpath, char *msg, size_t msg_sz) {
     sceIoMkdir(dstdir, 0777);
     snprintf(dstjar, sizeof(dstjar), "%s/" JAR_NAME, dstdir);
     if (sceIoRename(jarpath, dstjar) < 0) {
-        snprintf(msg, msg_sz, "install failed");
-        return 0;
+        /* cross-partition (e.g. uma0: -> ux0:) rename fails EXDEV;
+         * fall back to a copy. The SOURCE IS KEPT - a jar on another
+         * partition is the user's archive, not an inbox drop. */
+        if (copy_jar(jarpath, dstjar) < 0) {
+            snprintf(msg, msg_sz, "install failed");
+            return 0;
+        }
     }
     {
         GameEntry tmp;
@@ -1745,6 +1883,7 @@ int vita_menu_run(VitaGameSel *out) {
     int gsel = 0, gtop = 0;        /* grid cursor/scroll */
     int isel = 0, itop = 0;        /* inbox cursor/scroll */
     int fsel = 0, ftop = 0;        /* file browser cursor/scroll */
+    int setsel = 0;                /* settings option cursor */
     int mode = 0;                  /* 0 = normal, 1 = dialog */
     int dlg_sel = DLG_LAUNCH;
     int confirm_del = 0;
@@ -1993,7 +2132,8 @@ int vita_menu_run(VitaGameSel *out) {
                     }
                 }
                 if (tapped && tap_x >= TABBAR_W && fe_count > 0) {
-                    int row = (tap_y - 64) / row_h;
+                    /* tab 2 content starts at y=80 (below the cwd line) */
+                    int row = (tap_y - 80) / row_h;
                     int idx = ftop + row;
                     if (row >= 0 && idx >= 0 && idx < fe_count) {
                         FileEntry *e = &fes[idx];
@@ -2013,19 +2153,16 @@ int vita_menu_run(VitaGameSel *out) {
                 }
             } else if (tab == 3) { /* ---- 设置 ---- */
                 if (btn & SCE_CTRL_CROSS) {
-                    set_list_grid = !set_list_grid;
-                    settings_save();
-                    snprintf(msg, sizeof(msg), "games view: %s",
-                             set_list_grid ? "grid" : "list");
+                    settings_toggle(setsel, msg, sizeof(msg));
                     msg_us = sceKernelGetProcessTimeWide();
                 }
-                if (tapped && tap_x >= TABBAR_W && tap_y >= 64 &&
-                    tap_y < 64 + row_h) {
-                    set_list_grid = !set_list_grid;
-                    settings_save();
-                    snprintf(msg, sizeof(msg), "games view: %s",
-                             set_list_grid ? "grid" : "list");
-                    msg_us = sceKernelGetProcessTimeWide();
+                if (tapped && tap_x >= TABBAR_W && tap_y >= 64) {
+                    int row = (tap_y - 64) / row_h;
+                    if (row >= 0 && row < SET_N) {
+                        setsel = row;
+                        settings_toggle(setsel, msg, sizeof(msg));
+                        msg_us = sceKernelGetProcessTimeWide();
+                    }
                 }
             }
             /* tab 4 (退出) unreachable: tapping it breaks the loop and
@@ -2185,7 +2322,11 @@ int vita_menu_run(VitaGameSel *out) {
                 draw_text(TABBAR_W + 20, y + 52, INBOX_DIR, 2, C_FG);
             }
         } else if (tab == 2) {
-            draw_text(TABBAR_W + 12, 56, fe_cwd, 1, C_HINT);
+            /* cwd line: show the Vita pseudo-root as a friendly name */
+            draw_text(TABBAR_W + 12, 56,
+                      (fe_cwd[0] == '/' && fe_cwd[1] == '\0')
+                          ? "(Vita 根目录 / 分区列表)" : fe_cwd,
+                      1, C_HINT);
             y = 80;
             {
                 int shown = 0;
@@ -2203,22 +2344,39 @@ int vita_menu_run(VitaGameSel *out) {
             }
         } else if (tab == 3) {
             uint64_t maxb = 0, freeb = 0;
-            draw_text(TABBAR_W + 20, 76, "游戏视图:", 2, C_FG);
-            draw_text(TABBAR_W + 150, 76,
-                      set_list_grid ? "网格" : "列表", 2, C_TITLE);
-            draw_text(TABBAR_W + 20, 120, "按 X 或点击切换", 2, C_HINT);
+            /* option rows: UP/DOWN move setsel, X cycles the value */
+            y = 64;
+            for (i = 0; i < SET_N; i++) {
+                const char *val = (i == SET_VIEW)
+                                      ? (set_list_grid ? "网格" : "列表")
+                                      : jit_name(set_jit);
+                if (i == setsel) {
+                    fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
+                              row_h, (focus == 1) ? C_PANEL2 : C_SEL);
+                }
+                draw_text(TABBAR_W + 20, y,
+                          (i == SET_VIEW) ? "游戏视图" : "JIT 编译", 2,
+                          C_FG);
+                draw_text(TABBAR_W + 260, y, val, 2, C_TITLE);
+                y += row_h;
+            }
+            draw_text(TABBAR_W + 20, y + 8, "X 或点击切换选项值", 1, C_HINT);
+            y += 40;
             if (sceAppMgrGetDevInfo("ux0:", &maxb, &freeb) == 0) {
-                draw_textf(TABBAR_W + 20, 170, 2, C_FG,
-                           "ux0: free %llu MB / %llu MB",
+                draw_textf(TABBAR_W + 20, y, 2, C_FG,
+                           "ux0: 剩余 %llu MB / 共 %llu MB",
                            (unsigned long long)(freeb >> 20),
                            (unsigned long long)(maxb >> 20));
             }
-            draw_textf(TABBAR_W + 20, 210, 2, C_FG, "games: %d  inbox: %d",
+            y += 34;
+            draw_textf(TABBAR_W + 20, y, 2, C_FG, "游戏: %d  收件箱: %d",
                        game_count, inbox_count);
-            draw_text(TABBAR_W + 20, 250,
-                      "JIT: launch.cfg line4 jit=0|1|2", 2, C_HINT);
-            draw_text(TABBAR_W + 20, 290,
-                      "数据目录: ux0:/data/J2ME00001", 2, C_HINT);
+            y += 34;
+            draw_text(TABBAR_W + 20, y,
+                      "JIT 首轮后崩溃未解(v01.45), 慎开", 1, C_HINT);
+            y += 24;
+            draw_text(TABBAR_W + 20, y,
+                      "数据目录: ux0:/data/J2ME00001", 1, C_HINT);
         } else {
             /* tab 4 退出 content */
             draw_text(TABBAR_W + 20, 100, "按 X 或点击 退出 离开菜单", 2, C_FG);

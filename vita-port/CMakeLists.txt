@@ -584,16 +584,24 @@ set(VITA_VERSION  "01.77")
 #   Untouched on purpose: game scan/cache/dialog, install_inbox,
 #   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
 set(VITA_VERSION  "01.78")
-# 01.78c (2026-09-17): two-focus dpad navigation (user request #2:
-#   "LEFT/RIGHT moves the focus between the tab column and the
-#   content", not just tab cycling).
-#   - focus lives in the content area; LEFT pulls it out to the tab
-#     column (UP/DOWN walk the tabs there, RIGHT/X goes back in)
-#   - the installed grid only gives LEFT up at the edge column
-#   - L/R shoulders stay global tab shortcuts from either focus
-#   - visual state: focused tab = C_SEL + accent bar, current tab
-#     with focus elsewhere = C_PANEL2; content selection dims the
-#     same way while the tabs hold the focus; hint line is dynamic
+# 01.78d (2026-09-17): user request round 3.
+#   - 文件 tab now browses from the Vita pseudo-root ("/" lists
+#     ux0:, ur0:, uma0:, ...) instead of the data dir sandbox; ".."
+#     stops at "/". fe_scan appends the right separator so entries
+#     read "/ux0:" style paths. Installing a jar from ANOTHER
+#     partition falls back from sceIoRename (EXDEV) to a copy - the
+#     source is kept (a jar on uma0: is the user's archive, not an
+#     inbox drop). Tab-2 tap row math fixed to the y=80 content
+#     origin (was 64 since the cwd line was added).
+#   - 设置 tab is a real option list now: rows with a cursor
+#     (UP/DOWN + setsel), X or tap cycles the value. Options:
+#     游戏视图 (列表/网格) and JIT 编译 (关闭/仅首轮/每轮). Both
+#     persist - menu.cfg moved to a "view=/jit=" line format (the
+#     old single-char file still reads), and the JIT choice is
+#     written into launch.cfg line 4 so the main loop's
+#     read_jit_policy picks it up next round. Info block below the
+#     options keeps ux0 capacity, counts, the v01.45 JIT warning and
+#     the data dir.
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
