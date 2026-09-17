@@ -1,6 +1,16 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-17
 
+## 2026-09-17 v01.76：音频路径审查修复（未上机，与 v01.75 一并等真机验）
+
+> 全端口 SDK 规范审查（每函数 fd 配对扫描 + 人工复核）后的 3 处修复。fd 审计结论：全部配对（持久 fd 是设计，pcsl 句柄走 closefile 收尾）。
+
+- **`alog()` 自旋锁原子化**：旧 `while (lock); lock=1` 是 check-then-set，Vita 3 用户核下真竞态（VM 线程 + tone 线程并发调 alog）——交错行会污染挂死取证证据。改 `__sync_lock_test_and_set/__sync_lock_release`（ARMv7 ldrex/strex）。
+- **删除 `src/vita_audio.c` 死文件**：从未进构建；且其 `sceAudioOutOpenPort` 第 2 参数误当"声道数"传 1（实为每调用采样数），谁加回构建就是潜伏 bug。git 留档。
+- **`j2me_tone` 亲和裸 0 → 宏**：与 watchdog 统一 `SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT`。
+- 低优先已记录不动：`vita_net.c` 4 处 strcpy（inet_ntoa 最长 16B + PCSL 缓冲 ≥256B，实际安全）；`vita_main.c` mkdir 返回值未查（freopen 链会连锁暴露）。
+- 交付：`out/vpk/midp_vita_v01.76_review.vpk`（v01.76 b244, 33d42f2）。**未上机**——下次真机会话用这版，watchdog.log 预期不变（alive 首行 + HANG 双时钟行 + 三线程快照）。
+
 ## 2026-09-17 v01.75：看门狗规范审查版（未上机，等真机一并验）
 
 > 对照 vitasdk 头文件 + 本项目真机已验证实践的 code review，4 处修复，正常路径无行为变化。
