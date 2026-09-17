@@ -13,11 +13,21 @@
  *      is blind to the very scenario it hunts. Detection now counts
  *      poll ITERATIONS (12 x 250 ms ~= 3 s), no clock involved; the dual
  *      gettimeofday readings are kept in the REPORT for H2 evidence.
+ * v01.75 polish (code review against vitasdk headers):
+ *   - thread stack 0x2000 -> 0x4000: the dump path goes through
+ *     snprintf + sceIo* with a ~200 byte SceKernelThreadInfo on stack;
+ *     0x4000 matches j2me_tone, the project's verified floor. A stack
+ *     overflow here gets the thread KILLED by the kernel - exactly the
+ *     silent-watchdog failure this file exists to prevent.
+ *   - the HANG report now samples BOTH clocks: gettimeofday (newlib/
+ *     sceRtc链) AND sceKernelGetSystemTimeWide (kernel). If H2 is real,
+ *     WHICH of the two froze pinpoints the broken layer.
+ *   - cpuAffinityMask uses SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT
+ *     instead of a bare 0.
  */
 
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
-#include <psp2/kernel/processmgr.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -77,6 +87,12 @@ static wd_jlong wd_now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (wd_jlong)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Kernel clock (microseconds), independent of the gettimeofday chain:
+ * if H2 (clock freeze) is real, which of the two froze names the layer. */
+static wd_jlong wd_now_kernel_us(void) {
+    return (wd_jlong)sceKernelGetSystemTimeWide();
 }
 
 /* Write one line to the watchdog log (append, crash-safe like crumb) */
@@ -140,16 +156,27 @@ static int wd_thread_routine(SceSize args, void *argp) {
         if (reported) continue;  /* one report per hang */
 
         /* ---- hang detected: forensic snapshot ----
-         * clock liveness: two readings 100 ms apart must differ */
+         * clock liveness: two readings 100 ms apart must differ.
+         * BOTH clocks are sampled: gettimeofday (newlib/sceRtc) and the
+         * kernel time (sceKernelGetSystemTimeWide). kd ~= 100000 us if
+         * the kernel clock is healthy; d==0 with kd!=0 means only the
+         * gettimeofday chain froze (layer pinned), both stuck = deeper. */
         wd_jlong t0 = wd_now_ms();
+        wd_jlong k0 = wd_now_kernel_us();
         sceKernelDelayThread(100 * 1000);
         wd_jlong t1 = wd_now_ms();
+        wd_jlong k1 = wd_now_kernel_us();
         {
-            char buf[128];
+            char buf[256];
             int n = snprintf(buf, sizeof(buf),
-                             "[WD] HANG ce=%u polls=%d clock t0=%lld t1=%lld d=%lld\n",
-                             last_ce, stalled_polls, (long long)t0,
-                             (long long)t1, (long long)(t1 - t0));
+                             "[WD] HANG ce=%u polls=%d "
+                             "clock t0=%lld t1=%lld d=%lld | "
+                             "kclock k0=%lld k1=%lld kd=%lld us\n",
+                             last_ce, stalled_polls,
+                             (long long)t0, (long long)t1,
+                             (long long)(t1 - t0),
+                             (long long)k0, (long long)k1,
+                             (long long)(k1 - k0));
             wd_log(buf, n);
         }
 
@@ -170,7 +197,9 @@ void vita_watchdog_start(void) {
      * it for months). 0x10000150 = slightly LOWER priority than those
      * (higher numeric = lower prio), inside the known-good band. */
     SceUID t = sceKernelCreateThread("j2me_watchdog", wd_thread_routine,
-                                     0x10000150, 0x2000, 0, 0, NULL);
+                                     0x10000150, 0x4000, 0,
+                                     SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
+                                     NULL);
     if (t < 0) {
         /* log5 lesson: a silent return here is indistinguishable from
          * "watchdog fired but found nothing". Every failure is visible. */

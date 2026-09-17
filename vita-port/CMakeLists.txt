@@ -520,6 +520,17 @@ set(VITA_VERSION  "01.73")
 #   0x10000100; numeric higher = lower priority, so the watchdog stays
 #   the most pre-emptable thread in the process).
 set(VITA_VERSION  "01.74")
+# 01.75 (2026-09-17): code-review pass on vita_watchdog.c against the
+#   vitasdk headers (no behaviour change on the happy path):
+#   - thread stack 0x2000 -> 0x4000 (matches j2me_tone, the project's
+#     verified floor; a stack overflow gets the thread kernel-killed,
+#     i.e. a silently dead watchdog)
+#   - HANG report samples BOTH clocks now: gettimeofday AND
+#     sceKernelGetSystemTimeWide - if H2 is real, WHICH one froze names
+#     the broken layer (newlib/sceRtc chain vs kernel time)
+#   - cpuAffinityMask uses SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT
+#   - dropped unused <psp2/kernel/processmgr.h> include
+set(VITA_VERSION  "01.75")
 # 01.59 (2026-09-14): JSR 75 groundwork - the PCSL directory layer.
 #   pcsl_directory.h declares 8 entry points this port never implemented
 #   (grep pcsl_directory_ in vita_pcsl.c was empty), so anything calling
