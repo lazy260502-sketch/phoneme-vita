@@ -1922,6 +1922,7 @@ int vita_menu_run(VitaGameSel *out) {
     int isel = 0, itop = 0;        /* inbox cursor/scroll */
     int fsel = 0, ftop = 0;        /* file browser cursor/scroll */
     int setsel = 0;                /* settings option cursor */
+    int settop = 0;                /* settings scroll (setsel clamp) */
     int mode = 0;                  /* 0 = normal, 1 = dialog */
     int dlg_sel = DLG_LAUNCH;
     int confirm_del = 0;
@@ -2006,6 +2007,7 @@ int vita_menu_run(VitaGameSel *out) {
             int *psel = &sel, *ptop = &top;
             int nent = game_count;
             int in_content = (focus == 0); /* dpad drives the cursor */
+            int has_cursor = 1;            /* current tab has a list */
 
             if (tab == 0 && set_list_grid == TAB_GRIDMODE) {
                 psel = &gsel; ptop = &gtop;
@@ -2016,16 +2018,25 @@ int vita_menu_run(VitaGameSel *out) {
             } else if (tab == 2) {
                 psel = &fsel; ptop = &ftop;
                 nent = fe_count;
+            } else if (tab == 3) {
+                /* settings: its own cursor - defaulting to sel/top here
+                 * made UP/DOWN move the installed-games list instead */
+                psel = &setsel; ptop = &settop;
+                nent = SET_N;
+            } else {
+                /* tab 4 (退出): no list, dpad must not move anything */
+                has_cursor = 0;
+                nent = 0;
             }
 
-            if (in_content && (btn & SCE_CTRL_UP)) {
+            if (in_content && has_cursor && (btn & SCE_CTRL_UP)) {
                 if (tab == 0 && set_list_grid == TAB_GRIDMODE && gsel >= cols) {
                     gsel -= cols;
                 } else if (*psel > 0) {
                     (*psel)--;
                 }
             }
-            if (in_content && (btn & SCE_CTRL_DOWN)) {
+            if (in_content && has_cursor && (btn & SCE_CTRL_DOWN)) {
                 if (tab == 0 && set_list_grid == TAB_GRIDMODE &&
                     gsel + cols < nent) {
                     gsel += cols;
@@ -2063,7 +2074,7 @@ int vita_menu_run(VitaGameSel *out) {
                 if (gsel >= (gtop + grid_rows) * cols) {
                     gtop = gsel / cols - grid_rows + 1;
                 }
-            } else {
+            } else if (has_cursor) {
                 if (*psel < *ptop) *ptop = *psel;
                 if (*psel >= *ptop + lines) *ptop = *psel - lines + 1;
             }

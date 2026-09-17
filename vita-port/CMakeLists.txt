@@ -584,6 +584,15 @@ set(VITA_VERSION  "01.77")
 #   Untouched on purpose: game scan/cache/dialog, install_inbox,
 #   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
 set(VITA_VERSION  "01.78")
+# 01.78f (2026-09-17): fixed the 设置 tab stealing the games cursor
+#   (user report: "on 设置 the UP/DOWN keys do nothing, they actually
+#   move the installed-games list").
+#   The dpad cursor dispatcher had no tab==3 branch, so psel fell back
+#   to &sel/&top (the installed-games cursor) and nent stayed
+#   game_count. Now tab 3 gets its own cursor (setsel/settop, nent =
+#   SET_N) and tab 4 (退出, no list) is marked has_cursor=0 so the
+#   dpad moves nothing there. The scroll clamp only runs when the
+#   current tab actually has a list.
 # 01.78e (2026-09-17): fixed the empty 文件 tab (user report: "the Vita
 #   root and partitions show nothing"). Root cause: fe_scan called
 #   sceIoDopen("/") and returned EARLY when it failed, so the partition
