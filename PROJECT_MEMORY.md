@@ -3403,3 +3403,63 @@ UC 多 store 并存（空名设置库 FFFFFFFF + 书签库 + 缓存库），open
 - 首次 VPK 重编未触发 gen_version（版本头缓存 b203 d841b85），重建后
   正确：**v01.48 b206 (eb9b719)**，14458185 B。装 VPK 前先核对
   `strings midp_vita | grep version`。
+
+## 2026-09-18 v01.83：log9 coredump 定案"游戏轮次挂死"+ 泵墙钟兜底修复（dd73f18 / phoneme-cldc 57a1b3d）
+
+### 五轮取证链（log3→log9）
+- log3-log6：所有会话 0 次 `runMidlet returned`；挂点集中在 MIDlet 启动早期
+  （ToneTest stg1→stg2、FileManager startApp、封神榜 RMS open），println 逐字符打印中途冻结
+- log7：方向键分发器修复（v01.80）+ 心跳回放正常
+- log8（v01.81 看门狗优先级 0x10000100 修复后）：H2（时钟冻结）出局——
+  双时钟都活（d=100, kd=100062）；**vm RUNNING wait=none = 用户态满转**
+- log9（v01.82 看门狗故意数据中止触发 coredump）：转储解析定案
+
+### log9 转储解析方法（已验证，可复用）
+- `gunzip -c *.psp2dmp > core`；NOTE 布局：THREAD_INFO(0x1003)@0x694（5 线程，
+  步长 0xc8，名字 +0x10，pc +0xa4）；THREAD_REG_INFO(0x1004)@0x1e90
+  （主线程记录 +0：r0-r12 从 +0x10、sp=+0x44、lr=+0x48、pc=+0x4c）
+- MODULE_INFO：midp_vita 基址 0x81066000（本次 slide +0x66000，每次启动不同）；
+  栈回溯 = 扫栈段中 [基址,基址+大小) 的 dword 减 slide，nm bisect 定位
+- 转储只含栈段，不含代码/data/bss/Java 堆——BSS 静态变量运行时值不可读
+- 寄存器布局验证法：watchdog 线程 r0=0x81000000 r1=0x53455244（"DRES"）应与
+  触发指令 `*(volatile int*)0x81000000=0x53455244` 吻合 ✅
+
+### 现场重建（定案）
+- VM 线程 pc=`start_lightweight_thread_asm+0x8`、lr=桩入口、sp=分发层浅帧
+  （[sp+0]=`JVM::start+0x178`，`bl primordial_to_current_thread` 返回槽）、
+  r1=0（新线程无 TERMINATING 位）→ 调度器正把"从未运行过的 green 线程"交给引导桩
+- 残留帧：类加载 fread 链（open_entry→Inflater→parse_stackmaps→_read_r）+
+  一次线程切换（adjust_priority_list→set_current→on_task_switch）+ ani_mark CE#342 OUT
+- vm_boot.log 只有 `loop 0 enter`（JVM::start 从未返回）
+- **结论：green 线程生灭环**（线程死亡→重建→再死亡），环内无解释器 tick
+  检查点；`Scheduler::yield()` 的 VITA 泵门
+  `_timer_has_ticked || _estimated_event_readiness > 0` 永不满足
+  （后者只在 check_blocked_threads 内部递减；ticker 可被饿死）→
+  JVMSPI_CheckEvents 3 秒 0 次 → 整机表现卡死
+
+### 修复（v01.83）
+1. **phoneme-cldc Scheduler.cpp**（`#if defined(VITA)` 内，最小 diff）：
+   `wake_up_timed_out_sleepers` 加墙钟兜底——`vita_now - vita_last_pump_ms >= 50`
+   则无条件驱动 `check_blocked_threads(0)`。泵内 ANI 等待会真睡 50ms，
+   生灭环被节流、ticker/watchdog 不再饿死、事件恢复流转
+2. **OS_vita.cpp**：`vita_tick_count`（extern "C" volatile）计数 real_time_tick
+3. **vita_watchdog.c**：HANG 报告加 `tick=%u`——未来若再挂，一条日志即可分辨
+   "ticker 死了"vs"门没开"
+
+### 构建/产物
+- VM：`./rebuild_vm.sh`（33 对象，库守卫全过：jvm_fast_globals 单 D、无 C 解释器泄漏）
+- VPK：`out/vpk/midp_vita_v01.83_pump_backstop.vpk`（3639606 B，
+  md5 7c43c420624d495490aa83d8a4380850）
+- 提交：phoneme-cldc 57a1b3d（Scheduler+OS_vita，+21/-1）；
+  j2me 主仓 dd73f18（watchdog+CMakeLists 版本注释）
+
+### 复测判据（真机）
+- 正常轮次应能跑完（runMidlet returned 首次出现）
+- 若仍挂：watchdog.log 的 HANG 行 `tick=` 值——tick=0 → ticker 死；
+  tick 增长 → 门未开（本修复应已免疫）；且 v01.83 起泵每 50ms 必进，
+  `ce=` 不应再长时间冻结
+
+### 遗留
+- 生灭环的"第一因"（哪个 MIDlet 线程反复生灭）未从转储直接观测到
+  （Java 堆不在转储中）；兜底修复把环节流到可运行，若复测仍异常，
+  下一步可在桩入口加生命周期计数器
