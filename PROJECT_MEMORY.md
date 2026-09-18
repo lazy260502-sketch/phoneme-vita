@@ -1,5 +1,46 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-17
+> Last Updated: 2026-09-18
+
+## 2026-09-18 v01.79：**真机启动崩溃定案**——taiHEN 插件桩砸 r7（-O0 帧指针），`-fomit-frame-pointer` 根治（重要！）
+
+> 用户报告"真机启动报错"并附 `psp2core-1789660610-0x0000142ca1` 转储。**首次真机验证 v01.78h**（此前全部版本只在 Vita3K 验证）。本轮解析 Sony core dump（gzip → ARM ELF core，24 个 NOTE）完成取证。
+
+### 真机转储解析方法（新工具链，务必记住）
+- `psp2dmp` = gzip 压缩的 ARM ELF core。解压后 `readelf -l`：43 段 = 15 个 `0xe0xxxxxx/0x81xxxxxx` 内核/插件段 + 2 组重复的用户段（0x81641000 栈 0x40000、0xd0001000）+ 24 NOTE。
+- NOTE 按**标准 ELF note 格式**解析（namesz/descsz/type + 名字）：`THREAD_REG_INFO`(0x1004)、`PROCESS_INFO`(0x1002)、`MODULE_INFO`(0x1005)、`THREAD_INFO`(0x1003)、`STACK_INFO`(0x101b)。
+- **MODULE_INFO 里找 `midp_vita` 条目**：名字后 +0x30 附近是 `base/size`（本次 `0x8106f000 / 0x2c6efc`）。**真机加载器滑动段**（本次 +0x6f000，v01.67 时代观测过 +0x72000）——**重定位现场地址时必须减去模块基址偏移**！
+- THREAD_REG_INFO 布局（实测）：`+0x00` 头、`+0x0c` tid(0x178)、`+0x10` CPSR=0x60010030(abort+Thumb)、`+0x14` r0、`+0x28` r7、`+0x44` sp、`+0x48` lr(内核 abort 句柄 0xe00100bf)、`+0x4c` **pc**；`+0x174` 故障状态(0x807=写权限)、`+0x178` FAR。
+- 文件名里的异常地址（`0x142ca1`）是野跳转后的 PC，真实现场在 THREAD_REG_INFO 的 pc 里。
+
+### 崩溃链（全部实测）
+1. 重定位后故障 PC = **0x81004a1a = `str.w r3, [r7, #812]`**（v01.78h b257 的 `vita_menu_run+0x134`）——**`fe_scan()` 返回后第一条局部初始化**（`tab=0`），即菜单从未画出来，崩在启动五连调用之后。
+2. **r7 = 0x81000000**（= 链接基址 = henkaku 用户态系统调用号区间起点 `SYSCALLS_USER`）；FAR=0x8100032c（0x81000000+0x32c，写只读 .text）→ data abort。
+3. **全 256KB 栈扫描：0x81000000 仅出现一次**——在 fe_scan 的 `push {r7,lr}` 槽（0x81680648）⇒ **r7 在 fe_scan 入口前已被砸**，且不是从栈恢复的（是直接被写进寄存器）。
+4. **MODULE_INFO 显示进程内有 taiHEN 插件 oclockvita、Framecounter**：它们的 hook 桩是 16 字节 ARM `ldr r7,=syscall_id; svc 0; bx lr`——**砸 r7 且从不恢复**。
+5. Vita3K 把 hooked 导入走自家 HLE thunk（完整保存 guest 上下文）⇒ **模拟器永不复现**。
+6. CMAKE_BUILD_TYPE 为空 → GCC 默认 **-O0** → **每个函数都保留 r7 帧指针** → 菜单启动链（settings_load/menu_touch_init/scan_games/inbox_scan/fe_scan 全是 sceIo*/sceTouch*/sceAppMgr* 重度用户）任一被 hook 调用返回即帧指针报废 → 下一次局部写命中只读 .text。
+7. 排除项：字面池扫描（830 个被引用池中无"无重定位的绝对指针"）；veneer 检查（--pic-veneer 仍在且全部 PIC 形式）；fstubs 桩正常。
+
+### 修复
+- **`CMakeLists.txt` 给 vita-port 自己的 C/C++ 对象加 `-fomit-frame-pointer`**（v01.79）。反汇编验证 b258+：`vita_menu_run` 序言不再 `add r7,sp,#N`，全部局部经 r3/sp 相对寻址；r7 只在序言/尾声保存恢复——**活动 r7 被砸已无影响**。
+- 副作用评估：Thumb 回溯走 `.ARM.exidx` 仍可用；port 层无人读 r7 当 FP；菜单 UX 不变。
+- **同时收编 Vita3K 退出卡死家族（v01.78b~h 全系）**：菜单不再依赖 r7 穿过任意 callee 存活。v01.78h 的 longjmp 逃生与哨兵保留（防御纵深：万一还有别的破坏者，哨兵会报 `menu sen BAD`）。
+
+### 与 v01.67 的关系（用户提示"参考 cmakelist 记录"）
+- v01.67 = 静态构造期崩（main 之前）：ld 默认 ARM→Thumb veneer 的绝对字面量无重定位条目 → 真机跳到滑动前的旧地址。修复 = `--pic-veneer`。
+- v01.79 = 菜单启动期崩（main 之后）：taiHEN 桩砸 r7（-O0 帧指针）。修复 = `-fomit-frame-pointer`。
+- **同族规律：真机专有 = (段滑动 | 插件注入) 与 (链接期假设 | ABI 契约) 的交集；Vita3K 两者都不模拟。** 排查顺序：① 模块基址偏移重定位现场 → ② 扫无重定位的绝对地址 → ③ 查进程内插件 → ④ 查 ABI 契约（帧指针/syscall 寄存器）。
+
+### 交付 / 验证
+- `out/vpk/midp_vita_v01.79_nofp.vpk`（v01.79 **b259**，内嵌 hash `ed8b2c8`，md5 `4108040449474047bc3c74bcee3d24e2`，3639675 B）。提交 `ed8b2c8`。
+- 真机复测要点：① 启动进菜单（本次崩点）；② 菜单操作（浏览/安装/设置——都是被 hook 系统调用的重度路径）；③ 退出菜单→进游戏→退出→再进菜单多轮；④ Vita3K 回归（启动/退出/游戏全流程）。
+- 若真机仍有问题：转储在 `samples/j2me/debug/logs/`（本次就是从那里找到的），按"真机转储解析方法"一节处理。
+
+### 教训（新增）
+- **真机 coredump 是最高价值证据**：寄存器 + 全栈 + 模块表一次拿全，比 Vita3K 日志强一个量级。用户侧只要把 `psp2dmp` 拷进 `debug/logs/` 即可。
+- **-O0 + 帧指针 + 插件环境 = 炸弹**：任何"自己的代码"在别人 hook 的世界里跑，都不能假设 callee 保存 ABI 寄存器。
+- 旧转储（9-14 的 3 个，v01.7x 时代）寄存器现场签名不同（pc 在 VM 区），属另外的崩溃，未分析——若 v01.79 后真机还崩，先比对它们的 MODULE_INFO/寄存器。
+
 
 ## 2026-09-17 v01.78h：**退出卡死真定案**——保存寄存器块被会话中途清零，退出改走 longjmp（治标+取证）
 
