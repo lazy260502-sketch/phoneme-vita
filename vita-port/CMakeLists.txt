@@ -583,7 +583,17 @@ set(VITA_VERSION  "01.77")
 #   - Messages auto-expire after 4 s instead of sticking forever.
 #   Untouched on purpose: game scan/cache/dialog, install_inbox,
 #   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
-set(VITA_VERSION  "01.78")
+set(VITA_VERSION  "01.79")
+# 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
+#   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
+#   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
+#   with r7=0x81000000 = the henkaku user-syscall number base. taiHEN
+#   plugin stubs (oclockvita/Framecounter were in the process) load the
+#   syscall id into r7 for `svc 0` and never restore it; at -O0 every
+#   function in the port kept r7 as its frame pointer, so the first
+#   hooked call inside the menu startup chain corrupted the FP and the
+#   next local write hit read-only .text. -fomit-frame-pointer removes
+#   the dependency entirely.
 # 01.78h (2026-09-17): quit STILL hung on v01.78g. New forensics on the
 #   unstripped binary (nm + objdump) nailed the crash site: PC was
 #   vita_menu_run's EPILOGUE `ldmia.w sp!, {r4,r5,r7,r8,r9,sl,fp,pc}`
@@ -713,8 +723,17 @@ link_directories(
     ${CLDC_DIST}/lib
 )
 
-set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -Wall -Wno-unused-parameter")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fpermissive -Wall -Wno-unused-parameter")
+# v01.79 REAL-HW STARTUP CRASH FIX (taiHEN plugin stubs clobber r7):
+#   The 9-17 coredump faulted at `str.w r3, [r7, #812]` in
+#   vita_menu_run with r7=0x81000000 = the henkaku user-syscall base;
+#   taiHEN plugin stubs (oclockvita/Framecounter were in the process)
+#   load the syscall id into r7 for `svc 0` and never restore it. At
+#   -O0 (empty CMAKE_BUILD_TYPE) every function kept r7 as its frame
+#   pointer, so one hooked call in the menu startup chain smashed the
+#   FP and the next local write hit read-only .text. See the v01.79
+#   version note above for the full forensics.
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -Wall -Wno-unused-parameter -fomit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fpermissive -Wall -Wno-unused-parameter -fomit-frame-pointer")
 
 #==============================================================================
 # Include Directories
