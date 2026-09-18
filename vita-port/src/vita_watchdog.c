@@ -40,6 +40,10 @@ typedef int64_t wd_jlong;
 
 /* Pump entry counter - owned by vita_checkevents.c (v01.71 probe) */
 extern volatile unsigned int vita_ce_count;
+/* v01.83: tick count maintained by the CLDC cldc_ticker thread
+ * (OS_vita.cpp). HANG report prints it to separate "ticker
+ * dead/starved" from "ticks delivered but pump gate closed". */
+extern volatile unsigned int vita_tick_count;
 /* Set by vita_main.c: 1 while a MIDlet round runs (0 in the menu) */
 volatile int vita_wd_round_active = 0;
 /* VM thread id - recorded by vita_main.c right after the VM starts */
@@ -170,10 +174,10 @@ static int wd_thread_routine(SceSize args, void *argp) {
         {
             char buf[256];
             int n = snprintf(buf, sizeof(buf),
-                             "[WD] HANG ce=%u polls=%d "
+                             "[WD] HANG ce=%u polls=%d tick=%u "
                              "clock t0=%lld t1=%lld d=%lld | "
                              "kclock k0=%lld k1=%lld kd=%lld us\n",
-                             last_ce, stalled_polls,
+                             last_ce, stalled_polls, vita_tick_count,
                              (long long)t0, (long long)t1,
                              (long long)(t1 - t0),
                              (long long)k0, (long long)k1,

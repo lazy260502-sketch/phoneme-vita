@@ -635,6 +635,28 @@ set(VITA_VERSION  "01.81")
 #   Next session procedure: reproduce the hang, copy BOTH the new
 #   psp2core-*.psp2dmp AND the logs into debug/logs/log9/.
 set(VITA_VERSION  "01.82")
+# 01.83 (2026-09-18): log9 coredump ROOT CAUSE CLOSED. The dump pinned
+#   the VM thread at pc=start_lightweight_thread_asm+0x8 with lr=stub
+#   entry, sp at the dispatch frame ([sp]=JVM::start+0x178, right after
+#   `bl primordial_to_current_thread`), r1=0 (no TERMINATING) - i.e. the
+#   scheduler handing a NEVER-RUN green thread to its bootstrap stub.
+#   Combined with CE frozen for 3s, RUNNING wait=none, and stale frames
+#   showing the last real activity was a thread switch during early
+#   class-loading (fread chain + adjust_priority_list/set_current/
+#   on_task_switch), the only self-consistent picture is a thread
+#   create/die cycle spinning through the bootstrap stub with no
+#   interpreter tick checkpoints in the loop. In that state the VITA
+#   pump gate in Scheduler::wake_up_timed_out_sleepers
+#   (_timer_has_ticked || _estimated_event_readiness > 0) never opens:
+#   _estimated_event_readiness only decrements INSIDE
+#   check_blocked_threads, and the cldc_ticker can starve. Fix (VM
+#   side, phoneme-cldc Scheduler.cpp): wall-clock backstop - any loop
+#   through yield() drives JVMSPI_CheckEvents at least every 50ms.
+#   The pump's ANI wait then really sleeps, throttling the cycle and
+#   letting input/events flow again. Also: OS_vita.cpp counts ticks in
+#   vita_tick_count and the watchdog HANG report prints it, so the next
+#   hang (if any) separates "ticker dead" from "gate closed".
+set(VITA_VERSION  "01.83")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
