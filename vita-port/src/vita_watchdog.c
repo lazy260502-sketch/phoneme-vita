@@ -192,12 +192,21 @@ static int wd_thread_routine(SceSize args, void *argp) {
 
 void vita_watchdog_start(void) {
     /* log6 lesson: priority 0x10000300 -> SCE_KERNEL_ERROR_ILLEGAL_PRIORITY
-     * (0x80028023) on EVERY boot on real hardware. The verified-legal
-     * band in this project is 0x10000100 (cldc_ticker, j2me_tone both run
-     * it for months). 0x10000150 = slightly LOWER priority than those
-     * (higher numeric = lower prio), inside the known-good band. */
+     * (0x80028023) on EVERY boot on real hardware.
+     * log7 lesson (the important one): v01.74's "fix" to 0x10000150
+     * FAILED THE SAME WAY - watchdog.log shows `create FAILED
+     * rc=0x80028023` on every v01.80 boot too. This thread has NEVER
+     * run once on real hardware: every "no HANG report" so far meant
+     * "no watchdog", not "no hang", and the whole v01.71-v01.75
+     * forensics apparatus was dead weight. The only priority
+     * empirically PROVEN to create+run on this firmware (3.65) is
+     * 0x10000100 - j2me_tone and cldc_ticker both use it and tone
+     * requests demonstrably execute. There is no verified "band",
+     * only that one value. Same priority as the VM/tone threads is
+     * fine: the watchdog sleeps 250 ms at a time and the Vita has
+     * three user cores, so it cannot starve behind the VM thread. */
     SceUID t = sceKernelCreateThread("j2me_watchdog", wd_thread_routine,
-                                     0x10000150, 0x4000, 0,
+                                     0x10000100, 0x4000, 0,
                                      SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
                                      NULL);
     if (t < 0) {

@@ -590,6 +590,28 @@ set(VITA_VERSION  "01.79")
 #   UP/DOWN moved nothing on the installed tab. Heartbeat now logs
 #   tab/focus/view.
 set(VITA_VERSION  "01.80")
+# 01.81 (2026-09-18): log7 forensics round 1 - the hang watchdog has
+#   NEVER RUN on real hardware.
+#   log7 (v01.80 session): every MIDlet round hung (4/4, zero
+#   "runMidlet returned"), menu healthy as always; watchdog.log still
+#   shows `[WD] create FAILED rc=0x80028023` x5 - so v01.74's
+#   0x10000150 "fix" failed exactly like 0x10000300 did, and every
+#   v01.71-v01.75 hang report we never saw was actually "no watchdog".
+#   The ONLY priority empirically proven on this fw 3.65 unit is
+#   0x10000100 (j2me_tone + cldc_ticker create AND run with it; tone
+#   req/done pairs in audio_debug.log prove execution). There is no
+#   verified "legal band" - that assumption was wrong twice. The
+#   watchdog now uses 0x10000100 too (it sleeps 250 ms at a time on a
+#   3-core machine; same priority as the VM thread cannot starve it).
+#   Also: input heartbeat sampling 0x3FF -> 0x3F (every 64 pumps,
+#   ~1-3 s) so a frozen gettimeofday shows as stuck ms= lines BEFORE
+#   the log goes silent - the v01.73 H2 hypothesis (clock freeze,
+#   never ruled out) becomes directly readable from input_debug.log.
+#   Expected after this build: watchdog.log starts with `[WD] alive`,
+#   and the NEXT hang produces the full report (vm/tone/wd thread wait
+#   states + dual clock sample) that finally discriminates
+#   blocked-in-native vs spinning-in-userland vs frozen-clock.
+set(VITA_VERSION  "01.81")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)

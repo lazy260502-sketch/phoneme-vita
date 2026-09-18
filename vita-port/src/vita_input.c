@@ -379,7 +379,12 @@ void checkForSystemSignal(MidpReentryData *pNewSignal,
      * Java thread while the pump keeps running. */
     static unsigned int hb = 0;
     static jlong hb_last_ms = 0;
-    if ((hb++ & 0x3FF) == 0) {
+    /* v01.81: 0x3FF -> 0x3F. At 1024 pumps/sample (~40 s) every real
+     * hang died between sample #1 and #2, so the clock liveness data
+     * this heartbeat exists for was never captured. 64 pumps ~= 1-3 s:
+     * a frozen gettimeofday now shows up as ms= stuck across two (or
+     * more) consecutive lines before the log goes silent. */
+    if ((hb++ & 0x3F) == 0) {
         struct timeval tv;
         gettimeofday(&tv, NULL);
         jlong ms = (jlong)tv.tv_sec * 1000 + tv.tv_usec / 1000;
