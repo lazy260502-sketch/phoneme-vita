@@ -9,16 +9,17 @@ phoneME Feature (CLDC-HI + MIDP 2.0) JVM/J2ME 运行时移植到 Sony PS Vita
 ├── phoneme-cldc/     # CLDC 1.1 VM 工作副本（gitlink，见下）
 ├── phoneme-midp/     # MIDP 2.0 工作副本（gitlink，见下）
 ├── phoneme_source/   # 上游纯净参考树（只读，gitlink → magicus/phoneME）
-├── jamvm/            # 备选 JVM 源码树（gitlink → cfriedt/jamvm）
 ├── vita-port/        # Vita 启动器/菜单/字体/网络/输入（当前主力，产物 midp_vita.vpk）
-├── midp-vita/        # 旧版启动器（保留作参考，见 vita-port/PLAN.md）
 ├── jsr75/            # JSR-75 (FileConnection) 实现
 ├── patches/          # ★ 工作副本相对上游基线的完整补丁（见下）
 ├── tools/            # 手工重编辅助脚本
-├── docker/           # VitaSDK 构建镜像
 ├── rebuild_vm.sh     # VM 重编脚本（含完整 PRODUCT 旗标配方）
 └── *.md              # 文档（AGENTS.md / BUILD.md / PORTING.md / PROJECT_MEMORY.md …）
 ```
+
+> 注：本机另有 `jamvm/`（备选 JVM，未集成）、`cldc-vita/`（遗留实验）、
+> `docker/`（构建镜像）、`midp-vita/`（旧版启动器，仅作参考）四个目录，
+> 均不在构建链路上，未入库。
 
 ## phoneme-cldc / phoneme-midp 的获取方式（重要）
 
@@ -36,9 +37,8 @@ phoneME Feature (CLDC-HI + MIDP 2.0) JVM/J2ME 运行时移植到 Sony PS Vita
 3. 应用后工作副本 HEAD 对应本仓库 gitlink 记录的
    `phoneme-cldc = fd915f7`、`phoneme-midp = 6d216ae`。
 
-`phoneme_source/phoneME`（magicus/phoneME @ 5a13f65）与 `jamvm`
-（cfriedt/jamvm @ 236f9d8）的 gitlink 目标均在公开远端，可直接
-`git submodule update --init` 获取。
+`phoneme_source/phoneME`（magicus/phoneME @ 5a13f65）的 gitlink 目标在公开
+远端，可直接 `git submodule update --init` 获取。
 
 ## 构建
 
