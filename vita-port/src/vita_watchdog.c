@@ -28,6 +28,7 @@
 
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/kernel/processmgr.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -184,6 +185,32 @@ static int wd_thread_routine(SceSize args, void *argp) {
         wd_dump_thread("tone", vita_tone_tid);
         /* the watchdog itself, as a sanity marker */
         wd_dump_thread("wd", sceKernelGetThreadId());
+
+        /* v01.82: log8 nailed the shape of the hang (VM thread RUNNING,
+         * wait=none, both clocks alive) but the kernel API cannot name
+         * WHERE in userland it spins. A coredump can: faulting PC + the
+         * full stack memory pin the exact interpreter/GC/native site.
+         * Vita writes psp2core-*.psp2dmp on a fatal signal; the cleanest
+         * userspace way to request one is sceKernelSendSignal 
+         * followed by an intentional data abort. We deliberately write
+         * to a read-only address (the .text segment base): the resulting
+         * SIGSEGV/data-abort is exactly what the dumper catches. 
+         * NOTE: this kills the process on purpose - the session is
+         * already lost (every round so far ended in a force-kill), and
+         * the dump is worth more than a frozen process. */
+        {
+            char buf[128];
+            int n = snprintf(buf, sizeof(buf),
+                             "[WD] requesting coredump via data abort\n");
+            wd_log(buf, n);
+            /* give the log write a moment to hit the disk */
+            sceKernelDelayThread(200 * 1000);
+        }
+        {
+            volatile int *text_base = (volatile int *)0x81000000;
+            *text_base = 0x53455244; /* "DRES" - write to read-only .text */
+        }
+        /* not reached on success */
 
         reported = 1;
     }

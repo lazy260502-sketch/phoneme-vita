@@ -612,6 +612,29 @@ set(VITA_VERSION  "01.80")
 #   states + dual clock sample) that finally discriminates
 #   blocked-in-native vs spinning-in-userland vs frozen-clock.
 set(VITA_VERSION  "01.81")
+# 01.82 (2026-09-18): log8 - the watchdog finally ran, and its first two
+#   HANG reports rewrote the case file:
+#   - H2 (frozen clock) is DEAD: clock d=100 (exactly the 100ms sample
+#     gap), kclock kd=100062us - both clocks alive during the hang
+#   - THE line: vm 'J2ME00001' status=RUNNING wait=none - the VM thread
+#     is in NO kernel wait at all. It is spinning in USERLAND.
+#   - hang points (consistent with log7's mid-println truncations):
+#     file manager froze during startApp (CE=342), ToneTest froze between
+#     stg1 and stg2 (CE=206, ani 192/192 balanced - not inside the ANI
+#     wait). In every session the process ended in a force-kill; zero
+#     "runMidlet returned" since log3.
+#   The kernel API cannot see WHERE in userland it spins. A coredump
+#   can: faulting PC + stack memory name the exact interpreter/GC/native
+#   site. So the watchdog now deliberately triggers a data abort (write
+#   to the read-only .text base) right after logging the HANG report:
+#   the process dies, the system writes psp2core-*.psp2dmp, and the
+#   dump's VM-thread PC is the first hard address of this bug in 5
+#   sessions of hunting. Deliberate process death is acceptable - every
+#   hung session so far ended in a force-kill anyway, and the dump is
+#   worth more than a frozen process.
+#   Next session procedure: reproduce the hang, copy BOTH the new
+#   psp2core-*.psp2dmp AND the logs into debug/logs/log9/.
+set(VITA_VERSION  "01.82")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
