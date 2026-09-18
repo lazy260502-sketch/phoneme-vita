@@ -14,3 +14,16 @@ vita-port/midp_vita.vpk.out
 vita-port/vita_version.h
 vita-port/build/
 *.bak
+
+# midp-vita 构建标记（build_midp_vita.sh 运行时生成）
+midp-vita/.cldc_built
+midp-vita/.rom_built
+midp-vita/.*.md5
+
+# nokia stub 编译产物（由 build_nokia_stubs.sh 从 nokia_src 再生）
+vita-port/nokia_classes/
+
+# 根 .gitignore 的 `build` 会误伤 jsr75 的构建输入，显式放行
+!jsr75/build/
+!jsr75/build/cldc_application/
+!jsr75/build/cldc_application/subsystem.gmk

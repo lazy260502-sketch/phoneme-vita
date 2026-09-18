@@ -1,0 +1,64 @@
+#
+# JSR 75 (PDA / FileConnection) subsystem description for the PS Vita port
+# of phoneME MIDP 2.0.
+#
+# This file is included by
+#     phoneme-midp/build/common/makefiles/Subsystems.gmk
+# when USE_JSR_75=true, which happens (see SubsystemDefs.gmk line ~31)
+# BEFORE the generic SubsystemDefs.gmk block consumes the variables defined
+# here:
+#     $(MIDP_CLASSES_ZIP):: $(SUBSYSTEM_JSR_75_JAVA_FILES)
+#     JTWI_NATIVE_FILES  += $(SUBSYSTEM_JSR_75_NATIVE_FILES)
+#     EXTRA_INCLUDES     += $(SUBSYSTEM_JSR_75_EXTRA_INCLUDES)
+# so nothing else has to be wired up by hand.
+#
+# This is a Vita-local source tree (samples/j2me/jsr75).  Nothing here is
+# taken from the upstream phoneME archive and no upstream file is modified
+# to build it.  The Java sources contain only the interface signatures
+# required by the JSR 75 specification; every implementation body is
+# written for this port.
+#
+# Source layout:
+#     src/share/core/common/classes/    Java: API + implementation
+#     src/share/native/                 KNI natives (jsr75_file.c)
+#
+
+SUBSYSTEM_JSR_75        = jsr75
+SUBSYSTEM_JSR_75_DIR    = $(JSR_75_DIR)
+
+JSR_75_CLASSES_DIR      = $(SUBSYSTEM_JSR_75_DIR)/src/share/core/common/classes
+JSR_75_NATIVE_DIR       = $(SUBSYSTEM_JSR_75_DIR)/src/share/native
+
+#
+# Public API (javax.microedition.io.file), the implementation
+# (com.sun.midp.jsr075) and the Connector protocol
+# (com.sun.midp.io.j2me.file.Protocol) that makes
+# Connector.open("file:///data/...") resolve to this implementation.
+#
+# These are plain .java files on purpose: this port only runs .jpp files
+# through preprocess_jpp.py, and that script currently has an empty DEFINES
+# set, so an #ifdef ENABLE_JSR_75 guard would silently compile the source
+# away.
+#
+SUBSYSTEM_JSR_75_JAVA_FILES = \
+	$(JSR_75_CLASSES_DIR)/javax/microedition/io/file/ConnectionClosedException.java \
+	$(JSR_75_CLASSES_DIR)/javax/microedition/io/file/FileConnection.java \
+	$(JSR_75_CLASSES_DIR)/javax/microedition/io/file/FileSystemListener.java \
+	$(JSR_75_CLASSES_DIR)/javax/microedition/io/file/FileSystemRegistry.java \
+	$(JSR_75_CLASSES_DIR)/javax/microedition/io/file/IllegalModeException.java \
+	$(JSR_75_CLASSES_DIR)/com/sun/midp/jsr075/FileConnectionImpl.java \
+	$(JSR_75_CLASSES_DIR)/com/sun/midp/jsr075/FileStore.java \
+	$(JSR_75_CLASSES_DIR)/com/sun/midp/jsr075/FileSystemRegistryImpl.java \
+	$(JSR_75_CLASSES_DIR)/com/sun/midp/io/j2me/file/Protocol.java
+
+#
+# The native layer is compiled by this makefile (and not by the launcher
+# CMake project) so that it sees exactly the same KNI/PCSL headers as the
+# other MIDP natives.  The object lands in $(OBJ_DIR) and therefore in
+# libobj.a, which the vita-port links with --whole-archive, so the KNI entry
+# points are picked up by romgen automatically (ROMImage.cpp emits
+# "extern Java_<class>_<method>" for every registered native name).
+#
+vpath % $(JSR_75_NATIVE_DIR)
+SUBSYSTEM_JSR_75_NATIVE_FILES  = jsr75_file.c
+SUBSYSTEM_JSR_75_EXTRA_INCLUDES =
