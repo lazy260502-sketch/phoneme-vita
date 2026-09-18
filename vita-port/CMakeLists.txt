@@ -584,6 +584,12 @@ set(VITA_VERSION  "01.77")
 #   Untouched on purpose: game scan/cache/dialog, install_inbox,
 #   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
 set(VITA_VERSION  "01.79")
+# 01.80 (2026-09-18): 已安装 tab dpad fix - see the long comment above
+#   the 01.78h entry: v01.78f's `tab == 0 && GRIDMODE` first branch let
+#   the LIST case fall through to the tab-4 `else` (has_cursor = 0), so
+#   UP/DOWN moved nothing on the installed tab. Heartbeat now logs
+#   tab/focus/view.
+set(VITA_VERSION  "01.80")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
@@ -594,6 +600,28 @@ set(VITA_VERSION  "01.79")
 #   hooked call inside the menu startup chain corrupted the FP and the
 #   next local write hit read-only .text. -fomit-frame-pointer removes
 #   the dependency entirely.
+# 01.80 (2026-09-18): 已安装 tab had a DEAD dpad (user report: "在已安装
+#   游戏那里，没有上下移动切换游戏，只能在设置标签中上下切换" - and
+#   设置 was the ONLY tab that still moved).
+#   Root cause is v01.78f, i.e. the commit that fixed the same class of
+#   bug on the settings tab. The cursor dispatcher was written as
+#       if (tab == 0 && set_list_grid == TAB_GRIDMODE) {...}
+#       else if (tab == 1) ... else if (tab == 2) ...
+#       else if (tab == 3) ... else { has_cursor = 0; }
+#   where that trailing `else` was only ever meant to catch tab 4 (退出).
+#   Because the FIRST test also carried the grid-mode condition, the
+#   common case - tab 0 in LIST mode (the default view) - matched no
+#   branch at all, fell into the tab-4 else, and got has_cursor = 0.
+#   UP/DOWN then did nothing on 已安装, while 设置 kept working simply
+#   because it owns an explicit branch. Grid mode was never affected
+#   (its own `if` hit), which is why SQUARE-toggling the view looked
+#   like a workaround.
+#   Fix: the branch is `if (tab == 0)` and the list/grid choice moved
+#   INSIDE it (grid swaps psel/ptop to gsel/gtop; list keeps sel/top) -
+#   one tab, one branch, so no future tab can inherit tab 4's else.
+#   The 1 s heartbeat also logs tab/focus/view now, so this whole class
+#   ("which tab owns the dpad") is visible in crumb.log without a
+#   rebuild.
 # 01.78h (2026-09-17): quit STILL hung on v01.78g. New forensics on the
 #   unstripped binary (nm + objdump) nailed the crash site: PC was
 #   vita_menu_run's EPILOGUE `ldmia.w sp!, {r4,r5,r7,r8,r9,sl,fp,pc}`

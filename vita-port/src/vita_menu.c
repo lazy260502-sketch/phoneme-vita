@@ -1955,10 +1955,12 @@ int vita_menu_run(VitaGameSel *out) {
             unsigned long long now = sceKernelGetProcessTimeWide();
             if (now - menu_hb_us > 1000000ULL) {
                 menu_hb_us = now;
-                crumb_printf("menu hb: flips=%u rc=0x%08x games=%d btn=0x%x",
+                crumb_printf("menu hb: flips=%u rc=0x%08x games=%d btn=0x%x"
+                             " tab=%d focus=%d view=%c",
                              menu_flip_count,
                              (unsigned)menu_last_flip_rc,
-                             game_count, btn);
+                             game_count, btn, tab, focus,
+                             set_list_grid ? 'g' : 'l');
                 /* v01.78h: sentinel check (see sen[] above) */
                 for (k = 0; k < 8; k++) {
                     if (sen[k] != 0xC0DE0000u + (unsigned)k) {
@@ -2020,8 +2022,17 @@ int vita_menu_run(VitaGameSel *out) {
             int in_content = (focus == 0); /* dpad drives the cursor */
             int has_cursor = 1;            /* current tab has a list */
 
-            if (tab == 0 && set_list_grid == TAB_GRIDMODE) {
-                psel = &gsel; ptop = &gtop;
+            if (tab == 0) {
+                /* 已安装 has TWO views: list (sel/top) and grid
+                 * (gsel/gtop). v01.78f wrote this first branch as
+                 * `tab == 0 && GRIDMODE` with a trailing bare `else`
+                 * meant for tab 4 - so the LIST case fell through to
+                 * that else, has_cursor went 0 and the dpad was dead
+                 * on 已安装. 设置 kept working because it owns an
+                 * explicit branch. Keep the mode test INSIDE tab 0. */
+                if (set_list_grid == TAB_GRIDMODE) {
+                    psel = &gsel; ptop = &gtop;
+                }
                 nent = game_count;
             } else if (tab == 1) {
                 psel = &isel; ptop = &itop;
