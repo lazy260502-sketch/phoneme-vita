@@ -1,6 +1,0 @@
-MIDlet-Name: Hello
-MIDlet-Version: 1.0.0
-MIDlet-Vendor: Vita
-MIDlet-1: Hello, , HelloMIDlet
-MicroEdition-Profile: MIDP-2.0
-MicroEdition-Configuration: CLDC-1.1

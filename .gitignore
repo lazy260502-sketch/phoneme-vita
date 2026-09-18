@@ -27,3 +27,10 @@ vita-port/nokia_classes/
 !jsr75/build/
 !jsr75/build/cldc_application/
 !jsr75/build/cldc_application/subsystem.gmk
+
+# 未使用的目录（不入库：jamvm 备选 JVM / cldc-vita 遗留实验 /
+# docker 构建镜像 / midp-vita 旧版启动器，均不在当前构建链路上）
+/jamvm/
+/cldc-vita/
+/docker/
+/midp-vita/
