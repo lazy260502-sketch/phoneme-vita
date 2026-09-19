@@ -55,6 +55,12 @@ extern "C" {
     void vita_site_verifier_class(const char *name, int len);
     void vita_site_verifier_method(const char *name, int len);
     void vita_site_dump_verify(const char *path);
+    /* v01.88 clinit tracing - log14 froze with the verifier OFF (verify
+     * class=(none)) after 345 frames of normal play: the spin moved
+     * into <clinit> execution itself on the green-thread Java stack.
+     * Same single-writer discipline as the verifier hooks. */
+    void vita_site_clinit_class(const char *name, int len);
+    void vita_site_dump_clinit(const char *path);
 }
 
 #endif // GLOBALS_VITA_HPP

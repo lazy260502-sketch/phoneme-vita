@@ -219,6 +219,16 @@ void InstanceClass::initialize_internal(Thread *thread, Oop *m JVM_TRAPS) {
 
 void InstanceClass::clinit(JVM_SINGLE_ARG_TRAPS) {
   UsingFastOops fast_oops;
+#if defined(VITA)
+  {
+    /* v01.88: log14 froze with the verifier off after 345 frames of
+     * normal play; the spin moved into clinit execution. Record the
+     * class name so the HANG dump names the culprit. */
+    Symbol::Raw cn = name();
+    vita_site_clinit_class(cn().base_address(), cn().length());
+    vita_site_mark();
+  }
+#endif
   // Find the method to invoke
   Method::Fast init = find_local_method(Symbols::class_initializer_name(),
                                         Symbols::void_signature());

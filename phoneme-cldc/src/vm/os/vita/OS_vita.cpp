@@ -385,6 +385,44 @@ void vita_site_dump_verify(const char *path) {
     sceIoClose(fd);
 }
 
+/*=========================================================================
+ * v01.88 clinit tracing: log14 froze with the verifier OFF (verify
+ * class=(none)) after 345 frames of normal gameplay, ring seq=3 with
+ * three open_entry marks - the spin moved from verification into the
+ * execution of the fourth lazily-loaded class's <clinit> itself, on
+ * the green thread's Java stack (invisible to coredump and OS stack,
+ * same as the verifier spins were). This hook records the class whose
+ * clinit is about to run so the HANG dump names it.
+ *=======================================================================*/
+
+static char vita_clinit_class_name[64];
+
+/* Called at the top of InstanceClass::clinit per class. Same explicit
+ * length copy as the verifier hooks (Symbols are length-prefixed). */
+void vita_site_clinit_class(const char *name, int len) {
+    int i = 0;
+    if (name && len > 0) {
+        if (len > 63) len = 63;
+        for (; i < len; i++)
+            vita_clinit_class_name[i] = name[i];
+    }
+    vita_clinit_class_name[i] = 0;
+}
+
+/* Called from the watchdog thread after a HANG. Appends the clinit
+ * target (if any) to the site ring log. */
+void vita_site_dump_clinit(const char *path) {
+    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                          0777);
+    if (fd < 0) return;
+    char buf[96];
+    int n = snprintf(buf, sizeof(buf), "clinit class=%s\n",
+                     vita_clinit_class_name[0] ? vita_clinit_class_name
+                                               : "(none)");
+    sceIoWrite(fd, buf, n);
+    sceIoClose(fd);
+}
+
 /* Called by the launcher watchdog thread after a HANG is detected.
  * Slot (seq-1)&15 is the newest site; ordering below is newest first. */
 void vita_site_dump(const char *path) {
