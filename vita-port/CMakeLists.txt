@@ -1196,7 +1196,10 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
 #   build step runs after every make, so both files always reflect the last
 #   build; stale version-tagged files from older builds stay (history).
 #==============================================================================
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+# POST_BUILD on the executable fires BEFORE the VPK custom target packs
+# the archive (first build copied the PREVIOUS vpk - caught by md5), so
+# the copy must be its own target depending on the VPK target instead.
+add_custom_target(vpk_out_copy ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory ${PORT_DIR}/out/vpk
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
@@ -1204,6 +1207,7 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
             ${PORT_DIR}/out/vpk/midp_vita_v${VITA_VERSION}.vpk
+    DEPENDS ${PROJECT_NAME}.vpk-vpk
     COMMENT "Copying VPK to out/vpk/ (midp_vita.vpk + midp_vita_v${VITA_VERSION}.vpk)"
 )
 
