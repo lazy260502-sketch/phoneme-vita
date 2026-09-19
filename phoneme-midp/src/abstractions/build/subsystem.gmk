@@ -1,0 +1,42 @@
+#
+# Copyright  1990-2006 Sun Microsystems, Inc. All Rights Reserved.
+# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License version
+# 2 only, as published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License version 2 for more details (a copy is
+# included at /legal/license.txt).
+#
+# You should have received a copy of the GNU General Public License
+# version 2 along with this work; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+# 02110-1301 USA
+#
+# Vita-specific minimal abstractions subsystem.
+# Only provides the cldc_application stub classes needed by jsr135.
+#
+
+ifeq ($(ABSTRACTIONS_DIR),)
+$(error ABSTRACTIONS_DIR is not set.)
+endif
+
+ABSTRACTIONS_INCLUDE_DIRS += \
+    $(ABSTRACTIONS_DIR)/share/include
+
+include $(ABSTRACTIONS_DIR)/cldc_application/module.gmk
+
+printconfig::
+	@echo "ABSTRACTIONS_DIR          = $(ABSTRACTIONS_DIR)"
+	@echo "ABSTRACTIONS_INCLUDES     = $(ABSTRACTIONS_INCLUDES)"
+
+source_bundle:: abstractions_source_bundle
+
+ABSTRACTIONS_SOURCE_OUTPUT_DIR=$(SOURCE_OUTPUT_DIR)/abstractions
+
+abstractions_source_bundle:: $(ABSTRACTIONS_DIR)
+	@echo " ... abstractions stub source bundle" $(LOG)

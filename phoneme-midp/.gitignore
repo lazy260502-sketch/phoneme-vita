@@ -1,0 +1,27 @@
+# ---- Build products ----
+# build/vita_arm: keep only platform makefiles & hand-written scripts,
+# ignore all generated output (ROMImage_*.cpp, classes/, obj/, pcsl/, ...)
+/build/vita_arm/*
+!/build/vita_arm/GNUmakefile
+!/build/vita_arm/Makefile
+!/build/vita_arm/Options.gmk
+!/build/vita_arm/Platform.gmk
+!/build/vita_arm/Settings.gmk
+!/build/vita_arm/config.gmk
+!/build/vita_arm/gen_stubs.py
+!/build/vita_arm/preprocess_jpp.py
+
+# Object files / libraries / backups / logs
+*.o
+*.a
+*.bak
+*.original
+make.out
+makelog.out
+
+# Debug extraction scratch (eboot analysis)
+/vita_test/
+/vita_test_extracted/
+
+# Self-referencing convenience symlink
+/src/src

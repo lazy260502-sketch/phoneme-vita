@@ -1,0 +1,1 @@
+/home/zyb/vitasdk/samples/j2me/phoneme-cldc/src/vm/cpu/c/AsmStubs_x86_64.s

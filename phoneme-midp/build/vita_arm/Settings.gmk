@@ -1,0 +1,281 @@
+
+# Build settings. Generated file.
+# current directory: $(MIDP_DIR)/.
+CPU=arm
+GCC_VERSION=
+SUBSYSTEM_LCDUI_MODULES=chameleon
+TARGET_CPU=arm
+TARGET_DEVICE=vita
+USE_ABSTRACTIONS=true
+USE_AMS_FOLDERS=false
+USE_AUTOMATION=
+USE_AUTOTESTER=false
+USE_BINARY_CRYPTO=false
+USE_CLDC_11=true
+USE_CLDC_RELEASE=true
+USE_CMS=false
+USE_DEBUG=false
+USE_DIRECTDRAW=false
+USE_DYNAMIC_COMPONENTS=false
+USE_EXTENDED_ATTRIBUTES=false
+USE_FILE_SYSTEM=false
+USE_FIXED=false
+USE_FONT_CACHE=false
+USE_GCC=false
+USE_GCI=false
+USE_I3_TEST=false
+USE_ICON_CACHE=false
+USE_IMAGE_CACHE=false
+USE_JAVA_DEBUGGER=true
+USE_JAVA_PROFILER=false
+USE_JPEG=false
+USE_JSR_120=true
+USE_JSR_135=true
+USE_JSR_172=false
+USE_JSR_177=false
+USE_JSR_179=false
+USE_JSR_180=false
+USE_JSR_184=false
+USE_JSR_205=false
+USE_JSR_211=false
+USE_JSR_226=false
+USE_JSR_229=false
+USE_JSR_230=false
+USE_JSR_234=false
+USE_JSR_238=false
+USE_JSR_239=false
+USE_JSR_256=false
+USE_JSR_257=false
+USE_JSR_258=false
+USE_JSR_272=
+USE_JSR_280=false
+USE_JSR_281=false
+USE_JSR_290=false
+USE_JSR_293=false
+USE_JSR_75=false
+USE_JSR_82=false
+USE_MIDP_ABB=false
+USE_MIDP_MALLOC=false
+USE_MONET=false
+USE_MULTIPLE_DISPLAYS=false
+USE_MULTIPLE_ISOLATES=false
+USE_NAMS_TEST_SERVICE=false
+USE_NATIVE_APP_MANAGER=false
+USE_NATIVE_INSTALLER=false
+USE_NATIVE_PROFILER=false
+USE_NATIVE_PTI=false
+USE_NATIVE_RMS=false
+USE_NATIVE_SUITE_STORAGE=false
+USE_NETWORK_INDICATOR=false
+USE_NUTS_FRAMEWORK=false
+USE_OCSP=false
+USE_ON_DEVICE_DEBUG=false
+USE_PISCES=false
+USE_PORTING_DEMOS=
+USE_PUBLIC_AMS_API=false
+USE_RAW_AMS_IMAGES=false
+USE_RESTRICTED_CRYPTO=false
+USE_RMS_TREE_INDEX=false
+USE_SERVER_SOCKET=false
+USE_SSL=false
+USE_STATIC_PROPERTIES=false
+USE_SWERVE_22=
+USE_SYSTEM_CLASSES_DEBUG=false
+USE_VERBOSE_MAKE=false
+USE_VERIFY_ONCE=false
+USE_VM_PROFILES=false
+USE_WTK_DEBUG=false
+# =====================================================
+ifndef CONFIGURATION_OVERRIDE
+CONFIGURATION_OVERRIDE=
+endif
+ifndef EXTRA_ROMGEN_CFG_FILES
+EXTRA_ROMGEN_CFG_FILES=
+endif
+# =====================================================
+ifndef ABSTRACTIONS_DIR
+ABSTRACTIONS_DIR=$(MIDP_DIR)/src/abstractions
+endif
+ifndef CLDC_DIST_DIR
+CLDC_DIST_DIR=$(MIDP_DIR)/../phoneme-cldc/build/vita_arm/dist
+endif
+ifndef CMS_DIR
+CMS_DIR=
+endif
+ifndef CRYPTO_OUTPUT_DIR
+CRYPTO_OUTPUT_DIR=$(MIDP_DIR)/crypto_output
+endif
+ifndef JC_DIR
+JC_DIR=
+endif
+ifndef JPEG_DIR
+JPEG_DIR=
+endif
+ifndef JSR_120_DIR
+JSR_120_DIR=$(MIDP_DIR)/../phoneme_source/phoneME/jsr120
+endif
+ifndef JSR_135_DIR
+JSR_135_DIR=$(MIDP_DIR)/../phoneme_source/phoneME/jsr135
+endif
+ifndef JSR_172_DIR
+JSR_172_DIR=
+endif
+ifndef JSR_177_DIR
+JSR_177_DIR=
+endif
+ifndef JSR_179_DIR
+JSR_179_DIR=
+endif
+ifndef JSR_180_DIR
+JSR_180_DIR=
+endif
+ifndef JSR_184_DIR
+JSR_184_DIR=
+endif
+ifndef JSR_205_DIR
+JSR_205_DIR=
+endif
+ifndef JSR_211_DIR
+JSR_211_DIR=
+endif
+ifndef JSR_226_DIR
+JSR_226_DIR=
+endif
+ifndef JSR_229_DIR
+JSR_229_DIR=
+endif
+ifndef JSR_230_DIR
+JSR_230_DIR=
+endif
+ifndef JSR_234_DIR
+JSR_234_DIR=
+endif
+ifndef JSR_238_DIR
+JSR_238_DIR=
+endif
+ifndef JSR_239_DIR
+JSR_239_DIR=
+endif
+ifndef JSR_256_DIR
+JSR_256_DIR=
+endif
+ifndef JSR_257_DIR
+JSR_257_DIR=
+endif
+ifndef JSR_258_DIR
+JSR_258_DIR=
+endif
+ifndef JSR_272_DIR
+JSR_272_DIR=
+endif
+ifndef JSR_281_DIR
+JSR_281_DIR=
+endif
+ifndef JSR_290_DIR
+JSR_290_DIR=
+endif
+ifndef JSR_293_DIR
+JSR_293_DIR=
+endif
+ifndef JSR_75_DIR
+JSR_75_DIR=
+endif
+ifndef JSR_82_DIR
+JSR_82_DIR=
+endif
+ifndef PCSL_OUTPUT_DIR
+PCSL_OUTPUT_DIR=$(MIDP_DIR)/build/vita_arm/pcsl
+endif
+ifndef PISCES_DIR
+PISCES_DIR=
+endif
+ifndef PROJECT_CMS_DIR
+PROJECT_CMS_DIR=
+endif
+ifndef PROJECT_JSR_120_DIR
+PROJECT_JSR_120_DIR=$(MIDP_DIR)/../phoneme_source/phoneME/jsr120
+endif
+ifndef PROJECT_JSR_135_DIR
+PROJECT_JSR_135_DIR=$(MIDP_DIR)/../phoneme_source/phoneME/jsr135
+endif
+ifndef PROJECT_JSR_172_DIR
+PROJECT_JSR_172_DIR=
+endif
+ifndef PROJECT_JSR_177_DIR
+PROJECT_JSR_177_DIR=
+endif
+ifndef PROJECT_JSR_179_DIR
+PROJECT_JSR_179_DIR=
+endif
+ifndef PROJECT_JSR_180_DIR
+PROJECT_JSR_180_DIR=
+endif
+ifndef PROJECT_JSR_184_DIR
+PROJECT_JSR_184_DIR=
+endif
+ifndef PROJECT_JSR_205_DIR
+PROJECT_JSR_205_DIR=
+endif
+ifndef PROJECT_JSR_211_DIR
+PROJECT_JSR_211_DIR=
+endif
+ifndef PROJECT_JSR_226_DIR
+PROJECT_JSR_226_DIR=
+endif
+ifndef PROJECT_JSR_229_DIR
+PROJECT_JSR_229_DIR=
+endif
+ifndef PROJECT_JSR_230_DIR
+PROJECT_JSR_230_DIR=
+endif
+ifndef PROJECT_JSR_234_DIR
+PROJECT_JSR_234_DIR=
+endif
+ifndef PROJECT_JSR_238_DIR
+PROJECT_JSR_238_DIR=
+endif
+ifndef PROJECT_JSR_239_DIR
+PROJECT_JSR_239_DIR=
+endif
+ifndef PROJECT_JSR_256_DIR
+PROJECT_JSR_256_DIR=
+endif
+ifndef PROJECT_JSR_257_DIR
+PROJECT_JSR_257_DIR=
+endif
+ifndef PROJECT_JSR_258_DIR
+PROJECT_JSR_258_DIR=
+endif
+ifndef PROJECT_JSR_272_DIR
+PROJECT_JSR_272_DIR=
+endif
+ifndef PROJECT_JSR_280_DIR
+PROJECT_JSR_280_DIR=
+endif
+ifndef PROJECT_JSR_290_DIR
+PROJECT_JSR_290_DIR=
+endif
+ifndef PROJECT_JSR_293_DIR
+PROJECT_JSR_293_DIR=
+endif
+ifndef PROJECT_JSR_75_DIR
+PROJECT_JSR_75_DIR=
+endif
+ifndef PROJECT_JSR_82_DIR
+PROJECT_JSR_82_DIR=
+endif
+ifndef PROJECT_MIDP_DIR
+PROJECT_MIDP_DIR=$(MIDP_DIR)/.
+endif
+ifndef RESTRICTED_CRYPTO_DIR
+RESTRICTED_CRYPTO_DIR=
+endif
+ifndef SWERVE_DIR
+SWERVE_DIR=
+endif
+ifndef TOOLS_DIR
+TOOLS_DIR=$(MIDP_DIR)/../phoneme_source/phoneME/tools
+endif
+ifndef TOOLS_OUTPUT_DIR
+TOOLS_OUTPUT_DIR=$(MIDP_DIR)/../phoneme_source/phoneME/tools/output
+endif

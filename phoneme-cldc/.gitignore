@@ -1,0 +1,30 @@
+# ---- Build products ----
+/dist/
+/build/classes/
+/build/classes.zip
+/build/com/
+/build/tmpclasses/
+/build/linux_arm/
+/build/share/bin/
+/build/share/jni_stubs.c
+
+# build/vita_arm: keep only hand-written platform config & scripts,
+# ignore all generated output (ROMImage_*.cpp, binaries, target/, dist/, ...)
+/build/vita_arm/*
+!/build/vita_arm/Makefile
+!/build/vita_arm/vita_arm.cfg
+!/build/vita_arm/vita_arm.mk
+!/build/vita_arm/embed_midp.py
+
+# Object files / libraries / backups
+*.o
+*.a
+*.bak
+*.original
+*.backup_*
+
+# Workspace convenience symlink (points outside this repo)
+/src/midp
+
+# Unreferenced dev scratch
+/src/tools/buildtool/makedep/CheckProps.java
