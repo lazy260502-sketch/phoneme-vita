@@ -56,6 +56,7 @@ extern volatile SceUID vita_tone_tid;
  * even when the coredump cannot see the Java heap. */
 extern void vita_site_dump(const char *path);
 extern void vita_site_dump_verify(const char *path);
+extern void vita_site_dump_clinit(const char *path);
 
 #define WD_LOG_PATH "ux0:/data/J2ME00001/watchdog.log"
 #define WD_STALL_POLLS 12   /* 12 x 250 ms ~= 3 s, CLOCK-FREE threshold */
@@ -204,6 +205,10 @@ static int wd_thread_routine(SceSize args, void *argp) {
         /* v01.85: name the class.method the verifier was on when the
          * hang began (log11 froze inside verify_class itself). */
         vita_site_dump_verify("ux0:/data/J2ME00001/site_ring.log");
+        /* v01.88: name the class whose <clinit> was executing when the
+         * hang began (log14 froze with the verifier off, spin moved
+         * into clinit execution itself). */
+        vita_site_dump_clinit("ux0:/data/J2ME00001/site_ring.log");
 
         /* v01.82: log8 nailed the shape of the hang (VM thread RUNNING,
          * wait=none, both clocks alive) but the kernel API cannot name

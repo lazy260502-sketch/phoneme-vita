@@ -725,7 +725,20 @@ set(VITA_VERSION  "01.86")
 #   libobj.a's midp_run.o. Lesson recorded: after ANY midp-side source
 #   edit, build_vita.sh must be run and its COMPILE ERRORS checked - a
 #   failed compile leaves the old .o in libobj.a.
-set(VITA_VERSION  "01.87")
+# 01.88 (2026-09-20): log14 - VERIFIER CONFIRMED OFF, SPIN MOVED INTO
+#   CLINIT EXECUTION. site_ring.log: "verify class=(none)" and only 3
+#   open_entry marks (seq=3) - but the game ran 345 frames (~5 s,
+#   input HEARTBEAT + menu hb logs) before the freeze, so the round
+#   progressed far past v01.86/87 boots. THREAD_REG_INFO from the log14
+#   coredump: VM OS thread parked at start_lightweight_thread_asm
+#   (dispatch frame, same as log11) => the spin is on a green thread's
+#   Java stack - now inside the EXECUTION of the 4th lazily-loaded
+#   class's <clinit>, not its verification. Also unified the VPK output
+#   into out/vpk/ (midp_vita.vpk + midp_vita_v<ver>.vpk, POST_BUILD
+#   copy). New forensic hook: vita_site_clinit_class() records the
+#   class whose clinit is about to run; the watchdog HANG dump appends
+#   "clinit class=..." to site_ring.log.
+set(VITA_VERSION  "01.88")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
@@ -1172,6 +1185,26 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
     FILE     ${PORT_DIR}/config/fontbitmap.bin    data/J2ME00001/fontbitmap.bin
     FILE     ${MIDLET_JAR}                       data/J2ME00001/Hello.jar
     ${VITA_SKIN_FILE_ARGS}
+)
+
+#==============================================================================
+# v01.87: unified VPK output directory
+#   Historically the VPKs landed in two places: the build dir root (in-source
+#   cmake .) AND out/vpk/ (whatever the last manual copy left there). Keep ONE
+#   canonical location: out/vpk/, with the version-tagged name
+#   midp_vita_v<version>.vpk (plus the plain midp_vita.vpk copy). The post-
+#   build step runs after every make, so both files always reflect the last
+#   build; stale version-tagged files from older builds stay (history).
+#==============================================================================
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PORT_DIR}/out/vpk
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
+            ${PORT_DIR}/out/vpk/midp_vita.vpk
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
+            ${PORT_DIR}/out/vpk/midp_vita_v${VITA_VERSION}.vpk
+    COMMENT "Copying VPK to out/vpk/ (midp_vita.vpk + midp_vita_v${VITA_VERSION}.vpk)"
 )
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
