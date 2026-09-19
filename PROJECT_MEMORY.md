@@ -3530,3 +3530,62 @@ UC 多 store 并存（空名设置库 FFFFFFFF + 书签库 + 缓存库），open
   - `frozen=NO`（seq 仍在涨）= 环经过某个打点 → 重复的地址即环路径
   - 全空 ring = 环在 8 个打点之外 → 下一轮加桩（候选：InterpreterRuntime
     入口、EventFlag 等待路径）
+
+## 2026-09-20 v01.85：log11 ring 开口——自旋锁定在字节码验证器内部（c086d73 / phoneme-cldc 8c82c4b）
+
+### log11 取证结果（v01.84 装置首次命中）
+- `site_ring.log`：`seq=10 frozen=yes self=0x8105a178`
+- **self= 锚点定 slide**：vita_site_dump 运行时 0x8105a178 ↔ 静态 0x1020551b8
+  → slide=0x80FFB040（静态 = 运行时 + slide）——比 NOTE 段模块基址推法更直接可靠
+- ring 解码（时间序旧→新）：`open_entry → verify_class → open_entry×5 →
+  verify_class → open_entry → verify_class(最后)`
+- 两个地址符号化：`0x810aa8b8 = JVMVerifier::verify_class+24`、
+  `0x810bb098 = JarFileParser::open_entry+28`——正常类加载节奏
+
+### 定案
+- **最后事件 = verify_class 进入，此后 3+ 秒零打点**（无 GC collect、
+  无线程死亡路径、无下一次 open_entry）→ **自旋在 verify_class 子树内部**
+- core11 佐证：VM 线程 pc 仍为 `start_lightweight_thread_asm+0x14`
+  （分发桩帧，green 线程在 Java 堆栈执行，转储不可见）；主栈残留帧扫描
+  （0x8137f000-0x81381000 全窗口）只有更早的类加载链
+  （PNG/Inflater/parse_stackmaps/open_entry/fread），**零验证器帧**
+- watchdog：HANG ce=347 polls=12 tick=726（7.26s 会话，ticker 全程活）
+  ——与 log10 同形态，再次确认 tick 交付但未消费
+- vm_output.log 显示 MIDlet 构造完成两轮 startSuite 后冻结——自旋发生在
+  startApp 触发的后续类加载验证中
+
+### 代码走查排除（verify_class 子树内的循环）
+- `GetInstructionStarts::run`（wide_len≤0 有 `goto error` 保护）
+- `Method::iterate`（第一遍扫过则第二遍同序推进）
+- `populate_stackmap_cache`、`check_handlers`、`check_news`、
+  `SignatureStream::next`、`write_short/long_map`、`compress_verifier_stackmaps`
+  ——全有界
+- 剩余嫌疑（无法静态定案）：`check_stackmap_match` 对每分支目标做
+  stackmap 线性扫描（O(方法数×分支数) 平方复杂度）、巨方法/巨 switch 的
+  验证循环、`SystemDictionary::resolve` 触发的类加载递归（ring 只看到
+  verify_class 内层，resolve 引发的 open_entry 也该留痕——但没有，
+  故 resolve 排除）
+
+### v01.85 验证器深追装置
+- `vita_site_verifier_class(name)`：verify_class_internal 入口记录类名
+- `vita_site_verifier_method(name)`：VerifyMethodCodes::verify 入口记录方法名
+- `vita_site_dump_verify(path)`：HANG 时追加 `verify class=... method=...`
+  行到 site_ring.log（watchdog 调用）
+- ring 加两个阶段锚：verify_class_internal 进入 + 返回、iterate 开始
+  ——下一轮 ring 能判"卡在 verify 哪个阶段"
+- 名称缓存 64 字节 static（无锁，单写者 VM 线程；Symbol::base_address()
+  直拷，NUL 截断）
+
+### 构建/产物
+- VPK：`out/vpk/midp_vita_v01.85_verifier_trace.vpk`
+  （md5 a50e8fc792fef92af7b2ce009da8a728）
+- velf 符号：vita_site_verifier_class@0x1020556f0、method@0x102055738、
+  dump_verify@0x102055788
+- 提交：phoneme-cldc 8c82c4b（4 文件 +79）；j2me 主仓 c086d73（+20）
+
+### 复测判据（真机）
+- site_ring.log 应出现 `verify class=X method=Y`——直接点名肇事类与方法
+- ring 尾部：最后事件若仍是"verify_class 进入后静默"，配合类名可定位
+  具体方法代码（反编译该 jar 的该方法，查巨 switch/巨 stackmap）
+- 若 ring 显示 verify_class 返回后静默 → 自旋在
+  compress_verifier_stackmaps 或 set_verified 之后的下一环
