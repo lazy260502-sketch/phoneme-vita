@@ -738,7 +738,17 @@ set(VITA_VERSION  "01.86")
 #   copy). New forensic hook: vita_site_clinit_class() records the
 #   class whose clinit is about to run; the watchdog HANG dump appends
 #   "clinit class=..." to site_ring.log.
-set(VITA_VERSION  "01.88")
+# 01.89 (2026-09-20): log15 - CULPRIT CLASS NAMED. site_ring.log:
+#   "clinit class=com/app/filemanager/UI" with the ring showing 13
+#   clinit marks interleaved with 3 open_entry marks (seq=38) - a
+#   class-load STORM inside UI.<clinit>: the static initializer keeps
+#   triggering new lazy class loads and never returns. Same shape as
+#   the frozen register set as log11/14 (VM parked in dispatch frame,
+#   spin on the green-thread Java stack). Note the watchdog's depth
+#   forensics: v01.89 adds a 16-slot clinit HISTORY ring + depth
+#   counters (storm of sequential clinits vs deep recursive chain) +
+#   a return hook in set_initialized, all dumped on HANG.
+set(VITA_VERSION  "01.89")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
