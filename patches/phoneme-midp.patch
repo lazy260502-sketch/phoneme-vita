@@ -5057,7 +5057,7 @@ index b8da050..a7c03cf 100644
   * Sets the config directory for MIDP if needed.
   * In this directory static data as images and 
 diff --git a/src/ams/ams_base_cldc/reference/native/midp_run.c b/src/ams/ams_base_cldc/reference/native/midp_run.c
-index 08f53e9..329c485 100644
+index 08f53e9..55ef02a 100644
 --- a/src/ams/ams_base_cldc/reference/native/midp_run.c
 +++ b/src/ams/ams_base_cldc/reference/native/midp_run.c
 @@ -26,6 +26,20 @@
@@ -5214,10 +5214,26 @@ index 08f53e9..329c485 100644
  
  #if (ENABLE_JSR_205 || ENABLE_JSR_120)
      /*
-@@ -770,7 +860,15 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
+@@ -770,7 +860,31 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
  
      putClassPathExtToSysProperty(classPathExt);
  
++#if defined(VITA)
++    /* v01.86: disable runtime bytecode verification (root cause of the
++     * log9..log12 round-hang family). UseVerifier defaults to true
++     * (Globals.hpp), so every lazily-loaded jar class went through
++     * Verifier::verify_class on the VM thread; UI*.<clinit> in one game
++     * took seconds (quadratic stackmap scan) and froze the whole VM
++     * while the ticker stayed alive. MIDlet jars are preverified by the
++     * WTK toolchain (J2ME spec), so re-verifying at runtime is redundant
++     * here. Must run before midpRunVm - the #if (VERIFY_ONCE) save/
++     * restore block below is compiled out in this build. v01.87: use
++     * KNI_FALSE - JNI_FALSE is not defined on the midp side and the
++     * v01.86 build of this file silently failed, leaving the stale
++     * Sep-14 object linked into libobj.a (the verifier stayed on). */
++    JVM_SetUseVerifier(KNI_FALSE);
++#endif
++
 +    /* VITA HACK: limit do-while retries to prevent 21x infinite loop */
 +    int _vita_iter = 0;
 +
@@ -5230,7 +5246,7 @@ index 08f53e9..329c485 100644
          MIDP_ERROR status = MIDP_ERROR_NONE;
  
  #if (VERIFY_ONCE)
-@@ -790,18 +888,26 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
+@@ -790,18 +904,26 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
  #endif
          switch (status) {
          case MIDP_ERROR_OUT_MEM:
@@ -5257,7 +5273,7 @@ index 08f53e9..329c485 100644
              break;
          }
  
-@@ -833,7 +939,15 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
+@@ -833,7 +955,15 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
           *
           * Arguments to MIDlets are pass in the command state.
           */
@@ -5273,7 +5289,7 @@ index 08f53e9..329c485 100644
  
          measureStack(KNI_FALSE);
  
-@@ -842,6 +956,8 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
+@@ -842,6 +972,8 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
              classPath = NULL;
          }
  
@@ -5282,7 +5298,7 @@ index 08f53e9..329c485 100644
          /** 
           * Any subsequent VM runs that will or not happen after 
           * the first one counts as VM restart.
-@@ -931,7 +1047,7 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
+@@ -931,7 +1063,7 @@ midp_run_midlet_with_args_cp(SuiteIdType suiteId,
          }
  #endif /* ENABLE_ON_DEVICE_DEBUG */
  #endif /* ENABLE_JAVA_DEBUGGER */
@@ -5291,7 +5307,7 @@ index 08f53e9..329c485 100644
  
      pushcheckinall();
  
-@@ -1003,11 +1119,25 @@ static MIDP_ERROR getClassPathPlus(SuiteIdType suiteId,
+@@ -1003,11 +1135,25 @@ static MIDP_ERROR getClassPathPlus(SuiteIdType suiteId,
      int additionalPathLength = strlen(additionalPath);
      int i,j;
  
@@ -5317,7 +5333,7 @@ index 08f53e9..329c485 100644
          jarPath = PCSL_STRING_EMPTY;
      } else {
          MIDPError error;
-@@ -1021,23 +1151,86 @@ static MIDP_ERROR getClassPathPlus(SuiteIdType suiteId,
+@@ -1021,23 +1167,86 @@ static MIDP_ERROR getClassPathPlus(SuiteIdType suiteId,
          }
  
          if (error != ALL_OK) {
@@ -5406,7 +5422,7 @@ index 08f53e9..329c485 100644
      }
      for (i = 0; i < jarPathLen; i++) {
          newPath[i] = (JvmPathChar)jarPathData[i];
-@@ -1060,8 +1253,21 @@ static MIDP_ERROR getClassPathPlus(SuiteIdType suiteId,
+@@ -1060,8 +1269,21 @@ static MIDP_ERROR getClassPathPlus(SuiteIdType suiteId,
  
      *userClassPath = newPath;
  
@@ -5428,7 +5444,7 @@ index 08f53e9..329c485 100644
      return MIDP_ERROR_NONE;
  }
  
-@@ -1107,12 +1313,12 @@ static MIDP_ERROR getClassPathForVerifyOnce(
+@@ -1107,12 +1329,12 @@ static MIDP_ERROR getClassPathForVerifyOnce(
      *pClassPath = (JvmPathChar*)midpMalloc(
          sizeof(JvmPathChar) * (jarPathLen + 1));
      if (NULL == *pClassPath) {
@@ -5443,7 +5459,7 @@ index 08f53e9..329c485 100644
      }
  
      for (i = 0; i < jarPathLen; i++) {
-@@ -1180,3 +1386,4 @@ int midpRunMainClass(JvmPathChar *classPath,
+@@ -1180,3 +1402,4 @@ int midpRunMainClass(JvmPathChar *classPath,
      return vmStatus;
  }
  

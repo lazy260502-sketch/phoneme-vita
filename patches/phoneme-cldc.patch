@@ -2064,10 +2064,10 @@ index 0000000..e1a1b3d
 +#endif /* BUILD_FLAGS_VITA_HPP */
 diff --git a/src/vm/os/vita/Globals_vita.hpp b/src/vm/os/vita/Globals_vita.hpp
 new file mode 100644
-index 0000000..e9e260a
+index 0000000..098b1c1
 --- /dev/null
 +++ b/src/vm/os/vita/Globals_vita.hpp
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,60 @@
 +/*
 + * Globals_vita.hpp: Command line switches for the PS Vita platform.
 + *
@@ -2112,6 +2112,20 @@ index 0000000..e9e260a
 +        PLATFORM_RUNTIME_FLAGS_VFP(develop, product)
 +
 +#define stricmp strcasecmp
++
++/* v01.84 site ring (see OS_vita.cpp): hang forensics for native-code
++ * loops that never pass yield()/tick checkpoints. Called from share/
++ * call sites guarded by #if defined(VITA); defined in OS_vita.cpp. */
++extern "C" {
++    void vita_site_mark(void) __attribute__((noinline));
++    void vita_site_dump(const char *path);
++    /* v01.85 verifier deep tracing - names the class.method being
++     * verified at hang time (see OS_vita.cpp). v01.86: explicit length
++     * - Symbols are length-prefixed, NOT NUL-terminated. */
++    void vita_site_verifier_class(const char *name, int len);
++    void vita_site_verifier_method(const char *name, int len);
++    void vita_site_dump_verify(const char *path);
++}
 +
 +#endif // GLOBALS_VITA_HPP
 diff --git a/src/vm/os/vita/JVM_vita.cpp b/src/vm/os/vita/JVM_vita.cpp
@@ -2313,10 +2327,10 @@ index 0000000..6be9e61
 +}
 diff --git a/src/vm/os/vita/OS_vita.cpp b/src/vm/os/vita/OS_vita.cpp
 new file mode 100644
-index 0000000..09cfc6c
+index 0000000..2fcd947
 --- /dev/null
 +++ b/src/vm/os/vita/OS_vita.cpp
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,415 @@
 +/*
 + * OS_vita.cpp: PS Vita implementation of the VM
 + *               operating system porting interface
@@ -2353,6 +2367,7 @@ index 0000000..09cfc6c
 +// Vita-specific headers
 +#include <psp2/kernel/processmgr.h>
 +#include <psp2/kernel/threadmgr.h>
++#include <psp2/io/fcntl.h> /* v01.84 site ring: sceIoOpen for vita_site_dump */
 +
 +/*=========================================================================
 + * Performance counter support
@@ -2434,12 +2449,18 @@ index 0000000..09cfc6c
 +static volatile bool ticker_stopping = false;
 +static volatile bool ticker_stopped = false;
 +static bool ticker_created = false;
++/* v01.83: log9 showed the pump gate never opening for 3s while the VM
++ * spun in a thread create/die cycle. Expose the tick count so the
++ * watchdog HANG report can tell "ticker dead/starved" from "ticks
++ * delivered but gate closed". Read via extern from vita_watchdog.c. */
++extern "C" volatile unsigned int vita_tick_count = 0;
 +
 +static int ticker_thread_routine(SceSize args, void *argp) {
 +    while (!ticker_stopping) {
 +        ticker_running = true;
 +        sceKernelDelayThread(TickInterval * 1000);
 +        if (ticker_running && !ticker_stopping) {
++            vita_tick_count++;
 +            real_time_tick(TickInterval);
 +        }
 +    }
@@ -2601,6 +2622,130 @@ index 0000000..09cfc6c
 +    return true;
 +#endif
 +}
++
++/*=========================================================================
++ * v01.84 site ring: last-executed-site tracker for hang forensics
++ *
++ * log9+log10 coredumps froze the VM thread at start_lightweight_thread_asm+4
++ * (dispatch frame on the OS stack) with CE frozen 3+ s while cldc_ticker
++ * kept ticking. That rules out every loop passing through yield() or an
++ * interpreter tick checkpoint (the v01.83 pump backstop sits inside
++ * yield()). The spin lives in native C++ on a green thread's Java stack,
++ * and the Java heap is not in the coredump, so the dump cannot name the
++ * loop. vita_site_mark() stores one return address per call at strategic
++ * native entry points (16-slot ring + seq). The launcher watchdog dumps
++ * the ring on HANG: frozen seq + repeated tail names the loop.
++ * Lock-free / allocation-free: single writer (VM thread), readers
++ * tolerate torn seq. Dump path uses sceIo* directly - never stdio
++ * (log10 residue frames point at the stdio domain; do not forensics
++ * inside the crime scene).
++ * Declaration lives in Globals_vita.hpp (included by every VM TU via
++ * the generated .incl chain), so share/ call sites need no new headers.
++ *=======================================================================*/
++
++extern "C" {
++
++volatile unsigned int vita_site_seq = 0;
++
++#define VITA_SITE_RING_SIZE 16
++static const void *vita_site_ring[VITA_SITE_RING_SIZE];
++
++/* noinline so the return address of the CALLER (the marked site) is
++ * reliably captured; every entry in the ring is addr2line-able. */
++__attribute__((noinline)) void vita_site_mark(void) {
++    unsigned int s = vita_site_seq;
++    vita_site_ring[s & (VITA_SITE_RING_SIZE - 1)] =
++        __builtin_return_address(0);
++    vita_site_seq = s + 1;
++}
++
++/*=========================================================================
++ * v01.85 verifier deep tracing: log10's ring named the loop's
++ * neighborhood (last event = Verifier::verify_class entry, then 3+ s of
++ * silence) but not the loop itself - verification runs on the green
++ * thread's Java stack, invisible to both coredump and OS stack. These
++ * two hooks give the next dump a name: the class.method being verified
++ * at hang time, plus per-phase marks so the ring can tell which
++ * verifier phase is spinning.
++ * Written from the VM thread (single writer, same discipline as the
++ * ring); read by the watchdog via sceIo* only.
++ *=======================================================================*/
++
++static char vita_verify_class_name[64];
++static char vita_verify_method_name[64];
++
++/* Called at the top of Verifier::verify_class_internal per class.
++ * v01.86: takes an explicit length - Symbols are length-prefixed and
++ * NOT NUL-terminated, so a strlen-style copy ran past the name into
++ * adjacent symbol data (the garbage bytes after "com/app/filemanager/UI"
++ * in log12's site_ring.log). */
++void vita_site_verifier_class(const char *name, int len) {
++    int i = 0;
++    if (name && len > 0) {
++        if (len > 63) len = 63;
++        for (; i < len; i++)
++            vita_verify_class_name[i] = name[i];
++    }
++    vita_verify_class_name[i] = 0;
++}
++
++/* Called at the top of VerifyMethodCodes::verify per method (name may
++ * be NULL for <init>/<clinit> - caller passes what it has). Same
++ * length-bounded copy as above (v01.86). */
++void vita_site_verifier_method(const char *name, int len) {
++    int i = 0;
++    if (name && len > 0) {
++        if (len > 63) len = 63;
++        for (; i < len; i++)
++            vita_verify_method_name[i] = name[i];
++    }
++    vita_verify_method_name[i] = 0;
++}
++
++/* Called from the watchdog thread after a HANG. Appends the current
++ * verifier target (if any) to the site ring log. */
++void vita_site_dump_verify(const char *path) {
++    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
++                          0777);
++    if (fd < 0) return;
++    char buf[160];
++    int n = snprintf(buf, sizeof(buf), "verify class=%s method=%s\n",
++                     vita_verify_class_name[0] ? vita_verify_class_name
++                                               : "(none)",
++                     vita_verify_method_name[0] ? vita_verify_method_name
++                                                : "(none)");
++    sceIoWrite(fd, buf, n);
++    sceIoClose(fd);
++}
++
++/* Called by the launcher watchdog thread after a HANG is detected.
++ * Slot (seq-1)&15 is the newest site; ordering below is newest first. */
++void vita_site_dump(const char *path) {
++    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
++                          0777);
++    if (fd < 0) return;
++    char buf[128];
++    int n;
++    unsigned int s = vita_site_seq;
++    unsigned int s2 = vita_site_seq;
++    n = snprintf(buf, sizeof(buf),
++                 "site seq=%u frozen=%s self=0x%08x\n", s,
++                 s == s2 ? "yes" : "NO",
++                 (unsigned int)(unsigned long)&vita_site_dump);
++    sceIoWrite(fd, buf, n);
++    for (int i = 0; i < VITA_SITE_RING_SIZE; i++) {
++        int idx = (int)((s - 1 - (unsigned int)i) &
++                        (VITA_SITE_RING_SIZE - 1));
++        const void *v = vita_site_ring[idx];
++        if (v == NULL) continue;
++        n = snprintf(buf, sizeof(buf), "  [%2d] 0x%08x\n", i,
++                     (unsigned int)(unsigned long)v);
++        sceIoWrite(fd, buf, n);
++    }
++    sceIoClose(fd);
++}
++
++} /* extern "C" */
 diff --git a/src/vm/os/vita/OS_vita.hpp b/src/vm/os/vita/OS_vita.hpp
 new file mode 100644
 index 0000000..3bd542d
@@ -4624,7 +4769,7 @@ index fd788ba..3a687d7 100644
  
    address execution_entry(void) const {
 diff --git a/src/vm/share/memory/ObjectHeap.cpp b/src/vm/share/memory/ObjectHeap.cpp
-index 1512c6b..518e686 100644
+index 1512c6b..d232bb6 100644
 --- a/src/vm/share/memory/ObjectHeap.cpp
 +++ b/src/vm/share/memory/ObjectHeap.cpp
 @@ -29,6 +29,11 @@
@@ -4832,7 +4977,17 @@ index 1512c6b..518e686 100644
          ((MethodDesc*) p)->relocate_variable_part(delta);
        }
      }
-@@ -3379,11 +3408,11 @@ OopDesc* ObjectHeap::decode_near(OopDesc* obj, const QuickVars& qv ) {
+@@ -2826,6 +2855,9 @@ size_t ObjectHeap::reduce_compiler_usage(size_t requested) {
+ #endif
+ 
+ void ObjectHeap::collect(size_t min_free_after_collection JVM_TRAPS) {
++#if defined(VITA)
++  vita_site_mark(); /* v01.84: log10 - GC entry marker */
++#endif
+   min_free_after_collection = align_allocation_size(min_free_after_collection);
+ 
+   allocation_trap_must_be_disabled();
+@@ -3379,11 +3411,11 @@ OopDesc* ObjectHeap::decode_near(OopDesc* obj, const QuickVars& qv ) {
    const size_t near_offset = (size_t) klass & qv.near_mask;
    OopDesc* n;
  #if ENABLE_HEAP_NEARS_IN_HEAP 
@@ -4846,7 +5001,7 @@ index 1512c6b..518e686 100644
      // bit 31 is not set -- this means we're in heap
  
      // Lower bits contains relative offset to heap start
-@@ -3410,11 +3439,11 @@ inline OopDesc* ObjectHeap::decode_near(OopDesc* obj, OopDesc **heap_start,
+@@ -3410,11 +3442,11 @@ inline OopDesc* ObjectHeap::decode_near(OopDesc* obj, OopDesc **heap_start,
    const size_t near_offset = (size_t) klass & near_mask;
    OopDesc* n;
  #if ENABLE_HEAP_NEARS_IN_HEAP 
@@ -4860,7 +5015,7 @@ index 1512c6b..518e686 100644
      // bit 31 is not set -- this means we're in heap
  
      // Lower bits contains relative offset to heap start
-@@ -3705,7 +3734,7 @@ inline void ObjectHeap::compiler_area_compact( const int last_moving_up ) {
+@@ -3705,7 +3737,7 @@ inline void ObjectHeap::compiler_area_compact( const int last_moving_up ) {
      for( int i = last_moving_up; i >= 0; --i ) {
        const CompiledMethodDesc* const src = CompiledMethodCache::Map[i];
        CompiledMethodDesc* const dst =
@@ -4869,7 +5024,7 @@ index 1512c6b..518e686 100644
  
  #if ENABLE_JVMPI_PROFILE 
        // compiled code has been moved, so send compiled method unload event
-@@ -3739,7 +3768,7 @@ inline void ObjectHeap::compiler_area_compact( const int last_moving_up ) {
+@@ -3739,7 +3771,7 @@ inline void ObjectHeap::compiler_area_compact( const int last_moving_up ) {
      for( int i = last_moving_up; ++i <= upb; ) {
        const CompiledMethodDesc* const src = CompiledMethodCache::Map[i];
        CompiledMethodDesc* const dst =
@@ -4878,7 +5033,7 @@ index 1512c6b..518e686 100644
        if( src != dst ) {
          
  #if ENABLE_JVMPI_PROFILE 
-@@ -3789,7 +3818,7 @@ inline void ObjectHeap::compiler_area_update_pointers( void ) {
+@@ -3789,7 +3821,7 @@ inline void ObjectHeap::compiler_area_update_pointers( void ) {
      ForAllHandles( handle ) {
        const CompiledMethodDesc* p = (const CompiledMethodDesc*)handle->obj();
        if( compiler_area_contains( p ) ) {
@@ -4887,7 +5042,7 @@ index 1512c6b..518e686 100644
          if( delta ) {
            handle->set_obj( DERIVED( OopDesc*, p, delta ) );
          }
-@@ -3811,7 +3840,7 @@ inline void ObjectHeap::compiler_area_update_pointers( void ) {
+@@ -3811,7 +3843,7 @@ inline void ObjectHeap::compiler_area_update_pointers( void ) {
            CompiledMethodDesc* p = 
              (CompiledMethodDesc*)java_frame.compiled_method();
            if( compiler_area_contains( p ) ) {
@@ -4896,7 +5051,7 @@ index 1512c6b..518e686 100644
              if( delta ) {
                JavaFrame copy = java_frame;
                java_frame.caller_is(frame);
-@@ -4134,6 +4163,14 @@ void ObjectHeap::verify_layout() {
+@@ -4134,6 +4166,14 @@ void ObjectHeap::verify_layout() {
    GUARANTEE_R(_compiler_area_start      <= _compiler_area_top,        "sanity");
    GUARANTEE_R(_compiler_area_top        <= _large_object_area_bottom, "sanity");
    GUARANTEE_R(_large_object_area_bottom <= _heap_top,                 "sanity");
@@ -4911,7 +5066,7 @@ index 1512c6b..518e686 100644
    GUARANTEE_R(_heap_top                 <= _heap_limit,               "sanity");
    GUARANTEE_R(_heap_limit               <= _heap_end,                 "sanity");
  
-@@ -4534,7 +4571,7 @@ inline void* ObjectHeap::set_heap_limit( void* new_heap_limit ) {
+@@ -4534,7 +4574,7 @@ inline void* ObjectHeap::set_heap_limit( void* new_heap_limit ) {
    if( !in_use && _heap_min == _heap_capacity ) {
      in_use = true;
  
@@ -4920,7 +5075,7 @@ index 1512c6b..518e686 100644
  #ifdef AZZERT
      const size_t minimum_marking_stack_size = DISTANCE(_heap_top, _heap_limit);
      GUARANTEE(minimum_marking_stack_size
-@@ -4566,6 +4603,9 @@ inline void* ObjectHeap::set_heap_limit( void* new_heap_limit ) {
+@@ -4566,6 +4606,9 @@ inline void* ObjectHeap::set_heap_limit( void* new_heap_limit ) {
        LargeObject::move( -reduction, old_heap_top );
        _heap_top = heap_top;
        _heap_limit = heap_top + MimimumMarkingStackSize;
@@ -4930,7 +5085,7 @@ index 1512c6b..518e686 100644
        _young_generation_target_size = align_up(
          DISTANCE(_heap_start, heap_top) / YoungGenerationTarget );
        verify_layout();
-@@ -4629,7 +4669,7 @@ void ObjectHeap::save_java_stack_snapshot() {
+@@ -4629,7 +4672,7 @@ void ObjectHeap::save_java_stack_snapshot() {
  void ObjectHeap::print(Stream* st) {
    st->print_cr("Object heap       [0x%x,0x%x), %d bytes", 
                                     _heap_start, _heap_top,
@@ -4939,7 +5094,7 @@ index 1512c6b..518e686 100644
    st->print_cr("total/free bytes    [%d,%d]", total_memory(), free_memory());
    st->print_cr("- Collection area   [0x%x,0x%x, 0x%x)",
      _collection_area_start, _inline_allocation_top, _inline_allocation_end);
-@@ -4640,7 +4680,7 @@ void ObjectHeap::print(Stream* st) {
+@@ -4640,7 +4683,7 @@ void ObjectHeap::print(Stream* st) {
    st->print_cr("Min marking stack   [0x%x,0x%x)", _heap_top, _bitvector_start);
    st->print_cr("Bit vector          [0x%x,0x%x), %d bytes",
                                    _bitvector_start, _slices_start,
@@ -6073,10 +6228,20 @@ index d5500f0..314797a 100644
  #if ENABLE_JAVA_DEBUGGER
    case JVM_CONFIG_DEBUGGER_PORT:
 diff --git a/src/vm/share/runtime/JarFileParser.cpp b/src/vm/share/runtime/JarFileParser.cpp
-index af139e9..c6776b4 100644
+index af139e9..9daad7a 100644
 --- a/src/vm/share/runtime/JarFileParser.cpp
 +++ b/src/vm/share/runtime/JarFileParser.cpp
-@@ -1457,7 +1457,7 @@ ReturnOop FileDescriptor::allocate(JVM_SINGLE_ARG_TRAPS) {
+@@ -1278,6 +1278,9 @@ bool JarFileParser::find_entry(const char *match_name JVM_TRAPS)
+ }
+ 
+ ReturnOop JarFileParser::open_entry(int flags JVM_TRAPS) {
++#if defined(VITA)
++  vita_site_mark(); /* v01.84: log10 - class-file entry read marker */
++#endif
+   UsingFastOops fast_oops;
+   BufferedFile::Fast jar_buffer = buffered_file();
+   FileDecoder::Fast result;
+@@ -1457,7 +1460,7 @@ ReturnOop FileDescriptor::allocate(JVM_SINGLE_ARG_TRAPS) {
  }
  
  void FileDescriptor::set_handle(OsFile_Handle value) {
@@ -6099,7 +6264,7 @@ index edc9e0f..9055538 100644
    // print to log file
    if (LogVMOutput && has_log_file()) {
 diff --git a/src/vm/share/runtime/Scheduler.cpp b/src/vm/share/runtime/Scheduler.cpp
-index b65793c..37c029a 100644
+index b65793c..4e3d680 100644
 --- a/src/vm/share/runtime/Scheduler.cpp
 +++ b/src/vm/share/runtime/Scheduler.cpp
 @@ -614,7 +614,7 @@ void Scheduler::wake_up_terminated_sleepers(int task_id JVM_TRAPS) {
@@ -6111,7 +6276,7 @@ index b65793c..37c029a 100644
          }
          if (Thread::current()->equals(this_thread())) {
            Thread::set_current_pending_exception(&termination_signal);
-@@ -649,12 +649,28 @@ void Scheduler::wake_up_terminated_sleepers(int task_id JVM_TRAPS) {
+@@ -649,12 +649,42 @@ void Scheduler::wake_up_terminated_sleepers(int task_id JVM_TRAPS) {
  #endif
  
  void Scheduler::wake_up_timed_out_sleepers(JVM_SINGLE_ARG_TRAPS) {
@@ -6123,8 +6288,22 @@ index b65793c..37c029a 100644
 +  // touch and media events stuck in the native ring forever - the game
 +  // appears frozen (no key/touch response) although the VM is alive.
 +  // Drive the event pump from the timer tick instead.
++  //
++  // v01.83: log9 coredump showed the VM spinning in a thread create/die
++  // cycle (pc frozen at start_lightweight_thread_asm+0x8, CE counter
++  // frozen for 3s, RUNNING wait=none). In that loop this gate never
++  // opened: _estimated_event_readiness only counts down inside
++  // check_blocked_threads() itself, and the ticker-driven
++  // _timer_has_ticked can starve when the cycle hogs the CPU. Add a
++  // wall-clock backstop: any path that keeps calling yield()/this
++  // function now drives the pump at least every 50 ms, which also
++  // throttles the cycle (JVMSPI_CheckEvents waits up to 50 ms in ANI).
 +  if (!is_slave_mode()) {
-+    if (_timer_has_ticked || _estimated_event_readiness > 0) {
++    static jlong vita_last_pump_ms = 0;
++    jlong vita_now = Os::java_time_millis();
++    if (_timer_has_ticked || _estimated_event_readiness > 0 ||
++        (vita_now - vita_last_pump_ms) >= 50) {
++      vita_last_pump_ms = vita_now;
 +      _timer_has_ticked = false;
 +      check_blocked_threads(0);
 +    }
@@ -6140,7 +6319,7 @@ index b65793c..37c029a 100644
  
    // Wake up all sleeping threads that have timed out.
    jlong time = Os::java_time_millis();
-@@ -672,7 +688,7 @@ void Scheduler::wake_up_timed_out_sleepers(JVM_SINGLE_ARG_TRAPS) {
+@@ -672,7 +702,7 @@ void Scheduler::wake_up_timed_out_sleepers(JVM_SINGLE_ARG_TRAPS) {
            (time >= this_thread().wakeup_time())) {
          if (TraceThreadsExcessive) {
            TTY_TRACE_CR(("wakeup_timed_out_sleepers: signaling thread 0x%x"
@@ -6149,7 +6328,7 @@ index b65793c..37c029a 100644
                          this_thread().id()));
          }
          remove_waiting_thread(&this_thread);
-@@ -872,7 +888,7 @@ void Scheduler::wait_for(Thread* thread, jlong timeout) {
+@@ -872,7 +902,7 @@ void Scheduler::wait_for(Thread* thread, jlong timeout) {
    // This can be called for either a synchronization variable or for a
    // wait variable.  This may or may not be the current thread.
    if (TraceThreadsExcessive) {
@@ -6158,7 +6337,7 @@ index b65793c..37c029a 100644
                    thread->id()));
    }
  
-@@ -1280,7 +1296,7 @@ void Scheduler::interrupt_thread(Thread* thread JVM_TRAPS) {
+@@ -1280,7 +1310,7 @@ void Scheduler::interrupt_thread(Thread* thread JVM_TRAPS) {
          NOT_PRODUCT(trace("interrupt_thread: thread found", &this_thread));
          if (TraceThreadsExcessive) {
            TTY_TRACE_CR(("interrupt_thread: signaling thread 0x%x (id=%d)",
@@ -6167,7 +6346,7 @@ index b65793c..37c029a 100644
          }
          UsingFastOops fast_oops;
          Throwable::Fast exception;
-@@ -1304,7 +1320,7 @@ void Scheduler::interrupt_thread(Thread* thread JVM_TRAPS) {
+@@ -1304,7 +1334,7 @@ void Scheduler::interrupt_thread(Thread* thread JVM_TRAPS) {
            // exception at this point
            if (TraceThreadsExcessive) {
              TTY_TRACE_CR(("interrupt_thread: OOME, thread 0x%x",
@@ -6176,7 +6355,7 @@ index b65793c..37c029a 100644
            }
            thread->set_pending_interrupt();
            return;
-@@ -1328,7 +1344,7 @@ void Scheduler::interrupt_thread(Thread* thread JVM_TRAPS) {
+@@ -1328,7 +1358,7 @@ void Scheduler::interrupt_thread(Thread* thread JVM_TRAPS) {
    if (!found) {
      if (TraceThreadsExcessive) {
        TTY_TRACE_CR(("interrupt_thread: set pending interrupt for thread 0x%x",
@@ -6207,11 +6386,25 @@ index 3ef82d8..41680cc 100644
        if (TraceGC) {
          TTY_TRACE_CR(("TraceGC: 0x%p relocate object near from "
                        "stack lock 0x%p", obj, stack_near));
+diff --git a/src/vm/share/runtime/Task.cpp b/src/vm/share/runtime/Task.cpp
+index 34005ab..fc54b86 100644
+--- a/src/vm/share/runtime/Task.cpp
++++ b/src/vm/share/runtime/Task.cpp
+@@ -371,6 +371,9 @@ void Task::stop(int exit_code, int exit_reason JVM_TRAPS) {
+ }
+ 
+ void Task::cleanup_terminated_task(int id JVM_TRAPS) {
++#if defined(VITA)
++  vita_site_mark(); /* v01.84: log10 - task teardown marker */
++#endif
+   JVM_IGNORE_TRAPS;
+ 
+   if (GenerateROMImage || Universe::is_bootstrapping()) {
 diff --git a/src/vm/share/runtime/Thread.cpp b/src/vm/share/runtime/Thread.cpp
-index f526c1a..98bf2a0 100644
+index f526c1a..455f10a 100644
 --- a/src/vm/share/runtime/Thread.cpp
 +++ b/src/vm/share/runtime/Thread.cpp
-@@ -87,7 +87,7 @@ void Thread::setup_lightweight_stack(JVM_SINGLE_ARG_TRAPS) {
+@@ -87,10 +87,13 @@ void Thread::setup_lightweight_stack(JVM_SINGLE_ARG_TRAPS) {
    set_stack_limit();
  
    sp = setup_stack_asm(sp);
@@ -6220,7 +6413,43 @@ index f526c1a..98bf2a0 100644
  }
  
  void force_terminated(Thread* thread) {
-@@ -598,7 +598,7 @@ void Thread::set_stack_limit(address value) {
++#if defined(VITA)
++  vita_site_mark(); /* v01.84: log10 - death-path branch marker */
++#endif
+   ThreadObj::Raw thread_obj = thread->thread_obj();
+   thread_obj().set_terminated();
+ }
+@@ -103,6 +106,9 @@ ReturnOop Thread::task_for_thread( void ) const {
+ 
+ extern "C" {
+   void thread_task_cleanup()  {
++#if defined(VITA)
++    vita_site_mark(); /* v01.84: log10 - ring must see task cleanup */
++#endif
+     SETUP_ERROR_CHECKER_ARG;
+     // We come in here on primordial stack
+     UsingFastOops fast_oops;
+@@ -206,6 +212,9 @@ void Thread::lightweight_thread_uncaught_exception() {
+ }
+ 
+ void Thread::lightweight_thread_exit() {
++#if defined(VITA)
++  vita_site_mark(); /* v01.84: log10 - ring must see thread death */
++#endif
+   SETUP_ERROR_CHECKER_ARG;
+   Thread *thread = Thread::current();
+   if (TraceThreadsExcessive) {
+@@ -377,6 +386,9 @@ void Thread::start(JVM_SINGLE_ARG_TRAPS) {
+ }
+ 
+ void Thread::finish() {
++#if defined(VITA)
++  vita_site_mark(); /* v01.84: log10 - ring must see thread finish */
++#endif
+   SETUP_ERROR_CHECKER_ARG;
+   Thread *thread = Thread::current();
+   ThreadObj receiver = thread->thread_obj();
+@@ -598,7 +610,7 @@ void Thread::set_stack_limit(address value) {
  #ifdef UNDER_CE
    value = (address)((int)value | _system_address);
  #endif
@@ -6925,3 +7154,75 @@ index c48c901..e3e99b1 100644
  
  #if ENABLE_PERFORMANCE_COUNTERS || USE_DEBUG_PRINTING || ENABLE_JVMPI_PROFILE
  /**
+diff --git a/src/vm/share/verifier/Verifier.cpp b/src/vm/share/verifier/Verifier.cpp
+index 495da69..f36ccb5 100644
+--- a/src/vm/share/verifier/Verifier.cpp
++++ b/src/vm/share/verifier/Verifier.cpp
+@@ -54,6 +54,17 @@ bool Verifier::_is_cache_active = false;
+ void Verifier::verify_class_internal(InstanceClass* ic JVM_TRAPS) {
+   UsingFastOops fast_oops;
+ 
++#if defined(VITA)
++  {
++    /* v01.85: name the class being verified - log11 froze inside
++     * verify_class with the site ring as the only witness. v01.86:
++     * pass the Symbol length - symbols are not NUL-terminated. */
++    Symbol::Raw n = ic->name();
++    vita_site_verifier_class(n().base_address(), n().length());
++    vita_site_mark();
++  }
++#endif
++
+ #ifndef PRODUCT
+   if (TraceVerifier) {
+     tty->print("Verifying Class "); 
+@@ -94,6 +105,9 @@ void Verifier::verify_class_internal(InstanceClass* ic JVM_TRAPS) {
+ } 
+ 
+ void Verifier::verify_class(InstanceClass* ic JVM_TRAPS) {
++#if defined(VITA)
++  vita_site_mark(); /* v01.84: log10 - class-verify entry marker */
++#endif
+   GUARANTEE(!is_active(), "not re-entrant");
+ 
+   // this one allows is_active to be restored to false, even if 
+@@ -138,6 +152,9 @@ void Verifier::verify_class(InstanceClass* ic JVM_TRAPS) {
+ 
+   verify_class_internal(ic JVM_NO_CHECK_AT_BOTTOM); 
+ 
++#if defined(VITA)
++  vita_site_mark(); /* v01.85: verify_class_internal returned */
++#endif
+ #if ENABLE_PERFORMANCE_COUNTERS
+   // Don't count the class loading time during verification, since we want
+   // to meausre the effect of only verification itself (so that we can
+diff --git a/src/vm/share/verifier/VerifyMethodCodes.cpp b/src/vm/share/verifier/VerifyMethodCodes.cpp
+index 79d0b02..2269ab0 100644
+--- a/src/vm/share/verifier/VerifyMethodCodes.cpp
++++ b/src/vm/share/verifier/VerifyMethodCodes.cpp
+@@ -154,6 +154,15 @@ void VerifyMethodCodes::populate_stackmap_cache(Method *method) {
+ }
+ 
+ void VerifyMethodCodes::verify(Method *method, ObjArray *stackmaps JVM_TRAPS) {
++#if defined(VITA)
++  {
++    /* v01.85: name the method being verified - narrows the loop to a
++     * single method's code/stackmaps. v01.86: pass the Symbol length
++     * - symbols are not NUL-terminated. */
++    Symbol::Raw n = method->name();
++    vita_site_verifier_method(n().base_address(), n().length());
++  }
++#endif
+   BytecodeClosure::initialize(method);
+ 
+   populate_stackmap_cache(method);
+@@ -180,6 +189,9 @@ void VerifyMethodCodes::verify(Method *method, ObjArray *stackmaps JVM_TRAPS) {
+ 
+   set_no_control_flow(false);
+ 
++#if defined(VITA)
++  vita_site_mark(); /* v01.85: phases done, iteration begins */
++#endif
+   _num_stackmaps = stackmaps->length();
+   _current_stackmap_index = 0;
+ 

@@ -3589,3 +3589,93 @@ UC 多 store 并存（空名设置库 FFFFFFFF + 书签库 + 缓存库），open
   具体方法代码（反编译该 jar 的该方法，查巨 switch/巨 stackmap）
 - 若 ring 显示 verify_class 返回后静默 → 自旋在
   compress_verifier_stackmaps 或 set_verified 之后的下一环
+
+## 2026-09-20 v01.86：log12 定案——UseVerifier 默认 true 是根因，已关闭（ca95a95 / phoneme-cldc 43eda74）
+
+### log12 取证结果（v01.85 装置命中）
+- `site seq=51 frozen=yes self=0x810b0188`，slide=0x80FA5040
+- ring：`[0]=0x81100aa4`（最新）、`[1..12]=0x8110079c`（**同一地址重复 12 次**）、
+  `[13]=0x81100840`、`[14]=0x81100a3c`、`[15]=0x81111220`
+- `verify class=com/app/filemanager/UI<乱码> method=<clinit>`
+- watchdog `HANG ce=348 polls=12 tick=733`（ticker 全程活）
+- 乱码字节 = v01.85 Symbol 拷贝 bug 实证（见下）
+
+### 根因定案（触发链走查 + Globals.hpp 实证）
+- **`UseVerifier` 默认 true**（`phoneme-cldc/src/vm/share/utilities/Globals.hpp:292`）
+- `Universe::load_jar_entry`（Universe.cpp:1132）：`if (UseVerifier || VerifyOnly)
+  instance_class.verify()` → **每个从 jar 懒加载的类都在 VM 线程上被验证**
+- Java 侧全部排除：`VERIFY_ONCE=false` 使 Installer/SuiteVerifier/AppInfo 的
+  验证路径全部编译 out 或跳过；普通类加载（Class.forName → SystemDictionary::resolve
+  → load_jar_entry）正是懒加载验证路径——此前"普通加载不验证"的结论是错的
+- 12 次连续 mark = 游戏运行中 12 个类依次懒加载+验证；`UI*` 的 `<clinit>`
+  （UI 资源初始化，典型巨方法）撞上验证器平方复杂度
+  （`get_stackmap_index_for_offset` 每分支目标线性扫 stackmaps，HotRoutines.incl.hpp:234）
+  → 验证耗时数秒 → watchdog 判 HANG
+- **不是死循环，是病态慢**：验证在 VM 线程内同步执行，green 线程调度没机会跑，
+  完美解释 log9→log12 全链（ticker 活、CE 冻结、yield 不被调、coredump/OS 栈零验证器帧）
+
+### 修复（两仓）
+1. **phoneme-midp ca95a95**：`midp_run.c` 在 `midpRunVm` 前
+   `JVM_SetUseVerifier(JNI_FALSE)`（`#if defined(VITA)` 隔离，+13 行）。
+   MIDlet jar 均经 WTK preverify（J2ME 规范），运行时再验冗余。
+   `#if (VERIFY_ONCE)` 的保存/恢复块在本构建编译 out，无人再打开它
+2. **phoneme-cldc 43eda74**：修 Symbol 拷贝 bug——Symbol 是长度前缀存储、
+   非 NUL 结尾（Symbol.hpp: `length()`/`base_address()`），v01.85 的
+   `for (i<63 && name[i])` 会越过名字结尾读入相邻符号数据。
+   `vita_site_verifier_class/method` 改为显式传 `n().length()`（4 文件 +27/-15）
+
+### 构建/产物
+- rebuild_vm.sh：33 对象 OK（loopgen 链接失败=已知无害）；库守卫
+  `jvm_fast_globals`=1、`interpreter_dispatch_table`=0 通过；
+  新签名 `vita_site_verifier_class/method` 已在 libcldc_vm.a
+- VPK：`vita-port/midp_vita_v01.86_noverify.vpk`
+  md5 `4d0112f0f0278c92d0ae97c5ccd365bb`，版本串 `J2ME Player v01.86 b274 (9945938)`
+
+### 复测判据（真机）
+- **主判据**：原挂死游戏能过轮次不再冻结 → 根因修复生效
+- site_ring.log 不应再出现 verify_class 打点（验证器已关）
+- 若仍挂：ring 数据照旧可定位新肇事点（装置保留，打点仍在）
+- 遗留风险：若某游戏 jar 未 preverify（罕见），类加载时会抛
+  VerifyError 而非静默通过——届时看 vm_output.log 即可定位
+
+## 2026-09-20 v01.87：log13 定案——v01.86 从未编译进 VPK（JNI_FALSE 编译错误被遗漏）
+
+### log13 取证结果（v01.86 VPK 真机测试）
+- boot_log 确认跑的是 `J2ME Player v01.86 b274 (9945938)`
+- site_ring.log：`verify class=com/app/filemanager/UI method=<clinit>`
+  —— 类名干净（v01.85 Symbol 长度 bug 修复已生效，cldc 侧是新的），
+  但验证器仍在跑，12 次重复 mark 模式与 log12 完全相同
+- watchdog HANG（ce=342 polls=12）→ coredump，与 log9..12 同族
+
+### 根因（构建链断层，非 VM 逻辑）
+- `midp_run.c:873` 的 v01.86 改动用了 `JNI_FALSE`，**midp 侧没有这个宏**
+  （只有 kni.h 的 `KNI_FALSE`）→ 单对象重编报
+  `'JNI_FALSE' undeclared` 编译错误
+- 错误未被察觉，`libobj.a` 里的 `midp_run.o` 保持 9 月 14 日旧对象
+  （比 v01.86 源码 edit 旧 5 天）→ VPK 链接的还是没有
+  `JVM_SetUseVerifier` 调用的旧代码
+- 时间戳证据链：midp_run.o = Sep 14 05:17；midp_run.c = Sep 19 09:06；
+  libobj.a = Sep 16（内含旧对象）
+
+### 修复（phoneme-midp bd6f30d）
+- `midp_run.c:873`：`JNI_FALSE` → `KNI_FALSE`，注释记录 v01.87 教训
+- 重编流程：`rm build/vita_arm/obj/arm/midp_run.o && ./build_vita.sh`
+  （教训重申：单对象重编必须先 rm 旧 .o）
+- `libmidp.so` 链接失败（sceAppMgrGetDevInfo / _rom_linkcheck 未定义）
+  是**既有独立问题**，vita-port 不链 libmidp.so，直接用 libobj.a，无害
+- 验证闭环：`midp_run.o` 成员含 `U JVM_SetUseVerifier`；
+  `libobj_no_main.a`（vita-port 链接用）同含
+
+### 构建产物
+- VPK：`vita-port/midp_vita_v01.87_noverify2.vpk`
+  md5 `42d2f0864560a548f990df1246a70fe1`，版本串
+  `J2ME Player v01.87 b275 (6fa4282)`
+- velf 符号：`vita_site_verifier_class`(0x102055708) /
+  `vita_site_verifier_method`(0x102055774) 打点保留
+
+### 教训（写入流程纪律）
+- **改 midp 侧源码后必须跑 `build_vita.sh` 并检查编译错误**——
+  编译失败会把旧 .o 留在 libobj.a，VPK 静默链接旧代码
+- 判断"修复是否上机"不能只看版本串（版本头是 vita-port 侧生成的，
+  与 midp/cldc 对象新旧无关），要核对对象时间戳 + nm 符号
+- midp 侧布尔常量用 `KNI_TRUE/KNI_FALSE`（kni.h），不是 JNI_*
