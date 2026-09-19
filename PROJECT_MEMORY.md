@@ -3463,3 +3463,70 @@ UC 多 store 并存（空名设置库 FFFFFFFF + 书签库 + 缓存库），open
 - 生灭环的"第一因"（哪个 MIDlet 线程反复生灭）未从转储直接观测到
   （Java 堆不在转储中）；兜底修复把环节流到可运行，若复测仍异常，
   下一步可在桩入口加生命周期计数器
+
+## 2026-09-20 v01.84：log10 案情反转 + site ring 取证装置（118f8fd / phoneme-cldc ffdc429）
+
+### v01.83 真机验证结果：未修复，仍挂死
+- watchdog.log：`HANG ce=337 polls=12 tick=745`，双时钟活（d=100, kd=100252），
+  vm RUNNING wait=none——形态与 log8/log9 完全一致
+- 会话时长 7.5s（hb#1 t=1789783837332 → HANG t0=1789783844805）；
+  **tick=745 × 10ms ≈ 7.45s ≈ 全会话 → cldc_ticker 从头活到尾**
+
+### 案情反转（推翻 log9 的"ticker 饿死"推论）
+- tick 在涨但解释器没消费：说明解释器 3 秒没跑过字节码（方法入口 +
+  RESCHEDULE_COUNT 双检查点都没过）
+- CE #337 冻结 3.2s → `yield()` 没被调用过（v01.83 兜底在 yield 内，
+  反汇编证实已链接：wake_up_timed_out_sleepers@0x8108326c、50ms 分支@+0x1b0）
+- **新结论：环 = green 线程 Java 堆栈上的原生 C++ 自旋**——OS 栈只见
+  分发帧（pc=link stub+4，sp 距栈底 0x1050），Java 堆不在转储 →
+  环身份从转储物理不可见，已到信息极限
+- 残留帧（vfprintf→sscanf→JVMGlobals::parse_argument→__sinit）与 log9 的
+  类加载 fread 链不同——旧帧被覆写，仅说明"早期启动路径走过 stdio"，
+  不能定位环
+
+### log10 转储解析增量（相对 log9）
+- **双 slide 发现**：text slide=+0x1c000，data slide=+0x20000（不同！）
+  验证锚点三件套：ticker pc 落 sceKernelDelayThread 桩+8 ✅、
+  主线程 r5=gp_base+0x20000 ✅、VM pc/lr 落 stub+4/stub+0 ✅
+- NOTE 布局与 log9 不同（线程表@0x694 步长 0xc8、watchdog 寄存器@0x2300、
+  主线程寄存器@0x1e90）——**每份转储都要重新定位，不能套用**
+
+### v01.84 site ring 装置
+- `vita_site_mark()`（OS_vita.cpp，extern "C" noinline）：16 槽环形缓冲 +
+  `vita_site_seq`，存调用者返回地址（反汇编验证：`str lr, [..]` 原样入槽，
+  无 bl 冒充）；零锁零分配，单写者=VM 线程
+- 打点 8 处（每点 `#if defined(VITA)` 两行）：Thread::finish、
+  force_terminated、Thread::lightweight_thread_exit、thread_task_cleanup、
+  Task::cleanup_terminated_task、ObjectHeap::collect、Verifier::verify_class、
+  JarFileParser::open_entry
+- **故意不打 Scheduler::yield**——log10 证明环绕过 yield，打了只会淹没 ring
+- 声明集中 `Globals_vita.hpp` 尾部（每个 VM 翻译单元经生成 .incl 链第 7 行
+  包含它，share/ 打点无需新头文件）
+- `vita_site_dump()`：sceIo* 直写（绝不用 stdio——log10 残留帧恰指向
+  stdio 域，取证工具不进案发现场）；输出 `self=` 锚点 + frozen 判定 +
+  16 槽（最新在前）
+- watchdog HANG 分支在 coredump 请求**之前**调
+  `vita_site_dump("ux0:/data/J2ME00001/site_ring.log")`
+
+### 构建注册方式（本轮踩坑记录）
+- 新 .cpp 文件无法直接进构建：对象清单由 includeDB→makedep 生成，
+  `<os_family>` 宏替换登记，无通配入口 → ring 实现并入 `OS_vita.cpp`
+  尾部（它是 `OS_<os_family>.cpp`，必被编译），独立文件已删
+- 打点对象在 _MergedSrc002(Scheduler)/003(ObjectHeap,Task)/004(Thread,
+  Verifier)/006(JarFileParser)；改后 rm 对应 .o 重编（33 对象，库守卫全过）
+
+### 构建/产物
+- VPK：`out/vpk/midp_vita_v01.84_site_ring.vpk`（3640814 B，
+  md5 90e94fe1935df7ade3c1e670a6e6ce27）
+- 符号验证：vita_site_mark@0x1020556b8 / dump@0x1020551b8 /
+  seq@0x102793840 已链接进 velf
+- 提交：phoneme-cldc ffdc429（7 文件 +98）；j2me 主仓 118f8fd（+31）
+
+### 复测判据（真机）
+- 正常轮次跑完（runMidlet returned）→ 修复顺带生效（可能性低）
+- 仍挂死 → 取回 `site_ring.log`：
+  - `frozen=yes` + 尾部重复地址 = 环入口 → `addr2line -e midp_vita.velf`
+    直接得函数名（self= 锚点可校准 slide）
+  - `frozen=NO`（seq 仍在涨）= 环经过某个打点 → 重复的地址即环路径
+  - 全空 ring = 环在 8 个打点之外 → 下一轮加桩（候选：InterpreterRuntime
+    入口、EventFlag 等待路径）
