@@ -60,6 +60,7 @@ extern "C" {
      * into <clinit> execution itself on the green-thread Java stack.
      * Same single-writer discipline as the verifier hooks. */
     void vita_site_clinit_class(const char *name, int len);
+    void vita_site_clinit_return(void);
     void vita_site_dump_clinit(const char *path);
 }
 

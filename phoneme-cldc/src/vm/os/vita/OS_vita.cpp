@@ -397,6 +397,17 @@ void vita_site_dump_verify(const char *path) {
 
 static char vita_clinit_class_name[64];
 
+/* v01.89: clinit history ring - log15's ring showed 13 clinit marks
+ * interleaved with 3 open_entry marks (a class-load storm inside
+ * UI.<clinit>), but the single-slot name only recorded the LAST class.
+ * This history names the whole chain the storm walked through. Same
+ * single-writer discipline (VM thread writes, watchdog reads). */
+#define VITA_CLINIT_HIST 16
+static char vita_clinit_hist[VITA_CLINIT_HIST][48];
+static volatile unsigned int vita_clinit_count = 0;
+static volatile unsigned int vita_clinit_depth = 0;
+static volatile unsigned int vita_clinit_depth_max = 0;
+
 /* Called at the top of InstanceClass::clinit per class. Same explicit
  * length copy as the verifier hooks (Symbols are length-prefixed). */
 void vita_site_clinit_class(const char *name, int len) {
@@ -407,10 +418,28 @@ void vita_site_clinit_class(const char *name, int len) {
             vita_clinit_class_name[i] = name[i];
     }
     vita_clinit_class_name[i] = 0;
+    /* v01.89: append to the history ring (48-char slots) */
+    {
+        unsigned int c = vita_clinit_count;
+        char *slot = vita_clinit_hist[c & (VITA_CLINIT_HIST - 1)];
+        int j = 0;
+        if (len > 47) len = 47;
+        for (; j < len; j++)
+            slot[j] = name[j];
+        slot[j] = 0;
+        vita_clinit_count = c + 1;
+        /* depth tracking: clinit chains nest (A.clinit -> new B ->
+         * B.clinit -> ...). A storm shows high depth or many marks. */
+        unsigned int d = ++vita_clinit_depth;
+        if (d > vita_clinit_depth_max)
+            vita_clinit_depth_max = d;
+    }
 }
 
 /* Called from the watchdog thread after a HANG. Appends the clinit
- * target (if any) to the site ring log. */
+ * target (if any) to the site ring log. v01.89: also dumps the last
+ * 16 clinit classes (chain history) and the depth counters - log15
+ * proved a single name is not enough to see a load storm. */
 void vita_site_dump_clinit(const char *path) {
     SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
                           0777);
@@ -420,7 +449,28 @@ void vita_site_dump_clinit(const char *path) {
                      vita_clinit_class_name[0] ? vita_clinit_class_name
                                                : "(none)");
     sceIoWrite(fd, buf, n);
+    n = snprintf(buf, sizeof(buf), "clinit stats count=%u depth=%u max=%u\n",
+                 vita_clinit_count, vita_clinit_depth, vita_clinit_depth_max);
+    sceIoWrite(fd, buf, n);
+    /* history: newest first (same ordering as the site ring) */
+    unsigned int c = vita_clinit_count;
+    for (int i = 0; i < VITA_CLINIT_HIST; i++) {
+        const char *slot = vita_clinit_hist[(c - 1 - i) &
+                                            (VITA_CLINIT_HIST - 1)];
+        if (slot[0] == 0) continue;
+        n = snprintf(buf, sizeof(buf), "clinit [%2d] %s\n", i, slot);
+        sceIoWrite(fd, buf, n);
+    }
     sceIoClose(fd);
+}
+
+/* v01.89: called when a clinit RETURNS (InstanceClass::set_initialized
+ * path is the completion signal). Decrements the nesting depth so the
+ * watchdog dump can tell "storm of sequential clinits" (depth low,
+ * count high) from "deep recursive clinit chain" (depth high). */
+void vita_site_clinit_return(void) {
+    if (vita_clinit_depth > 0)
+        vita_clinit_depth--;
 }
 
 /* Called by the launcher watchdog thread after a HANG is detected.
