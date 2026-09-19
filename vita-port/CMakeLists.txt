@@ -677,6 +677,22 @@ set(VITA_VERSION  "01.83")
 #   NB: mark is deliberately NOT on Scheduler::yield - log10 proved the
 #   loop bypasses yield, and a yield site would only flood the ring.
 set(VITA_VERSION  "01.84")
+# 01.85 (2026-09-20): log11 - THE RING SPOKE. site_ring.log (seq=10
+#   frozen=yes) decoded with the self= anchor (slide 0x80FFB040): the
+#   last two distinct sites alternate JarFileParser::open_entry+28 and
+#   JVMVerifier::verify_class+24 - a normal class-load rhythm - and the
+#   FINAL event is verify_class entry, followed by 3+ s of total silence
+#   (no GC collect, no thread death, no next open_entry). The spin is
+#   INSIDE the bytecode verifier, running on the green thread's Java
+#   stack: invisible to the coredump (core11 vm thread still parked at
+#   start_lightweight_thread_asm+0x14) and to the OS stack residue
+#   (verified: zero verifier frames there). v01.85 adds verifier deep
+#   tracing: verify_class_internal records the class name,
+#   VerifyMethodCodes::verify records the method name (dumped on HANG
+#   via site_ring.log "verify class=... method=..." line), plus two
+#   phase marks in the ring (verify_class entry/return, iterate begin)
+#   so the next dump names the exact loop.
+set(VITA_VERSION  "01.85")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
