@@ -51,6 +51,11 @@ volatile SceUID vita_wd_vm_tid = -1;
 /* Tone thread id - exported by vita_audio_javacall.c */
 extern volatile SceUID vita_tone_tid;
 
+/* v01.84: site-ring dump (defined in the VM's OS_vita.cpp, C linkage).
+ * Writes the last-executed-native-site ring so a HANG names the loop
+ * even when the coredump cannot see the Java heap. */
+extern void vita_site_dump(const char *path);
+
 #define WD_LOG_PATH "ux0:/data/J2ME00001/watchdog.log"
 #define WD_STALL_POLLS 12   /* 12 x 250 ms ~= 3 s, CLOCK-FREE threshold */
 #define WD_POLL_MS  250
@@ -189,6 +194,12 @@ static int wd_thread_routine(SceSize args, void *argp) {
         wd_dump_thread("tone", vita_tone_tid);
         /* the watchdog itself, as a sanity marker */
         wd_dump_thread("wd", sceKernelGetThreadId());
+
+        /* v01.84: dump the VM's site ring BEFORE the coredump request.
+         * log10 proved the dump cannot name a native loop running on a
+         * green thread's Java stack; the ring can. It writes with
+         * sceIo* (no stdio) and is safe from this thread. */
+        vita_site_dump("ux0:/data/J2ME00001/site_ring.log");
 
         /* v01.82: log8 nailed the shape of the hang (VM thread RUNNING,
          * wait=none, both clocks alive) but the kernel API cannot name

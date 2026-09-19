@@ -657,6 +657,26 @@ set(VITA_VERSION  "01.82")
 #   vita_tick_count and the watchdog HANG report prints it, so the next
 #   hang (if any) separates "ticker dead" from "gate closed".
 set(VITA_VERSION  "01.83")
+# 01.84 (2026-09-20): log10 coredump round - the case REVERSED. The dump
+#   (HANG ce=337 polls=12 tick=745) proves the cldc_ticker never stopped
+#   (745 ticks ~= the full 7.5 s session), so ticks were DELIVERED but
+#   never consumed: the interpreter ran no bytecode for the last 3+ s and
+#   yield() was never called - otherwise the v01.83 wall-clock backstop
+#   inside yield() would have fired. The spin therefore lives in native
+#   C++ code on a green thread's Java stack (the OS stack only shows the
+#   dispatch frame at start_lightweight_thread_asm+4, and the Java heap
+#   is not part of the coredump), so the dump physically cannot name the
+#   loop. v01.84 adds the site ring: vita_site_mark() records one return
+#   address per call at native entry points on the death path
+#   (finish/force_terminated/lightweight_thread_exit/thread_task_cleanup/
+#   cleanup_terminated_task) plus GC (ObjectHeap::collect), class verify
+#   (Verifier::verify_class) and class-file reads (JarFileParser::
+#   open_entry). On HANG the watchdog dumps the 16-slot ring to
+#   site_ring.log (sceIo*, no stdio) before requesting the coredump:
+#   frozen seq + repeated tail addresses = the loop, addr2line-able.
+#   NB: mark is deliberately NOT on Scheduler::yield - log10 proved the
+#   loop bypasses yield, and a yield site would only flood the ring.
+set(VITA_VERSION  "01.84")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
