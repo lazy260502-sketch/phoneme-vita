@@ -692,7 +692,40 @@ set(VITA_VERSION  "01.84")
 #   via site_ring.log "verify class=... method=..." line), plus two
 #   phase marks in the ring (verify_class entry/return, iterate begin)
 #   so the next dump names the exact loop.
-set(VITA_VERSION  "01.85")
+set(VITA_VERSION  "01.86")
+# 01.86 (2026-09-20): log12 - ROOT CAUSE FOUND AND FIXED. The ring named
+#   com/app/filemanager/UI*.<clinit> frozen in verification, and the
+#   trigger-chain walk closed the case: UseVerifier defaults to TRUE
+#   (Globals.hpp:292), so Universe::load_jar_entry verified EVERY
+#   lazily-loaded jar class on the VM thread. The 12 identical ring
+#   entries = 12 classes verified back-to-back during gameplay; UI*'s
+#   <clinit> hit the verifier's quadratic stackmap scan
+#   (get_stackmap_index_for_offset) and froze the VM for seconds while
+#   the ticker stayed alive (matches log9..log12 exactly: ticker alive,
+#   CE frozen, yield never called, spin invisible to coredump). Java-side
+#   verify paths were all dead ends (VERIFY_ONCE=false). Fix: midp_run.c
+#   calls JVM_SetUseVerifier(FALSE) before midpRunVm under #if
+#   defined(VITA) - MIDlet jars are WTK-preverified (J2ME spec), runtime
+#   re-verification is redundant. Also fixes the v01.85 Symbol-name bug:
+#   Symbols are length-prefixed, NOT NUL-terminated, so the name copy ran
+#   past the end (the garbage after "com/app/filemanager/UI" in log12);
+#   vita_site_verifier_class/method now take an explicit length.
+# 01.87 (2026-09-20): log13 - the v01.86 fix NEVER SHIPPED. boot_log
+#   showed v01.86 b274, but site_ring.log still showed "verify
+#   class=com/app/filemanager/UI method=<clinit>" with the SAME 12-mark
+#   pattern as log12 - yet with a CLEAN class name, proving the cldc
+#   side (rebuild_vm.sh -> libcldc_vm.a) was new while the verifier
+#   stayed on. The midp side was never rebuilt: midp_run.o in libobj.a
+#   was dated Sep 14 (5 days older than the v01.86 source edit), because
+#   the v01.86 edit used JNI_FALSE which does NOT exist on the midp side
+#   (only KNI_FALSE from kni.h) - the single-object recompile FAILED
+#   with "'JNI_FALSE' undeclared", the error went unnoticed, and the VPK
+#   silently linked the stale Sep-14 object. Fix: KNI_FALSE + full midp
+#   rebuild (rm midp_run.o first), verified U JVM_SetUseVerifier now in
+#   libobj.a's midp_run.o. Lesson recorded: after ANY midp-side source
+#   edit, build_vita.sh must be run and its COMPILE ERRORS checked - a
+#   failed compile leaves the old .o in libobj.a.
+set(VITA_VERSION  "01.87")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
