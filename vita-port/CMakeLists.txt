@@ -825,7 +825,20 @@ set(VITA_VERSION  "01.86")
 #   tree: Scheduler::pump_events_vita() (the same 50 ms-throttled pump,
 #   now callable from non-yield contexts) invoked at the end of
 #   Java_java_lang_Thread_start0 - one kick per spawn-cycle iteration.
-set(VITA_VERSION  "01.93")
+# 01.94 (2026-09-19): forensic ring coverage - log20 retest confirmed
+#   v01.93 works: CE advanced 364 -> #371 (~7 more pumps during boot,
+#   so the start0 pump fires in the spawn path). But the freeze has the
+#   SAME signature as log19/log9 (last CE completes ANI OUT, the next
+#   never starts) and no longer passes through start0 - the loop is one
+#   level deeper (pure stub ping-pong or another non-start0 cycle).
+#   log20 evidence was thin (4 files; watchdog.log/site_ring.log/
+#   coredump missing). v01.94 adds vita_site_mark() at: the
+#   pump_events_vita() gate (ring sees the pump actually run),
+#   Java_java_lang_Thread_start0 head (loop re-enters start0?), and
+#   Scheduler::start (spawn registration). Next hang's site_ring.log
+#   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
+#   lines, all inside #if defined(VITA).
+set(VITA_VERSION  "01.94")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
