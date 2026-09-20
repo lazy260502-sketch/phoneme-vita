@@ -807,7 +807,25 @@ set(VITA_VERSION  "01.86")
 #   Also: watchdog preload grace is now bounded (extension counter,
 #   same WD_STORM_MAX_POLLS cap) so a stalled sweep can never again
 #   run past the deadline without producing a core dump.
-set(VITA_VERSION  "01.92")
+# 01.93 (2026-09-20): log19 - v01.92 verified working (preload begin/done
+#   both present, stderr 3924 B with 29 BEFORE/AFTER_NATIVES pairs and
+#   zero dumps), but the freeze returned in its OLDEST form (log9/16/17
+#   family). Forensics, this time instruction-level: PC=
+#   start_lightweight_thread_asm+0x10 (the tst/bleq pair), LR=entry ->
+#   the dump caught a FRESH call: the VM was re-entering the stub in a
+#   loop. clinit chain (35 entries) byte-identical to log16 ends in
+#   java/util/Timer; CE froze at #364 for 3.3 s; ticker thread alive
+#   (thread[4] in delay loop). Root cause: the java.lang.Thread
+#   create/die cycle (start0 -> Thread::allocate seeds the stub address
+#   -> Scheduler::start -> dispatch) NEVER calls yield(), so the v01.83
+#   pump backstop inside wake_up_timed_out_sleepers() is unreachable on
+#   this path; the interpreter tick checkpoint that would consume the
+#   ticker's flag only runs while executing Java bytecode, and the
+#   spawned thread dies in natives before any. Fix lives in the CLDC
+#   tree: Scheduler::pump_events_vita() (the same 50 ms-throttled pump,
+#   now callable from non-yield contexts) invoked at the end of
+#   Java_java_lang_Thread_start0 - one kick per spawn-cycle iteration.
+set(VITA_VERSION  "01.93")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
