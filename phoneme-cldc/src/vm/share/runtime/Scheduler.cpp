@@ -648,6 +648,23 @@ void Scheduler::wake_up_terminated_sleepers(int task_id JVM_TRAPS) {
 }
 #endif
 
+#if defined(VITA)
+void Scheduler::pump_events_vita() {
+  // v01.93: extracted from the v01.83 gate inside
+  // wake_up_timed_out_sleepers() so non-yield contexts (green-thread
+  // spawn path, see start0) can drive the same throttled pump. The
+  // static is shared: whichever site fires first owns the 50 ms window.
+  static jlong vita_last_pump_ms = 0;
+  jlong vita_now = Os::java_time_millis();
+  if (_timer_has_ticked || _estimated_event_readiness > 0 ||
+      (vita_now - vita_last_pump_ms) >= 50) {
+    vita_last_pump_ms = vita_now;
+    _timer_has_ticked = false;
+    check_blocked_threads(0);
+  }
+}
+#endif // VITA
+
 void Scheduler::wake_up_timed_out_sleepers(JVM_SINGLE_ARG_TRAPS) {
 #if defined(VITA)
   // On Vita all javacall audio/media paths are synchronous (no Java thread
@@ -667,15 +684,11 @@ void Scheduler::wake_up_timed_out_sleepers(JVM_SINGLE_ARG_TRAPS) {
   // wall-clock backstop: any path that keeps calling yield()/this
   // function now drives the pump at least every 50 ms, which also
   // throttles the cycle (JVMSPI_CheckEvents waits up to 50 ms in ANI).
+  // v01.93: body moved to Scheduler::pump_events_vita() so the
+  // start_lightweight_thread_asm spawn path (which never yields) can
+  // share it - see Java_java_lang_Thread_start0 in Natives.cpp.
   if (!is_slave_mode()) {
-    static jlong vita_last_pump_ms = 0;
-    jlong vita_now = Os::java_time_millis();
-    if (_timer_has_ticked || _estimated_event_readiness > 0 ||
-        (vita_now - vita_last_pump_ms) >= 50) {
-      vita_last_pump_ms = vita_now;
-      _timer_has_ticked = false;
-      check_blocked_threads(0);
-    }
+    pump_events_vita();
   }
 #else
   if (!is_slave_mode() && !Universe::scheduler_async()->is_null()) {

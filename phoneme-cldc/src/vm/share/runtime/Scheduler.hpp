@@ -234,6 +234,16 @@ private:
   static void set_timer_tick() {
     _timer_has_ticked = true;
   }
+#if defined(VITA)
+  /* v01.93: wall-clock event-pump backstop. log19 coredump: the VM spun
+   * re-entering start_lightweight_thread_asm (new java.lang.Thread
+   * create/die cycles) - a path that never passes through yield(), so
+   * the v01.83 gate inside wake_up_timed_out_sleepers() never opened and
+   * JVMSPI_CheckEvents starved for 3.3 s until the watchdog fired. This
+   * helper is the SAME 50 ms throttled pump, callable from contexts the
+   * yield path never reaches (e.g. Java_java_lang_Thread_start0). */
+  static void pump_events_vita();
+#endif
   static bool has_waiters(Oop* obj);
   static void allocate_blocked_threads_buffer(int target_size JVM_TRAPS);
   static void allocate_blocked_threads_buffer(JVM_SINGLE_ARG_TRAPS) {

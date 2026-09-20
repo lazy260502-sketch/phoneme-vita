@@ -1301,6 +1301,20 @@ void Java_java_lang_Thread_start0(JVM_SINGLE_ARG_TRAPS) {
 #else
   new_thread().start(JVM_SINGLE_ARG_NO_CHECK_AT_BOTTOM);
 #endif
+#if defined(VITA)
+  /* v01.93: log19 coredump - the VM froze re-entering
+   * start_lightweight_thread_asm (pc=+0x10, lr=entry = a fresh call
+   * every time) while JVMSPI_CheckEvents starved for 3.3 s. The
+   * spawn/die cycle that game code runs through java.lang.Thread
+   * reaches this native once per iteration, but never yields, so the
+   * pump backstop inside Scheduler::yield() was unreachable. Kick the
+   * throttled pump here: the new thread gets dispatched when the
+   * current native returns to the interpreter; pumping before that
+   * is safe (this thread holds no scheduler state of its own and the
+   * current thread stays RUNNING - JVMSPI_CheckEvents only polls
+   * native event queues and unblocks ASYNC_BLOCKED threads). */
+  Scheduler::pump_events_vita();
+#endif
 }
 
 // private synchronized native void internalExit();
