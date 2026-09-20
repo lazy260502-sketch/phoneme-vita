@@ -3957,11 +3957,21 @@ watchdog 3 秒 HANG 取证杀进程。Vita3K 宿主 FS 微秒级延迟，从不�
 - watchdog 只有一行 STORM（preload=28），preload 计数 864 正常推进后转 HANG（有界宽容按设计工作）
 - log18 那层（I/O 洪水）已关闭。log19 的卡死是**另一层**：log9/16/17 同族自旋，这次无 I/O 干扰、现场最干净
 
-### log19 现场指令级铁证
-- VM 主线程 PC=0x810d04c4（静态 0x810bb4c4 = `start_lightweight_thread_asm+0x10`，
-  即 `tst r1,#0x40000000` 之后那条 `bleq invoke_pending_entries`@0x810bb4cc）
-- **LR=0x810bb4b4 = 函数入口**——LR 是绿线程首次调度时种入栈帧的值，说明 dump 瞬间
-  是**又一次全新调用**：VM 在循环重进该 stub
+### log19 现场指令级铁证（**v2 更正**：parse 工具修复后重解出正确归属）
+- **更正**：最初把 PC=0x810d04c4 标成 `start_lightweight_thread_asm+0x10` 是**错的**——
+  那次是拿错 ELF（v01.91 布局）+ 拍脑袋 entry=PC-0x10 的产物。用 v01.92 ELF +
+  slide=0x15000 + nm 二分（parse_core18b.py 修复版，objdump 逐条核对）：
+  - 静态 PC=0x810bb4c4 = **primordial_to_current_thread+0x14**：`ldr r6,[r1,#100]`
+    （jsp = THREAD->stack_pointer）；start_lightweight_thread_asm 实际从 0x810bb4d4
+    才开始（v01.92 布局）
+  - 静态 LR=0x810bb4b4 = primordial_to_current_thread+0x04（`push {lr}` 那条地址，
+    不是"函数入口"也不是调用者返回地址）
+  - **r1=0**：`_current_thread` 快速全局（jvm_fast_globals）在该瞬间为 NULL——
+    PC 那条 load 若真执行会取 [0x64] 触发数据 abort；进程没死，说明是挂起快照点
+- 冻结点在**绿线程切换桩（primordial_to_current_thread 序言）内**，而非
+  start_lightweight 桩体内——仍在 spawn/die 自旋经过的同一套切换机制里，
+  与"自旋不经 yield"诊断不矛盾；但旧解读"LR=入口=每次新调用"作废
+- site ring 16 槽全部 = `JVMInstanceClass::clinit` 内 mark（seq=1048 冻结），连
 - site ring 16 槽全部 = `JVMInstanceClass::clinit` 内 mark（seq=1048 冻结），连
   Thread::finish 的 mark 都没有 → 新线程在原生层即死
 - clinit hist 35 条与 log16 **逐字节一致**，尾部 java/util/Timer；CE 冻在 #364 共 3.3 秒
@@ -3997,7 +4007,10 @@ log19 是"自旋**根本不经过** yield"——同一症状，不同盲区
   thread[0] 寄存器窗口在 note entry +0x08 起：sp=+0x38、lr=+0x3c、pc=+0x40、
   cpsr=+0x44
 - log19 slide=0x15000（site_ring self 0x81068a38 − vita_site_dump 静态 0x81053a38）。
-  符号化用 `vita-port/build/midp_vita`（Sep 20 07:41 = v01.92）
+  符号化必须用**与现场同版本的 ELF**：v01.92 版 nm 校验锚点
+  primordial_to_current_thread@0x810bb4b0；v01.93 的 build/midp_vita 布局已变
+  （同地址是 png_set_quantize）。`parse_core18b.py <core> <elf> 0x1e74 0x15000`
+  现已支持 slide + nm 符号表二分（addr2line 对 strip 的 velf 只回 ??，不可用）
 - core 的 LOAD 段**不含 .data/.bss**（0x814bxxxx 不可读）：vita_clinit_hist/
   gc_count/preload_count 读不了，好在 site_ring.log 已打印全部
 
@@ -4013,4 +4026,9 @@ log19 是"自旋**根本不经过** yield"——同一症状，不同盲区
 1. 按键进游戏后不再 3 秒冻结；CE 计数持续单调涨
 2. watchdog.log 无 HANG；若仍 HANG，新 core 的 ring 应不再是 clinit 满槽
    （pump_events_vita 生效后自旋会被 50ms 泵节流，ring 会看到新标记）
-3. 若还挂：冻结点应移到下一层——届时先用正确的 argv 路径 + CPSR 偏移解析
+3. 若还挂：注意残留风险——若自旋是纯 stub ping-pong（既不回 start0 也不进
+   wake_up_timed_out_sleepers），v01.93 的泵仍点不着；届时看新 core 的 PC 是否
+   仍在 primordial_to_current_thread / current_thread_to_primordial 簇内，
+   若是则下一步把泵点挂到这两条 stub 的 C++ 调用侧
+   （Scheduler.cpp:1707 / JVM.cpp:280）。解析用修复版工具：
+   `python3 debug/tools/parse_core18b.py <core> <elf> 0x1e74 0x15000`
