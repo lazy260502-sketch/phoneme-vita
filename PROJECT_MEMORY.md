@@ -3891,3 +3891,60 @@ UC 多 store 并存（空名设置库 FFFFFFFF + 书签库 + 缓存库），open
 3. **第 3 键不再卡死**（clinit/open_entry 触发面已消灭）→ 案结
 4. 若仍卡：ring 里 clinit/open_entry 应消失，新冻结点直接点名剩余
    问题；preload 若卡在中间不动 → resolve 死循环，看 dump 的类名
+
+---
+
+## 2026-09-20 v01.92：log18 取证结案 —— NATIVES dump 洪水打瘫 ux0: 存储
+
+### 根因（coredump 三重铁证，非猜测）
+1. VM 主线程冻结点 PC=sceIoWrite+8（静态 0x81106b98），LR=_write_r+0x37
+   （紧跟 `blx sceIoWrite`@0x810fe236）
+2. coredump 内存 r0=0x813bf590 缓冲区内容 =
+   `POST_NATIVES idx=166 oop=0x812143f8 klass_bytes=[4d 6f 64 65 15 00 ...]`
+3. midp_stderr.log 大小 0xCECC=52940 字节（log10~17 恒 1644），713 行
+   NATIVES dump，冻结时正在写最后一行
+
+### 因果链
+v01.91 预载 sweep 把 8 个 ROM 常驻 natives 系统类拉进运行时
+ClassFileParser → ClassFileParser.cpp 历史遗留调试 dump（016e041 带入，
+上游没有）对每个 natives 类**每个常量池 Utf8 条目**无条件 fprintf 一行
+（PRE_NATIVES/POST_NATIVES 两个循环块）→ stderr 无缓冲、每行一次独立
+sceIoWrite → 数百次背靠背小写打瘫真机 ux0: 存储栈 → 冻在 syscall 内 →
+watchdog 3 秒 HANG 取证杀进程。Vita3K 宿主 FS 微秒级延迟，从不复现。
+
+### 修复（v01.92，已提交 cldc 6c601f5 / vita-port 1a81fbf）
+- ClassFileParser.cpp：删 PRE_NATIVES/POST_NATIVES 两个无条件 dump 循环，
+  **保留** register_natives_for 与 BEFORE/AFTER_NATIVES 单行、保留条件式
+  CORRUPT 扫描块（静默，无 I/O 洪水风险）
+- JVM.cpp 预载注释重写为 log18 实况（565 行 clear 在 apocalypse 路径，
+  预载块从来没有 clear——此前注释有误导，已修正）
+- vita_watchdog.c：preload 宽容改为**有界**（extension 计数 ≤
+  WD_STORM_MAX_POLLS，~30s），"preload 在涨"不再能无限豁免死锁
+- 预载 sweep 本身保留（preload 28→303 正常推进，是对 log16/17 的正确解法）
+
+### coredump 解析方法学（复用资产）
+- `.psp2dmp` 是 **gzip 流**（magic 1f8b）→ gunzip 得 5MB ELF32 ARM core
+- THREAD_REG_INFO note：ELF phdr[7] off 0x1e74，desc@0x1e90，
+  ver=17/count=5/esz=0x178；线程条目按 CPSR 签名 0x800f0010 扫描定位
+- 工具：`debug/tools/parse_core18.py`（phdr/notes）、`parse_core18b.py`
+  （寄存器+CPSR 签名法）；解压产物 /tmp/core18/core
+- **slide 每个构建都不同**：v01.91=0x59000（log17=0x1B000）。校准公式：
+  `site_ring.log self 值 − vita_site_dump 静态地址(0x810552d8) = slide`。
+  每个新 coredump 必须重标，不可沿用旧值
+- 符号化：`arm-vita-eabi-addr2line -f -C -e vita-port/midp_vita <静态地址>`
+  （v01.91 的 ELF 是 Sep 20 05:56 那份）
+
+### 构建产物（v01.92）
+- `vita-port/out/vpk/midp_vita_v01.92.vpk` md5
+  `37e759fa0f3cea31a9a7549ca1c742ba`，velf 版本串 01.92×2
+- 库验证：`arm-vita-eabi-strings -a libcldc_vm.a | grep -c PRE_NATIVES`
+  = 0、POST_NATIVES = 0、BEFORE_NATIVES = 1（保留项在位）
+- **loopgen 链接失败是已知噪音**：rebuild_vm.sh 的 `|| true` 容忍 ARM
+  对象参与宿主工具链接（fast_memclear 等 undefined），产物看 repack 成功
+  与守卫计数，不要被吓到；宿主工具坏了单独跑 `./rebuild_vm.sh tools`
+
+### 复测判据（v01.92）
+1. vm_boot.log 出现 `[preload] begin` **和** `[preload] done` 两行
+2. midp_stderr.log 回到恒定 ~1.6KB，0 行 NATIVES
+3. 进游戏第 3 键不再卡死；watchdog.log 无 HANG
+4. 若仍卡：ring/clinit 应不再是 open_entry 链，看新冻结点
