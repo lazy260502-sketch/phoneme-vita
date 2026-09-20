@@ -148,12 +148,18 @@ static void wd_dump_thread(const char *tag, SceUID tid) {
  * kill the process while forensics are still improving. */
 extern volatile unsigned int vita_clinit_count;
 extern volatile unsigned int vita_gc_count;
+/* v01.91: eager-preload progress (one per successfully defined jar
+ * class during the boot-time define sweep, see JVM::load_main_class).
+ * The sweep freezes the CE pump by design for its whole duration;
+ * without this counter the watchdog would kill the process mid-boot. */
+extern volatile unsigned int vita_preload_count;
 
 static int wd_thread_routine(SceSize args, void *argp) {
     (void)args; (void)argp;
     unsigned int last_ce = 0;
     unsigned int last_clinit = 0;
     unsigned int last_gc = 0;
+    unsigned int last_preload = 0;
     int stalled_polls = 0;
     int reported = 0;
     int storm_noted = 0;
@@ -166,6 +172,7 @@ static int wd_thread_routine(SceSize args, void *argp) {
             last_ce = vita_ce_count;
             last_clinit = vita_clinit_count;
             last_gc = vita_gc_count;
+            last_preload = vita_preload_count;
             stalled_polls = 0;
             reported = 0;
             storm_noted = 0;
@@ -176,6 +183,7 @@ static int wd_thread_routine(SceSize args, void *argp) {
             last_ce = vita_ce_count;
             last_clinit = vita_clinit_count;
             last_gc = vita_gc_count;
+            last_preload = vita_preload_count;
             stalled_polls = 0;   /* pump moved - hang not present */
             storm_noted = 0;
             continue;
@@ -186,19 +194,36 @@ static int wd_thread_routine(SceSize args, void *argp) {
          * on real I/O - the emulator hides this (fast x86 JIT + host
          * fs), the real handheld does not. Keep waiting (up to
          * WD_STORM_MAX_POLLS) instead of killing the process, but note
-         * the storm once in the log so post-mortems see it. */
+         * the storm once in the log so post-mortems see it.
+         * v01.91: vita_preload_count joins the group - the boot-time
+         * define sweep advances it once per class while CE is frozen
+         * by design. */
         if (vita_clinit_count != last_clinit ||
-            vita_gc_count != last_gc) {
+            vita_gc_count != last_gc ||
+            vita_preload_count != last_preload) {
+            /* capture BEFORE reassigning the baselines below */
+            int preload_advanced = (vita_preload_count != last_preload);
             last_clinit = vita_clinit_count;
             last_gc = vita_gc_count;
+            last_preload = vita_preload_count;
             if (!storm_noted) {
                 char buf[128];
                 int n = snprintf(buf, sizeof(buf),
                                  "[WD] STORM ce=%u clinit=%u gc=%u "
+                                 "preload=%u "
                                  "(pump starved but progressing)\n",
-                                 vita_ce_count, last_clinit, last_gc);
+                                 vita_ce_count, last_clinit, last_gc,
+                                 last_preload);
                 wd_log(buf, n);
                 storm_noted = 1;
+            }
+            if (preload_advanced) {
+                /* v01.91: the boot-time define sweep is strictly
+                 * bounded by the jar size - while it advances, wait
+                 * without any deadline (a big jar on real ux0: I/O can
+                 * legitimately outlast WD_STORM_MAX_POLLS). */
+                stalled_polls = 0;
+                continue;
             }
             if (stalled_polls < WD_STORM_MAX_POLLS) {
                 stalled_polls++;  /* count slowly: 1 per poll while the

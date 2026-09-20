@@ -764,7 +764,28 @@ set(VITA_VERSION  "01.86")
 #       storm on the emulator's x86 JIT + host fs finishes sub-second;
 #       vendor KVMs preloaded whole jars into RAM; we do neither, so a
 #       slow storm was misreported as a hang and abort'ed.
-set(VITA_VERSION  "01.90")
+# 01.91 (2026-09-20): log17 - the case is CLOSED at instruction level.
+#   First non-parking freeze point: PC=invoke_pending_entries+0xc
+#   (the pending_entries NULL test itself, r1=0 = about to return),
+#   LR=start_lightweight_thread_asm+0 (the address every green thread
+#   starts from - setup_stack_asm plants it). Single-shot sampling hit
+#   the same path 3 dumps in a row => the VM thread cycles through
+#   green-thread first-scheduling at high frequency. Decisive: the
+#   site ring froze on JVMInstanceClass::clinit+0x34 (x13) alternating
+#   with JarFileParser::open_entry+0x1c (x3) - a lazy class-load chain
+#   (clinit -> open_entry -> define -> next clinit, count=35 in log16)
+#   running in the native pending-entry loop: no interpreter tick
+#   checkpoint, no yield() pump backstop, CE starves, watchdog kills.
+#   Fix (phoneme-cldc ec747ab): EAGER class preload at VM start -
+#   JVM::load_main_class now calls Universe::load_all_in_classpath
+#   (the romizer's own upstream walk) before the first byte runs.
+#   Define-only, no initialize: <clinit> chains stay in the
+#   interpreter and every later resolve hits the dictionary instead
+#   of real ux0: I/O. vita_preload_count feeds the watchdog (preload
+#   advancing = boot sweep in progress, wait without deadline); the
+#   STORM log line gains preload=%u and the site-ring stats line
+#   gains preload=%u.
+set(VITA_VERSION  "01.91")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
