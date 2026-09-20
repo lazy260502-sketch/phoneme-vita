@@ -62,6 +62,13 @@ extern "C" {
     void vita_site_clinit_class(const char *name, int len);
     void vita_site_clinit_return(void);
     void vita_site_dump_clinit(const char *path);
+    /* v01.90: progress counters readable by the launcher watchdog
+     * (defined in OS_vita.cpp). vita_clinit_count advances during a
+     * class-load storm even while the CE pump is starved; vita_gc_count
+     * names a stop-the-world GC spin (invisible to every other hook
+     * because the coredump has no Java heap). */
+    extern volatile unsigned int vita_clinit_count;
+    extern volatile unsigned int vita_gc_count;
 }
 
 #endif // GLOBALS_VITA_HPP

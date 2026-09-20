@@ -1099,6 +1099,13 @@ void Java_java_lang_Class_invoke_1clinit(JVM_SINGLE_ARG_TRAPS) {
 // private native void init9();
 void Java_java_lang_Class_init9(JVM_SINGLE_ARG_TRAPS) {
   UsingFastOops fast_oops;
+#if defined(VITA)
+  vita_site_clinit_return(); /* v01.90: clinit COMPLETION point - this
+   * native is what java.lang.Class.invoke calls after <clinit> ran.
+   * v01.89 hooked set_initialized(), but bootstrap_initialize() calls
+   * it too (ROM classes), silently decrementing the depth for classes
+   * that never ran a clinit - log16's depth=0 was an artifact. */
+#endif
   JavaClassObj::Raw receiver = GET_PARAMETER_AS_OOP(0);
   JavaClass::Fast c = receiver().java_class();
   if (c().is_instance_class()) {

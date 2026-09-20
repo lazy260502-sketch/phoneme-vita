@@ -404,9 +404,19 @@ static char vita_clinit_class_name[64];
  * single-writer discipline (VM thread writes, watchdog reads). */
 #define VITA_CLINIT_HIST 16
 static char vita_clinit_hist[VITA_CLINIT_HIST][48];
-static volatile unsigned int vita_clinit_count = 0;
+/* v01.90: exported (drop static) so the launcher watchdog can treat it
+ * as a liveness/progress counter - a class-load storm advances it even
+ * while the CE pump is starved (log16: CE frozen 3.2 s while the storm
+ * kept loading classes on real ux0: I/O). */
+volatile unsigned int vita_clinit_count = 0;
 static volatile unsigned int vita_clinit_depth = 0;
 static volatile unsigned int vita_clinit_depth_max = 0;
+
+/* v01.90: GC pass counter. The coredump cannot see the Java heap, so a
+ * stop-the-world GC spin is invisible to every current forensic hook;
+ * a monotonically advancing count at least names "GC was running and
+ * how many times" in the HANG dump. */
+volatile unsigned int vita_gc_count = 0;
 
 /* Called at the top of InstanceClass::clinit per class. Same explicit
  * length copy as the verifier hooks (Symbols are length-prefixed). */
@@ -449,8 +459,9 @@ void vita_site_dump_clinit(const char *path) {
                      vita_clinit_class_name[0] ? vita_clinit_class_name
                                                : "(none)");
     sceIoWrite(fd, buf, n);
-    n = snprintf(buf, sizeof(buf), "clinit stats count=%u depth=%u max=%u\n",
-                 vita_clinit_count, vita_clinit_depth, vita_clinit_depth_max);
+    n = snprintf(buf, sizeof(buf), "clinit stats count=%u depth=%u max=%u gc=%u\n",
+                 vita_clinit_count, vita_clinit_depth, vita_clinit_depth_max,
+                 vita_gc_count);
     sceIoWrite(fd, buf, n);
     /* history: newest first (same ordering as the site ring) */
     unsigned int c = vita_clinit_count;

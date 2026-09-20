@@ -124,9 +124,6 @@ ReturnOop InstanceClass::initialize_for_task(JVM_SINGLE_ARG_TRAPS){
 }
 
 void InstanceClass::set_initialized() {
-#if defined(VITA)
-  vita_site_clinit_return(); /* v01.89: clinit chain depth tracking */
-#endif
  TaskMirror::Raw tm;
  tm = task_mirror_desc();
  GUARANTEE(tm.not_null(), "task mirror must not be null");
