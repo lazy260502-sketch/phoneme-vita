@@ -2142,47 +2142,21 @@ ReturnOop ClassFileParser::parse_class_internal(ClassParserState *stack JVM_TRAP
   }
   // Setup up native code.
   if (has_native_methods || !UseROM) {
-    // DEBUG: Check before register_natives, print raw bytes of soon-to-be-corrupted entries
-    {
-      ConstantPool* cp_raw = &cp;
-      TypeArray::Raw tags = cp_raw->tags();
-      OopDesc **ep = (OopDesc**)cp_raw->base_address();
-      jubyte *tp = (jubyte*)tags().base_address();
-      jubyte *te = tp + cp_raw->length();
-      tp++; ep++;
-      while (tp < te) {
-        if (*tp == JVM_CONSTANT_Utf8) {
-          OopDesc *oop = *ep;
-          unsigned char* p = (unsigned char*)oop;
-          fprintf(stderr, "PRE_NATIVES idx=%ld oop=%p klass_bytes=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
-                  (long)(tp - (jubyte*)tags().base_address()), (void*)oop,
-                  p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
-        }
-        tp++; ep++;
-      }
-    }
+    /* v01.92: the per-entry Utf8 dumps that used to bracket
+     * register_natives_for (PRE_NATIVES/POST_NATIVES) are gone. log18
+     * nailed them as the round-3 regression: the v01.91 boot-time
+     * define sweep parses every jar class up front, each class with
+     * natives dumped one line per CP entry (713 lines / 52 KB in
+     * log18 vs a constant 1.6 KB before), and every fprintf on the
+     * Vita is its own sceIoWrite on the unbuffered stderr stream.
+     * Hundreds of back-to-back small writes starved the ux0: storage
+     * stack - the core dump froze inside sceIoWrite with
+     * "POST_NATIVES idx=166 ..." still in the write buffer. The
+     * conditional CORRUPT scanners above stay: they are silent
+     * unless a real corruption is found. */
     fprintf(stderr, "BEFORE_NATIVES: heap_top=%p\n", (void*)_heap_top);
     Natives::register_natives_for(&this_class JVM_CHECK_0);
     fprintf(stderr, "AFTER_NATIVES_CALL: heap_top=%p\n", (void*)_heap_top);
-    // DEBUG: Check after register_natives, print raw bytes
-    {
-      ConstantPool* cp_raw = &cp;
-      TypeArray::Raw tags = cp_raw->tags();
-      OopDesc **ep = (OopDesc**)cp_raw->base_address();
-      jubyte *tp = (jubyte*)tags().base_address();
-      jubyte *te = tp + cp_raw->length();
-      tp++; ep++;
-      while (tp < te) {
-        if (*tp == JVM_CONSTANT_Utf8) {
-          OopDesc *oop = *ep;
-          unsigned char* p = (unsigned char*)oop;
-          fprintf(stderr, "POST_NATIVES idx=%ld oop=%p klass_bytes=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
-                  (long)(tp - (jubyte*)tags().base_address()), (void*)oop,
-                  p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
-        }
-        tp++; ep++;
-      }
-    }
   }
   // DEBUG: Check after register_natives
   {

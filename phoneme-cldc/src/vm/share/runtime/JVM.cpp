@@ -208,7 +208,12 @@ inline bool JVM::load_main_class(JVM_SINGLE_ARG_TRAPS) {
    * interpreter (tick-checked) and every later resolve hits the
    * dictionary instead of the disk. OOM inside load_jar_entry clears
    * its own exception and skips the class, degrading gracefully back
-   * to lazy loading for whatever did not fit. */
+   * to lazy loading for whatever did not fit.
+   * v01.92: keep it. log18 proved the regression was NOT the sweep
+   * itself - preload reached 303 defined classes and the core froze
+   * inside sceIoWrite while flushing the ClassFileParser
+   * PRE/POST_NATIVES stderr dumps that the sweep triggered (one
+   * syscall per constant-pool entry; removed in v01.92). */
   {
     extern void vita_boot_log(const char *fmt, ...);
     vita_boot_log("[preload] begin load_all_in_classpath");
