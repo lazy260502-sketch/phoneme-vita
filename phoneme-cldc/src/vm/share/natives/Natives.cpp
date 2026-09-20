@@ -1275,6 +1275,14 @@ void Java_java_lang_Thread_sleep(JVM_SINGLE_ARG_TRAPS) {
 
 // private native void start0();
 void Java_java_lang_Thread_start0(JVM_SINGLE_ARG_TRAPS) {
+#if defined(VITA)
+  /* v01.94: ring must see spawn-loop re-entry. log20 proved the freeze
+   * loop no longer passes through start0 (CE advanced ~7 pumps during
+   * boot, then froze) - if the next hang's ring still ends here the
+   * loop re-enters start0 but the pump gate stays shut; if the ring
+   * ends on the pump site instead, the loop bypasses start0 entirely. */
+  vita_site_mark();
+#endif
   UsingFastOops fast_oops;
   ThreadObj::Fast receiver = GET_PARAMETER_AS_OOP(0);
   if (!receiver().is_unstarted()) {

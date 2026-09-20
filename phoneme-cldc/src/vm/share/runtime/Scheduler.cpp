@@ -660,6 +660,12 @@ void Scheduler::pump_events_vita() {
       (vita_now - vita_last_pump_ms) >= 50) {
     vita_last_pump_ms = vita_now;
     _timer_has_ticked = false;
+    /* v01.94: ring must see the pump actually run. log20 froze with the
+     * same signature as log19 (last CE completes ANI OUT, next never
+     * starts) but no longer passes through start0 - so mark here to
+     * distinguish "pump starved entirely" from "pump ran and froze
+     * inside check_blocked_threads()/JVMSPI_CheckEvents". */
+    vita_site_mark();
     check_blocked_threads(0);
   }
 }
@@ -1241,6 +1247,13 @@ void Scheduler::sleep_current_thread(jlong millis) {
 
 void Scheduler::start(Thread* thread JVM_TRAPS) {
   NOT_PRODUCT(trace("start", thread));
+#if defined(VITA)
+  /* v01.94: spawn registration point. Together with the start0 mark
+   * (Natives.cpp) and Thread::finish mark the ring can now tell apart
+   * "loop re-enters Scheduler::start" from "loop reaches start0" and
+   * "loop dies threads" - naming the cycle directly on next hang. */
+  vita_site_mark();
+#endif
   if (!Universe::is_bootstrapping()) {
     allocate_blocked_threads_buffer(_active_count+1 JVM_CHECK);
   }
