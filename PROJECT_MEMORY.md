@@ -3877,9 +3877,12 @@ UC 多 store 并存（空名设置库 FFFFFFFF + 书签库 + 缓存库），open
 
 ### 构建产物
 - `vita-port/out/vpk/midp_vita_v01.91.vpk`
-  md5 `475b9221b725e81f1cdc456344faf337`，
-  版本串 `J2ME Player v01.91 b287 (5b1e0c7)`（SCE 头 eboot 无法
-  grep 明文，验证用 `strings midp_vita.velf`）
+  md5 `8630deb58eafa6c053e214f9955694aa`，
+  版本串 `J2ME Player v01.91 b288 (222b42e)`（velf grep 验证；
+  注意 222b42e 与 5b1e0c7 代码相同，仅多记忆文档提交）
+- 库守卫：`vita_preload_count`(B) + `load_all_in_classpath`(T)
+  在 libcldc_vm.a 与 velf 均就位；`jvm_fast_globals` 无重复定义、
+  `interpreter_dispatch_table` 未泄漏（守卫计数 0）
 
 ### 复测判据（v01.91）
 1. vm_boot.log 出现 `[preload] begin/done` 两行 → 预载路径执行
