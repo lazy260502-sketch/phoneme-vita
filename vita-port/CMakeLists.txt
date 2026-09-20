@@ -748,7 +748,23 @@ set(VITA_VERSION  "01.86")
 #   forensics: v01.89 adds a 16-slot clinit HISTORY ring + depth
 #   counters (storm of sequential clinits vs deep recursive chain) +
 #   a return hook in set_initialized, all dumped on HANG.
-set(VITA_VERSION  "01.89")
+# 01.90 (2026-09-20): log16 - THIRD keypress (UP) freeze; storm CONFIRMED
+#   but depth=0 was an artifact (set_initialized is also called by
+#   bootstrap_initialize for ROM classes, silently decrementing).
+#   Fixes/forensics this round:
+#   (a) clinit return hook moved to Java_java_lang_Class_init9() - the
+#       real "clinit finished" point (what Class.invoke calls after
+#       <clinit> ran);
+#   (b) vita_gc_count: GC pass counter (a stop-the-world GC spin is
+#       invisible to every current hook - coredump has no Java heap);
+#   (c) watchdog PROGRESS-AWARE: clinit/GC counters advancing = "storm
+#       in progress", not "dead" - keeps the round alive up to ~30 s
+#       (WD_STORM_MAX_POLLS) instead of killing at 3 s. This directly
+#       addresses "real HW dies, emulator/old phones don't": the same
+#       storm on the emulator's x86 JIT + host fs finishes sub-second;
+#       vendor KVMs preloaded whole jars into RAM; we do neither, so a
+#       slow storm was misreported as a hang and abort'ed.
+set(VITA_VERSION  "01.90")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)

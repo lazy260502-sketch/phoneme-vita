@@ -61,6 +61,10 @@ extern void vita_site_dump_clinit(const char *path);
 #define WD_LOG_PATH "ux0:/data/J2ME00001/watchdog.log"
 #define WD_STALL_POLLS 12   /* 12 x 250 ms ~= 3 s, CLOCK-FREE threshold */
 #define WD_POLL_MS  250
+/* v01.90: max extra polls while clinit/GC counters still advance
+ * (~30 s at 250 ms): a real class-load storm converges well within
+ * this; past it the round is effectively dead and we take the dump. */
+#define WD_STORM_MAX_POLLS 120
 
 static const char *wd_wait_type_name(SceUInt32 t) {
     /* waitType encoding follows the kernel's wait-category numbering
@@ -138,11 +142,21 @@ static void wd_dump_thread(const char *tag, SceUID tid) {
     wd_log(buf, n);
 }
 
+/* v01.90: VM-side progress counters (OS_vita.cpp). A class-load storm
+ * (log14..16) or a GC cycle advances these while the CE pump is starved:
+ * that is "pathologically slow", not "dead" - the watchdog must not
+ * kill the process while forensics are still improving. */
+extern volatile unsigned int vita_clinit_count;
+extern volatile unsigned int vita_gc_count;
+
 static int wd_thread_routine(SceSize args, void *argp) {
     (void)args; (void)argp;
     unsigned int last_ce = 0;
+    unsigned int last_clinit = 0;
+    unsigned int last_gc = 0;
     int stalled_polls = 0;
     int reported = 0;
+    int storm_noted = 0;
 
     for (;;) {
         sceKernelDelayThread(WD_POLL_MS * 1000);
@@ -150,15 +164,51 @@ static int wd_thread_routine(SceSize args, void *argp) {
         if (!vita_wd_round_active) {
             /* menu runs its own loop - only watch MIDlet rounds */
             last_ce = vita_ce_count;
+            last_clinit = vita_clinit_count;
+            last_gc = vita_gc_count;
             stalled_polls = 0;
             reported = 0;
+            storm_noted = 0;
             continue;
         }
 
         if (vita_ce_count != last_ce) {
             last_ce = vita_ce_count;
+            last_clinit = vita_clinit_count;
+            last_gc = vita_gc_count;
             stalled_polls = 0;   /* pump moved - hang not present */
+            storm_noted = 0;
             continue;
+        }
+
+        /* v01.90: CE frozen, but if clinit/GC counters still advance the
+         * VM is making progress through a class-load storm or a GC run
+         * on real I/O - the emulator hides this (fast x86 JIT + host
+         * fs), the real handheld does not. Keep waiting (up to
+         * WD_STORM_MAX_POLLS) instead of killing the process, but note
+         * the storm once in the log so post-mortems see it. */
+        if (vita_clinit_count != last_clinit ||
+            vita_gc_count != last_gc) {
+            last_clinit = vita_clinit_count;
+            last_gc = vita_gc_count;
+            if (!storm_noted) {
+                char buf[128];
+                int n = snprintf(buf, sizeof(buf),
+                                 "[WD] STORM ce=%u clinit=%u gc=%u "
+                                 "(pump starved but progressing)\n",
+                                 vita_ce_count, last_clinit, last_gc);
+                wd_log(buf, n);
+                storm_noted = 1;
+            }
+            if (stalled_polls < WD_STORM_MAX_POLLS) {
+                stalled_polls++;  /* count slowly: 1 per poll while the
+                                   * counters move; full stall trips */
+                if (stalled_polls < WD_STALL_POLLS)
+                    continue;
+            }
+            /* counters still moving after WD_STORM_MAX_POLLS => treat as
+             * hung anyway (a storm must converge within ~30 s or it is
+             * effectively dead); fall through to the HANG report. */
         }
 
         /* counter frozen; require WD_STALL_POLLS consecutive frozen
