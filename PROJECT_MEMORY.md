@@ -3679,3 +3679,212 @@ UC 多 store 并存（空名设置库 FFFFFFFF + 书签库 + 缓存库），open
 - 判断"修复是否上机"不能只看版本串（版本头是 vita-port 侧生成的，
   与 midp/cldc 对象新旧无关），要核对对象时间戳 + nm 符号
 - midp 侧布尔常量用 `KNI_TRUE/KNI_FALSE`（kni.h），不是 JNI_*
+
+## 2026-09-20 v01.88：log14 定案——验证器确认已关，自旋转移进 <clinit> 执行
+
+### log14 取证结果（v01.87 VPK 真机测试）
+- boot_log：`J2ME Player v01.87 b275 (6fa4282)` 确认新 VPK 在跑
+- **site_ring.log：`verify class=(none) method=(none)`——验证器确认关闭**（v01.87 修复生效）
+- ring 仅 seq=3：3 个 mark 全是 `JarFileParser::open_entry+0x1c`
+  （0x8111b280，slide=0x80F9B040 由 self= &vita_site_dump 换算）
+- **游戏正常跑了 345 帧（~5 秒，HEARTBEAT/input 日志 + 345 次动画心跳）**，
+  用户按键 2 次后冻结 → watchdog HANG（ce=345 polls=12）→ coredump
+- THREAD_REG_INFO 解析（NOTE@0x1e90，5 线程 × 0x178）：VM OS 线程
+  PC=LR=`start_lightweight_thread_asm`（泊位，与 log11 相同）→
+  **自旋在绿色线程的 Java 栈上，coredump 不含 Java 堆，无法直接定位**
+
+### 结论
+- log12 的"验证器平方慢"只是第一层：关掉验证器后冻结依旧，但时间点
+  从启动期移到游戏运行 5 秒后。第 4 个懒加载类的 `<clinit>` 执行本身
+  死循环（或病态慢）——之前的验证器抽象解释同样会走进该循环，所以
+  log9~13 的"验证冻结"其实是同一个 `<clinit>` 病毒码的两次发作
+- crumb 的 `vm UseCompiler=1` 是 runMidlet 前读的默认值；runMidlet 内
+  `-int` 解析后 JIT 实际关闭（v01.46 起默认），JIT 嫌疑排除
+
+### v01.88 取证装置（phoneme-cldc d16d385 / vita-port efb956c+8c9f）
+- `InstanceClass::clinit()` 头部：记录类名 + ring mark
+  （照 v01.85 verifier 模式，显式长度拷贝）
+- `OS_vita.cpp`：`vita_site_clinit_class(name,len)` +
+  `vita_site_dump_clinit()`（watchdog HANG 时追加 `clinit class=...` 行）
+- `vita_watchdog.c`：HANG 时调用 dump_clinit
+- CMakeLists：VPK 输出统一到 `out/vpk/`
+  （`midp_vita.vpk` + `midp_vita_v<ver>.vpk`，独立 `vpk_out_copy`
+  target 依赖 VPK 目标——POST_BUILD 挂可执行目标会在打包前跑，
+  拷到上一次的 VPK，md5 比对抓出）
+
+### 构建产物
+- `vita-port/out/vpk/midp_vita_v01.88.vpk`
+  md5 `34ac7d0e23aaf9c5c87bc418b5437dd2`，
+  版本串 `J2ME Player v01.88 b280 (efb956c)`
+- velf：`vita_site_clinit_class` @0x102055868 打点在位
+
+### 复测判据（v01.88）
+- site_ring.log 若出现 `clinit class=<肇事类名>` → 直接定案，
+  下一步针对该类做超时/补丁
+- 若 `clinit class=(none)` 但 ring 3 个 mark 不变 → 卡点在
+  open_entry 与 clinit 之间的 native 解析段（类文件 parse），需
+  给 ClassFileParser 加打点
+
+## 2026-09-20 v01.89：log15 定案——肇事类点名：UI.<clinit> 类加载风暴
+
+### log15 取证结果（v01.88 打点命中）
+- boot：`v01.88 b280 (efb956c)`；游戏跑 336 帧（~5 秒）后按键冻结
+- **site_ring.log：`clinit class=com/app/filemanager/UI`** —— 肇事类定案
+- ring（seq=38）：13 次 `JVMInstanceClass::clinit+0x34` 交替
+  3 次 `JarFileParser::open_entry+0x1c`
+  （slide=0x80f9f040，由 self=0x810b61a8 ↔ dump 静态 0x1020551e8 换算）
+- core15 寄存器组：VM OS 线程 PC=`start_lightweight_thread_asm+4`，
+  栈上 `JVM::start+0x178` ← `JVM_Start+0xa4` —— 与 log11/14 相同泊位
+- Java 堆不在 coredump（搜类名只命中 dump 缓冲自身）
+
+### 定案
+- **`com/app/filemanager/UI` 的静态初始化器永不返回**：执行中不断
+  触发新类的懒加载（clinit↔open_entry 交替），形成类加载风暴
+- 与 log12 闭环：验证器开启时对同一 `<clinit>` 做抽象解释同样走进
+  该路径（表现为"验证平方慢"）；关闭后真执行照样发作。一个病毒
+  `<clinit>`，两种发作形态
+- ring 16 槽内 13:3 的 clinit:open_entry 比例 + seq=38（5 秒内 38 个
+  事件）说明风暴在进行中，非单次卡死
+
+### v01.89 装置（phoneme-cldc f3ff88e / vita-port 84767d9）
+- 16 槽 clinit 历史 ring（48 字符槽）+ count/depth/max_depth 计数
+- `set_initialized()` 挂 `vita_site_clinit_return()`：深度递减，
+  可区分"顺序 clinit 风暴"（depth 低 count 高）vs"递归 clinit 链"
+  （depth 高）
+- HANG dump 输出：`clinit stats count=N depth=D max=M` + 16 行历史
+
+### 构建产物
+- `vita-port/out/vpk/midp_vita_v01.89.vpk`
+  md5 `dd909e82455c6c4f44dd4f22ef5f915b`，
+  版本串 `J2ME Player v01.89 b283 (84767d9)`
+
+### 复测判据（v01.89）
+- `clinit stats depth=` 高（>10）→ UI.clinit 递归触发链，看历史
+  ring 找环（A→B→A）→ 需要懒加载改造或 jar 预全量加载
+- `depth` 低但 `count` 高 → 顺序风暴（UI.clinit 内部循环 new 类），
+  可能是游戏代码病态（如反射/Class.forName 循环）
+- 下一步修复候选（定案后实施）：
+  (a) 预先全量加载 game.jar 所有类（启动时一次解压+定义，消除懒加载
+      风暴面）——最贴合 phoneME 设计（UseROM 的文件系统版）
+  (b) 若历史 ring 显示环，对该 jar 启用-clinit递归保护
+
+## 2026-09-20 v01.90：watchdog 进度感知——风暴≠挂死（真机/模拟器差异的对策落地）
+
+### 动机（log16 复盘 + 用户三问）
+- 第 3 次按键（▲UP=菜单导航）触发 UI 类懒加载 → 类加载风暴
+  （clinit 历史：UI←MenuCanvas←FileManagerMIDlet...，count=35）
+- 真机卡死的本质是**病态慢**（真实 ux0: I/O + 软件 inflate × 35 类），
+  而模拟器（x86 JIT + 宿主文件系统）亚秒完成、旧手机 KVM 整 jar 预载
+  内存，都"看不见"这个风暴
+- 旧 watchdog 3 秒判死 → 主动 data abort → 用户看到的"闪退"其实是
+  我们自己杀的进程
+
+### v01.90 改动（phoneme-cldc 34ecb7c / vita-port 861de1b）
+1. **修正 v01.89 depth 伪数据**：return 钩子从 set_initialized() 移到
+   Java_java_lang_Class_init9()——后者才是 clinit 真正完成点
+   （java.lang.Class.invoke 在 <clinit> 跑完后调它）；前者被
+   bootstrap_initialize()（ROM 类）也调用，偷跑递减导致 log16
+   depth=0 假象
+2. **vita_gc_count**：GC pass 计数（ObjectHeap::collect 入口）——
+   stop-the-world GC 自旋对现有所有取证装置不可见（coredump 无
+   Java 堆），至少能在 HANG dump 里点名"GC 在跑、跑了多少轮"
+3. **watchdog 进度感知**：CE 冻结但 clinit/gc 计数在前进 = 风暴进行
+   中，不杀；上限 WD_STORM_MAX_POLLS=120（~30 秒）后仍前进才判死。
+   STORM 事件记一行日志（ce/clinit/gc 快照）
+4. clinit/gc 计数从 static 改导出（Globals_vita.hpp 声明）
+
+### 行为变化（用户可感知）
+- 真机风暴期间：游戏最多卡 ~30 秒后要么恢复（风暴收敛，类缓存热了
+  后续不再卡）要么才被 dump——不再 3 秒闪退
+- watchdog.log 出现 `[WD] STORM ce=N clinit=M gc=K` 行 = 风暴实录
+
+### 构建产物
+- `vita-port/out/vpk/midp_vita_v01.90.vpk`
+  md5 `ce69ab3a34486049942f7d12747ece9d`，
+  版本串 `J2ME Player v01.90 b285 (861de1b)`
+
+### 复测判据（v01.90）
+1. 游戏第 3 键后卡 ~5-30 秒**然后恢复** → 定案"病态慢"，终极修复
+   方向=jar 全量预载（v01.91 候选）
+2. 卡满 30 秒被 dump → 看 clinit stats：count 涨到多少（35→N）；
+   gc= 大数 → GC 自旋主导，需查堆压力
+3. depth 正常应 ≥1（UI.clinit 未返回时冻结）；depth=0 且 count 不涨
+   → 自旋在 clinit 之外的纯字节码/native/GC 区，看 gc 计数分流
+
+## 2026-09-20 log17 + v01.91：指令级定案 + 启动期全量预载（终极修复）
+
+### log17 取证（v01.90 真机复测）
+- 现象：依旧卡顿后立即闪退；无 STORM 行，`HANG ce=340 polls=12`（3秒即杀）
+- **STORM 假设被证伪**：count 冻结在 35、gc=0 —— 计数完全不动 = 真死锁
+  非"病态慢"。watchdog 进度感知逻辑本身无 bug，只是计数不动
+- coredump 首次取得**非泊位冻结点**：VM 线程 PC=`invoke_pending_entries+0xc`
+  LR=`start_lightweight_thread_asm+0`
+
+### 指令级解码（本轮方法论成果，务必复用）
+1. **地址域勘误**：velf symtab 用链接域 `0x102xxxxxx`，section 头用
+   `0x81xxxxxx` 域（差 0x81000000）。真机 slide 很小：
+   `slide = ring self(0x81070278) − ELF 里 vita_site_dump(0x81055278)
+   = 0x1B000`。**换算公式：静态域 = 运行时 − 0x1B000**（此前用
+   0x80fe5040 是域混淆，符号相对关系恰好没算错纯属侥幸）
+2. 验证方法：`bash CMakeFiles/midp_vita.dir/link.txt` 重链出原始 ELF
+   `midp_vita`（其符号即静态域），objdump/nm 均可用
+3. **THREAD_REG_INFO 解析**（note desc @0x1e90）：`ver,count,esz` 头，
+   条目 = tid(4B) + r0..r15(64B)。SP=w[13] LR=w[14] PC=w[15]
+   （w 从 tid 之后数）
+4. THREAD_INFO（@0x684 note）：ver=18 count=5 esz=0xc8；条目 = tid +
+   32B 名字 + 状态字。`0x1`=RUNNING、`0x80000008`=WAITING(delay)
+5. core17 五线程全景：VM 停在 cmp r1,#0（r1=0 必然立即返回——不可能
+   自旋于此）；j2me_tone/cldc_ticker 正常 WAITING(delay)；watchdog
+   自己 RUNNING；SceCommonDialogWorker 寄存器垃圾（采样残留）
+
+### 定案：绿色线程生灭风暴（churn）+ clinit/open_entry 交替链
+- `setup_stack_asm`（InterpreterRuntime_arm.cpp:124）给每个新绿色线程
+  栈底预置 `start_lightweight_thread_asm` 为返回地址 → 三次 dump
+  （log9/10/17）全撞在首调度路径头部 = VM 线程高频反复走线程启动
+- **烟枪**：site ring 冻结时 16 槽只有两个地址——
+  `JVMInstanceClass::clinit+0x34` ×13、`JarFileParser::open_entry+0x1c` ×3
+- 机制：按键 → UI 懒加载链（clinit→open_entry→define→下一 clinit）
+  走**纯 native pending-entry 调度循环**——不经解释器 tick 检查、
+  不经 yield 的 pump backstop（ani_mark 停在 `CE #340 ANI OUT`）、
+  不经任何打点 → CE 饿死 → 输入无响应 → watchdog 3 秒杀
+- log16/log17 两次独立运行 ring 完全一致 = 确定性卡死非偶发竞态
+- 三方环境差异定论：模拟器（x86 JIT+宿主fs 亚秒消化）/旧手机 KVM
+  （整 jar 预载 RAM+无 watchdog）/真机（真实 I/O+逐类懒加载+激进
+  watchdog）——只有真机踩中这条路径
+
+### v01.91 改动（phoneme-cldc ec747ab / vita-port 5b1e0c7）
+- `JVM.cpp` load_main_class：VITA 下先 `Universe::load_all_in_classpath()`
+  （上游 romizer 同款路径，ENABLE_PERFORMANCE_COUNTERS=1 使
+  USE_JAR_ENTRY_ENUMERATOR=1，函数本就在 velf）——bootstrap 完成、
+  app_classpath 就绪、首字节执行前。**只 define 不 initialize**
+  （clinit 链留在解释器有 tick 检查；后续 resolve 全命中字典不再碰盘）
+- `Universe.cpp` load_jar_entry：成功 define 后 `vita_preload_count++`
+- `OS_vita.cpp/Globals_vita.hpp`：定义+导出 `vita_preload_count`；
+  site dump stats 行加 `preload=%u`
+- `vita_watchdog.c`：STORM 分支并入 preload 计数；**preload 前进 =
+  启动期有界扫描，无截止等待**（大 jar 真机 I/O 可超 30 秒）；
+  clinit/gc 风暴维持 30 秒收敛上限不变；STORM 行加 preload=%u
+- OOM 自适应降级：load_jar_entry 内部清异常跳过该类，装不下的
+  自动回退 lazy 加载
+
+### v01.86 教训的变体（第二次踩，引以为戒）
+- `_MergedSrc005.o` 时间戳 03:01（v01.90 构建），改 JVM.cpp（05:45）
+  后 make **不重编**——`.incl` 生成文件不更新，make 不跟踪其对源文件
+  的直接 #include 依赖。**改 share/ 下源码必须先 rm 对应
+  _MergedSrc*.o**（本轮：rm _MergedSrc004.o _MergedSrc005.o OS_vita.o）
+- 验证方法：`arm-vita-eabi-objdump -dr _MergedSrc005.o | grep -c
+  "R_ARM_CALL.*load_all_in_classpath"` 必须 ≥1（第一轮=0 抓了个正着）
+
+### 构建产物
+- `vita-port/out/vpk/midp_vita_v01.91.vpk`
+  md5 `475b9221b725e81f1cdc456344faf337`，
+  版本串 `J2ME Player v01.91 b287 (5b1e0c7)`（SCE 头 eboot 无法
+  grep 明文，验证用 `strings midp_vita.velf`）
+
+### 复测判据（v01.91）
+1. vm_boot.log 出现 `[preload] begin/done` 两行 → 预载路径执行
+2. 启动变慢数秒属预期（全 jar define），watchdog.log 若出现
+   `STORM ... preload=N` 且 N 在涨 → 预载被正确宽容
+3. **第 3 键不再卡死**（clinit/open_entry 触发面已消灭）→ 案结
+4. 若仍卡：ring 里 clinit/open_entry 应消失，新冻结点直接点名剩余
+   问题；preload 若卡在中间不动 → resolve 死循环，看 dump 的类名
