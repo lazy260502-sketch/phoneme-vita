@@ -4032,3 +4032,59 @@ log19 是"自旋**根本不经过** yield"——同一症状，不同盲区
    若是则下一步把泵点挂到这两条 stub 的 C++ 调用侧
    （Scheduler.cpp:1707 / JVM.cpp:280）。解析用修复版工具：
    `python3 debug/tools/parse_core18b.py <core> <elf> 0x1e74 0x15000`
+
+---
+
+## v01.94（2026-09-19）：log20 复测结论 + site ring 取证覆盖
+
+### log20 取证（v01.93 复测，同一游戏 com.app.filemanager.FileManagerMIDlet）
+
+- **v01.93 确认在跑**：boot_log "version: J2ME Player v01.93 b293 (f95de68)"。
+- **修复起效证据（关键）**：ani_mark.log "CE #371 ANI OUT" vs v01.92 期 log19 的
+  "CE #364 ANI OUT"——boot 期多泵了 ~7 次。v01.93 的 start0 泵在 spawn 循环里
+  确实开火，**不是原地打转**。
+- **但冻结同签名**：最后一个泵完整跑完 "ANI OUT"，下一个泵从未开始
+  （CE #371 后冻结）→ 冻结循环**不再经过 start0**，比 log19 的 spawn 路径
+  更深一层（残留风险第 3 条应验："纯 stub ping-pong 或其它不回 start0 的循环"）。
+- **log20 证据面教训**：只有 4 个文件（boot_log/crumb/ani_mark/audio_debug），
+  watchdog.log、site_ring.log、midp_stderr.log、psp2dmp 全缺。
+  启动成功必写 "[WD] alive"——watchdog.log 缺失最可能是**用户拷日志不全**
+  （Vita3K 在 Windows 侧：C:/Users/zyb/AppData/Roaming/Vita3K/Vita3K/ux0/data/J2ME00001/）。
+  以后每次复测汇报必须附"完整收集清单"。
+
+### v01.94 改动（取证增强，不是修复）
+
+放弃新建 Sites_vita.cpp 路线（其依赖的 incls/_Sites_vita.cpp.incl 不存在；
+includeDB 驱动的 MergedSrc 机制对新 .cpp 不透明），改在既有文件内联 mark，
+diff 最小（2 文件 +21 行，全在 #if defined(VITA) 内）：
+
+| 插桩点 | 文件:行 | ring 区分 |
+|---|---|---|
+| pump_events_vita() 门开处 | Scheduler.cpp:666 | "泵在跑且冻在泵内(查 JVMSPI/MIDP pump)" vs "泵彻底饿死" |
+| Java_java_lang_Thread_start0 头 | Natives.cpp:1277 | "循环仍回 start0 但泵门不开" vs "绕开 start0" |
+| Scheduler::start 头 | Scheduler.cpp:1249 | spawn 登记点；配合 Thread::finish(:216 已有) 可分辨 spawn/die 循环 |
+
+- 声明可见性已验证：Globals_vita.hpp 经 .incl 链对 MergedSrc002/003 可见
+  （grep "Globals_vita.hpp" __MergedSrc00{2,3}.cpp.incl 均命中）。
+- nm 落位：U vita_site_mark 出现在 target/release/_MergedSrc00{2,3,4,6}.o
+  （02=Scheduler 泵+start、03=Natives start0、04=Thread finish(旧有)、
+  06=OS_vita 定义）；库级未定义引用闭合；jvm_fast_globals D=1；
+  C 解释器泄漏=0。
+
+### 复测判读表（下一次 HANG 的 site_ring.log）
+
+1. ring 尾 = pump site → 泵最后一次真的跑了，冻在 check_blocked_threads/
+   JVMSPI_CheckEvents 内 → 下一步查 MIDP pump 与 ANI 路径
+2. ring 尾 = start0 头 → 循环仍回 start0 但 pump 门不开（50ms 窗口/两旗标都
+   不满足）→ 下一步放宽门条件或在门内加 trace
+3. ring 尾 = Scheduler::start + finish 交替 → 仍在 spawn/die，但绕过 start0
+   （查其它 spawn 入口，如 Isolate/Task 层）
+4. ring 尾 = clinit 满 / 其它 → 新循环，ring 序列直接点名
+
+### 构建
+
+- cldc HEAD=1d4f2b8（Scheduler.cpp/Natives.cpp，+21）；vita-port HEAD=6b56847
+  （CMakeLists.txt 版本行 01.94 + 案情注释）。
+- VPK: out/vpk/midp_vita_v01.94.vpk，3648309 字节，
+  md5 e869d14222da32c6d0df79ab597d6aff；版本串 "J2ME Player v01.94 b296 (53a558d)"；
+  vita_site_mark@0x81053f38。
