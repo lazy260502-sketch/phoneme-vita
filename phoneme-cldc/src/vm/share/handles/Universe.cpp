@@ -1129,6 +1129,14 @@ void Universe::load_jar_entry(char* name, int length, JarFileParser* jf_parser
         return;
       }
 
+#if defined(VITA)
+      /* v01.91: progress counter for the eager preload driven from
+       * JVM::load_main_class (see there for the log17 rationale).
+       * Declared in Globals_vita.hpp (visible via the .incl chain).
+       * The launcher watchdog treats an advancing preload count like
+       * a clinit/GC storm: CE frozen but progressing == not dead. */
+      vita_preload_count++;
+#endif
       if (UseVerifier || VerifyOnly) {
         instance_class.verify(JVM_SINGLE_ARG_NO_CHECK_AT_BOTTOM);
       }

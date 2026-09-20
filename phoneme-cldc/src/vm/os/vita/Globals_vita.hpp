@@ -69,6 +69,10 @@ extern "C" {
      * because the coredump has no Java heap). */
     extern volatile unsigned int vita_clinit_count;
     extern volatile unsigned int vita_gc_count;
+    /* v01.91: eager-preload progress counter (see JVM::load_main_class
+     * and Universe::load_jar_entry) - advanced once per successfully
+     * defined jar class during the boot-time define sweep. */
+    extern volatile unsigned int vita_preload_count;
 }
 
 #endif // GLOBALS_VITA_HPP

@@ -418,6 +418,13 @@ static volatile unsigned int vita_clinit_depth_max = 0;
  * how many times" in the HANG dump. */
 volatile unsigned int vita_gc_count = 0;
 
+/* v01.91: eager-preload progress counter (incremented in
+ * Universe::load_jar_entry after a successful define, see
+ * JVM::load_main_class for the log17 rationale). The watchdog reads
+ * it so the boot-time define sweep - which freezes the CE pump by
+ * design - is not mistaken for a hang. */
+volatile unsigned int vita_preload_count = 0;
+
 /* Called at the top of InstanceClass::clinit per class. Same explicit
  * length copy as the verifier hooks (Symbols are length-prefixed). */
 void vita_site_clinit_class(const char *name, int len) {
@@ -459,9 +466,9 @@ void vita_site_dump_clinit(const char *path) {
                      vita_clinit_class_name[0] ? vita_clinit_class_name
                                                : "(none)");
     sceIoWrite(fd, buf, n);
-    n = snprintf(buf, sizeof(buf), "clinit stats count=%u depth=%u max=%u gc=%u\n",
+    n = snprintf(buf, sizeof(buf), "clinit stats count=%u depth=%u max=%u gc=%u preload=%u\n",
                  vita_clinit_count, vita_clinit_depth, vita_clinit_depth_max,
-                 vita_gc_count);
+                 vita_gc_count, vita_preload_count);
     sceIoWrite(fd, buf, n);
     /* history: newest first (same ordering as the site ring) */
     unsigned int c = vita_clinit_count;

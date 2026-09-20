@@ -192,6 +192,30 @@ ReturnOop JVM::get_main_args(JVM_SINGLE_ARG_TRAPS) {
 inline bool JVM::load_main_class(JVM_SINGLE_ARG_TRAPS) {
 
   UsingFastOops fast_oops;
+#if defined(VITA)
+  /* v01.91: log17 nailed the round-hang mechanism. The site ring froze
+   * on JVMInstanceClass::clinit+0x34 x13 alternating with
+   * JarFileParser::open_entry+0x1c x3: a key press starts a lazy class
+   * load chain (UI <- MenuCanvas <- FileManagerMIDlet <- ... <-
+   * java/util/Timer, count=35 in log16) whose pending-entry scheduling
+   * loop lives entirely in native code - it passes no interpreter tick
+   * checkpoint, no yield() pump backstop (ani_mark stayed at "CE #340
+   * ANI OUT"), so input starves and the watchdog kills the process.
+   * Define every class in the app classpath EAGERLY here, before the
+   * first byte runs: the romizer uses the same upstream path
+   * (load_all_in_classpath), so this is a supported walk, not a hack.
+   * Define-only (no initialize): runtime <clinit> chains stay in the
+   * interpreter (tick-checked) and every later resolve hits the
+   * dictionary instead of the disk. OOM inside load_jar_entry clears
+   * its own exception and skips the class, degrading gracefully back
+   * to lazy loading for whatever did not fit. */
+  {
+    extern void vita_boot_log(const char *fmt, ...);
+    vita_boot_log("[preload] begin load_all_in_classpath");
+    Universe::load_all_in_classpath(JVM_SINGLE_ARG_CHECK_0);
+    vita_boot_log("[preload] done (see site_ring stats for count)");
+  }
+#endif
   InstanceClass::Fast klass = JVM::resolve_class(_main_class JVM_CHECK_0);
 
   // Make sure the class is initialized
