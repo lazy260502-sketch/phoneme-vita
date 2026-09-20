@@ -163,6 +163,7 @@ static int wd_thread_routine(SceSize args, void *argp) {
     int stalled_polls = 0;
     int reported = 0;
     int storm_noted = 0;
+    int preload_extensions = 0;   /* v01.92: bounded grace for the sweep */
 
     for (;;) {
         sceKernelDelayThread(WD_POLL_MS * 1000);
@@ -176,6 +177,7 @@ static int wd_thread_routine(SceSize args, void *argp) {
             stalled_polls = 0;
             reported = 0;
             storm_noted = 0;
+            preload_extensions = 0;
             continue;
         }
 
@@ -186,6 +188,7 @@ static int wd_thread_routine(SceSize args, void *argp) {
             last_preload = vita_preload_count;
             stalled_polls = 0;   /* pump moved - hang not present */
             storm_noted = 0;
+            preload_extensions = 0;
             continue;
         }
 
@@ -218,12 +221,25 @@ static int wd_thread_routine(SceSize args, void *argp) {
                 storm_noted = 1;
             }
             if (preload_advanced) {
-                /* v01.91: the boot-time define sweep is strictly
-                 * bounded by the jar size - while it advances, wait
-                 * without any deadline (a big jar on real ux0: I/O can
-                 * legitimately outlast WD_STORM_MAX_POLLS). */
+                /* v01.92: the boot-time define sweep is bounded by the
+                 * jar size, but log18 showed "advancing preload" can
+                 * still mask a real stall (the frozen VM was mid
+                 * sceIoWrite, one native class parse still short of
+                 * the next counter tick). Grant the sweep a generous
+                 * extension instead of no deadline: each advancing
+                 * poll resets the stall counter, but WD_STORM_MAX_POLLS
+                 * polls (~30 s) without ANY progress since the last
+                 * extension still falls through to the HANG report so
+                 * a dead sweep always leaves a core dump. */
                 stalled_polls = 0;
-                continue;
+                if (++preload_extensions > WD_STORM_MAX_POLLS) {
+                    /* every poll advanced preload yet extensions
+                     * exceeded the cap - impossible unless the
+                     * counter is broken; stop trusting it. */
+                    preload_advanced = 0;
+                } else {
+                    continue;
+                }
             }
             if (stalled_polls < WD_STORM_MAX_POLLS) {
                 stalled_polls++;  /* count slowly: 1 per poll while the

@@ -785,7 +785,29 @@ set(VITA_VERSION  "01.86")
 #   advancing = boot sweep in progress, wait without deadline); the
 #   STORM log line gains preload=%u and the site-ring stats line
 #   gains preload=%u.
-set(VITA_VERSION  "01.91")
+# 01.92 (2026-09-20): log18 - v01.91 regression root-caused WITH A CORE
+#   DUMP, not by guessing. vm_boot.log: "[preload] begin" present,
+#   "[preload] done" MISSING. Watchdog: one STORM line (preload=28),
+#   then HANG at 3 s with a core dump. Site-ring stats: preload=303
+#   (sweep did advance 28 -> 303 between the STORM line and the dump).
+#   The core's VM thread: PC=sceIoWrite+8, LR=_write_r - frozen INSIDE
+#   the write syscall, and the write buffer still holds
+#   "POST_NATIVES idx=166 oop=0x812143f8 klass_bytes=[4d 6f 64 65 ...]".
+#   Root cause: ClassFileParser.cpp carried uncommitted-looking (but
+#   committed in 016e041) DEBUG dumps - PRE_NATIVES/POST_NATIVES print
+#   one stderr line PER CONSTANT-POOL ENTRY, unconditionally, for every
+#   class with natives. Before the sweep, only classes loaded lazily
+#   triggered them (stderr was a constant 1644 bytes in log10..log17);
+#   the v01.91 boot sweep parses every jar class up front => 713 dump
+#   lines / 52 KB in log18, each fprintf its own sceIoWrite on the
+#   unbuffered stderr stream. Hundreds of back-to-back small writes
+#   starved the ux0: storage stack (Vita3K's host FS hides this -
+#   microsecond latency). Fix: delete the two dump loops, keep the
+#   conditional CORRUPT scanners (silent unless actually corrupt).
+#   Also: watchdog preload grace is now bounded (extension counter,
+#   same WD_STORM_MAX_POLLS cap) so a stalled sweep can never again
+#   run past the deadline without producing a core dump.
+set(VITA_VERSION  "01.92")
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)
