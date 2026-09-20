@@ -3948,3 +3948,69 @@ watchdog 3 秒 HANG 取证杀进程。Vita3K 宿主 FS 微秒级延迟，从不�
 2. midp_stderr.log 回到恒定 ~1.6KB，0 行 NATIVES
 3. 进游戏第 3 键不再卡死；watchdog.log 无 HANG
 4. 若仍卡：ring/clinit 应不再是 open_entry 链，看新冻结点
+
+## 2026-09-20 v01.93：log19 指令级定案 —— 泵兜底挂在 yield 上，绿线程自旋根本到不了（cldc f95de68 / vita-port d5916a5）
+
+### 先说清一个事实：v01.92 修复被 log19 证明**生效**
+- vm_boot.log `[preload] begin` + `done` 两行齐
+- midp_stderr.log 3924 字节、29 对 BEFORE/AFTER_NATIVES、**零行** NATIVES dump
+- watchdog 只有一行 STORM（preload=28），preload 计数 864 正常推进后转 HANG（有界宽容按设计工作）
+- log18 那层（I/O 洪水）已关闭。log19 的卡死是**另一层**：log9/16/17 同族自旋，这次无 I/O 干扰、现场最干净
+
+### log19 现场指令级铁证
+- VM 主线程 PC=0x810d04c4（静态 0x810bb4c4 = `start_lightweight_thread_asm+0x10`，
+  即 `tst r1,#0x40000000` 之后那条 `bleq invoke_pending_entries`@0x810bb4cc）
+- **LR=0x810bb4b4 = 函数入口**——LR 是绿线程首次调度时种入栈帧的值，说明 dump 瞬间
+  是**又一次全新调用**：VM 在循环重进该 stub
+- site ring 16 槽全部 = `JVMInstanceClass::clinit` 内 mark（seq=1048 冻结），连
+  Thread::finish 的 mark 都没有 → 新线程在原生层即死
+- clinit hist 35 条与 log16 **逐字节一致**，尾部 java/util/Timer；CE 冻在 #364 共 3.3 秒
+- 其余线程健康：[4] cldc_ticker 在 delay 循环（ticker 活着、vita_tick_count 在涨）
+
+### 根因（这次是钉死的，不是推断）
+ARM 上 `start_lightweight_thread` 是生成器桩（`InterpreterStubs_arm.cpp:229`），
+C 版被 `#if !defined(ARM)` 排除。游戏代码 `new Thread().start()` 的循环：
+`Java_java_lang_Thread_start0`(Natives.cpp:1277) → `Thread::allocate`（栈帧种入
+stub 地址）→ `Scheduler::start` → 返回解释器切到新线程 → 桩执行 → 新线程在
+native 里死亡 → 再次 start0……**这条路径不经过任何 yield()**：
+- v01.83 的 50ms 泵兜底挂在 `wake_up_timed_out_sleepers`，只有 yield()/wait 循环会调它
+- ticker 置的 `_timer_has_ticked` 标志，消费点在**解释器 tick 检查点**→
+  `Thread::timer_tick`→yield——只有执行 Java 字节码才到达；被 spawn 的线程还没跑
+  字节码就死了，泵永远等不到消费者
+→ CE 泵饿死 3.3 秒，watchdog HANG 取证。v01.83 修的是"自旋**经过** yield 但门不开"，
+log19 是"自旋**根本不经过** yield"——同一症状，不同盲区
+
+### 修复（最小 diff：3 文件 +45/-8，全部 `#if defined(VITA)`）
+- `Scheduler.hpp/cpp`：把 v01.83 gate 抽成 `Scheduler::pump_events_vita()`
+  （同一 50ms 节流、共享 static，声明放 public 区——注意类里 `private:` 在前）
+- `Natives.cpp` `Java_java_lang_Thread_start0` 尾部调用它：每次 spawn 循环迭代
+  必经此处；上下文安全（当前线程在 native 里 RUNNING，无半成品调度状态；
+  JVMSPI_CheckEvents 只轮询原生队列并 unblock ASYNC 线程）
+- 关键教训：**stub 是宿主生成器产物，改 `SharedStubs_arm.cpp` 进不了二进制**
+  （`pack_lib()` 里 `Interpreter_arm.o`——全部桩所在成员——故意从旧库回填，
+  因为重新生成的丢了 jvm_f2i/jvm_d2i 浮点桩）。插桩点必须选会被重编的 C++ 成员
+
+### coredump 解析新坑（两个叠加差点误判）
+- `debug/tools/parse_core18b.py` 路径**硬编码**（`/tmp/core18/core` + 旧 ELF），
+  忽略 argv → 解析 log19 时静默返回 log18 旧寄存器。使用前必须 sed 替换路径
+- CPSR 签名 `0x800f0010` **不通用**：log19 VM 线程 cpsr=0x60070010 扫不到。
+  thread[0] 寄存器窗口在 note entry +0x08 起：sp=+0x38、lr=+0x3c、pc=+0x40、
+  cpsr=+0x44
+- log19 slide=0x15000（site_ring self 0x81068a38 − vita_site_dump 静态 0x81053a38）。
+  符号化用 `vita-port/build/midp_vita`（Sep 20 07:41 = v01.92）
+- core 的 LOAD 段**不含 .data/.bss**（0x814bxxxx 不可读）：vita_clinit_hist/
+  gc_count/preload_count 读不了，好在 site_ring.log 已打印全部
+
+### 构建产物（v01.93）
+- 重编：`rm _MergedSrc002.o _MergedSrc003.o`（Scheduler→002、Natives→003，用
+  `target/generated/incls/__MergedSrc*.incl` 查归属）→ `./rebuild_vm.sh`
+- 守卫：jvm_fast_globals 唯一 D 定义、C 解释器泄漏 0、
+  `_ZN12JVMScheduler16pump_events_vitaEv` 在 002 定义 T / 003 引用 U 闭合
+- `vita-port/out/vpk/midp_vita_v01.93.vpk` md5 `46ab6e0af78f856094b4b1fbc070af2a`，
+  velf 版本串 01.93×2，`nm build/midp_vita | grep pump_events` = 0x81080af8
+
+### 复测判据（v01.93）
+1. 按键进游戏后不再 3 秒冻结；CE 计数持续单调涨
+2. watchdog.log 无 HANG；若仍 HANG，新 core 的 ring 应不再是 clinit 满槽
+   （pump_events_vita 生效后自旋会被 50ms 泵节流，ring 会看到新标记）
+3. 若还挂：冻结点应移到下一层——届时先用正确的 argv 路径 + CPSR 偏移解析
