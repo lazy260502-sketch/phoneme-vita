@@ -2117,6 +2117,25 @@ extern "C" void switch_thread(Thread* thread) {
   /* v01.98: denominator for the lane/pump counters. switch_thread is
    * extern "C" (outside the class), so qualify the static explicitly. */
   Scheduler::_vita_switch_count++;
+  /* v01.99 FIX: log23 (v01.98 forensics) closed the chain: at hang the
+   * ring holds ONLY switch_thread marks (16x), lanes freeze at fast=377
+   * slow=0 while switch=512169 keeps climbing, and pump stops at 370 ==
+   * the CE count. The spinning loop is pure Java compute: every quantum
+   * it re-enters switch_thread (the only back-branch checkpoint), but it
+   * NEVER passes through yield() or start0 - so every pump site hung in
+   * v01.83/v01.93 (yield fast lane, thread spawn) can never fire. With
+   * the pump dead, JVMSPI_CheckEvents never drains the native event
+   * ring, the blocked Java thread (wait on monitor / callSerially) is
+   * never woken, and the loop never sees the wakeup flag -> deadlock.
+   * Fix: drive the SAME throttled pump from this checkpoint - it is the
+   * one site every quantum is guaranteed to pass. pump_events_vita()
+   * carries its own 50 ms wall-clock gate plus timer/readiness opens,
+   * so a healthy VM pays at most one check per 50 ms, and the hang loop
+   * now drains input events -> wakes the waiter -> breaks the cycle.
+   * check_blocked_threads(0) re-enters JVMSPI_CheckEvents in ANI mode
+   * which sleeps up to 50 ms per call, adding back-pressure that also
+   * throttles the spin. */
+  Scheduler::pump_events_vita();
 #endif
   if (Scheduler::_yield_on_thread_switch) {
     // We need to call yield() after Scheduler::block_current_thread() is

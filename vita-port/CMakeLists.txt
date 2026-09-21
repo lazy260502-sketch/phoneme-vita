@@ -838,7 +838,23 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "01.98")
+set(VITA_VERSION  "01.99")
+# 01.99 (2026-09-23): THE FIX for the multi-round "hangs after a few
+#   keypresses" saga. log23 (first v01.98 forensics capture) closed the
+#   causal chain: at hang the site ring holds ONLY switch_thread marks,
+#   lanes freeze (fast=377 slow=0) while switch=512169 keeps climbing,
+#   pump stops at 370 == CE count, priority queues empty, all 5 threads
+#   ACTIVE but unschedulable. The spin loop is pure Java compute that
+#   re-enters switch_thread every quantum but never passes yield() or
+#   start0 - so every pump site from v01.83/v01.93 could never fire and
+#   the pump starved -> blocked waiter never woken -> deadlock. Fix:
+#   one-line call to Scheduler::pump_events_vita() inside the existing
+#   VITA block of switch_thread() - the single checkpoint every quantum
+#   must pass. It reuses the existing 50 ms wall-clock throttle, so a
+#   healthy VM pays ~nothing; in the spin it drains input events, wakes
+#   the waiter, and ANI-mode CheckEvents adds back-pressure that also
+#   throttles the loop. CLDC: Scheduler.cpp +25 lines (comment + call),
+#   all inside #if defined(VITA).
 # 01.98 (2026-09-22): log22 forensics instrumentation - quantify the
 #   fast-lane ping-pong. Four counters (yield fast/slow lane, pump
 #   executions, switch_thread passes) exported through the v01.95
