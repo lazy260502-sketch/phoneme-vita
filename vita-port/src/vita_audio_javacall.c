@@ -23,6 +23,23 @@
 #include "javacall_memory.h"
 #include "javanotify_multimedia.h"
 
+/* v01.96: WAV (RIFF/PCM) support, implemented in vita_wav.c */
+typedef struct {
+    long data_off, data_len, rate;
+    int  channels, bits;
+} wav_info;
+int  vita_wav_parse_header(const uint8_t *buf, long len, wav_info *info);
+long vita_wav_duration_ms(const wav_info *info);
+javacall_result vita_port_media_download_handled_by_device(
+        javacall_handle handle, /*OUT*/ javacall_bool* isHandled);
+
+/* Stub override: Java MediaDownload must stream data to us (see
+ * vita_wav.c for the full stub-vs-KNI-default-TRUE analysis). */
+javacall_result javacall_media_download_handled_by_device(
+        javacall_handle handle, /*OUT*/ javacall_bool* isHandled) {
+    return vita_port_media_download_handled_by_device(handle, isHandled);
+}
+
 /* ---------------------------------------------------------------------------
  * Audio diagnosis log (independent fd, not affected by VM stderr redirect)
  * ------------------------------------------------------------------------- */
@@ -87,6 +104,9 @@ static void alog(const char *fmt, ...) {
 #define JTS_FIRST_CHUNK     1024    /* first packet size reported to Java  */
 #define JTS_MAX_REPEAT      8       /* REPEAT expansion guard              */
 #define JTS_MAX_EVENTS      4096    /* expanded event list guard           */
+/* v01.97: hard ceiling for the dynamically grown WAV buffer (32 MB
+ * ~ 3 minutes of 44.1 kHz stereo 16-bit; allocated on demand only). */
+#define WAV_MAX_BUFFER      (32 * 1024 * 1024)
 
 /* One expanded playback event */
 typedef struct {
@@ -95,17 +115,35 @@ typedef struct {
     int32_t volume;    /* 0..100 */
 } jts_event;
 
+/* WAV playback state, filled by do_buffering (see vita_wav.c) */
+typedef struct {
+    int      valid;        /* header parsed, ready to play           */
+    long     data_off;     /* PCM payload offset within wav_data     */
+    long     data_len;     /* PCM payload bytes                      */
+    long     rate;         /* sample rate                            */
+    int      channels;     /* 1 or 2                                 */
+    int      bits;         /* 8 or 16                                */
+} wav_state;
+
 /* Native player handle created by javacall_media_create */
 typedef struct {
     int      app_id;
     int      player_id;
     int      state;        /* 0=idle 1=realized 2=prefetched 3=playing */
-    uint8_t  jts_data[JTS_MAX_SIZE];
+    /* v01.97: jts_data is heap-allocated (initial block JTS_MAX_SIZE,
+     * grown on demand for large WAV in do_buffering). JTS sequences
+     * still fit the initial block, so their path only gains an
+     * indirection; the struct shrinks from ~32.5 KB to ~200 bytes. */
+    uint8_t  *jts_data;
+    long     wav_cap;      /* allocated size of jts_data */
     long     jts_len;      /* bytes buffered */
     long     whole_size;   /* set via javacall_media_set_whole_content_size */
     long     duration_ms;  /* computed total sequence duration, -1 unknown */
     long     volume;       /* 0..100 */
     javacall_bool mute;
+    /* v01.96: WAV (audio/x-wav) support */
+    wav_state wav;
+    uint32_t  wav_buf_len; /* accumulated bytes in jts_data for WAV  */
     /* playback progress (touched by player thread) */
     volatile int      playing;
     volatile long     cur_time_ms;
@@ -143,6 +181,13 @@ static vita_player *g_jts_req = NULL;          /* sequence to play next   */
 static volatile unsigned int g_jts_seq = 0;    /* bumped on each request  */
 static volatile unsigned int g_jts_done = 0;   /* last finished request   */
 
+/* WAV playback request (Player.start) - same handshake pattern.
+ * A player is either JTS or WAV (mutually exclusive by content type),
+ * so the WAV fields of the vita_player are stable once start is given. */
+static vita_player *g_wav_req = NULL;          /* player to play next     */
+static volatile unsigned int g_wav_seq = 0;    /* bumped on each request  */
+static volatile unsigned int g_wav_done = 0;   /* last finished request   */
+
 /* ---------------------------------------------------------------------------
  * caps / configuration (static, tone-only)
  * ------------------------------------------------------------------------- */
@@ -156,6 +201,14 @@ static const char g_tone_content_type[] = "audio/x-tone-seq";
 static javacall_media_caps g_caps_tone[] = {
     { JAVACALL_MEDIA_FORMAT_TONE,
       g_tone_content_type,
+      JAVACALL_MEDIA_MEMORY_PROTOCOL | JAVACALL_MEDIA_FILE_LOCAL_PROTOCOL,
+      0 },
+    /* v01.96: WAV PCM. MS_PCM matches JAVACALL_MEDIA_FORMAT_MS_PCM;
+     * HighLevelPlayer throws Unsupported media format unless this call
+     * returns a known format string, and KNIMediaDownload needs the
+     * memory protocol to stream bytes via nBuffering. */
+    { JAVACALL_MEDIA_FORMAT_MS_PCM,
+      "audio/x-wav",
       JAVACALL_MEDIA_MEMORY_PROTOCOL | JAVACALL_MEDIA_FILE_LOCAL_PROTOCOL,
       0 },
     { 0, NULL, 0, 0 } /* array terminator - do not remove */
@@ -533,6 +586,87 @@ static long jts_total_duration(const jts_event *evs, long n) {
     return total;
 }
 
+/* ---------------------------------------------------------------------------
+ * WAV playback (v01.96) - see vita_wav.c for the header parser.
+ * PCM lives in pl->jts_data[pl->wav.data_off .. +data_len); the player
+ * thread converts it chunk by chunk to 48 kHz stereo, so multi-MB BGM
+ * never needs a second full-size buffer.
+ * ------------------------------------------------------------------------- */
+
+/** Volume-scaled sample fetch; 8-bit WAV is unsigned, 16-bit signed. */
+static int32_t wav_sample_at(const vita_player *pl, long frame, int ch) {
+    const uint8_t *base = pl->jts_data + pl->wav.data_off;
+    long bytes_per_frame = (long)pl->wav.channels * (pl->wav.bits >> 3);
+    const uint8_t *p = base + frame * bytes_per_frame + ch * (pl->wav.bits >> 3);
+    int32_t s;
+    if (pl->wav.bits == 8) {
+        s = ((int32_t)p[0] - 128) << 8;          /* u8 -> s16-ish */
+    } else {
+        s = (int32_t)(int16_t)(p[0] | (p[1] << 8));
+    }
+    s = (s * (int32_t)pl->volume) / 100;
+    return s;
+}
+
+/** Render a buffered WAV on the player thread; handshake like JTS. */
+static void wav_render_player(vita_player *pl, unsigned int my_seq) {
+    long frames, out_frames_total, rendered = 0;
+    int bytes_per_frame;
+
+    pl->playing = 1;
+    pl->stop_flag = 0;
+    pl->cur_time_ms = 0;
+
+    if (audio_out_open() != 0) {
+        pl->playing = 0;
+        return;
+    }
+
+    bytes_per_frame = pl->wav.channels * (pl->wav.bits >> 3);
+    frames = pl->wav.data_len / bytes_per_frame;
+    out_frames_total = frames * (OUT_SAMPLE_RATE / pl->wav.rate);
+
+    while (rendered < out_frames_total) {
+        int produced = 0;
+        if (pl->stop_flag || g_wav_seq != my_seq) break;
+        while (produced < OUT_CHUNK_FRAMES && rendered < out_frames_total) {
+            /* source position of this output frame (nearest) */
+            long src = rendered * frames / out_frames_total;
+            int32_t l, r;
+            if (pl->wav.channels == 2) {
+                l = wav_sample_at(pl, src, 0);
+                r = wav_sample_at(pl, src, 1);
+            } else {
+                l = wav_sample_at(pl, src, 0);
+                r = l;
+            }
+            g_out_buffer[produced*2+0] = (int16_t)l;
+            g_out_buffer[produced*2+1] = (int16_t)r;
+            produced++;
+            rendered++;
+        }
+        if (produced < OUT_CHUNK_FRAMES) {
+            memset(&g_out_buffer[produced*2], 0,
+                   (OUT_CHUNK_FRAMES-produced) * 2 * sizeof(int16_t));
+        }
+        sceAudioOutOutput(g_audio_port, g_out_buffer);
+        pl->cur_time_ms = (long)(((long long)rendered * 1000) / OUT_SAMPLE_RATE);
+    }
+
+    pl->playing = 0;
+    pl->cur_time_ms = pl->duration_ms;
+
+    if (!pl->stop_flag && g_wav_seq == my_seq) {
+        ALOG("notify END_OF_MEDIA (wav done)");
+        javanotify_on_media_notification(
+            JAVACALL_EVENT_MEDIA_END_OF_MEDIA,
+            pl->app_id, pl->player_id, JAVACALL_OK,
+            (void *)(long)(pl->duration_ms / 1000));
+    }
+    pl->stop_flag = 0;
+    alog("wav done: frames=%ld dur=%ld seq=%u\n", frames, pl->duration_ms, my_seq);
+}
+
 /* v01.72: the tone player thread's id, published for the hang
  * watchdog (vita_watchdog.c). -1 until javacall_media_initialize runs. */
 volatile SceUID vita_tone_tid = -1;
@@ -583,6 +717,17 @@ static int tone_player_thread(SceSize args, void *argp) {
                     }
                     pl->stop_flag = 0;
                 }
+            }
+            continue;
+        }
+
+        /* --- WAV playback request? (v01.96) --- */
+        if (g_wav_seq != g_wav_done) {
+            vita_player *pl = g_wav_req;
+            unsigned int my_seq = g_wav_seq;
+            g_wav_done = my_seq;
+            if (pl != NULL && pl->wav.valid) {
+                wav_render_player(pl, my_seq);
             }
             continue;
         }
@@ -692,7 +837,10 @@ javacall_result javacall_media_get_event_data(javacall_handle handle,
     return JAVACALL_INVALID_ARGUMENT;
 }
 
-/* URI is a UTF-16 string; compare against "device://tone" (ASCII subset) */
+/* URI is a UTF-16 string; compare against "device://tone" (ASCII subset).
+ * v01.96: no longer used by create() - WAV support made it MIME-driven;
+ * kept for reference/debug use. */
+#if 0
 static int uri_is_device_tone(javacall_const_utf16_string uri, long len) {
     static const char dev[] = "device://tone";
     if (uri == NULL || len < (long)sizeof(dev) - 1) return 0;
@@ -701,6 +849,7 @@ static int uri_is_device_tone(javacall_const_utf16_string uri, long len) {
     }
     return 1;
 }
+#endif
 
 javacall_result javacall_media_create(int appID, int playerID,
                                       javacall_const_utf16_string uri,
@@ -712,12 +861,10 @@ javacall_result javacall_media_create(int appID, int playerID,
     if (handle == NULL) return JAVACALL_INVALID_ARGUMENT;
     *handle = NULL;
 
-    /* Only device tone players are supported; everything else (wav/midi/
-     * http files) fails fast so Java gets a clean MediaException instead
-     * of a half-working player. */
-    if (!uri_is_device_tone(uri, uriLength)) {
-        return JAVACALL_INVALID_ARGUMENT;
-    }
+    /* v01.96: accept any URI and decide by the requested MIME in realize
+     * instead. Non-WAV non-tone content still fails fast there (see
+     * realize's mime check) so Java gets a clean MediaException. */
+    (void)uri; (void)uriLength;
 
     pl = (vita_player *)javacall_malloc(sizeof(vita_player));
     if (pl == NULL) return JAVACALL_OUT_OF_MEMORY;
@@ -732,6 +879,15 @@ javacall_result javacall_media_create(int appID, int playerID,
     pl->volume = g_master_volume;
     pl->mute = JAVACALL_FALSE;
 
+    /* v01.97: initial heap block; small WAVs and every JTS sequence fit
+     * without realloc churn. */
+    pl->jts_data = (uint8_t *)javacall_malloc(JTS_MAX_SIZE);
+    if (pl->jts_data == NULL) {
+        javacall_free(pl);
+        return JAVACALL_OUT_OF_MEMORY;
+    }
+    pl->wav_cap = JTS_MAX_SIZE;
+
     *handle = (javacall_handle)pl;
     return JAVACALL_OK;
 }
@@ -739,10 +895,21 @@ javacall_result javacall_media_create(int appID, int playerID,
 javacall_result javacall_media_close(javacall_handle handle) {
     ALOG("close");
     vita_player *pl = (vita_player *)handle;
+    int spins = 0;
     if (pl == NULL) return JAVACALL_OK;
     /* request stop; the player thread copies what it needs per event */
     pl->stop_flag = 1;
     if (g_jts_req == pl) g_jts_req = NULL;
+    if (g_wav_req == pl) g_wav_req = NULL;
+    /* v01.97: jts_data is heap now and a long BGM render can still be
+     * inside wav_render_player - give the player thread time to notice
+     * stop_flag before freeing. Bounded: one output chunk is ~10 ms,
+     * 50 x 4 ms covers it plus slack (close is not latency-critical). */
+    while (pl->playing && spins < 50) {
+        sceKernelDelayThread(4000);
+        spins++;
+    }
+    if (pl->jts_data != NULL) javacall_free(pl->jts_data);
     javacall_free(pl);
     return JAVACALL_OK;
 }
@@ -768,8 +935,13 @@ javacall_result javacall_media_get_format(javacall_handle handle,
         /*OUT*/ javacall_media_format_type* format) {
     ALOG("get_format");
     vita_player *pl = (vita_player *)handle;
-    (void)pl;
     if (format == NULL) return JAVACALL_INVALID_ARGUMENT;
+    if (pl != NULL && pl->wav.valid) {
+        /* HighLevelPlayer throws Unsupported unless realize's
+         * nGetMediaFormat returns a known caps format string. */
+        *format = JAVACALL_MEDIA_FORMAT_MS_PCM;
+        return JAVACALL_OK;
+    }
     /* UNKNOWN lets HighLevelPlayer map device://tone to DEVICE_TONE
      * itself (handledByDevice=true, no source.connect/download). */
     *format = JAVACALL_MEDIA_FORMAT_UNKNOWN;
@@ -799,8 +971,28 @@ javacall_result javacall_media_realize(javacall_handle handle,
                                        long mimeLength) {
     ALOG("realize");
     vita_player *pl = (vita_player *)handle;
-    (void)mime; (void)mimeLength;
     if (pl == NULL) return JAVACALL_INVALID_ARGUMENT;
+
+    /* Remember whether this player is a WAV by its requested MIME
+     * ("audio/x-wav" arrives as UTF-16 from HighLevelPlayer.realize).
+     * Anything that is neither tone (handled elsewhere in Java) nor WAV
+     * still realizes fine here - the format check that surfaces the
+     * MediaException is nGetMediaFormat below. */
+    pl->wav.valid = 0;
+    {
+        static const char wav_mime[] = "audio/x-wav";
+        long m = (long)sizeof(wav_mime) - 1;
+        long i;
+        if (mime != NULL && mimeLength >= m) {
+            int match = 1;
+            for (i = 0; i < m; i++) {
+                if (mime[i] != (javacall_utf16)wav_mime[i]) { match = 0; break; }
+            }
+            if (match) pl->wav.valid = 1;   /* MIME says WAV; header check
+                                               happens in do_buffering */
+        }
+    }
+
     if (pl->state == 0) pl->state = 1;
     return JAVACALL_OK;
 }
@@ -823,7 +1015,19 @@ javacall_result javacall_media_start(javacall_handle handle) {
 
     pl->state = 3;
 
-    if (pl->jts_len >= 2) {
+    if (pl->wav.valid) {
+        /* WAV: hand off to the player thread like JTS. Header must have
+         * been parsed in do_buffering; otherwise report END_OF_MEDIA. */
+        if (pl->wav_buf_len > 0) {
+            g_wav_req = pl;
+            g_wav_seq++;
+        } else {
+            ALOG("notify END_OF_MEDIA (wav no data)");
+            javanotify_on_media_notification(JAVACALL_EVENT_MEDIA_END_OF_MEDIA,
+                                             pl->app_id, pl->player_id,
+                                             JAVACALL_OK, (void *)0);
+        }
+    } else if (pl->jts_len >= 2) {
         /* Hand off to the player thread; never block the VM thread. */
         g_jts_req = pl;
         g_jts_seq++;
@@ -907,7 +1111,10 @@ javacall_result javacall_media_get_java_buffer_size(javacall_handle handle,
     /* Non-zero values make MediaDownload.download() actually run and
      * deliver the JTS bytes via nBuffering. */
     *java_buffer_size = JTS_MAX_SIZE;
-    *first_chunk_size = JTS_FIRST_CHUNK;
+    /* v01.96: WAV slides a window through this buffer, so the first
+     * packet is bigger (must cover a whole RIFF header comfortably);
+     * JTS keeps its original small first chunk. */
+    *first_chunk_size = (pl != NULL && pl->wav.valid) ? 4096 : JTS_FIRST_CHUNK;
     return JAVACALL_OK;
 }
 
@@ -932,6 +1139,26 @@ javacall_result javacall_media_get_buffer_address(javacall_handle handle,
     return JAVACALL_OK;
 }
 
+/* v01.97: grow the heap buffer so a whole Java packet always fits.
+ * The Java download loop advances its read offset by the length we
+ * report, so dropping bytes would desync the stream permanently -
+ * growth (doubling, WAV_MAX_BUFFER ceiling) is the only safe answer.
+ * Returns 0 on success, -1 on allocation failure/ceiling. */
+static int wav_ensure_cap(vita_player *pl, long needed) {
+    long new_cap;
+    uint8_t *nb;
+    if (needed <= pl->wav_cap) return 0;
+    if (needed > WAV_MAX_BUFFER) return -1;
+    new_cap = pl->wav_cap;
+    while (new_cap < needed) new_cap *= 2;
+    if (new_cap > WAV_MAX_BUFFER) new_cap = WAV_MAX_BUFFER;
+    nb = (uint8_t *)javacall_realloc(pl->jts_data, (unsigned int)new_cap);
+    if (nb == NULL) return -1;
+    pl->jts_data = nb;
+    pl->wav_cap = new_cap;
+    return 0;
+}
+
 javacall_result javacall_media_do_buffering(javacall_handle handle,
                                  const void* buffer,
                                  /*INOUT*/ long* length,
@@ -950,10 +1177,74 @@ javacall_result javacall_media_do_buffering(javacall_handle handle,
 
     if (buffer == NULL || *length <= 0) {
         /* End of buffering marker (Java sends NULL/-1). JTS always
-         * arrives in one chunk, so nothing to do here. */
+         * arrives in one chunk; for WAV the whole file is already
+         * accumulated, so finish the header parse now. */
         *length = 0;
         *need_more_data = JAVACALL_FALSE;
         *next_chunk_size = 0;
+        if (pl->wav.valid && !pl->wav.data_off) {
+            wav_info info;
+            if (vita_wav_parse_header(pl->jts_data, pl->wav_buf_len, &info)) {
+                pl->wav.data_off = info.data_off;
+                pl->wav.data_len = info.data_len;
+                pl->wav.rate     = info.rate;
+                pl->wav.channels = info.channels;
+                pl->wav.bits     = info.bits;
+                pl->duration_ms  = vita_wav_duration_ms(&info);
+                alog("wav buffered: %ld Hz %d ch %d bit, %ld ms, %ld bytes\n",
+                     info.rate, info.channels, info.bits,
+                     pl->duration_ms, info.data_len);
+            } else {
+                alog("wav parse FAILED (%ld bytes)\n", pl->wav_buf_len);
+                pl->wav.valid = 0;
+                /* v01.97: a big heap buffer is of no use now - drop back
+                 * to the initial block so a failed stream does not pin
+                 * megabytes until close(). */
+                {
+                    uint8_t *nb = (uint8_t *)javacall_malloc(JTS_MAX_SIZE);
+                    if (nb != NULL) {
+                        javacall_free(pl->jts_data);
+                        pl->jts_data = nb;
+                        pl->wav_cap = JTS_MAX_SIZE;
+                    }
+                }
+                return JAVACALL_INVALID_ARGUMENT;
+            }
+        }
+        return JAVACALL_OK;
+    }
+
+    /* v01.97: WAV chunks - KNI copies each sliding window to the START
+     * of jts_data (see vita_wav.c), so append into our storage here.
+     * The Java loop advances by the length we report, so we must take
+     * every byte: grow the buffer instead of clamping (v01.96 clamped
+     * at 32 KB and truncated long BGMs). */
+    if (pl->wav.valid) {
+        long take = *length;
+        if (wav_ensure_cap(pl, (long)pl->wav_buf_len + take) != 0) {
+            /* Ceiling hit or OOM: fail the stream cleanly instead of
+             * silently corrupting the PCM data. */
+            alog("wav buf grow FAILED at %lu+%ld bytes\n",
+                 (unsigned long)pl->wav_buf_len, take);
+            pl->wav.valid = 0;
+            *length = 0;
+            *need_more_data = JAVACALL_FALSE;
+            *next_chunk_size = 0;
+            return JAVACALL_OUT_OF_MEMORY;
+        }
+        if (take > 0) {
+            memcpy(pl->jts_data + pl->wav_buf_len, buffer, take);
+            pl->wav_buf_len += (uint32_t)take;
+        }
+        /* Keep pulling until Java reports stream EOF (it then sends the
+         * NULL end-of-buffering marker, where the RIFF parse happens).
+         * whole_size is only a hint - not all sources know it. The
+         * returned size becomes Java's next packetSize; a nonzero
+         * regular-read value is required (0 would make KNI treat the
+         * next nBuffering call as the end marker). */
+        *need_more_data = JAVACALL_TRUE;
+        *next_chunk_size = 4096;
+        *length = take;
         return JAVACALL_OK;
     }
 
@@ -986,6 +1277,9 @@ javacall_result javacall_media_clear_buffer(javacall_handle handle) {
     vita_player *pl = (vita_player *)handle;
     if (pl == NULL) return JAVACALL_INVALID_ARGUMENT;
     pl->jts_len = 0;
+    pl->wav_buf_len = 0;
+    pl->wav.data_off = 0;
+    pl->wav.data_len = 0;
     pl->duration_ms = -1;
     pl->whole_size = -1;
     return JAVACALL_OK;

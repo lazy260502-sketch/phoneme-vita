@@ -2151,6 +2151,11 @@ void *javacall_malloc(unsigned int size) {
     return malloc(size);
 }
 
+/* v01.97: needed by the WAV dynamic buffer in vita_audio_javacall.c */
+void *javacall_realloc(void *ptr, unsigned int size) {
+    return realloc(ptr, size);
+}
+
 void javacall_free(void *ptr) {
     free(ptr);
 }
