@@ -4166,3 +4166,216 @@ diff 最小（2 文件 +21 行，全在 #if defined(VITA) 内）：
    计数器；无 switch mark → 冻结在第一次 switch 前 → 查 dispatch 初始化。
 3. Thread::allocate mark 计数暴涨 → Timer/spawn 风暴实锤 → 查 log21
    clinit 链上 java/util/Timer 的触发方。
+
+---
+
+## v01.96（2026-09-21）：WAV PCM 播放（MMAPI 最大功能缺口）——JSR-135 分发链打通
+
+### 根因分析（Java 侧源码引证，本次调研核心成果）
+
+**WAV 数据通路断裂点 = stub `javacall_media_download_handled_by_device` 不写 OUT 参数。**
+
+- `libpcsl_multimedia.c:224` 的 stub 返回 `JAVACALL_NOT_IMPLEMENTED` 且**不写**
+  `*isHandled`；`KNIHighLevelPlayer.c` 的 `nIsHandledByDevice` 预置
+  `returnValue = KNI_TRUE` → Java 恒得 `handledByDevice=true`。
+- 后果：`HighLevelPlayer.realize` 永不创建 `MediaDownload` → `nBuffering`
+  永不触发 → **任何字节都到不了 native**（tone/JTS 不受影响：DirectTone 的
+  `setSequence` 静态直调 `MediaDownload.nBuffering`，绕过该判断）。
+- 修复：vita_wav.c 定义 `vita_port_media_download_handled_by_device()` 写
+  `*isHandled = JAVACALL_FALSE` 返回 `JAVACALL_OK`，同文件提供
+  `javacall_media_download_handled_by_device` 覆盖包装。链接顺序（vita-port
+  对象先于 stub 库 + `--allow-multiple-definition`，v01.12-14 机制）保证
+  第一定义胜出。**已用 objdump 验证**：`javacall_media_download_handled_by_device
+  @0x8100ce50` 为尾调用 `b.w vita_port_media_download_handled_by_device`。
+
+### 分发链其余要点（Java 侧行为，全部源码核实）
+
+- `nGetMediaFormat` 返回 UNKNOWN 时 Java 走 `ext2Format`/`mime2Format` 回退，
+  mFormats 表**只有 gif→GIF，无 wav** → 必须 native 侧回答 MS_PCM：
+  caps 表加 `{JAVACALL_MEDIA_FORMAT_MS_PCM, "audio/x-wav", memory|file, 0}`
+  （终结符保留）+ `realize` 记 MIME + `get_format` 对 wav.valid 返 MS_PCM。
+- `KNIMediaDownload.c doBuffering` 滑窗协议：`KNI_GetRawArrayRegion` 把
+  Java buffer 当前窗口拷到 **native buffer 开头（非累积）** → native 必须
+  自行 memcpy 追加；`next_chunk_size` 返回作下一包大小；Java 结束标记是
+  `nBuffering(null, 0, 0)`（buffer NULL）。
+- `MediaDownload.java`：先 `nSetWholeContentSize`（contLength>0 时）→
+  `nGetJavaBufferSize`/`nGetFirstPacketSize` → 循环 nBuffering。
+- `getPlayerFromType`：nIsToneControlSupported→DirectTone（tone 路径不变）、
+  nIsMIDI→DirectMIDI、否则 DirectPlayer。
+- END_OF_MEDIA 通知数据单位为**秒**（Java 乘 1000），沿用 JTS 约定。
+
+### 改动清单（全部在 vita-port，phoneme-cldc/midp 零改动）
+
+| 文件 | 改动 |
+|---|---|
+| `src/vita_wav.c`（新建，~180 行） | RIFF 解析器（PCM 8/16bit、1-2ch、4-96kHz、fmt 必须先于 data、奇数 chunk 补齐）+ `vita_wav_parse_header`/`vita_wav_duration_ms` + stub 覆盖 |
+| `src/vita_audio_javacall.c`（8 处） | wav_state 字段；caps 加 MS_PCM 行；`g_wav_req/g_wav_seq/g_wav_done` 握手；tone_player_thread 加 WAV 分支；`wav_sample_at`（8bit unsigned→<<8、16bit LE、volume 缩放）+ `wav_render_player`（48kHz 立体声流式渲染、nearest 重采样、逐 chunk 查 stop/seq、自然结束发 END_OF_MEDIA）；create 去掉 tone-only 拦截；get_format/realize MIME 驱动；start 握手投递；do_buffering 滑窗累积 + 结束标记时解析 RIFF；close 清 g_wav_req；clear_buffer 重置；get_java_buffer_size WAV 首包 4096；uri_is_device_tone 改 #if 0（防 static 未用警告） |
+| `CMakeLists.txt` | add_executable 加 `src/vita_wav.c`；版本 01.96 + 版本注释块 |
+
+### 构建验证（已通过）
+
+- `./build.sh` 全绿无新警告；产物 `build/cmake/midp_vita.vpk` +
+  `out/vpk/midp_vita_v01.96.vpk/.sym`。
+- 符号验证：`arm-vita-eabi-nm` 见 `javacall_media_download_handled_by_device`(T)、
+  `vita_port_media_download_handled_by_device`(T)、`vita_wav_parse_header`(T)、
+  `vita_wav_duration_ms`(T)；反汇编确认覆盖生效。
+- git 自查：vita-port 仅 2 M + 1 新增；phoneme-cldc/phoneme-midp 内部
+  `status --porcelain` 均为空。
+
+### 运行时验证方法（待上机）
+
+- Vita3K 加载含 `Manager.createPlayer(url, "audio/x-wav")` 的 MIDlet 或游戏
+  BGM 路径；看 `audio_debug.log`：应出现 `wav buffered: <rate> Hz <ch> ch
+  <bits> bit, <ms> ms` 与 `wav done`；失败路径为 `wav parse FAILED`。
+- 回归点：ToneTest 的 device://tone 路径必须照常（DirectTone 静态调
+  nBuffering，不经过 handled_by_device）。
+
+### 遗留风险
+
+1. ~~WAV >32KB 被截断~~ → **v01.97 已解决**（缓冲动态化，见下节）。
+2. `create` 不再按 URI 拦截，坏内容延迟到 realize/nGetMediaFormat 才抛
+   MediaException（Java 侧行为一致，但失败点后移）。
+3. need_more_data 循环依赖 Java `pKniInfo->needMoreData`（nNeedMoreDataImmediatelly），
+   协议已核实但未经上机验证。
+
+---
+
+## v01.97（2026-09-21）：WAV 缓冲动态化——消除 32KB 截断（v01.96 遗留风险 1）
+
+### 协议核实（决定设计的三个 Java/KNI 事实）
+
+1. `MediaDownload.java:194` `roffset += num_read`：Java **恒按 native 报告的
+   length 推进读偏移**——v01.96 的 clamp（take=room）等于丢字节，流永久错位。
+   所以扩容是唯一安全解，不能"截断容忍"。
+2. `KNIMediaDownload.c doBuffering`：nBuffering 的返回值就是 Java 下一轮
+   packetSize，**need_more_data=TRUE 时返回 0 会让 KNI 把下一次 nBuffering
+   当结束标记**（length<=0 分支）→ next_chunk_size 恒 4096。
+3. EOF 由 Java `stream.read` 返回 -1 触发（eom → NULL 结束标记）；
+   `whole_size` 只是提示（不是所有源都知道长度）→ do_buffering 的 WAV 分支
+   need_more_data 恒 TRUE，终止交给 Java 的结束标记。
+
+### 改动（3 文件，均在 vita-port）
+
+| 文件 | 改动 |
+|---|---|
+| `src/vita_audio_javacall.c` | `jts_data` 改堆指针 + `wav_cap`（结构体 32.5KB→~200B）；create 分配初始块（JTS_MAX_SIZE）；`wav_ensure_cap()` 倍增扩容（WAV_MAX_BUFFER=32MB 上限 ≈3 分钟 44.1k stereo 16bit）；do_buffering WAV 分支改扩容+整包语义；close 退避等待（50×4ms）渲染线程响应 stop_flag 后再 free（use-after-free 防护）；解析失败缩回初始块 |
+| `src/vita_pcsl.c` | 补 `javacall_realloc`（此前只有 malloc/free，链接期发现缺失） |
+| `CMakeLists.txt` | 版本 01.97 + 注释块 |
+
+JTS 路径不受影响：序列必 fit 初始块，仅多一层指针间接。
+
+### 构建与验证（已通过）
+
+- 第一轮链接失败 `undefined reference to javacall_realloc` → 补
+  vita_pcsl.c 后全绿。产物 `out/vpk/midp_vita_v01.97.vpk`（3650329 字节）。
+- 符号/反汇编核验：`javacall_realloc` T 0x8100aaa4；
+  `javacall_media_do_buffering` 内 `bl javacall_realloc`（扩容调用在位，
+  wav_ensure_cap 被 -O 内联）；`javacall_media_close` 内 sceKernelDelayThread
+  退避循环在位。
+
+### 运行时验证方法（待上机）
+
+- 用 >32KB 的 22kHz/16bit mono WAV（44KB 起，v01.96 会截断的文件）测
+  createPlayer("audio/x-wav")：audio_debug.log 应出现完整
+  `wav buffered: ... bytes`（data_len 应等于文件实际 PCM 长度，非 32KB）
+  且播放到自然结束发 END_OF_MEDIA。
+- 32MB 上限路径：构造超大 WAV 看日志 `wav buf grow FAILED` + MediaException
+  （预期失败行为，非崩溃）。
+
+### 遗留风险
+
+1. 倍增扩容峰值内存 = 2×文件大小（realloc 拷贝瞬间），32MB 上限文件峰值
+   ~64MB——Vita 用户态可用堆 ~192MB，单文件安全，多 player 并发大文件
+   未测。
+2. close 退避上限 200ms，若渲染线程因 audio_out 阻塞超过 200ms 仍可能
+   free 竞争（实际 OUT_CHUNK_FRAMES=512@48kHz ≈10.7ms/块，余量 20 倍）。
+
+## log22 判读（2026-09-22，v01.97 b303 运行件）：ping-pong 定案 + 事件泵饿死机制
+
+### 数据完整性
+
+16 文件全（含 log20 曾缺失的 watchdog.log）。v01.95 三装置首次同时开火。
+parse_psp2dmp.py slide=0x3a000 自动求解（anchor 法第三次实战），v01.97.sym
+符号化零漂移。
+
+### 三方证据
+
+| 装置 | 数据 | 判读 |
+|---|---|---|
+| site_ring | 15×switch_thread+0x28、1×pump_events_vita+0x3c（残影）、seq=513589 frozen=yes | v01.94 判读表第 1 分支命中：纯桩 ping-pong |
+| wd_snapshot | cur_thread=0x81401d10 status=ACTIVE(0) pending=0 active_count=5 async=1 timer_ticked=1 ev_readness=0 | 判死 log21"全新派发态"（cur 稳定非初生非死）；新矛盾：5 活线程无人做功 |
+| coredump | PC=start_lightweight_thread_asm+0x8（ldr r1,[r0,#0x68] 读 status 槽）r1=0、LR=同函数+0x0、栈走唯一 JVM::start+0x178 | 与 wd_snapshot status=0 互证 |
+
+### 指令级机制链（把 log21"卡在桩簇"细化到指令）
+
+- 桩头（810bbb44）：`+0x8 ldr r1,[r0,#0x68]`（status 槽，非 pending）→
+  `tst r1,#0x40000000`(TERMINATING) → 无该位 → `bleq invoke_pending_entries`
+- ASM 版 invoke_pending_entries（810bb86c）：头三句
+  `ldr r1,[r0,#0x24](pending); cmp r1,#0; moveq pc,lr`——pending=0 直接
+  早退，与 wd_snapshot pending=0 严丝合缝
+- Scheduler::yield（Scheduler.cpp:1092）：**next_thread 非空 → 跳过整个
+  wait_for_event_or_timer 循环（事件泵挂在此路径）→ 直接回 switch_thread**
+
+### 机制结论
+
+active_count=5 → get_next_runnable_thread 永远选得出 → yield 永远走
+"快车道" → 事件泵永久饿死（ring 仅 1 次 pump 残影）→ 按键不再分发 →
+表象"按键几次就挂死"。触发同 log21：同游戏、末次按键 0x10 释放后、
+clinit 同终态 java/util/Timer(count=35)。
+
+### 下一步（按性价比排序）
+
+1. vita_wd_dump_threads（扩展 OS_vita.cpp 快照，遍历 active 链 +
+   scheduler_waiting 链，打印每线程 id/status/is_just_born）——直接回答
+   "5 个线程是谁、谁被反复选中又反复让出"
+2. yield 快车道空转计数器进 wd_snapshot——量化"泵饿死"
+3. active_count 泄漏排查：Universe::invoke_pending_entries（工作副本
+   Universe.cpp:1201）里 active_count<=0 时每圈 initialize_main+start，
+   若主线程被重复登记则计数虚高（5 可能 = 真实 3~4 + 泄漏）
+4. 桩计数器（生成器嵌 mark）：区分早退/走到桩尾比例
+
+## v01.98（2026-09-22）：log22 判读落地 + 泵饿死量化装置
+
+### 判读复盘（详见上节 log22 判读）
+
+三方证据定案纯桩 ping-pong：ring 15×switch_thread+0x28、wd_snapshot
+active_count=5 pending=0 status=ACTIVE、PC=start_lightweight_thread_asm+0x8。
+核心矛盾升级为：**5 个活线程为何无人做有用功**。指令级链路（本轮补全）：
+ASM 版 invoke_pending_entries(810bb86c) 头三句 `ldr r1,[r0,#0x24]; cmp;moveq pc,lr`
+与 pending=0 严丝合缝；yield() 快车道（next_thread 非空）完全跳过事件泵循环。
+
+### v01.98 改动（取证增强，全部 #if defined(VITA)）
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-cldc/src/vm/share/runtime/Scheduler.cpp` | 静态区 4 计数器（_vita_yield_fast/slow、_vita_pump_runs、_vita_switch_count）；yield 快/慢车道埋点；pump_events_vita 泵执行计数；switch_thread 计数；文件尾 vita_sched_dump_threads()（全局线程链 + 优先级队列清单，id/pri/status）+ 4 个 extern C 计数器桥 |
+| `phoneme-cldc/src/vm/share/runtime/Scheduler.hpp` | 4 计数器静态成员声明 + 类内读取器 |
+| `phoneme-cldc/src/vm/os/vita/OS_vita.cpp` | wd_snapshot 输出 lanes 行 + 调用线程清单转储（static 4KB 缓冲） |
+| `vita-port/CMakeLists.txt` | 版本 01.98 |
+
+### 构建踩坑记录（本轮新增教训）
+
+1. **修改 MergedSrc 分组内源文件后，必须 rm target/release/_MergedSrc00N.o 再重编**——make 依赖挂在 wrapper .cpp（Sep 3 生成）上，不追踪 incl 内的源文件；本轮 Scheduler.cpp 改动就落在 _MergedSrc002 组，首次重编静默沿用旧对象（rebuild_vm.sh 的 `|| true` 掩盖了编译错误输出）。另注意 switch_thread 是 extern "C"（类外），引用计数器必须写 `Scheduler::_vita_switch_count`。
+2. **build_midp_vita.sh 走旧 midp-vita 工程（只编 main.c，无 vm_rom_stubs.o）**——现行工程是 vita-port（含 vm_rom_stubs.c 定义 _rom_linkcheck_mffd_false）；走错工程会报 undefined reference to `_rom_linkcheck_mffd_false`。正确构建命令：`cd vita-port && cmake --build build -j8`。
+3. step1_cldc 的 Universe.cpp md5 marker 过时会触发遗留的 debug/AZZERT 重编路径（违反 PRODUCT ABI 规则）；CLDC 库已用 rebuild_vm.sh 重编时，刷新 `.cldc_universe.md5`/`.cldc_jvmspi.md5`/`.cldc_built` 三个 marker 跳过。
+
+### 产物与提交
+
+- VPK：`vita-port/out/vpk/midp_vita_v01.98.vpk`（3650773 字节，b305）
+- .sym：`vita-port/out/vpk/midp_vita_v01.98.sym`（4284200 字节）——下轮 coredump 符号化用
+- 提交：387c451（CLDC 装置）+ 9b70c2d（版本）+ 35d1827（补 v01.96/97 WAV 遗留源码，使树与 b303 产物一致）
+
+### 下一轮 HANG 判读表（v01.98 增量）
+
+看 site_ring.log 尾部 wd_snapshot 段：
+
+| 证据组合 | 结论 |
+|---|---|
+| fast 增长 + pump 停滞 | 快车道饿死泵（log22 假说成立）→ 修 yield 快车道补泵 |
+| fast 增长 + pump 增长 | 泵在跑但事件送不到 → 查 check_blocked_threads/JVMSPI_CheckEvents |
+| slow 增长 | 假说推翻：线程都不可运行 → 看线程清单谁是等待者 |
+| threads(priority-queues) 有 DEAD/TERM 线程 | 死线程未摘队列 → 修 remove_from_active/adjust_priority_list |
+
+### 遗留
+
+- 0001-save-change.patch（历史遗留未跟踪文件）仍在。
