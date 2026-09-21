@@ -428,6 +428,30 @@ void Scheduler::sleep_forever() {
   }
 #endif
 
+#if defined(VITA)
+  /* v02.00 THE REAL FIX: upstream master mode treats the all-blocked
+   * state as an app deadlock ("waiting on monitors that will never get
+   * notified") because on real phones a host slave loop owns the event
+   * pump. This port runs master mode with NO host loop: a game waiting
+   * for a keypress IS the all-blocked state. log22/23/24 all froze in
+   * the upstream else-branch below - Os::sleep() never pumps events,
+   * never wakes timed sleepers, so the runnable queue can never be
+   * re-filled and the VM sleeps forever (ring seq frozen, pump==CE
+   * frozen, heartbeat frozen, PC residue at the green-thread berth).
+   * Replace the eternal sleep with a bounded idle loop: wake due
+   * sleepers, drive the same 50ms-throttled event pump that
+   * switch_thread uses, nap 50 ms. Key/touch/timer events then re-fill
+   * the queue and the loop exits. */
+  SETUP_ERROR_CHECKER_ARG;
+  while (*get_next_runnable_thread() == NULL) {
+    wake_up_timed_out_sleepers(JVM_SINGLE_ARG_CHECK);
+    pump_events_vita();
+    Os::sleep(50);
+  }
+  /* Mirror the debugger branch two calls up: install the woken thread
+   * as current before returning into switch_thread. */
+  Thread::set_current(get_next_runnable_thread());
+#else
   if (AbortOnInfiniteWait) {
     TTY_TRACE_CR(("Infinite wait detected. Aborting ..."));
     *((int*)0x01) = 1; // IMPL_NOTE: perhaps adding an Os::abort()?
@@ -438,6 +462,7 @@ void Scheduler::sleep_forever() {
       Os::sleep(0x7fffffff);
     }
   }
+#endif
 }
 
 /*
