@@ -1,7 +1,62 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-23
+> Last Updated: 2026-09-24
 
-## 2026-09-23 v01.99：**按键挂死悬案定案并修复**——switch_thread 泵背压（THE FIX）
+## 2026-09-24 v02.00：**挂死真根因定案**——sleep_forever 无泵死睡（THE REAL FIX，推翻 v01.99 判读）
+
+> log24（v01.99 b308）证明 v01.99 泵**执行过但无效**，且推翻了 log23 定案的"空转环"理论。VM 不是在转，是**睡着了**。本轮解码 dump 全部 17 个内核线程后因果链真正闭合。
+
+### v01.99 判读错误（先认错）
+
+1. `switch=512169` 是**开机累计值**，单次采样无时间序列——"51 万次切换打在环上"是未验证推断，实际挂死时什么都没在切换。
+2. log24 site_ring（修正 ASLR slide=0x11000 后符号化）：`[0]=pump_events_vita+0x48`（v01.99 泵第 405 次执行的 mark）、`[1..15]=switch_thread+0x28`——泵确实在跑，最后一帧 CE#405 完整跑完（ani_mark OUT 在案），然后 **seq/pump/CE/心跳全部同时冻结**。转的东西不会冻住；冻住=睡了。
+
+### log24 决定性数据
+
+```
+wd_snapshot: cur_thread=0x81401d10 active_count=5 timer_ticked=1(ev_readiness=0)
+lanes fast=374 slow=0 pump=405 switch=181549
+threads(priority-queues): (null)   ← 5 线程全 ACTIVE 却不在任何队列
+watchdog: HANG ce=405 polls=12      ← pump==CE==405 三证同冻
+```
+
+- coredump：`pc=start_lightweight_thread_asm+0x8`、`r0=0x81eddfb4`（=线程清单 id=4 的 oop，按键触发的 Timer→TimerThread→Object.wait() 阻塞时的分发上下文残影）。
+- `timer_ticked=1` 冻结互证：ticker OS 线程活着在置位，但泵死了没人消费/清零。
+
+### 真因果链（master 模式调度无人区）
+
+1. 游戏等按键 = 所有 Java 线程阻塞（MIDP **正常态**，非应用 bug）。
+2. 最后一个可运行线程阻塞 → `block_current_thread → switch_thread`（ring 里 15 个 switch mark）→ `master_mode(next=NULL)` → **`sleep_forever()`**（Scheduler.cpp:424）。
+3. 上游实现 `while(队列空) Os::sleep(0x7fffffff)`——**从不泵事件、从不唤醒超时睡眠者**，队列只有泵送事件才能重填 → 永久死锁。`sceKernelDelayThread(0x7fffffff*1000)` 还有 32 位溢出问题（实际非永久）。
+4. 上游手机靠宿主 slave 循环泵事件，master 模式把 all-blocked 当调试场景（AbortOnInfiniteWait）；本移植是 master 模式且**无宿主循环**——v01.83/93/99 所有泵位都在"有线程可运行"才走的路径上，全阻塞状态是**调度无人区**。
+
+### 修复（Scheduler.cpp sleep_forever，`#if defined(VITA)`，+25 行）
+
+```cpp
+SETUP_ERROR_CHECKER_ARG;
+while (*get_next_runnable_thread() == NULL) {
+  wake_up_timed_out_sleepers(JVM_SINGLE_ARG_CHECK);  // 唤醒到期等待者（MIDP 事件循环靠带超时 wait）
+  pump_events_vita();                                 // 与 switch_thread 同款 50ms 节流泵
+  Os::sleep(50);
+}
+Thread::set_current(get_next_runnable_thread());      // 镜像调试器分支：安装唤醒线程
+```
+
+反汇编验证（_MergedSrc002.o @1d91c）：循环体 bl 三件套齐全，退出尾调 set_current。最终 ELF 符号 `_ZN12JVMScheduler13sleep_foreverEv`@0x81082bf4。
+
+### 方法论教训（本轮新增，血泪）
+
+1. **计数器单次快照无时间序列语义**——"累计值很大"≠"正在增长"。
+2. **符号化必先减 ASLR slide**（本轮 0x11000），否则张冠李戴（首次错标 monitor_exit）。
+3. **附件摘要≠实际文件清单**——log24 实际 16 文件，先 ls 核实再开口。
+
+### 构建/提交记录
+
+- phoneme-cldc 提交 `0f13a59`；VPK `vita-port/out/vpk/midp_vita_v02.00.vpk`(3650852B)/`.sym`(4284248B)。
+- 复测预期：同按键序列不再挂死；若再看门狗 HANG，site_ring 应见 pump 持续增长（睡眠循环每 50ms 一泵）。
+
+## 2026-09-23 v01.99：~~按键挂死悬案定案并修复~~——switch_thread 泵背压（判读已被 v02.00 推翻，泵位无效）
+
+> ⚠️ 本章"空转环"定论已被 log24 推翻：switch 计数是累计值非增速，VM 实为全阻塞死睡。泵挂在 switch_thread 顶部只在"有线程可运行"时经过，全阻塞态（挂死态）根本到不了。保留本章仅作教训记录。
 
 > 用户原话："到底有没有分析到原因，一直子在抓log，能不能一步到位"。log23（v01.98 取证装置首战）给出决定性数据，因果链闭合，本轮直接交付修复 v01.99。
 

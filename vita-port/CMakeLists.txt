@@ -838,7 +838,26 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "01.99")
+set(VITA_VERSION  "02.00")
+# 02.00 (2026-09-21): THE REAL FIX - Scheduler::sleep_forever idle loop.
+#   log24 (v01.99) falsified the "spinning loop" theory: the v01.99 pump
+#   DID run (ring freshest slot = pump_events_vita+0x48 after slide
+#   correction) and then ring seq / pump / CE / heartbeat ALL froze
+#   simultaneously. Nothing spins - the VM is ASLEEP. Decoding all 17
+#   kernel threads in the dump's THREAD_INFO showed every thread idle,
+#   priority queues empty, all 5 Java threads ACTIVE-but-blocked (a
+#   game waiting for a keypress). Root cause: this port runs upstream
+#   master mode with NO host event loop, so when the LAST runnable
+#   thread blocks, switch_thread_master_mode(NULL) falls into
+#   sleep_forever() whose upstream loop is while(queue empty)
+#   Os::sleep(0x7fffffff) - it NEVER pumps events, NEVER wakes timed
+#   sleepers, so the queue can never refill: permanent deadlock. On
+#   real phones a host slave loop owns the pump; here nobody does.
+#   Fix (#if defined(VITA) in sleep_forever): bounded idle loop - wake
+#   due sleepers + the same 50ms-throttled pump switch_thread uses +
+#   50ms nap - then set_current(woken) mirroring the debugger branch.
+#   Key/touch/timer events now re-fill the queue and the VM wakes.
+#   CLDC: Scheduler.cpp +27 lines, single function, VITA-only.
 # 01.99 (2026-09-23): THE FIX for the multi-round "hangs after a few
 #   keypresses" saga. log23 (first v01.98 forensics capture) closed the
 #   causal chain: at hang the site ring holds ONLY switch_thread marks,
