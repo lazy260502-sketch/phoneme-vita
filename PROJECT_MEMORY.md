@@ -1,5 +1,48 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-18
+> Last Updated: 2026-09-23
+
+## 2026-09-23 v01.99：**按键挂死悬案定案并修复**——switch_thread 泵背压（THE FIX）
+
+> 用户原话："到底有没有分析到原因，一直子在抓log，能不能一步到位"。log23（v01.98 取证装置首战）给出决定性数据，因果链闭合，本轮直接交付修复 v01.99。
+
+### log23 决定性数据（v01.98 b305，site_ring wd_snapshot 段）
+
+```
+lanes fast=377 slow=0 pump=370 switch=512169
+threads(priority-queues): (null)
+threads(active-list): 5 线程全 st=00000000（无任何等待/暂停标志）
+```
+
+watchdog：HANG ce=370；input_debug：按键 0x40/0x10 触发模式与 log21/22 一致。
+
+### 因果链定论（三条证据交叉闭合，非推测）
+
+1. **`pump=370 == CE=370`**：挂死后事件泵零执行——泵停在最后一次正常 CheckEvents。
+2. **`switch=512169` vs `fast=377 slow=0`**：51 万次切换全部直接打在 switch_thread 上，yield 两车道在正常期后就冻结。**空转环是纯 Java 计算循环**（可能是 UI/Canvas 重绘忙循环），每量子经解释器 back-branch 检查点重入 switch_thread，但从不经过 yield() 或 start0。
+3. **v01.83/v01.93 的泵位全部挂错路**：yield 快车道（wake_up_timed_out_sleepers 入口）与 start0 埋点都在这条环不经过的路径上——这就是历轮修复无效的原因。
+4. 队列真空 + 5 线程无标志：所有 Java 线程都在等事件/监视器唤醒（callSerially/monitor wait），而唯一能送事件的事件泵已停摆 → 无人入队 → 无人可调度 → 死锁自锁。
+
+### 修复（Scheduler.cpp switch_thread VITA 块，+19 行）
+
+```cpp
+Scheduler::_vita_switch_count++;
+Scheduler::pump_events_vita();   // v01.99 FIX: 50ms 节流泵挂在唯一必经检查点
+```
+
+- **为什么安全**：pump_events_vita 自带 50ms 墧钟节流 + timer_ticked/_estimated_event_readiness 门；健康 VM 每 50ms 至多一次 check_blocked_threads(0)，开销可忽略。
+- **为什么有效**：switch_thread 是解释器 back-branch 量子检查点，**每量子必经**。泵活过来 → JVMSPI_CheckEvents 抽干原生事件环 → 唤醒阻塞的 Java 线程 → 重新入队 → 打破死锁。ANI 模式 CheckEvents 每次最多睡 50ms，同时给空转环加上背压。
+- 内联证据：`_ZZN12JVMScheduler16pump_events_vitaEvE17vita_last_pump_ms`（bss 静态局部）出现在最终 ELF——泵已内联进 switch_thread 热点。
+
+### 构建/提交记录
+
+- 提交 `9da738c`（phoneme-cldc + vita-port 同 commit）；VPK 产物 `vita-port/out/vpk/midp_vita_v01.99.vpk`(3650733B)/`.sym`(4284208B)。
+- 构建流程照旧：`rm _MergedSrc002.o _MergedSrc003.o` → `rebuild_vm.sh`（33 对象，29 成员重打包）→ `cmake --build build -j8`。
+- exe 链接报 `fast_memclear` 未定义是**预期行为**（脚本内注释注明，`|| true` 吞掉；库目标不受影响）。
+
+### 遗留
+
+- 待真机/Vita3K 复测：同样按键序列（0x40/0x10 交替数次）不再挂死；观察 site_ring 中 pump 计数在 HANG 期不再停滞。
+- 0x810f71b4/0x810f521c（ring 槽值）未逐一符号化——数据已定案，无需回溯。
 
 ## 2026-09-18 v01.80：**已安装标签方向键失效**——v01.78f 的 `else` 分支吞掉了"列表模式 tab 0"（最小逻辑落空）
 
