@@ -1326,8 +1326,13 @@ add_custom_target(vpk_out_copy ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
             ${PORT_DIR}/out/vpk/midp_vita_v${VITA_VERSION}.vpk
+    # v01.95: 符号归档——psp2dmp 解析（debug/tools/parse_psp2dmp.py）需要
+    # 与 dump 同版本的未 strip 链接产物；build/ 下的会被下次构建覆盖。
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}
+            ${PORT_DIR}/out/vpk/midp_vita_v${VITA_VERSION}.sym
     DEPENDS ${PROJECT_NAME}.vpk-vpk
-    COMMENT "Copying VPK to out/vpk/ (midp_vita.vpk + midp_vita_v${VITA_VERSION}.vpk)"
+    COMMENT "Copying VPK to out/vpk/ (midp_vita.vpk + midp_vita_v${VITA_VERSION}.vpk + .sym)"
 )
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
