@@ -838,7 +838,54 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "01.95")
+set(VITA_VERSION  "01.98")
+# 01.98 (2026-09-22): log22 forensics instrumentation - quantify the
+#   fast-lane ping-pong. Four counters (yield fast/slow lane, pump
+#   executions, switch_thread passes) exported through the v01.95
+#   extern "C" bridge into vita_wd_snapshot, plus a thread inventory
+#   dump (global thread list + priority queues, id/pri/status per
+#   thread) to answer "who are the active_count=5 threads". CLDC:
+#   Scheduler.cpp/.hpp + OS_vita.cpp, all inside #if defined(VITA).
+#   Watchdog output: site_ring.log gains "lanes fast=... pump=..." and
+#   "threads(active-list)/threads(priority-queues)" sections.
+# 01.97 (2026-09-21): WAV buffer made dynamic - fixes the >32 KB truncation
+#   left open by 01.96. Java's download loop advances its read offset by
+#   the length do_buffering reports, so clamping (dropping bytes) would
+#   desync the stream permanently; growth is the only safe answer.
+#   - do_buffering WAV branch: wav_ensure_cap() doubles the block (32 MB
+#     ceiling ~ 3 min of 44.1k stereo 16-bit) so every packet fits whole;
+#     need_more_data stays TRUE until Java's EOF end-marker (whole_size
+#     is only a hint, not all sources know it); next_chunk_size stays
+#     4096 - a 0 return makes KNI treat the next nBuffering as the end
+#     marker, so 0 must never be returned while more data is wanted.
+#   - close() waits (bounded 50 x 4 ms) for a playing render to notice
+#     stop_flag before freeing jts_data (use-after-free guard).
+#   - parse failure after buffering shrinks the block back to JTS_MAX_SIZE.
+#   JTS path untouched: sequences always fit the initial block, so
+#   jts_len/whole_size logic is unchanged.
+# 01.96 (2026-09-21): WAV PCM playback (audio/x-wav) - the biggest MMAPI
+#   gap after tone. Three pieces, all in the port layer:
+#   1. vita_wav.c (new): RIFF parser (PCM 8/16-bit, 1-2 ch, 4-96 kHz) AND
+#      the javacall_media_download_handled_by_device override. The stub in
+#      libpcsl_multimedia.a returned NOT_IMPLEMENTED without touching the
+#      OUT param, KNI's nIsHandledByDevice pre-sets TRUE, so Java believed
+#      the device pulls data itself and never created its MediaDownload -
+#      nBuffering never fired, no byte ever reached us. Answering FALSE
+#      turns on Java's chunked download for every non-device player.
+#   2. vita_audio_javacall.c: caps entry {MS_PCM, audio/x-wav, memory|file}
+#      (terminator kept - see the v-wild-pointer comment); realize() marks
+#      players whose MIME is audio/x-wav; do_buffering() ACCUMULATES the
+#      sliding window KNI writes to jts_data start (GetRawArrayRegion does
+#      not append) and parses RIFF at end-of-buffering; start() hands the
+#      player to the shared thread via g_wav_req/g_wav_seq (same handshake
+#      as JTS, VM thread never blocks); wav_render_player() streams
+#      frames -> 48k stereo chunks, nearest-neighbour resample, stop/preempt
+#      checks per chunk, END_OF_MEDIA on natural end (seconds, as Java
+#      multiplies by 1000).
+#   3. get_java_buffer_size: first chunk 4096 for WAV (covers RIFF header
+#      in one packet), JTS unchanged at 1024.
+#   Untouched: tone/JTS paths, scheduler, watchdog (hang hunt not disturbed;
+#   the only shared file gains are the wav fields + new branches).
 # 01.95 (2026-09-21): log21 forensics landed - the freeze is INSIDE the
 #   green-thread stub cluster. v01.94's ring worked: 16/16 slots =
 #   pump_events_vita+0x3c (last healthy pumps) and coredump PC=
@@ -1119,6 +1166,7 @@ add_executable(${PROJECT_NAME}
     src/vm_rom_stubs.c
     src/vita_storage.c
     src/vita_audio_javacall.c
+    src/vita_wav.c
     src/vita_media_notify.c
     src/vita_sms_javacall.c
     src/vita_checkevents.c
