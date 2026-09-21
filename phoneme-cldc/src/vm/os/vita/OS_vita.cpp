@@ -542,6 +542,12 @@ extern "C" {
     int  vita_sched_active_count(void);
     int  vita_sched_timer_ticked(void);
     int  vita_sched_ev_readiness(void);
+    /* v01.98: lane/pump/switch counters + thread inventory. */
+    unsigned int vita_sched_yield_fast(void);
+    unsigned int vita_sched_yield_slow(void);
+    unsigned int vita_sched_pump_runs(void);
+    unsigned int vita_sched_switch_count(void);
+    int  vita_sched_dump_threads(char *out, int out_size);
 }
 
 void vita_wd_snapshot(const char *path) {
@@ -586,6 +592,28 @@ void vita_wd_snapshot(const char *path) {
                  "  timer_ticked=%d ev_readiness=%d\n",
                  vita_sched_timer_ticked(), vita_sched_ev_readiness());
     sceIoWrite(fd, buf, n);
+    /* v01.98: log22 quantified the ping-pong but could not separate
+     * "pump starving in the fast lane" from "pump running but
+     * delivering nothing". These four counters do: yield_fast climbing
+     * while pump_runs stalls = starvation (the log22 hypothesis);
+     * pump_runs climbing with no event delivery = the pump runs but
+     * check_blocked_threads()/JVMSPI_CheckEvents drops the ball. */
+    n = snprintf(buf, sizeof(buf),
+                 "  lanes fast=%u slow=%u pump=%u switch=%u\n",
+                 vita_sched_yield_fast(), vita_sched_yield_slow(),
+                 vita_sched_pump_runs(), vita_sched_switch_count());
+    sceIoWrite(fd, buf, n);
+    /* v01.98: WHO are the active_count threads? Walk the global thread
+     * list (ground truth) and the priority queues (scheduler's runnable
+     * opinion) - see vita_sched_dump_threads in Scheduler.cpp. Buffer
+     * sized for VITA_SCHED_DUMP_MAX(48) lines x2 + headers. */
+    {
+        static char thread_dump[4096];
+        int len = vita_sched_dump_threads(thread_dump,
+                                          (int)sizeof(thread_dump));
+        if (len > 0)
+            sceIoWrite(fd, thread_dump, len);
+    }
     sceIoClose(fd);
 }
 

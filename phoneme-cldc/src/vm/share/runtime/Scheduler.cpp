@@ -38,6 +38,23 @@ bool       Scheduler::_yield_on_thread_switch;
 
 OopDesc*   _next_runnable_thread = NULL;
 
+#if defined(VITA)
+/* v01.98: log22 quantified the ping-pong (ring 15x switch marks, 1x pump
+ * residue, wd_snapshot active_count=5) but could not tell "pump starving
+ * in the fast lane" from "pump running but delivering nothing". Four
+ * plain counters, exported read-only through the extern "C" bridge at
+ * the bottom of this file: yield picks between two lanes - fast (a
+ * runnable thread exists, event-wait loop skipped entirely) and slow
+ * (no runnable thread, pump runs inside the wait loop). If a hang shows
+ * yield_fast climbing while pump_runs stalls, the fast lane is starving
+ * the pump - the log22 hypothesis, now testable. switch_count is the
+ * denominator (every context switch passes switch_thread's head). */
+unsigned int Scheduler::_vita_yield_fast_count  = 0;
+unsigned int Scheduler::_vita_yield_slow_count  = 0;
+unsigned int Scheduler::_vita_pump_runs         = 0;
+unsigned int Scheduler::_vita_switch_count      = 0;
+#endif
+
 OopDesc*   Scheduler::_gc_global_head;
 OopDesc*   Scheduler::_gc_current_thread = NULL;
 
@@ -660,6 +677,10 @@ void Scheduler::pump_events_vita() {
       (vita_now - vita_last_pump_ms) >= 50) {
     vita_last_pump_ms = vita_now;
     _timer_has_ticked = false;
+    /* v01.98: count actual pump executions (not just entries). Paired
+     * with the yield lane counters this separates "pump starving in the
+     * fast lane" from "pump running but delivering nothing". */
+    _vita_pump_runs++;
     /* v01.94: ring must see the pump actually run. log20 froze with the
      * same signature as log19 (last CE completes ANI OUT, next never
      * starts) but no longer passes through start0 - so mark here to
@@ -1091,6 +1112,12 @@ void Scheduler::yield() {
 
   Thread *next_thread = get_next_runnable_thread(Thread::current());
   if (next_thread->not_null()) {
+#if defined(VITA)
+    /* v01.98: fast lane taken - the else branch below (where the event
+     * pump lives) is skipped entirely. See the counter block note at the
+     * top of this file. */
+    Scheduler::_vita_yield_fast_count++;
+#endif
     if (TraceThreadsExcessive) {
       if (!next_thread->equals(Thread::current())) {
         TTY_TRACE_CR(("yield: next_runnable thread 0x%x (id=%d)",
@@ -1101,6 +1128,10 @@ void Scheduler::yield() {
       slave_mode_wait_for_event_or_timer(0);
     }
   } else {
+#if defined(VITA)
+    /* v01.98: slow lane taken - the event pump runs inside this branch. */
+    Scheduler::_vita_yield_slow_count++;
+#endif
     Thread::Raw wait_thrd;
     Thread::Raw t;
     if (TraceThreadsExcessive) {
@@ -2083,6 +2114,9 @@ extern "C" void switch_thread(Thread* thread) {
    * present means pure stub ping-pong, WITHOUT it means a dispatch
    * freeze before the first switch. Distinguishes the two directly. */
   vita_site_mark();
+  /* v01.98: denominator for the lane/pump counters. switch_thread is
+   * extern "C" (outside the class), so qualify the static explicitly. */
+  Scheduler::_vita_switch_count++;
 #endif
   if (Scheduler::_yield_on_thread_switch) {
     // We need to call yield() after Scheduler::block_current_thread() is
@@ -2372,5 +2406,100 @@ extern "C" int vita_sched_timer_ticked(void) {
 }
 extern "C" int vita_sched_ev_readiness(void) {
   return Scheduler::get_estimated_event_readiness();
+}
+/* v01.98: lane/pump/switch counters for vita_wd_snapshot. */
+extern "C" unsigned int vita_sched_yield_fast(void) {
+  return Scheduler::get_vita_yield_fast_count();
+}
+extern "C" unsigned int vita_sched_yield_slow(void) {
+  return Scheduler::get_vita_yield_slow_count();
+}
+extern "C" unsigned int vita_sched_pump_runs(void) {
+  return Scheduler::get_vita_pump_runs();
+}
+extern "C" unsigned int vita_sched_switch_count(void) {
+  return Scheduler::get_vita_switch_count();
+}
+
+/* v01.98: log22 left the central question open - active_count=5 but the
+ * VM does no useful work (pure stub ping-pong). WHO are the 5 threads
+ * and what state is each in? get_next_runnable_thread() only walks the
+ * priority queues and never re-checks status, so a dead-but-still-
+ * queued thread stays "runnable" forever - this dump makes that visible
+ * by walking BOTH structures: the global thread list (ground truth of
+ * what exists) and the priority queues (the scheduler's opinion of what
+ * is runnable), printing id/priority/status for each. The output is a
+ * fixed-size text buffer handed back through the os_vita sceIo writer;
+ * watchdog context, so Raw handles only and no allocation. */
+#define VITA_SCHED_DUMP_MAX 48
+extern "C" int vita_sched_dump_threads(char *out, int out_size) {
+  /* one line per thread + queue entries; both loops below are bounded
+   * by VITA_SCHED_DUMP_MAX lines each, plus header lines */
+  int pos = 0;
+  int n;
+
+  n = snprintf(out + pos, out_size - pos,
+               "threads(active-list):\n");
+  if (n > 0) pos += n;
+
+  /* global list: every Thread object that exists. ForAllThreads filters
+   * on last_java_frame_exists() which is wrong for a corpse dump, so
+   * walk the raw global_next chain instead. */
+  {
+    int count = 0;
+    for (Thread::Raw t = Universe::global_threadlist()->obj();
+         t.not_null() && count < VITA_SCHED_DUMP_MAX;
+         t = t().global_next(), count++) {
+      jint st = t().status();
+      n = snprintf(out + pos, out_size - pos,
+                   "  t%p id=%d pri=%d st=%08x%s%s%s\n",
+                   (void*)t.obj(), t().id(),
+                   (int)t().priority(), (unsigned int)st,
+                   (st & THREAD_TERMINATING) ? " TERM" : "",
+                   (st & THREAD_JUST_BORN)   ? " NEW"  : "",
+                   (st & THREAD_DEAD)        ? " DEAD" : "");
+      if (n > 0 && pos + n < out_size) pos += n; else break;
+    }
+    if (count >= VITA_SCHED_DUMP_MAX) {
+      n = snprintf(out + pos, out_size - pos, "  ...(truncated)\n");
+      if (n > 0) pos += n;
+    }
+  }
+
+  n = snprintf(out + pos, out_size - pos,
+               "threads(priority-queues):\n");
+  if (n > 0) pos += n;
+
+  /* priority queues: the scheduler's runnable set. NUM_PRIORITY_SLOTS
+   * is 10 (ThreadObj.hpp:106); slot 0 unused, iterate 1..9. */
+  {
+    ObjArray::Raw priority_list = Universe::scheduler_priority_queues();
+    if (priority_list.is_null()) {
+      n = snprintf(out + pos, out_size - pos, "  (null)\n");
+      if (n > 0) pos += n;
+    } else {
+      for (int priority = 1; priority < ThreadObj::NUM_PRIORITY_SLOTS;
+           priority++) {
+        Thread::Raw t = priority_list().obj_at(priority);
+        if (t.is_null()) continue;
+        n = snprintf(out + pos, out_size - pos,
+                     "  q%d:", priority);
+        if (n > 0) pos += n;
+        int count = 0;
+        while (!t.is_null() && count < VITA_SCHED_DUMP_MAX) {
+          jint st = t().status();
+          n = snprintf(out + pos, out_size - pos,
+                       " t%p(id=%d,st=%08x)",
+                       (void*)t.obj(), t().id(), (unsigned int)st);
+          if (n > 0 && pos + n < out_size) pos += n; else { t = Thread::Raw(); break; }
+          t = t().next();
+          count++;
+        }
+        n = snprintf(out + pos, out_size - pos, "\n");
+        if (n > 0) pos += n;
+      }
+    }
+  }
+  return pos;
 }
 #endif

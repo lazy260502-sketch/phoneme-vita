@@ -249,6 +249,25 @@ private:
   static int get_async_count() {
     return _async_count;
   }
+  /* v01.98: lane/pump/switch counters - see the note at the top of
+   * Scheduler.cpp. Statics live there; readers below keep them out of
+   * the generated include chain. */
+  static unsigned int _vita_yield_fast_count;
+  static unsigned int _vita_yield_slow_count;
+  static unsigned int _vita_pump_runs;
+  static unsigned int _vita_switch_count;
+  static unsigned int get_vita_yield_fast_count() {
+    return _vita_yield_fast_count;
+  }
+  static unsigned int get_vita_yield_slow_count() {
+    return _vita_yield_slow_count;
+  }
+  static unsigned int get_vita_pump_runs() {
+    return _vita_pump_runs;
+  }
+  static unsigned int get_vita_switch_count() {
+    return _vita_switch_count;
+  }
 #endif
 #if defined(VITA)
   /* v01.93: wall-clock event-pump backstop. log19 coredump: the VM spun
