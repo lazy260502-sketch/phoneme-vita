@@ -4088,3 +4088,81 @@ diff 最小（2 文件 +21 行，全在 #if defined(VITA) 内）：
 - VPK: out/vpk/midp_vita_v01.94.vpk，3648309 字节，
   md5 e869d14222da32c6d0df79ab597d6aff；版本串 "J2ME Player v01.94 b296 (53a558d)"；
   vita_site_mark@0x81053f38。
+## v01.95（2026-09-21）：log21 定案后的活快照取证 + 取证工具固化
+
+### 改动（三项，均为取证增强）
+
+| 改动 | 文件 | 目的 |
+|---|---|---|
+| vita_wd_snapshot() | OS_vita.cpp（新 extern C 函数）+ Scheduler.cpp 尾部 4 个 vita_sched_* 包装 | watchdog HANG 时**先读活进程**：Thread::current() 的 status/pending/jsp、scheduler 的 active/async 计数、timer_ticked、ev_readiness。log21 证明 coredump 读不到 .bss 头（jvm_fast_globals），尸体不可读就读病人 |
+| switch_thread mark | Scheduler.cpp:2063 头部 | 冻结 ring 里若**有** switch mark = 纯桩 ping-pong（切换在走但进不了任何 C++）；**没有** = 派发冻结在第一次 switch 之前 |
+| Thread::allocate mark | Thread.cpp:293 头部 | 冻结期间 spawn 计数（log21 clinit ring 终于 java/util/Timer <clinit>，疑似 spawn 风暴） |
+
+- Scheduler.hpp 加 VITA 块只读访问器（get_timer_has_ticked /
+  get_estimated_event_readiness / get_async_count，类内 inline 读 private
+  static 合法）；OS_vita.cpp 经 extern "C" 桥接调用（其 incl 链无
+  Scheduler.hpp，不能直接写 Scheduler::）。
+- 三处 mark 的汇编落位已验证：switch_thread 头部 bl vita_site_mark 在
+  前 40 条内；_MergedSrc004.o 内 _ZN9JVMThread8allocateEv 含 mark；
+  库守卫 jvm_fast_globals D=1、C 解释器泄漏=0。
+
+### 构建与产物
+
+- cldc HEAD=b67e8ad（4 文件 +128）；vita-port HEAD=81ff590（watchdog 调用
+  + 版本注释 + .sym 归档目标）。
+- VPK: out/vpk/midp_vita_v01.95.vpk，3649012 字节，
+  md5 5517ed4b0fe33208d3998ad17d87d876；版本串 "J2ME Player v01.95 b301
+  (81ff590)"；代码段较 v01.94 增 720 字节（新代码已链接）。
+- **新流程**：每次构建自动归档 out/vpk/midp_vita_v<版本>.sym（未 strip
+  链接产物）——psp2dmp 解析必须用与 dump 同版本的符号，build/ 下的会被
+  覆盖。
+
+### 任务 2：psp2dmp 解析技能化（已交付）
+
+- `debug/tools/parse_psp2dmp.py`：gzip 自动解压、ELF32 PT_LOAD/PT_NOTE、
+  THREAD_REG_INFO(0x1004) 寄存器窗口自适应（+0x10 实测校准）、slide
+  自动求解（site_ring.log self= 行作 anchor 按符号名定位，就近取页 +
+  残差<0x800 容版本漂移）、nm 符号化 PC/LR、栈走（runtime 区间过滤）。
+  log21/log19 双样本验证通过（slide 0x44000/0x15000 均自动解出）。
+- 技能文件：`.instructions/psp2dmp-forensics.instructions.md`（判读要点、
+  日志链路、16 文件收集清单、版本对应）。
+- PSVita core note 布局实测：name 段无对齐填充；descsz=0x760。
+
+### 任务 3：方法论复盘——为什么 20 轮取证没根治
+
+**根因：观察点与故障点系统性错位。**
+
+1. v01.84→v01.94 十版的 mark 全部埋在 C++ 层（pump 门、start0、Scheduler
+   方法），而 log21 定案循环在**纯 ASM 桩簇**（start_lightweight_thread_asm
+   ↔ invoke_pending_entries，PC/LR 都在桩入口、C 栈只剩 JVM::start 一帧）。
+   ring 16 槽全残影 = 冻结期不经过任何 C++ 站点。**在错的层撒再多 mark
+   也只能证明"没经过"，不能回答"在桩里干什么"。**
+2. 每轮只加观察不加修复，且观察结果常是"排除"而非"定位"（r5/r8 排除、
+   slide 自洽、捕获空洞定性）——排除法在 4+ 个自由度上收敛极慢。
+3. coredump 捕获空洞（脏页-only）直到 log21 才定性，此前多轮对着不可读
+   的 .bss/堆做推断，等于少了最重要证据源还不自知。
+
+**优化（已开始执行）：**
+
+1. **假设驱动替代撒网**：log21 的 PC/LR/fp=0/r1=0 已足够提出具体假设——
+   "primordial_to_current_thread 每圈重载 LR=桩入口 → bleq invoke_pending
+   → pending=NULL 早退 → 折返"的单圈路径。下一版直接在桩内加计数器
+   验证单圈路径，而非再撒 C++ mark。桩是 C++ 生成器产的 ASM
+   （InterpreterRuntime_arm.cpp 的 setup_stack_asm / SharedStubs_arm.cpp
+   的 generate_invoke_pending_entries / InterpreterStubs_arm.cpp 的
+   generate_primordial_to_current_thread），生成器可嵌 mark 调用。
+2. **活快照**（本版 vita_wd_snapshot）：死物不可读就先读活的，直接判死
+   "反复全新派发"假设（若 wd_snapshot 里 cur_thread 稳定同一指针 +
+   status 不变 = 不是全新派发，是同一圈循环）。
+3. **工具固化**（本版 parse_psp2dmp.py + 技能文件）：把每轮 ~30 分钟的
+   手工解析降到一条命令，取证成本不再挤占分析时间。
+4. **符号归档**（本版 .sym）：杜绝"构建覆盖符号源导致旧 dump 无法解"。
+
+### 下一步（log22 预期判读）
+
+1. wd_snapshot（新文件，watchdog 写）：cur_thread 指针稳定？status 值？
+   pending 条目数？spawn 计数还在涨？
+2. site_ring：尾槽有 switch mark → 纯桩 ping-pong 定案 → 下一步桩内
+   计数器；无 switch mark → 冻结在第一次 switch 前 → 查 dispatch 初始化。
+3. Thread::allocate mark 计数暴涨 → Timer/spawn 风暴实锤 → 查 log21
+   clinit 链上 java/util/Timer 的触发方。
