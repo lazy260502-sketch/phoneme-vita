@@ -838,7 +838,26 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "01.94")
+set(VITA_VERSION  "01.95")
+# 01.95 (2026-09-21): log21 forensics landed - the freeze is INSIDE the
+#   green-thread stub cluster. v01.94's ring worked: 16/16 slots =
+#   pump_events_vita+0x3c (last healthy pumps) and coredump PC=
+#   invoke_pending_entries entry / LR=start_lightweight_thread_asm
+#   entry / fp=0 / r1(pending)=NULL, C stack down to ONE frame
+#   (JVM::start+0x178, right after primordial_to_current_thread). The
+#   cycle touches NO C++ site at all - not even Thread::finish /
+#   force_terminated / lightweight_thread_exit. Also learned: the
+#   coredump structurally cannot see .data/.bss head nor the Java heap
+#   (Vita3K dumps only dirty anonymous pages), so Thread fields /
+#   VerifyOnly / scheduler counters must be read from the live process.
+#   v01.95 adds: (1) vita_wd_snapshot() in OS_vita.cpp - watchdog reads
+#   _current_thread + status/pending/jsp, VerifyOnly, active/async
+#   count, timer_ticked, ev_readiness at HANG time (no slide math);
+#   (2) switch_thread mark - frozen ring WITH switch marks = pure stub
+#   ping-pong, WITHOUT = dispatch freeze before first switch;
+#   (3) Thread::allocate mark - counts spawns during the freeze
+#   (log21 clinit ring ended at java/util/Timer <clinit>, spawn storm
+#   suspected). CLDC: Scheduler.cpp/.hpp, Thread.cpp, OS_vita.cpp.
 # 01.79 (2026-09-18): real-hw STARTUP crash fix - omit the frame pointer.
 #   See the long comment at the CMAKE_C_FLAGS block below: the 9-17
 #   coredump pinned the fault at vita_menu_run+0x134 (`str [r7,#812]`)

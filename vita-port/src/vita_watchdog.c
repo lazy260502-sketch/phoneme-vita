@@ -57,6 +57,10 @@ extern volatile SceUID vita_tone_tid;
 extern void vita_site_dump(const char *path);
 extern void vita_site_dump_verify(const char *path);
 extern void vita_site_dump_clinit(const char *path);
+/* v01.95: live-globals snapshot compiled into the VM image - reads
+ * _current_thread/status/pending/jsp, VerifyOnly, scheduler counters
+ * from the frozen-but-mapped process (the coredump cannot see them). */
+extern void vita_wd_snapshot(const char *path);
 
 #define WD_LOG_PATH "ux0:/data/J2ME00001/watchdog.log"
 #define WD_STALL_POLLS 12   /* 12 x 250 ms ~= 3 s, CLOCK-FREE threshold */
@@ -300,6 +304,12 @@ static int wd_thread_routine(SceSize args, void *argp) {
          * hang began (log14 froze with the verifier off, spin moved
          * into clinit execution itself). */
         vita_site_dump_clinit("ux0:/data/J2ME00001/site_ring.log");
+        /* v01.95: live-globals snapshot FIRST (it dereferences VM data
+         * structures; if the VM image ever gets unmapped mid-crash the
+         * ring dumps below still ran). log21: the coredump's capture
+         * holes (.data/.bss head, whole Java heap) hid exactly these
+         * values - read them from the patient, not the corpse. */
+        vita_wd_snapshot("ux0:/data/J2ME00001/site_ring.log");
 
         /* v01.82: log8 nailed the shape of the hang (VM thread RUNNING,
          * wait=none, both clocks alive) but the kernel API cannot name
