@@ -235,6 +235,22 @@ private:
     _timer_has_ticked = true;
   }
 #if defined(VITA)
+  /* v01.95: read-only accessors backing the extern "C" wrappers at the
+   * bottom of Scheduler.cpp (vita_sched_*), which the launcher
+   * watchdog's live-globals snapshot (vita_wd_snapshot in OS_vita.cpp)
+   * calls - the coredump cannot see .bss head, so the watchdog reads
+   * the values through VM code instead. */
+  static bool get_timer_has_ticked() {
+    return _timer_has_ticked;
+  }
+  static int get_estimated_event_readiness() {
+    return _estimated_event_readiness;
+  }
+  static int get_async_count() {
+    return _async_count;
+  }
+#endif
+#if defined(VITA)
   /* v01.93: wall-clock event-pump backstop. log19 coredump: the VM spun
    * re-entering start_lightweight_thread_asm (new java.lang.Thread
    * create/die cycles) - a path that never passes through yield(), so

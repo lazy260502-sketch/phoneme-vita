@@ -2073,6 +2073,17 @@ extern "C" void switch_thread(Thread* thread) {
       "Should not switch threads when throwing exception from quick native");
   
   SETUP_ERROR_CHECKER_ARG;
+#if defined(VITA)
+  /* v01.95: interpreter dispatch point. log21 coredump froze the VM
+   * thread inside the green-thread stub cluster (PC=invoke_pending_
+   * entries entry, LR=start_lightweight_thread_asm entry, fp=0) with
+   * the ring showing ONLY pump marks - the cycle never reaches any
+   * C++ site. If the interpreter were dispatching Java at all it must
+   * pass through here every quantum: a frozen ring WITH this mark
+   * present means pure stub ping-pong, WITHOUT it means a dispatch
+   * freeze before the first switch. Distinguishes the two directly. */
+  vita_site_mark();
+#endif
   if (Scheduler::_yield_on_thread_switch) {
     // We need to call yield() after Scheduler::block_current_thread() is
     // called. yield() may cause JVMSPI_CheckEvent() to be called, and the
@@ -2343,3 +2354,23 @@ Thread *Scheduler::get_next_runnable_thread(Thread *starting_thread) {
 
 
  
+
+#if defined(VITA)
+/* v01.95: extern "C" read-only accessors for the launcher watchdog's
+ * live-globals snapshot (vita_wd_snapshot in OS_vita.cpp). OS_vita's
+ * generated include chain has Thread.hpp but not Scheduler.hpp, so the
+ * snapshot reaches these counters through C linkage instead of the
+ * class - see the v01.95 note in OS_vita.cpp. */
+extern "C" int vita_sched_async_count(void) {
+  return Scheduler::get_async_count();
+}
+extern "C" int vita_sched_active_count(void) {
+  return Scheduler::active_count();
+}
+extern "C" int vita_sched_timer_ticked(void) {
+  return (int)Scheduler::get_timer_has_ticked();
+}
+extern "C" int vita_sched_ev_readiness(void) {
+  return Scheduler::get_estimated_event_readiness();
+}
+#endif

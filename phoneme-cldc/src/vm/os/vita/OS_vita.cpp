@@ -518,4 +518,75 @@ void vita_site_dump(const char *path) {
     sceIoClose(fd);
 }
 
+/*=========================================================================
+ * v01.95 live-globals snapshot: log21's coredump proved the capture
+ * holes are structural - Vita3K only grabs dirty anonymous pages, so
+ * the main module's .data/.bss head (jvm_fast_globals._current_thread,
+ * VerifyOnly, Scheduler::_timer_has_ticked / _estimated_event_readiness)
+ * and the whole Java heap (Thread oop fields, Java stacks) are NEVER in
+ * the dump. Every one of those values is one pointer deref away from
+ * code that already links into the VM image, so instead of reading a
+ * corpse, read the PATIENT: this runs in the VM image (sees every
+ * symbol without slide arithmetic), called by the launcher watchdog
+ * after a HANG, right before the site-ring dumps. Read-only, single
+ * reader, torn values tolerated (the thread is frozen anyway).
+ * NOTE: _OS_vita.cpp.incl pulls Thread.hpp but NOT Scheduler.hpp, so
+ * the scheduler counters are reached through extern "C" accessors
+ * (defined in Scheduler.cpp) instead of the C++ class - keeps the
+ * generated include chain untouched.
+ *=======================================================================*/
+
+extern "C" {
+    /* Defined in Scheduler.cpp (v01.95). */
+    int  vita_sched_async_count(void);
+    int  vita_sched_active_count(void);
+    int  vita_sched_timer_ticked(void);
+    int  vita_sched_ev_readiness(void);
+}
+
+void vita_wd_snapshot(const char *path) {
+    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                          0777);
+    if (fd < 0) return;
+    char buf[160];
+    int n;
+
+    /* Thread::current() expands to (Thread*)&_current_thread, i.e.
+     * &jvm_fast_globals.current_thread - the handle cell itself. */
+    Thread *ct = Thread::current();
+    n = snprintf(buf, sizeof(buf), "wd_snapshot cur_thread=0x%08x\n",
+                 (unsigned int)(unsigned long)ct);
+    sceIoWrite(fd, buf, n);
+
+    if (ct != NULL && (unsigned int)(unsigned long)ct > 0x1000) {
+        jint st = ct->status();
+        ReturnOop pe = ct->pending_entries();
+        n = snprintf(buf, sizeof(buf),
+                     "  status=0x%08x pending=0x%08x jsp=0x%08x\n",
+                     (unsigned int)st,
+                     (unsigned int)(unsigned long)pe,
+                     (unsigned int)ct->stack_pointer());
+        sceIoWrite(fd, buf, n);
+        if (st & THREAD_TERMINATING)
+            sceIoWrite(fd, "  TERMINATING\n", 14);
+        if (st & THREAD_JUST_BORN)
+            sceIoWrite(fd, "  JUST_BORN\n", 12);
+        if (st & THREAD_DEAD)
+            sceIoWrite(fd, "  DEAD\n", 7);
+        if (st & THREAD_NOT_ACTIVE_MASK)
+            sceIoWrite(fd, "  NOT_ACTIVE\n", 13);
+    }
+
+    n = snprintf(buf, sizeof(buf),
+                 "  active_count=%d async_count=%d VerifyOnly=%d\n",
+                 vita_sched_active_count(), vita_sched_async_count(),
+                 (int)VerifyOnly);
+    sceIoWrite(fd, buf, n);
+    n = snprintf(buf, sizeof(buf),
+                 "  timer_ticked=%d ev_readiness=%d\n",
+                 vita_sched_timer_ticked(), vita_sched_ev_readiness());
+    sceIoWrite(fd, buf, n);
+    sceIoClose(fd);
+}
+
 } /* extern "C" */

@@ -291,6 +291,16 @@ void Thread::lightweight_thread_exit() {
 }
 
 ReturnOop Thread::allocate(JVM_SINGLE_ARG_TRAPS) {
+#if defined(VITA)
+  /* v01.95: spawn point. log21 clinit ring ended at java/util/Timer
+   * <clinit> - Timer's clinit creates its daemon thread, and the
+   * midp_stderr spawn-storm residue (~30 BEFORE/AFTER_NATIVES pairs)
+   * suggests rapid create/die cycling. This mark counts actual
+   * Thread oop allocations so the next ring separates "spawn storm
+   * continues during the freeze" (allocate marks advance) from
+   * "spawn finished, dispatch dead" (marks stop). */
+  vita_site_mark();
+#endif
   UsingFastOops fast_oops;
   GUARANTEE(!Universe::is_bootstrapping(),
             "Cannot allocate thread while bootstrapping");
