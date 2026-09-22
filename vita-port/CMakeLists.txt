@@ -838,7 +838,19 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.00")
+set(VITA_VERSION  "02.01")
+# 02.01 (2026-09-22): log26 verdict - v02.00 sleep_forever theory FALSIFIED.
+#   Fresh dump with the fixed queue dump shows sf=0/0/0 (sleep_forever
+#   never entered) because the priority queue is NEVER empty: ghost
+#   members (id1 parked with wait_obj, id4 parked with wakeup_time)
+#   stay linked in the runnable ring. The OS thread froze dispatching
+#   id4 at start_lightweight_thread_asm+0x14 (pc in dump, r0=id4,
+#   TLS +0x0c = id4) with ring frozen on the last switch_thread mark.
+#   Forensics upgrade only: cur_thread cell dereference (was printing
+#   the BSS cell address, stable 0x81401d10 across runs), per-thread
+#   wait_obj/wakeup_time (landed in v02.00), gnrt=hits/nulls dispatch
+#   counters to separate "one-shot freeze" from "ghost ring keeps
+#   dispatching" on the next hang.
 # 02.00 (2026-09-21): THE REAL FIX - Scheduler::sleep_forever idle loop.
 #   log24 (v01.99) falsified the "spinning loop" theory: the v01.99 pump
 #   DID run (ring freshest slot = pump_events_vita+0x48 after slide
