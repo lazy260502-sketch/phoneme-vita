@@ -2515,20 +2515,30 @@ extern "C" int vita_sched_dump_threads(char *out, int out_size) {
 
   /* global list: every Thread object that exists. ForAllThreads filters
    * on last_java_frame_exists() which is wrong for a corpse dump, so
-   * walk the raw global_next chain instead. */
+   * walk the raw global_next chain instead.
+   * v02.00: also print WHAT each thread is waiting on. _wait_obj is
+   * the monitor object (null when queued-runnable), _wakeup_time is
+   * the absolute deadline (0 = infinite wait, no timeout). This pair
+   * answers "why is the queue empty": the all-blocked window is
+   * exactly when every thread has wait_obj set and none has timed
+   * out yet. */
   {
     int count = 0;
     for (Thread::Raw t = Universe::global_threadlist()->obj();
          t.not_null() && count < VITA_SCHED_DUMP_MAX;
          t = t().global_next(), count++) {
       jint st = t().status();
+      ReturnOop wo = t().wait_obj();
+      jlong wt = t().wakeup_time();
       n = snprintf(out + pos, out_size - pos,
-                   "  t%p id=%d pri=%d st=%08x%s%s%s\n",
+                   "  t%p id=%d pri=%d st=%08x%s%s%s wait=%p %s\n",
                    (void*)t.obj(), t().id(),
                    (int)t().priority(), (unsigned int)st,
                    (st & THREAD_TERMINATING) ? " TERM" : "",
                    (st & THREAD_JUST_BORN)   ? " NEW"  : "",
-                   (st & THREAD_DEAD)        ? " DEAD" : "");
+                   (st & THREAD_DEAD)        ? " DEAD" : "",
+                   (void*)(unsigned long)wo,
+                   (wt == 0) ? "no-timeout" : "timed");
       if (n > 0 && pos + n < out_size) pos += n; else break;
     }
     if (count >= VITA_SCHED_DUMP_MAX) {
