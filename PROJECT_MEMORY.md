@@ -1,9 +1,36 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-24
+> Last Updated: 2026-09-22
+
+## 2026-09-22 log25：**测错了版本**——v01.85 旧 VPK（复测流程教训 + 旧版数据佐证定论）
+
+> 用户带回 log25 报"还是卡死"。判读第一步必须核对 boot_log 版本行：`version: J2ME Player v01.85 b273 (c086d73)` = 9 月 19 日的 v01.85——v01.93/v01.99/**v02.00 修复全都没被测到**。工作区产物没错（midp_vita.vpk == midp_vita_v02.00.vpk, md5 ffe1cd1f, 3651192B, 09-22 04:01），是设备上没重装。
+
+### 复测流程新规矩（硬性）
+
+1. **装完先看 boot_log 第 2 行**：必须是目标版本号（当前 `v02.00`）才允许开始操作。
+2. 附件摘要≠文件清单：log25 摘要又写 3 个文件、实际 16 个——**同一坑踩两次**，判读前永远先 ls。
+
+### log25 (v01.85) 与 log24 (v01.99) 同构性（佐证定论）
+
+| 证据 | log24 | log25 |
+|---|---|---|
+| watchdog | HANG ce=405 polls=12 | HANG ce=350 polls=12 |
+| VM 线程 | RUNNING wait=none | RUNNING wait=none |
+| tone | WAITING delay(1) | WAITING delay(1) |
+| coredump sp/fp/r1 | 8137ffb0 / 0 / 0 | 8137ffb0 / 0 / 0（逐字段同） |
+
+v01.85 是无泵纯净上游行为，其挂死姿势与 v01.99 完全一致——上游裸行为必挂，定论无需修正。ring 的 `verify class=com/app/filemanager/UI` 与 log24 clinit 链头部对上。
+
+### v02.00 复测判据（修复版独有观测点）
+
+- watchdog `lanes` 行尾新增 `sf=entries/spins/last_ms`（sleep_forever 进入/圈数/最后睡眠）
+- 线程清单每行新增 `wait=<obj> timed/no-timeout`（谁在等谁、有没有超时）
+- `priority-queues` 段已改读真实 Task 队列（ENABLE_ISOLATES 下 Universe 槽位是废证据）
+- 判定：不挂=修复生效；挂且 sf=1/spins 涨=泵交付侧问题（查 JVMSPI_CheckEvents 内部）；挂且 sf=0=sleep_forever 定论作废，转向出生桩计数器
 
 ## 2026-09-24 v02.00：**挂死真根因定案**——sleep_forever 无泵死睡（THE REAL FIX，推翻 v01.99 判读）
 
-> log24（v01.99 b308）证明 v01.99 泵**执行过但无效**，且推翻了 log23 定案的"空转环"理论。VM 不是在转，是**睡着了**。本轮解码 dump 全部 17 个内核线程后因果链真正闭合。
+> log24（v01.99 b308）证明 v01.99 泵执行过但无效，且推翻了 log23 定案的"空转环"理论。VM 不是在转，是**睡着了**。本轮解码 dump 全部 17 个内核线程后因果链真正闭合。
 
 ### v01.99 判读错误（先认错）
 
