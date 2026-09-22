@@ -421,6 +421,18 @@ void Scheduler::remove_from_suspend(Thread *thread) {
     on monitors. This may be caused by a deadlock, or by applications
     that purposefully wait on monitors that will never get notified.
 */
+/* v02.00: sleep_forever forensics - log24 froze with the VM thread
+ * RUNNING (not WAITING like the tone thread) and PC parked at the
+ * green-thread berth stub. These counters make the idle loop visible
+ * to the watchdog snapshot: entries = times sleep_forever was entered,
+ * spins = idle-loop iterations, last_ms = Os::sleep span of the most
+ * recent spin (0x7fffffff in the upstream branch = dead sleep).
+ * Declared here (before sleep_forever) because the loop below
+ * increments them; the extern "C" readouts live at the file tail. */
+static unsigned int _vita_sf_entries  = 0;
+static unsigned int _vita_sf_spins    = 0;
+static unsigned int _vita_sf_last_ms  = 0;
+
 void Scheduler::sleep_forever() {
 #ifndef PRODUCT
   if (!DisableDeadlockFinder) {
@@ -443,11 +455,15 @@ void Scheduler::sleep_forever() {
    * switch_thread uses, nap 50 ms. Key/touch/timer events then re-fill
    * the queue and the loop exits. */
   SETUP_ERROR_CHECKER_ARG;
+  _vita_sf_entries++;
   while (*get_next_runnable_thread() == NULL) {
     wake_up_timed_out_sleepers(JVM_SINGLE_ARG_CHECK);
     pump_events_vita();
+    _vita_sf_spins++;
+    _vita_sf_last_ms = 50;
     Os::sleep(50);
   }
+  _vita_sf_last_ms = 0;
   /* Mirror the debugger branch two calls up: install the woken thread
    * as current before returning into switch_thread. */
   Thread::set_current(get_next_runnable_thread());
@@ -2464,6 +2480,17 @@ extern "C" unsigned int vita_sched_pump_runs(void) {
 extern "C" unsigned int vita_sched_switch_count(void) {
   return Scheduler::get_vita_switch_count();
 }
+/* v02.00: sleep_forever idle-loop readouts (state declared above
+ * sleep_forever, before first use). */
+extern "C" unsigned int vita_sched_sf_entries(void) {
+  return _vita_sf_entries;
+}
+extern "C" unsigned int vita_sched_sf_spins(void) {
+  return _vita_sf_spins;
+}
+extern "C" unsigned int vita_sched_sf_last_ms(void) {
+  return _vita_sf_last_ms;
+}
 
 /* v01.98: log22 left the central question open - active_count=5 but the
  * VM does no useful work (pure stub ping-pong). WHO are the 5 threads
@@ -2515,9 +2542,23 @@ extern "C" int vita_sched_dump_threads(char *out, int out_size) {
   if (n > 0) pos += n;
 
   /* priority queues: the scheduler's runnable set. NUM_PRIORITY_SLOTS
-   * is 10 (ThreadObj.hpp:106); slot 0 unused, iterate 1..9. */
+   * is 10 (ThreadObj.hpp:106); slot 0 unused, iterate 1..9.
+   * v02.00 FIX: with ENABLE_ISOLATES (this build, vita_arm.cfg) the
+   * queues live in Task(FIRST_TASK)._priority_queue - see
+   * Universe::setup_thread_priority_list(). The old read of
+   * Universe::scheduler_priority_queues() was the never-assigned
+   * non-isolates slot, so it printed "(null)" unconditionally: a
+   * forensics tool bug, not evidence of an empty queue. Read the real
+   * per-task queue instead. Task::get_task is a ReturnOop pure read
+   * (GUARANTEE compiles out in PRODUCT), safe in watchdog context. */
   {
-    ObjArray::Raw priority_list = Universe::scheduler_priority_queues();
+    ObjArray::Raw priority_list;
+#if ENABLE_ISOLATES
+    Task::Raw task = Task::get_task(Task::FIRST_TASK);
+    priority_list = task().priority_queue();
+#else
+    priority_list = Universe::scheduler_priority_queues();
+#endif
     if (priority_list.is_null()) {
       n = snprintf(out + pos, out_size - pos, "  (null)\n");
       if (n > 0) pos += n;
