@@ -53,6 +53,16 @@ unsigned int Scheduler::_vita_yield_fast_count  = 0;
 unsigned int Scheduler::_vita_yield_slow_count  = 0;
 unsigned int Scheduler::_vita_pump_runs         = 0;
 unsigned int Scheduler::_vita_switch_count      = 0;
+/* v02.01: log26 verdict overturned v02.00 - the queue is NEVER empty
+ * (ghost waiters parked in the ring), so sleep_forever is never
+ * entered (sf=0/0/0). The freeze instead sits in the unmarked ASM
+ * berth-stub loop; every re-dispatch re-enters
+ * get_next_runnable_thread(). These counters separate "one-shot
+ * freeze" (dispatch stalls) from "ring keeps dispatching ghosts"
+ * (dispatch climbs after hang onset). Declared at file head because
+ * get_next_runnable_thread() (mid-file) increments them. */
+static unsigned int _vita_gnrt_hits   = 0;
+static unsigned int _vita_gnrt_nulls  = 0;
 #endif
 
 OopDesc*   Scheduler::_gc_global_head;
@@ -2443,6 +2453,9 @@ Thread *Scheduler::get_next_runnable_thread(Thread *starting_thread) {
   } while (--task_loop_count > 0);
 #endif
   _next_runnable_thread = NULL;
+#if defined(VITA)
+  _vita_gnrt_nulls++;
+#endif
   return (Thread *)&_next_runnable_thread;
 }
 
@@ -2490,6 +2503,14 @@ extern "C" unsigned int vita_sched_sf_spins(void) {
 }
 extern "C" unsigned int vita_sched_sf_last_ms(void) {
   return _vita_sf_last_ms;
+}
+/* v02.01: dispatch readouts (state declared at file head, before
+ * get_next_runnable_thread uses them). */
+extern "C" unsigned int vita_sched_gnrt_hits(void) {
+  return _vita_gnrt_hits;
+}
+extern "C" unsigned int vita_sched_gnrt_nulls(void) {
+  return _vita_gnrt_nulls;
 }
 
 /* v01.98: log22 left the central question open - active_count=5 but the

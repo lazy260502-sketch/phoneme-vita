@@ -551,6 +551,9 @@ extern "C" {
     unsigned int vita_sched_sf_entries(void);
     unsigned int vita_sched_sf_spins(void);
     unsigned int vita_sched_sf_last_ms(void);
+    /* v02.01: dispatch counters (see Scheduler.cpp). */
+    unsigned int vita_sched_gnrt_hits(void);
+    unsigned int vita_sched_gnrt_nulls(void);
     int  vita_sched_dump_threads(char *out, int out_size);
 }
 
@@ -562,20 +565,27 @@ void vita_wd_snapshot(const char *path) {
     int n;
 
     /* Thread::current() expands to (Thread*)&_current_thread, i.e.
-     * &jvm_fast_globals.current_thread - the handle cell itself. */
+     * &jvm_fast_globals.current_thread - the handle cell itself.
+     * v02.01: also dereference the cell - log26 showed the raw cell
+     * address (0x81401d10, stable across runs) being mistaken for the
+     * thread object; the TLS note proves the actual current thread is
+     * the cell CONTENTS (= id4 at hang). */
     Thread *ct = Thread::current();
-    n = snprintf(buf, sizeof(buf), "wd_snapshot cur_thread=0x%08x\n",
-                 (unsigned int)(unsigned long)ct);
+    Thread *cur = (Thread *)(*(OopDesc **)ct);
+    n = snprintf(buf, sizeof(buf),
+                 "wd_snapshot cur_cell=0x%08x cur_thread=0x%08x\n",
+                 (unsigned int)(unsigned long)ct,
+                 (unsigned int)(unsigned long)cur);
     sceIoWrite(fd, buf, n);
 
-    if (ct != NULL && (unsigned int)(unsigned long)ct > 0x1000) {
-        jint st = ct->status();
-        ReturnOop pe = ct->pending_entries();
+    if (cur != NULL && (unsigned int)(unsigned long)cur > 0x1000) {
+        jint st = cur->status();
+        ReturnOop pe = cur->pending_entries();
         n = snprintf(buf, sizeof(buf),
                      "  status=0x%08x pending=0x%08x jsp=0x%08x\n",
                      (unsigned int)st,
                      (unsigned int)(unsigned long)pe,
-                     (unsigned int)ct->stack_pointer());
+                     (unsigned int)cur->stack_pointer());
         sceIoWrite(fd, buf, n);
         if (st & THREAD_TERMINATING)
             sceIoWrite(fd, "  TERMINATING\n", 14);
@@ -603,11 +613,13 @@ void vita_wd_snapshot(const char *path) {
      * pump_runs climbing with no event delivery = the pump runs but
      * check_blocked_threads()/JVMSPI_CheckEvents drops the ball. */
     n = snprintf(buf, sizeof(buf),
-                 "  lanes fast=%u slow=%u pump=%u switch=%u sf=%u/%u/%u\n",
+                 "  lanes fast=%u slow=%u pump=%u switch=%u sf=%u/%u/%u"
+                 " gnrt=%u/%u\n",
                  vita_sched_yield_fast(), vita_sched_yield_slow(),
                  vita_sched_pump_runs(), vita_sched_switch_count(),
                  vita_sched_sf_entries(), vita_sched_sf_spins(),
-                 vita_sched_sf_last_ms());
+                 vita_sched_sf_last_ms(),
+                 vita_sched_gnrt_hits(), vita_sched_gnrt_nulls());
     sceIoWrite(fd, buf, n);
     /* v01.98: WHO are the active_count threads? Walk the global thread
      * list (ground truth) and the priority queues (scheduler's runnable
