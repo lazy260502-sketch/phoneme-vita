@@ -1,6 +1,22 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-22
 
+## 2026-09-22 目录整治：**VPK 输出目录统一为 `vita-port/out/vpk/`（唯一出口）**
+
+> log25 装到 v01.85 旧版的直接原因查明：工作区曾有三个 VPK 位置，其中 `samples/j2me/out/vpk/` 是 CMake 迁移后**没人更新的僵尸目录**（最新停在 v01.85, 09-19），用户从那里抓的包。本轮已整治：
+
+### 整治内容
+
+1. 旧目录历史 VPK（v01.68~v01.85 共 16 个）**并入** `vita-port/out/vpk/`（无文件名冲突），僵尸目录 `samples/j2me/out/` 与游离副本 `vita-port/midp_vita.vpk` **删除**
+2. 全工作区现只有一处 VPK：`samples/j2me/vita-port/out/vpk/`（22 个文件 = 各版本 .vpk/.sym + 当前 `midp_vita.vpk` == `midp_vita_v02.00.vpk`）
+3. 脚本/文档无过时路径引用（已 grep 核实）
+
+### 规矩（从本轮起）
+
+- **装包永远从这个目录拿**：`vita-port/out/vpk/midp_vita.vpk`（或带版本号的副本）
+- 装完**先看 boot_log 第 2 行版本号**再开始测试（log25 教训）
+- 日志固定写在设备端 `ux0:/data/J2ME00001/`（boot_log/watchdog/site_ring/crumb/input_debug 等 16 个文件，Vita3K 侧在 `C:/Users/zyb/AppData/Roaming/Vita3K/Vita3K/ux0/data/J2ME00001/`）——与构建产物目录无关，不会变
+
 ## 2026-09-22 log25：**测错了版本**——v01.85 旧 VPK（复测流程教训 + 旧版数据佐证定论）
 
 > 用户带回 log25 报"还是卡死"。判读第一步必须核对 boot_log 版本行：`version: J2ME Player v01.85 b273 (c086d73)` = 9 月 19 日的 v01.85——v01.93/v01.99/**v02.00 修复全都没被测到**。工作区产物没错（midp_vita.vpk == midp_vita_v02.00.vpk, md5 ffe1cd1f, 3651192B, 09-22 04:01），是设备上没重装。
