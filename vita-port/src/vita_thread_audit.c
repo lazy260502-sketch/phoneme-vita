@@ -51,6 +51,8 @@
 #include <string.h>
 #include <stdint.h>
 
+#include <png.h>
+
 #include "vita_thread_audit.h"
 
 #define AUDIT_MAX_THREADS 32
@@ -162,6 +164,19 @@ int __wrap_sceKernelStartThread(SceUID tid, SceSize arglen, void *argp) {
 }
 
 /* ------------------------------------------------------------------ */
+/* -Wl,--wrap=png_read_image                                          */
+/* ------------------------------------------------------------------ */
+
+volatile unsigned vita_png_reads = 0;
+
+extern void __real_png_read_image(png_structp, png_bytepp);
+
+void __wrap_png_read_image(png_structp png, png_bytepp image) {
+    vita_png_reads++;
+    __real_png_read_image(png, image);
+}
+
+/* ------------------------------------------------------------------ */
 /* Watchdog dump entry point                                          */
 /* ------------------------------------------------------------------ */
 
@@ -238,32 +253,16 @@ void vita_thread_audit_dump(const char *path) {
         sceIoWrite(fd, buf, n);
     }
 
-    /* Per-core run state: which tid each CPU is actually executing
-     * right now. The syscall form takes a tid like GetThreadInfo
-     * (checked against the shipped header); passing 0 = current
-     * thread yields OUR run status row - on a healthy system the
-     * watchdog itself must appear on some cpu row as RUNNING. That
-     * self-check is what makes "all four rows name other tids while
-     * the VM tid sits READY" a trustworthy starvation verdict. */
-    {
-        SceKernelThreadRunStatus rs;
-        memset(&rs, 0, sizeof(rs));
-        rs.size = sizeof(rs);
-        if (sceKernelGetThreadRunStatus(sceKernelGetThreadId(), &rs) >= 0) {
-            n = snprintf(buf, sizeof(buf),
-                         "[AUDIT] cpu0=0x%x/0x%x cpu1=0x%x/0x%x "
-                         "cpu2=0x%x/0x%x cpu3=0x%x/0x%x (tid/prio)\n",
-                         rs.cpuInfo[0].threadId, rs.cpuInfo[0].priority,
-                         rs.cpuInfo[1].threadId, rs.cpuInfo[1].priority,
-                         rs.cpuInfo[2].threadId, rs.cpuInfo[2].priority,
-                         rs.cpuInfo[3].threadId, rs.cpuInfo[3].priority);
-            sceIoWrite(fd, buf, n);
-        } else {
-            n = snprintf(buf, sizeof(buf),
-                         "[AUDIT] GetThreadRunStatus failed\n");
-            sceIoWrite(fd, buf, n);
-        }
-    }
+    /* log27 lesson: sceKernelGetThreadRunStatus NEVER RETURNS when
+     * called from a user-mode thread on fw 3.65 real hardware - the
+     * log27 watchdog froze inside the syscall (kernel PC e000df82),
+     * truncating the whole forensic chain AFTER the thread table
+     * (no per-core line, no site ring, no vm marker, no data abort;
+     * the psp2core dump had to come from the system instead). The
+     * GetThreadInfo loop above is proven safe (v01.75+), so the
+     * per-core run state is simply dropped: the thread table plus
+     * each thread's status field already decides starvation vs
+     * userland-spin. */
 
     sceIoClose(fd);
 }

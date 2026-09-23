@@ -838,7 +838,7 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.02")
+set(VITA_VERSION  "02.03")
 # 02.01 (2026-09-22): log26 verdict - v02.00 sleep_forever theory FALSIFIED.
 #   Fresh dump with the fixed queue dump shows sf=0/0/0 (sleep_forever
 #   never entered) because the priority queue is NEVER empty: ghost
@@ -1297,6 +1297,14 @@ target_link_libraries(${PROJECT_NAME}
     # disprove VM starvation in one snapshot.
     -Wl,--wrap=sceKernelCreateThread
     -Wl,--wrap=sceKernelStartThread
+    # v02.03 (log27): the coredump caught the VM thread RUNNING inside
+    # png_do_rgb_to_gray - unreachable through any legal caller (MIDP's
+    # imgdcd decoder never calls libpng; the only png_read_image caller
+    # is vita_icon_decode_png, done before the menu exits). Wrapping
+    # png_read_image counts entries from vita_icon.c so a repeat run
+    # can cross-check "libpng really was executing" vs "stale/garbage
+    # register context".
+    -Wl,--wrap=png_read_image
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm
