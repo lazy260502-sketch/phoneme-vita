@@ -504,13 +504,19 @@ int main(int argc, char *argv[]) {
             {
                 int status;
                 crumb_marker("runMidlet enter");
-                /* Read the VM flag AFTER the round: runMidlet.c has parsed
-                 * "-int" by then, so this is the mode the round actually
-                 * ran in (1 = JIT enabled, 0 = pure interpreter). */
-                crumb_printf("vm UseCompiler=%d (jit policy=%d)",
+                /* log28 lesson: printing UseCompiler HERE (before the
+                 * runMidlet call) shows the Globals.hpp default (1),
+                 * because "-int" is parsed INSIDE runMidlet ->
+                 * JVM_ParseOneArg. The old single print misled log28
+                 * analysis into a JIT hypothesis for an hour. Keep this
+                 * pre-round line (shows the default) and add a post-round
+                 * line that shows the mode the round actually ran in. */
+                crumb_printf("vm UseCompiler(pre)=%d (jit policy=%d)",
                              (&UseCompiler == NULL) ? -1 : (int)UseCompiler,
                              vita_jit_policy);
                 status = runMidlet(run_argc, run_argv);
+                crumb_printf("vm UseCompiler(post)=%d <- actual round mode",
+                             (&UseCompiler == NULL) ? -1 : (int)UseCompiler);
                 crumb_printf("runMidlet returned %d", status);
                 crumb_marker("runMidlet exit");
                 crumb_flush();

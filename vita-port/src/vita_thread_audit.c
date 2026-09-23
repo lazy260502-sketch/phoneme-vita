@@ -263,7 +263,15 @@ void vita_thread_audit_dump(const char *path) {
      * per-core run state is simply dropped: the thread table plus
      * each thread's status field already decides starvation vs
      * userland-spin. */
-
+    /* log28 lesson: the v02.03 wrap counter existed but this dump
+     * never printed it - the whole png-reads criterion (site-ring
+     * entries pointing into libpng vs actual libpng traffic) was
+     * unusable. .bss is NOT captured by psp2core, so the dump cannot
+     * recover it either. Print it here, every dump. */
+    extern volatile unsigned vita_png_reads;
+    n = snprintf(buf, sizeof(buf),
+                 "[AUDIT] png_read_image calls=%u\n", vita_png_reads);
+    sceIoWrite(fd, buf, n);
     sceIoClose(fd);
 }
 

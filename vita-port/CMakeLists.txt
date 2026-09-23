@@ -838,7 +838,7 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.03")
+set(VITA_VERSION  "02.04")
 # 02.01 (2026-09-22): log26 verdict - v02.00 sleep_forever theory FALSIFIED.
 #   Fresh dump with the fixed queue dump shows sf=0/0/0 (sleep_forever
 #   never entered) because the priority queue is NEVER empty: ghost
