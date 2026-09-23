@@ -4520,3 +4520,49 @@ ASM 版 invoke_pending_entries(810bb86c) 头三句 `ldr r1,[r0,#0x24]; cmp;moveq
 ### 遗留
 
 - 0001-save-change.patch（历史遗留未跟踪文件）仍在。
+
+---
+
+## 2026-09-23 log27 分析（v02.02 取证版 / build 9081d2e 系）
+
+### 证据清单
+
+- `watchdog.log`：`HANG ce=401 polls=12`（tick=1713 停滞，双时钟健康 d=100/kd=100326）——与前几轮完全同指纹
+- `site_ring.log`（v02.02 新线程表，**本次最有价值的证据**）：
+  - 全进程只有 **3 个注册线程**：j2me_tone（WAITING delay 1ms）、j2me_watchdog（RUNNING）、cldc_ticker（WAITING delay 10ms），全部 prio=0xa0
+  - **没有 ANI 池线程**——pthread_create 路径在挂死场景从未创建过线程 → **pte 优先级倒置/饿死理论正式证伪**
+- `thread_audit.log`：`wrap active, first tid=... 'j2me_tone'`（wrap 机制工作正常）
+- coredump（THREAD_INFO + THREAD_REG_INFO 完整解码，工具改进版已固化到 `debug/tools/`）：
+  - 全进程 **5 个内核线程**：J2ME00001(VM主)、SceCommonDialogWorker、j2me_tone、j2me_watchdog、cldc_ticker
+  - **VM 主线程 status=RUNNING、wait=none**，PC=0x810d0120 = `png_do_rgb_to_gray+0x12c0`（libpng NEON 变换循环），lr 同函数内（+0x1594），cpsr=0x40070010（用户态、无异常位）
+  - 寄存器残留字符串 `skin/pba r.im`（chameleon 皮肤进度条图片名）
+  - j2me_tone/cldc_ticker 的 `+0xa0` 字段落在 `_rom_task_mirrors`（ROM 数据区）→ **WAITING 线程的该字段不是有效 PC**（仅 RUNNING 态可信）
+
+### 判决
+
+1. **饿死理论（log26 头号嫌疑）证伪**：VM 是 RUNNING 不是 READY；不存在更高优先级竞争者；ANI 池线程根本没创建。
+2. **VM 冻结点在 libpng 的 png_do_rgb_to_gray NEON 循环内**，且经调用图全量排查：
+   - MIDP 的 `decode_png_image`（imgdcd）是纯 C 自带解码器，**从不调用 libpng**
+   - 全二进制中 `png_read_image` 的唯一调用者是 `vita_icon_decode_png`（vita-port 菜单图标），且菜单阶段早已结束
+   - **没有任何代码启用过 `png_set_rgb_to_gray`**（rgb_to_gray 变换不可能被合法触发）
+   - → VM 主线程出现在 libpng 内部 = **执行流损坏（野跳转/垃圾 PC）**，非合法调用链
+3. **watchdog 被 v02.02 的 `sceKernelGetThreadRunStatus` 冻死在内核里**（PC=e000df82，40s 不返回；fw3.65 该 API 从用户态调用挂起）——导致 site_ring/vm 标记/abort 全没执行，coredump 由系统机制兜底产生。**教训：未在真机验证过的内核 API 一律先包一层或不用**（GetThreadInfo 自 v01.75 已验证安全）。
+
+### 新头号嫌疑（log27 后重排）
+
+1. **JIT/I-cache**：VM=UseCompiler=1（crumb: `jit cfg=0 -> policy=0` 但 boot_log 显示 UseCompiler=1），真机 Cortex-A9 多核 I-cache 一致性 vs Vita3K 不模拟。已查 `CompiledMethod_arm.cpp`/`SharedStubs_arm.cpp` 调用 `arm_flush_icache`→`OsMisc_flush_icache`→`__builtin___clear_cache` 存在，但**romgen 生成的 ROM 代码块与 JIT 代码缓冲区的维护路径未逐点核实**（需要下轮对 `_rom_text_block*` 写入点与 flush 时序做全审计）
+2. 函数指针表/ROM 镜像数据被写坏（PC 落在数据区或库函数中段 = 跳转表损坏的另一形态）
+3. 栈溢出踩坏返回地址（VM 主线程栈顶 sp=0x8137ffb0 距栈底仅 0x30 字节余量的历史问题仍在——本次 sp 距 0x81380000 仅 0x50）
+
+### 本轮代码改动（v02.03，commit 4e7992d）
+
+- `vita_thread_audit.c`：删除 `sceKernelGetThreadRunStatus` 调用（真机挂起的元凶）；新增 `--wrap=png_read_image` 计数器 `vita_png_reads`（dump 尾部打印 `[AUDIT] png_read_image calls=N`）
+- `CMakeLists.txt`：加 `-Wl,--wrap=png_read_image`；版本 02.03
+- 产物：`out/vpk/midp_vita_v02.03.vpk`（3652821B，b318）
+- 下轮判读：若再次 HANG 且 coredump 仍见 VM 在 libpng 内 → 看 `png_read_image calls`：菜单图标扫描应≈游戏数（本档 5）→ 远超即异常；为 0 则证明 PC 完全不可信（垃圾上下文），主攻 I-cache/跳转表审计
+
+### log27 系列日志的判读基准
+
+- THREAD_REG_INFO 布局（376B/entry）：`+0x0c..+0x3c`=r0..r12，`+0x40`=sp，`+0x44`=lr，`+0x48`=pc，`+0x4c`=cpsr
+- THREAD_INFO 布局（desc=[u32 0x12][u32 count]，200B/entry）：`+0x00`=esz(0xc8)，`+0x04`=tid，`+0x08..+0x27`=name[32]，`+0x2c/+0x30`=init/currentPriority（工具 `debug/tools/threads27.py` 已按此实现并验证）
+- REG_INFO 行数多于 THREAD_INFO（含 tid=0 的内核内部行），且用户线程行的 tid 字段不可靠（VM 行 regtid=5）——按精确 tid 匹配名字，匹配不上就标 `?`；VM 主线程靠"pc/lr 落用户 .text 且 sp 在其栈内"识别
