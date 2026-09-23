@@ -35,6 +35,8 @@
 #include <sys/time.h>
 
 #include "vita_watchdog.h"
+/* v02.02: OS-side thread forensics (--wrap= registration table). */
+#include "vita_thread_audit.h"
 
 typedef int64_t wd_jlong;
 
@@ -291,6 +293,12 @@ static int wd_thread_routine(SceSize args, void *argp) {
         wd_dump_thread("tone", vita_tone_tid);
         /* the watchdog itself, as a sanity marker */
         wd_dump_thread("wd", sceKernelGetThreadId());
+        /* v02.02: full registered-thread table + per-core run state.
+         * Proves or disproves "VM thread starved by higher-priority
+         * natives" in one snapshot - the OS-side evidence the
+         * Vita3K-vs-real-HW gap analysis needs. */
+        vita_thread_audit_dump("ux0:/data/J2ME00001/site_ring.log");
+        vita_thread_audit_dump_vm_marker("ux0:/data/J2ME00001/site_ring.log");
 
         /* v01.84: dump the VM's site ring BEFORE the coredump request.
          * log10 proved the dump cannot name a native loop running on a

@@ -838,7 +838,7 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.01")
+set(VITA_VERSION  "02.02")
 # 02.01 (2026-09-22): log26 verdict - v02.00 sleep_forever theory FALSIFIED.
 #   Fresh dump with the fixed queue dump shows sf=0/0/0 (sleep_forever
 #   never entered) because the priority queue is NEVER empty: ghost
@@ -1219,6 +1219,7 @@ add_executable(${PROJECT_NAME}
     src/vita_checkevents.c
     src/vita_watchdog.c
     src/vita_crumb.c
+    src/vita_thread_audit.c
 )
 
 # Size of the bundled jar, baked into the binary for the runtime
@@ -1285,6 +1286,17 @@ target_link_libraries(${PROJECT_NAME}
     # exactly the callers we care about (newlib FILE-lock init, VM/ANi
     # pthread usage). Wrapper must come before -lpthread.
     -Wl,--wrap=pte_osSemaphoreCreate
+    # v02.02 thread forensics: register EVERY thread created in this
+    # process (direct callers + libpthread's pte_osThreadCreate inside
+    # vita_osal.o, whose priority mapping 0x140-pte_prio gives ANI pool
+    # threads real priorities 0x81..0xC0 - numerically LOWER and thus
+    # HIGHER priority than the VM thread on the lower-number-wins Vita
+    # scheduler; Vita3K does not model this, real HW does).
+    # vita_thread_audit.c keeps the registry; the watchdog dumps it on
+    # HANG (status/wait/prio/cpu + per-core run state) to prove or
+    # disprove VM starvation in one snapshot.
+    -Wl,--wrap=sceKernelCreateThread
+    -Wl,--wrap=sceKernelStartThread
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm
