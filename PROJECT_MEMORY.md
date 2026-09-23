@@ -4566,3 +4566,41 @@ ASM 版 invoke_pending_entries(810bb86c) 头三句 `ldr r1,[r0,#0x24]; cmp;moveq
 - THREAD_REG_INFO 布局（376B/entry）：`+0x0c..+0x3c`=r0..r12，`+0x40`=sp，`+0x44`=lr，`+0x48`=pc，`+0x4c`=cpsr
 - THREAD_INFO 布局（desc=[u32 0x12][u32 count]，200B/entry）：`+0x00`=esz(0xc8)，`+0x04`=tid，`+0x08..+0x27`=name[32]，`+0x2c/+0x30`=init/currentPriority（工具 `debug/tools/threads27.py` 已按此实现并验证）
 - REG_INFO 行数多于 THREAD_INFO（含 tid=0 的内核内部行），且用户线程行的 tid 字段不可靠（VM 行 regtid=5）——按精确 tid 匹配名字，匹配不上就标 `?`；VM 主线程靠"pc/lr 落用户 .text 且 sp 在其栈内"识别
+
+---
+
+## 2026-09-23 log28 分析（v02.03 取证版 / build 9081d2e）
+
+### 证据清单
+
+- `watchdog.log`：HANG ce=398 polls=12 tick=1713（同指纹）；**v02.03 取证链完整生效**——线程行（VM=RUNNING wait=none）、site ring、vm 标记、主动 data abort 全部到位（log27 教训的 API 已摘除）
+- `site_ring.log`（首次完整 ring）：
+  - `site seq=189824 frozen=yes`——site mark 已调用 18.9 万次后停摆
+  - ring 16 条中 15 条 = `0x810cf614`（`png_do_rgb_to_gray+0x834`），1 条 = `0x810cd5a4`（`png_image_read_colormap+0x7b4`）
+  - **反汇编验证：两个地址的前一条指令都不是 BL**（`mov r3,r1` / `adds r6,#3`）——不可能是 `vita_site_mark` 的合法返回地址 → **ring 本身被写坏**（或 mark 被野调用）
+  - `wd_snapshot` 读到 `status=0xe5957710 / pending=0xe586b014 / jsp=0xe5933034`——**三个值全部解码为合法 ARM 指令**（LDR R7,[R5,#1808] / STR R11,[R6,#20] / LDR R3,[R3,#52]）——机器码涂进了 Thread 对象字段
+  - 同一 dump 内 active-list 先读 `st=00000000`（正常）后读指令字 → dump 期间 VM 线程仍在持续乱写
+- coredump（PC 换代，log27→log28）：
+  - VM 主线程 pc=lr=0x81108374 = `_rom_method_variable_parts_src+0x130`——**.rodata 数据区**（该处是指针表，非代码）
+  - 寄存器 r5/r6/r7/r10/r11/r12 与 log27 **完全相同**——同一条确定性路径复现
+  - **走栈决定性证据：[sp]=`_svfprintf_r+0x894`**——最内层真实帧是 newlib vfprintf 内部；8167e8xx 区还有成对 `0x81141bdb/0x811526cc`（ROM 尾部数据符号）残留
+- 堆段扫描：无成片指令字涂抹（最长 run=0）、text 指针密度 0.25%（正常 vtable 水平）→ 污染是**点状精准**，不是大面积刷写
+
+### 判决
+
+1. **JIT 假说出局**：`runMidlet.c` 确凿注入 `-int`（policy=0 → `JVM_ParseOneArg({"-int"})` → `UseCompiler=false`，Arguments.cpp:128）。crumb `vm UseCompiler=1` 是**打印点缺陷**——在 runMidlet 调用前读的是默认值（v02.04 已修：pre/post 两条）。phoneME 的 `-int` 自 v01.46 起就是默认。
+2. **执行流损坏维持判决并升级**：VM 线程 pc=lr 落在 .rodata、ring 返回地址无 BL 来源、Thread 对象字段是指令字——三处独立证据同指"执行/数据边界被击穿"。栈残留 `_svfprintf_r` 内部帧 + OS_vita.cpp log10 时代注释（"residue frames point at the stdio domain"）+ v01.92 注释（log18 曾冻死在 stderr 写路径）——**newlib stdio（vfprintf/sceIoWrite 未缓冲 stderr）是反复出现的案发现场邻近物**。
+3. **新头号嫌疑：phoneME 多线程对同一 FILE*（stdout/stderr 经 freopen 绑定 ux0: 文件）的非同步并发写**。VM 线程（tty->print → jvm_printf → stdout）与启动器/其他线程并发 fprintf 同一 FILE，newlib 的 _svfprintf_r 内部锁在 Vita 上若行为异常（或 FILE 结构被部分写坏），轻则互相踩格式化状态、重则 longjmp/野返回。堆扫描排除大面积涂抹后，"stdio 内部状态机被并发破坏"与点状精准污染的形态吻合。
+   - 反证条件：log28 里 BEFORE_NATIVES×30 都是顺序打完的（未冻结在写中），冻结点在挂死时段的某次输出。真机独有 + Vita3K 不挂：Vita3K 的 sceIoWrite 时序/调度不同，竞争窗口不同。
+
+### v02.04 改动（commit 37c7408）
+
+- `vita_thread_audit.c`：dump 尾部补打 `[AUDIT] png_read_image calls=%u`（v02.03 的 wrap 计数器从未被打印，判据落空；.bss 不进 psp2core，事后也无法恢复）
+- `vita_main.c`：UseCompiler crumb 拆 pre/post 两条（pre=默认值，post=实际轮次模式）
+- 产物：`out/vpk/midp_vita_v02.04.vpk`（3652473B，b322）
+
+### 下一步（v02.05 候选）
+
+1. **stdio 并发假设的正面验证**：给 `jvm_printf`/`fprintf(stderr,..)` 高频路径套 `--wrap` 计数器（_svfprintf_r 无法直接 wrap，但可 wrap `fwrite/fputc/fflush` 统计挂死时段的 stdio 流量与线程归属）；或干脆将 VM 的 tty 输出改为 sceIoWrite 直写（绕开 stdio）做对照轮
+2. ring 中毒溯源：`vita_site_mark` 是 noinline 直接被 bl——在 mark 入口记录 lr 到独立数组（两份 ring 交叉验证是否 ring 数组本身被涂还是 mark 被野调用）
+3. 若确认 stdio 并发：最小修复 = VM 侧所有输出加一把专用互斥锁（JVMSPI_PrintRaw 与 ClassFileParser 的 fprintf 改走同一加锁通道）
