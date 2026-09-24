@@ -63,6 +63,10 @@ unsigned int Scheduler::_vita_switch_count      = 0;
  * get_next_runnable_thread() (mid-file) increments them. */
 static unsigned int _vita_gnrt_hits   = 0;
 static unsigned int _vita_gnrt_nulls  = 0;
+/* v02.05: Thread::timer_tick entry count (defined in Thread.cpp next
+ * to the Java-site sampling probe) - read through the accessor bridge
+ * at the bottom of this file. */
+extern unsigned int _vita_ttk_count;
 #endif
 
 OopDesc*   Scheduler::_gc_global_head;
@@ -2511,6 +2515,19 @@ extern "C" unsigned int vita_sched_gnrt_hits(void) {
 }
 extern "C" unsigned int vita_sched_gnrt_nulls(void) {
   return _vita_gnrt_nulls;
+}
+/* v02.05: timer-tick chain readouts for vita_wd_snapshot (see the
+ * log29 note in OS_vita.cpp). _rt_timer_ticks is a plain global
+ * (GlobalDefinitions.hpp:1919, defined in InterpreterSkeleton.cpp),
+ * incremented by Thread::set_timer_tick() from the ticker thread and
+ * zeroed by clear_timer_tick() at the tail of Thread::timer_tick.
+ * The counter of timer_tick entries lives in Thread.cpp next to the
+ * probe call. */
+extern "C" unsigned int vita_sched_rt_ticks(void) {
+  return (unsigned int)_rt_timer_ticks;
+}
+extern "C" unsigned int vita_sched_ttk_count(void) {
+  return _vita_ttk_count;
 }
 
 /* v01.98: log22 left the central question open - active_count=5 but the

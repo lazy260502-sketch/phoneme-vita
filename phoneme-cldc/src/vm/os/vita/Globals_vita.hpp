@@ -62,6 +62,13 @@ extern "C" {
     void vita_site_clinit_class(const char *name, int len);
     void vita_site_clinit_return(void);
     void vita_site_dump_clinit(const char *path);
+    /* v02.05: interpreter Java-site sampling - Thread::timer_tick
+     * records the current class.method (length-bounded Symbol copy,
+     * PRODUCT-safe) so a HANG dump can name the Java loop when the
+     * lane/pump counters freeze (the log29 open question). */
+    void vita_site_java_frame(void);
+    void vita_site_dump_java(const char *path);
+    extern volatile unsigned int vita_java_sample_count;
     /* v01.90: progress counters readable by the launcher watchdog
      * (defined in OS_vita.cpp). vita_clinit_count advances during a
      * class-load storm even while the CE pump is starved; vita_gc_count

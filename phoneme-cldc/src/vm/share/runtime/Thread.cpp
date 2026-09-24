@@ -545,6 +545,13 @@ void Thread::stack_overflow(Thread *thread, address stack_pointer) {
   }
 }
 
+#if defined(VITA)
+/* v02.05: entry count of Thread::timer_tick - see the probe note in
+ * OS_vita.cpp. Read by the watchdog through the extern "C" accessor
+ * vita_sched_ttk_count (Scheduler.cpp accesssor bridge). */
+unsigned int _vita_ttk_count = 0;
+#endif
+
 void Thread::timer_tick() {
   SETUP_ERROR_CHECKER_ARG;
   Thread *thread = Thread::current();
@@ -555,6 +562,15 @@ void Thread::timer_tick() {
 #endif
 
   _global_tick_count++;
+
+#if defined(VITA)
+  /* v02.05: sample the current Java class.method here (the exact
+   * function log29's frozen pc pointed into) - see the probe note in
+   * OS_vita.cpp. Runs on the VM thread; the watchdog only reads the
+   * static text buffers through sceIo. */
+  _vita_ttk_count++;
+  vita_site_java_frame();
+#endif
 
 #if ENABLE_PROFILER
   // We must check is_ready() to distinguish real time ticks

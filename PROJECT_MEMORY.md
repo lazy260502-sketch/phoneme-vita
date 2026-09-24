@@ -4525,6 +4525,8 @@ ASM 版 invoke_pending_entries(810bb86c) 头三句 `ldr r1,[r0,#0x24]; cmp;moveq
 
 ## 2026-09-23 log27 分析（v02.02 取证版 / build 9081d2e 系）
 
+> **⚠️ 勘误（2026-10-14，log29 判决）**：本章使用的 coredump 符号化 slide 常数**错了 0x37040**（用了旧 build 的 .sym 换算）。用四锚点重新定标后，"PC=png_do_rgb_to_gray"、"ring 落 libpng"、"寄存器残留 skin/pba r.im" 等全部判读为**符号化假象**；"执行流损坏"的判决**作废**。正确判读见下方 log29 章节（真实现场 = log23 同型"纯 Java 计算饿死事件泵"指纹：clinit com/app/filemanager/UI）。本章 THREAD_INFO/REG_INFO 布局等**结构层数据仍有效**。
+
 ### 证据清单
 
 - `watchdog.log`：`HANG ce=401 polls=12`（tick=1713 停滞，双时钟健康 d=100/kd=100326）——与前几轮完全同指纹
@@ -4571,6 +4573,8 @@ ASM 版 invoke_pending_entries(810bb86c) 头三句 `ldr r1,[r0,#0x24]; cmp;moveq
 
 ## 2026-09-23 log28 分析（v02.03 取证版 / build 9081d2e）
 
+> **⚠️ 勘误（2026-10-14，log29 判决）**：同 log27——slide 错位 0x37040 使 "pc=lr=0x81108374 落 .rodata"、"ring 返回地址无 BL 来源"、"wd_snapshot 三值解码为 ARM 指令"全部是**错位符号化产物**；"执行流损坏维持判决并升级"与"stdio 并发写"假说**作废**（wd_snapshot 三垃圾值的真因是 v02.01 引入的 handle 双重解引用 bug，见 log29）。正确判读见下方 log29 章节。
+
 ### 证据清单
 
 - `watchdog.log`：HANG ce=398 polls=12 tick=1713（同指纹）；**v02.03 取证链完整生效**——线程行（VM=RUNNING wait=none）、site ring、vm 标记、主动 data abort 全部到位（log27 教训的 API 已摘除）
@@ -4604,3 +4608,76 @@ ASM 版 invoke_pending_entries(810bb86c) 头三句 `ldr r1,[r0,#0x24]; cmp;moveq
 1. **stdio 并发假设的正面验证**：给 `jvm_printf`/`fprintf(stderr,..)` 高频路径套 `--wrap` 计数器（_svfprintf_r 无法直接 wrap，但可 wrap `fwrite/fputc/fflush` 统计挂死时段的 stdio 流量与线程归属）；或干脆将 VM 的 tty 输出改为 sceIoWrite 直写（绕开 stdio）做对照轮
 2. ring 中毒溯源：`vita_site_mark` 是 noinline 直接被 bl——在 mark 入口记录 lr 到独立数组（两份 ring 交叉验证是否 ring 数组本身被涂还是 mark 被野调用）
 3. 若确认 stdio 并发：最小修复 = VM 侧所有输出加一把专用互斥锁（JVMSPI_PrintRaw 与 ClassFileParser 的 fprintf 改走同一加锁通道）
+
+---
+
+## 2026-10-14 log29 分析（v02.04 / build 37c7408 系）：符号化勘误 + 判决大反转 + v02.05 取证装置
+
+### 换算公式（最高优先级记忆，取代一切旧 slide）
+
+- 唯一可 nm 的 ELF：`vita-port/build/midp_vita.velf`
+- **VMA = symtab − 0x81000000**（symtab 里的地址直接减模块基）
+- **runtime = VMA + 0x37000**（psp2core dump 里的地址）
+- 等价：**symtab = runtime + 0x80FC9000**
+- log27/28 用的 slide 差了 **0x37040**（旧 build 残留换算）——所有"pc 落库函数/.rodata"的判读全是错位假象
+
+### 四锚点定标法（本轮固化，今后每次符号化必做）
+
+1. thread_audit 的三个 creator 地址（`__wrap_sceKernelCreateThread` 的 BL 返回地址）
+2. watchdog abort 写 0x81000000 处的 "DRES" 标记
+3. site ring 的 switch_thread/pump 地址（代码形态交叉验证）
+4. 上面 3+ 个独立锚点必须给出**同一个** slide 才可信
+
+**教训**：①符号化必须 ≥2 独立锚点；②工具自身输出也要验证——`nm` 标签可有 **+0x40 系统性偏移**（本轮 site_mark/switch_thread/__wrap_sceKernelCreateThread 三例），矛盾时以**反汇编代码形态**为准（看 BL 指令、函数序言，不信标签）。
+
+### 判决反转
+
+- **log27/28 的"执行流损坏"全部作废**：PC 不在 png_do_rgb_to_gray、不在 .rodata；ring 没有中毒；寄存器"残留字符串"是错位解读。
+- **wd_snapshot 三垃圾值的真因**：v02.01 引入的 handle **双重解引用 bug**——`Thread::current()` 返回的是 handle cell（`&_current_thread`），`ct->status()` 这种方法调用**本来就经 `*this` 解引用到真 oop**；再显式 `*(OopDesc**)ct` 等于把 oop 首字段当指针再解一次 = 读到错位字段（垃圾值/指令字全是这个机制的产物）。**phoneME handle 语义：对 Thread* 调方法 = 自动解引用；显式二次解引用 = 永远错。**
+- **真实现场（log29 定案）**：VM 主线程 pc = `interpreter_timer_tick+0x14`（timer tick stub 内、完全健康的位置），走栈 `JVM::start ← JVM_Start ← midp_run_midlet_with_args_cp`；辅助线程健康（tone/ticker 在 delay 睡眠）；**全 liveness 冻结**：fast=372 slow=0 pump=381（==CE） switch=188996，clinit=`com/app/filemanager/UI` count=35 depth=0——与 **log23 "纯 Java 计算饿死事件泵"完全同指纹**。
+
+### 未解矛盾（v02.05 取证目标）
+
+ticker 活着（每 10ms `real_time_tick` → `Thread::set_timer_tick` → `_rt_timer_ticks++`），VM 若还在跑字节码，back-branch 检查点应每 10ms 开一次泵——但 ce/pump/fast 全冻结，而 pc 停在 timer_tick stub 内。三个假说存活：
+
+- (a) 解释器不再过 back-branch 检查点（pc 采样只是冻结前最后一瞬，VM 实际在别处/汇编 berth 循环）
+- (b) 检查点触发但 `Thread::timer_tick` 永不完成（冻在函数中段）
+- (c) 触发且完成但内部 yield 每次早退（is_stopping/pending exception 反复触发）
+
+### v02.05 取证装置（本轮落地）
+
+| 探针 | 位置 | 区分什么 |
+|---|---|---|
+| `vita_sched_rt_ticks()`（读 `_rt_timer_ticks`） | Scheduler.cpp 访问器桥 | ticker→检查点置位链是否活着（rt_ticks 攀升=置位链活着） |
+| `_vita_ttk_count`（`vita_sched_ttk_count()`） | Thread.cpp，`Thread::timer_tick` 顶部 | 检查点是否真的进到了 C++ 层 |
+| `vita_site_java_frame()`（采样当前 Java class.method + `vita_java_sample_count`） | 同上（JavaFrame 构造仿上游 ENABLE_PROFILER 块） | **给 Java 循环点名**；samples 攀升而 lanes 冻结 = 直接杀 (a) |
+| wd_snapshot 新行 `rt_ticks/ttk/jsmp` | OS_vita.cpp | 三值一次快照 |
+| `vita_site_dump_java` | watchdog HANG 链（site_ring.log） | dump 文本（VM 线程写、wd 只读，无锁同 clinit 探针纪律） |
+
+判读表：
+
+| 证据组合 | 结论 |
+|---|---|
+| rt_ticks 攀升 + ttk 冻结 | (a) 成立：检查点死了 → 主攻解释器为何不过 back-branch（ berth stub / 汇编循环） |
+| ttk 攀升 + samples 攀增 + lanes 冻结 | (c) 方向：yield 早退或 pump 门判据问题 |
+| 三者全冻结 + rt_ticks 也冻结 | ticker→置位链断了（更深：ticker 线程被饿死？） |
+| samples 攀升 + 名字稳定在某一 method | 该 method 就是饿死泵的 Java 循环本体 |
+
+### 已修 bug（v02.05 顺带）
+
+- `vita_wd_snapshot` 双重解引用（见上"判决反转"）——`cur` 删除，直接用 `ct` 调方法；保留 `cur_cell`/`cur_thread` 打印（`cur_thread` 现在打印 `*(OopDesc**)ct` 即 cell 内容地址，仅供与旧日志对照）。
+
+### 本轮代码改动（v02.05）
+
+- `phoneme-cldc/src/vm/os/vita/OS_vita.cpp`：wd_snapshot 修 bug；`vita_site_java_frame`/`vita_site_dump_java`/`vita_java_sample_count`；wd_snapshot 补 `rt_ticks/ttk/jsmp` 行；访问器 extern 声明两条
+- `phoneme-cldc/src/vm/share/runtime/Thread.cpp`：`_vita_ttk_count` 定义 + timer_tick 顶部计数与采样调用（`#if defined(VITA)`）
+- `phoneme-cldc/src/vm/share/runtime/Scheduler.cpp`：`vita_sched_rt_ticks`/`vita_sched_ttk_count` 访问器 + `_vita_ttk_count` extern 声明
+- `phoneme-cldc/src/vm/os/vita/Globals_vita.hpp`：三条新声明
+- `vita-port/src/vita_watchdog.c`：HANG 链补 `vita_site_dump_java`
+- `vita-port/CMakeLists.txt`：版本 02.05 + 注释块
+- 产物：`vita-port/out/vpk/midp_vita_v02.05.vpk`（构建后回填字节/构建号）
+
+### 遗留风险
+
+- `vita_site_java_frame` 在 timer_tick 顶部构造 JavaFrame——若冻结发生在**汇编 berth stub 循环**（无 Java 帧），`f.method()` 可能读到残帧/空帧：探针对 NULL Symbol 已防御，但**名字可能停在冻结前最后一帧**，判读时需与 samples 计数联动（samples 冻结=名字不可全信；samples 攀升=名字可信）。
+- `_rt_timer_ticks` 是 int 非原子，watchdog 跨线程读可能撕裂——仅用于"是否还在攀升"的定性判读，不做精确值。

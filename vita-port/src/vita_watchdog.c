@@ -59,6 +59,7 @@ extern volatile SceUID vita_tone_tid;
 extern void vita_site_dump(const char *path);
 extern void vita_site_dump_verify(const char *path);
 extern void vita_site_dump_clinit(const char *path);
+extern void vita_site_dump_java(const char *path);
 /* v01.95: live-globals snapshot compiled into the VM image - reads
  * _current_thread/status/pending/jsp, VerifyOnly, scheduler counters
  * from the frozen-but-mapped process (the coredump cannot see them). */
@@ -312,6 +313,11 @@ static int wd_thread_routine(SceSize args, void *argp) {
          * hang began (log14 froze with the verifier off, spin moved
          * into clinit execution itself). */
         vita_site_dump_clinit("ux0:/data/J2ME00001/site_ring.log");
+        /* v02.05: name the Java class.method the interpreter was in at
+         * the last timer tick (log29: every lane/pump counter frozen
+         * while pc sat in Thread::timer_tick - this names the loop
+         * and its sample count separates the surviving hypotheses). */
+        vita_site_dump_java("ux0:/data/J2ME00001/site_ring.log");
         /* v01.95: live-globals snapshot FIRST (it dereferences VM data
          * structures; if the VM image ever gets unmapped mid-crash the
          * ring dumps below still ran). log21: the coredump's capture

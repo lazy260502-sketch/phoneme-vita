@@ -838,7 +838,34 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.04")
+set(VITA_VERSION  "02.05")
+# 02.05 (2026-10-14): log29 verdict + forensic upgrade.
+#   log29 RE-ANALYZED the log27/28 coredumps with a properly anchored
+#   symbolization (4 independent anchors incl. the wd "DRES" write):
+#   the old slide was off by 0x37040, so every "pc in .rodata / ring
+#   pointing at libpng/stdio" claim in the log27/28 analyses was an
+#   artifact. Real scene: VM healthy-looking at
+#   interpreter_timer_tick+0x14, but ALL liveness frozen (fast=372
+#   slow=0 pump=381==CE switch=188996, clinit=UI count=35) - the
+#   log23 "pure Java compute starves the event pump" fingerprint
+#   again. Also found+fixed: v02.01's wd_snapshot double-dereference
+#   bug (Thread* is a handle cell; method calls already dereference
+#   through it - the explicit *(OopDesc**)ct read garbage fields).
+#   v02.05 forensics (to split the 3 surviving hypotheses: (a)
+#   back-branch checkpoints dead, (b) timer_tick entered but never
+#   completes, (c) completes but yield bails early):
+#   - Thread::timer_tick entry counter (_vita_ttk_count, accessor
+#     vita_sched_ttk_count) + _rt_timer_ticks snapshot (accessor
+#     vita_sched_rt_ticks): rt_ticks climbing with ttk frozen = (a);
+#     both frozen together = (b)/(c).
+#   - vita_site_java_frame: samples the current Java class.method at
+#     the top of Thread::timer_tick (length-bounded Symbol copy,
+#     PRODUCT-safe) - names the Java loop; sample count climbing with
+#     lanes frozen kills (a) outright.
+#   - wd_snapshot prints rt_ticks/ttk/jsmp; watchdog dumps
+#     vita_site_dump_java into site_ring.log.
+#   CLDC: OS_vita.cpp + Thread.cpp + Scheduler.cpp + Globals_vita.hpp,
+#   all inside #if defined(VITA); vita-port: vita_watchdog.c.
 # 02.01 (2026-09-22): log26 verdict - v02.00 sleep_forever theory FALSIFIED.
 #   Fresh dump with the fixed queue dump shows sf=0/0/0 (sleep_forever
 #   never entered) because the priority queue is NEVER empty: ghost

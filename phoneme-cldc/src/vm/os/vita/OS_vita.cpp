@@ -491,6 +491,93 @@ void vita_site_clinit_return(void) {
         vita_clinit_depth--;
 }
 
+/*=========================================================================
+ * v02.05 interpreter Java-site sampling: log29's verdict (overturning
+ * log27/28 - those symbolizations were slide-error artifacts) is the
+ * log23 fingerprint: every liveness counter frozen (fast=372 slow=0
+ * pump=381==CE switch=188996, clinit=com/app/filemanager/UI) while
+ * the VM thread pc sat at interpreter_timer_tick+0x14. Three
+ * hypotheses survive: (a) the interpreter no longer passes back-
+ * branch checkpoints (the pc sample was the last instant before the
+ * freeze), (b) checkpoints fire but Thread::timer_tick never
+ * completes (frozen mid-call), (c) they fire and complete but the
+ * yield inside bails early every time. This probe samples the
+ * CURRENT Java class.method from the top of Thread::timer_tick (the
+ * exact function the frozen pc pointed into): a sample count that
+ * keeps CLIMBING while the lane/pump counters stay frozen kills (a)
+ * and names the Java loop; a frozen count confirms (a). Written from
+ * the VM thread (single writer, same discipline as the verifier and
+ * clinit hooks), read by the watchdog through sceIo only.
+ * PRODUCT-safe: explicit length-bounded Symbol copies only - no
+ * Stream/Signature parsing (Method::print_name_on is
+ * USE_DEBUG_PRINTING-gated and empty in PRODUCT builds).
+ *=======================================================================*/
+
+static char vita_java_class_name[64];
+static char vita_java_method_name[64];
+volatile unsigned int vita_java_sample_count = 0;
+
+/* Called from the top of Thread::timer_tick (see Thread.cpp) on the
+ * VM thread. JavaFrame construction matches the ENABLE_PROFILER block
+ * that upstream ships at the same point - the frame at a timer tick
+ * is always an interpreted Java frame. */
+void vita_site_java_frame(void) {
+    vita_java_sample_count++;
+    /* JavaFrame(Thread*) matches the upstream ENABLE_PROFILER block at
+     * this exact point in Thread::timer_tick - the frame at a timer
+     * tick is always an interpreted Java frame. */
+    Thread *thread = Thread::current();
+    JavaFrame f(thread);
+    Method m(f.method());
+    Symbol::Raw mn = m().name();
+    if (mn.not_null()) {
+        int len = mn().length();
+        char *src = mn().base_address();
+        int i = 0;
+        if (src && len > 0) {
+            if (len > 63) len = 63;
+            for (; i < len; i++)
+                vita_java_method_name[i] = src[i];
+        }
+        vita_java_method_name[i] = 0;
+    }
+    InstanceClass::Raw h = m().holder();
+    if (h.not_null()) {
+        Symbol::Raw cn = h().name();
+        if (cn.not_null()) {
+            int len = cn().length();
+            char *src = cn().base_address();
+            int i = 0;
+            if (src && len > 0) {
+                if (len > 63) len = 63;
+                for (; i < len; i++)
+                    vita_java_class_name[i] = src[i];
+            }
+            vita_java_class_name[i] = 0;
+        }
+    }
+}
+
+/* Called from the watchdog thread after a HANG. Appends the sampled
+ * Java site (if any) to the site ring log, plus the counter that
+ * separates "interpreter still ticking" from "checkpoints dead". */
+void vita_site_dump_java(const char *path) {
+    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                          0777);
+    if (fd < 0) return;
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "java site=%s.%s\n",
+                     vita_java_class_name[0] ? vita_java_class_name
+                                             : "(none)",
+                     vita_java_method_name[0] ? vita_java_method_name
+                                              : "(none)");
+    sceIoWrite(fd, buf, n);
+    n = snprintf(buf, sizeof(buf), "java samples=%u\n",
+                 vita_java_sample_count);
+    sceIoWrite(fd, buf, n);
+    sceIoClose(fd);
+}
+
 /* Called by the launcher watchdog thread after a HANG is detected.
  * Slot (seq-1)&15 is the newest site; ordering below is newest first. */
 void vita_site_dump(const char *path) {
@@ -554,6 +641,10 @@ extern "C" {
     /* v02.01: dispatch counters (see Scheduler.cpp). */
     unsigned int vita_sched_gnrt_hits(void);
     unsigned int vita_sched_gnrt_nulls(void);
+    /* v02.05: timer-tick chain forensics (see Scheduler.cpp) -
+     * _rt_timer_ticks snapshot + Thread::timer_tick entry count. */
+    unsigned int vita_sched_rt_ticks(void);
+    unsigned int vita_sched_ttk_count(void);
     int  vita_sched_dump_threads(char *out, int out_size);
 }
 
@@ -566,26 +657,29 @@ void vita_wd_snapshot(const char *path) {
 
     /* Thread::current() expands to (Thread*)&_current_thread, i.e.
      * &jvm_fast_globals.current_thread - the handle cell itself.
-     * v02.01: also dereference the cell - log26 showed the raw cell
-     * address (0x81401d10, stable across runs) being mistaken for the
-     * thread object; the TLS note proves the actual current thread is
-     * the cell CONTENTS (= id4 at hang). */
+     * v02.05 FIX: v02.01 added an explicit second dereference here
+     * (cur = *(OopDesc**)ct) and then called cur->status() etc. But
+     * phoneME handles are "method call dereferences *this": ct->foo()
+     * already reads through the cell. The explicit deref made every
+     * read land one OopDesc header off - log29's wd_snapshot printed
+     * garbage for status/pending/jsp. Use ct directly; keep printing
+     * the cell contents address (not dereferenced again) for run-to-
+     * run comparison with the older logs. */
     Thread *ct = Thread::current();
-    Thread *cur = (Thread *)(*(OopDesc **)ct);
     n = snprintf(buf, sizeof(buf),
                  "wd_snapshot cur_cell=0x%08x cur_thread=0x%08x\n",
                  (unsigned int)(unsigned long)ct,
-                 (unsigned int)(unsigned long)cur);
+                 (unsigned int)(unsigned long)*(OopDesc **)ct);
     sceIoWrite(fd, buf, n);
 
-    if (cur != NULL && (unsigned int)(unsigned long)cur > 0x1000) {
-        jint st = cur->status();
-        ReturnOop pe = cur->pending_entries();
+    if (ct != NULL && (unsigned int)(unsigned long)*(OopDesc **)ct > 0x1000) {
+        jint st = ct->status();
+        ReturnOop pe = ct->pending_entries();
         n = snprintf(buf, sizeof(buf),
                      "  status=0x%08x pending=0x%08x jsp=0x%08x\n",
                      (unsigned int)st,
                      (unsigned int)(unsigned long)pe,
-                     (unsigned int)cur->stack_pointer());
+                     (unsigned int)ct->stack_pointer());
         sceIoWrite(fd, buf, n);
         if (st & THREAD_TERMINATING)
             sceIoWrite(fd, "  TERMINATING\n", 14);
@@ -605,6 +699,20 @@ void vita_wd_snapshot(const char *path) {
     n = snprintf(buf, sizeof(buf),
                  "  timer_ticked=%d ev_readiness=%d\n",
                  vita_sched_timer_ticked(), vita_sched_ev_readiness());
+    sceIoWrite(fd, buf, n);
+    /* v02.05: timer-tick chain - log29 froze with pc inside
+     * Thread::timer_tick while every lane/pump counter was frozen.
+     * rt_ticks is the raw _rt_timer_ticks global (ticker writes it,
+     * clear_timer_tick zeroes it after a completed Thread::timer_tick);
+     * ttk is the entry count of Thread::timer_tick itself. The pair
+     * separates "ticker alive but back-branch checkpoints dead"
+     * (rt_ticks climbing, ttk frozen) from "checkpoints fire but
+     * timer_tick never completes" (ttk frozen at a value that stopped
+     * advancing WITH rt_ticks, sample count also frozen). */
+    n = snprintf(buf, sizeof(buf),
+                 "  rt_ticks=%u ttk=%u jsmp=%u\n",
+                 vita_sched_rt_ticks(), vita_sched_ttk_count(),
+                 vita_java_sample_count);
     sceIoWrite(fd, buf, n);
     /* v01.98: log22 quantified the ping-pong but could not separate
      * "pump starving in the fast lane" from "pump running but
