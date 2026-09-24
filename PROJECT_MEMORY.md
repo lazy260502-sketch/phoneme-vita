@@ -4675,7 +4675,7 @@ ticker 活着（每 10ms `real_time_tick` → `Thread::set_timer_tick` → `_rt_
 - `phoneme-cldc/src/vm/os/vita/Globals_vita.hpp`：三条新声明
 - `vita-port/src/vita_watchdog.c`：HANG 链补 `vita_site_dump_java`
 - `vita-port/CMakeLists.txt`：版本 02.05 + 注释块
-- 产物：`vita-port/out/vpk/midp_vita_v02.05.vpk`（构建后回填字节/构建号）
+- 产物：`vita-port/out/vpk/midp_vita_v02.05.vpk`（3652606B，b324，版本串 `J2ME Player v02.05 b324 (9d221a2)`）；.sym 4287160B（下轮 coredump 符号化用，注意按 log29 换算公式重算 slide）
 
 ### 遗留风险
 
