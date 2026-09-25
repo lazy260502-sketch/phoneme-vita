@@ -4924,3 +4924,14 @@ Skeleton 的 C++ 桩只是声明）。
 - `runClocks d>0` + 某核 tid=vm → **线程真在跑**：转内核态自旋方向（联系 SceKernel 等待链）或 userland 活锁（q5 乒乓破局——给 wait_for 加看门狗）。
 - `runClocks d==0` + 无核持有 vm → **账本幽灵**：调度位丢失复活（但形态变为"账本 RUNNING 却从未派发"），需内核侧取证。
 - `runstatus vm cpuN=tid...` 里 vm 持续在场但 runClocks 不动 → 内核统计自身矛盾，报 Vita 内核 bug 方向。
+
+## 2026-09-25 log33 分析（v02.08 / build e984a29 / b329）：runClocks d=0 —— 账本幽灵实锤，两假说同灭，runstatus 装置自毁定因
+
+判决与全部证据链见 `debug/logs/log33/ANALYSIS.md`。要点：
+
+- **vm runClocks d=0（500ms 零周期）、release 冻结、tone d=2005 / wd d=1662 正常** → 内核自旋（烧核必增）与 userland 活锁（烧 CPU 必增）一并死亡；**账本幽灵实锤**（账本 RUNNING(cpu=1) 但从未派发）。
+- 与 log32 三刺全 rc=成功却无效自洽：对账本"在核上"的线程，affinity/priority 改写不触碰任何 runqueue。
+- **wd 死因**：v02.08 runstatus 块——SDK `SceKernelThreadRunStatus` 52 字节 vs 内核写 0x178 字节 → 栈砸、返回地址打飞（fault 0x352e27 奇地址野跳转；log 断流于 runstatus 行前；site_ring 未创建；core 内 wd 块无 DRES 锚点）。判决数据恰因采样先行而幸存。
+- 冻点四连（log30-33 全在 yield/换出路径）：本轮 `interpreter_timer_tick+0x10`（slide=0x16000）——pc 残点=换出残留实锤，与 d=0 互证。
+- v02.09（d013e54）：runstatus 安全化（静态 1KiB 缓冲 + hex dump + 3 采样 MOVING/frozen）后置；KICK0=`sceKernelSendSignal`（对账本 RUNNING 线程唯一能触碰派发状态的原语）；KICK4=`sceKernelChangeThreadPriority2`（stub 有、头文件无，即时生效变体）。
+- log34 判读：KICK0 rc=0+ce 恢复=幽灵治疗成功；4 核表持续无 vm=幽灵终审；全无效则携 hex dump 转内核 bug 方向。
