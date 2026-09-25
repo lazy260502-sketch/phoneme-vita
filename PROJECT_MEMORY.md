@@ -4747,3 +4747,27 @@ watchdog：`HANG ce=401 polls=12 tick=1660` 双时钟健康；VM `RUNNING wait=n
 3. coredump 之外补一份 `sceKernelGetThreadInfo` 全字段 dump（HANG 链内、abort 前）。
 4. 观察点：VM 主线程创建路径（midp_run / JVM_Start）的 affinity 设置是否有历史遗留（如 `sceKernelCreateThread` attr 未设 affinity 默认单核？查 main.c 创建参数）。
 5. crumb 侧 `[pte] sem create` 洪流（sem_init/pthread_mutex_init，v02.05 前日志）与挂死时间相关性——次要，先不动。
+
+## 2026-10-15 v02.06 装置实施（build 9ff6fe2 / b326）：affinity 取证 + 治疗性 kick
+
+对应 log30 章节五条计划中 ①②③④ 的落地（⑤暂缓）。产物 `out/vpk/midp_vita_v02.06.vpk`（3653964B，md5 f1d4f554a2da59fd1dca06ecc0d729bf），版本串 `J2ME Player v02.06 b326 (9ff6fe2)`。
+
+### 改动内容（vita-port，3 文件 +101/-4）
+
+- `vita_watchdog.c`：
+  - `wd_dump_thread()` 线程行补 `attr / aff=0x%x(init 0x%x) / cpu / lastcpu / preempt` 五字段（SceKernelThreadInfo 已有，仅打印）。
+  - **治疗性 KICK**（HANG 链内、所有只读取证之后、data abort 之前）：`sceKernelChangeThreadCpuAffinityMask(vita_wd_vm_tid, 3)` 后以 12×250ms 观察 ce 计数器。
+- `vita_thread_audit.c`：audit 表行补 `aff=0x%x(init 0x%x) attr=0x%x`。
+- `CMakeLists.txt`：版本 02.06；链接清单补 `SceKernelThreadMgr_stub`——**`sceKernelChangeThreadCpuAffinityMask` 只在 ThreadMgr stub 里，SceLibKernel_stub 只重导出 `GetThreadCpuAffinityMask2` 变体**；跨 stub 重复符号由既有 `--allow-multiple-definition`（v01.67）兜底。
+
+### 查证结论（动手前完成）
+
+- SDK 头 `threadmgr.h:355/365`：`sceKernelGetThreadCpuAffinityMask(SceUID)` / `sceKernelChangeThreadCpuAffinityMask(SceUID, int mask)` 均存在；stub 符号 `nm` 确认。
+- VM 主线程不是自建线程：`vita_main.c` 直接 `vita_wd_vm_tid = sceKernelGetThreadId()`——就是引导进程主线程，无 `sceKernelCreateThread` attr 历史遗留可言，affinity 只能运行时观察/修改（计划④排除，无源代码级遗留）。
+
+### 下次 HANG 的判读表
+
+- wd/audit 线程行 `aff==0 或单核 且 cpu!=lastcpu` → **调度位丢失实锤路径**（READY 但 per-core runqueue 没摘到）。
+- `[WD] KICK RECOVERED (ce X -> Y)` → **假说实锤 + kick 即 shipping workaround**（恢复后 watchdog 重新武装，最多 3 次；第 4 次挂起改走 data abort 拿 coredump，捕捉复发现场的内核侧状态）。
+- `KICK no effect` → 假说存疑，按原流程 coredump；affinity 字段仍提供旁证。
+- 注意：KICK 恢复场景下 ring/snapshot dump 已先行落盘（kick 前执行），不影响取证完整性；但 abort 前的 `requesting coredump via data abort` 日志不会出现，属预期。
