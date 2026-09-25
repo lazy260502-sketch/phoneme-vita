@@ -4936,6 +4936,50 @@ Skeleton 的 C++ 桩只是声明）。
 - v02.09（d013e54）：runstatus 安全化（静态 1KiB 缓冲 + hex dump + 3 采样 MOVING/frozen）后置；KICK0=`sceKernelSendSignal`（对账本 RUNNING 线程唯一能触碰派发状态的原语）；KICK4=`sceKernelChangeThreadPriority2`（stub 有、头文件无，即时生效变体）。
 - log34 判读：KICK0 rc=0+ce 恢复=幽灵治疗成功；4 核表持续无 vm=幽灵终审；全无效则携 hex dump 转内核 bug 方向。
 
+## 2026-09-25 log35 分析（v02.10 / build b332）：**根因找到——VM 卡在绿灯无界 park，tick 无法打断等待（移植层丢失 EINTR 语义）**
+
+判决与全部证据链见 `debug/logs/log35/ANALYSIS.md`。要点：
+
+- **地址映射钉死**：slide=0x77000，两条**指令级**锚点互证——① wd 自己的 DRES
+  `0x8108578a`→vma `0x8100e78a` = `str r2,[r3,#0]`（r3=0x81000000）；② vm pc `0x81133a90`→`0x810bca90`
+  = `interpreter_timer_tick+0x24`。核心转储 `THREAD_REG_INFO` 布局解出：块基址 0x1e9c、步长 0x178、
+  **`+0x040` = saved PC**；5 线程全部符号化（vm / 外来系统线程 tid=0x400100c3 / tone / wd=DRES / ticker），
+  tone+ticker 的 pc 都落在 `SceThreadmgr` fstub（各自在 delay 里）→ 交叉验证换算正确。
+- **d=0 四连**（`vm runClocks 10227223 -> 10227223`；tone d=2002 / wd d=1642 健康对照）。
+- **KICK 全灭且路线终结**：KICK0/1/2/3/4 全部"rc 成功但 ce 394→394 无效果"；
+  **KICK5 `SuspendThreadForVM`/`ResumeThreadForVM` rc=`0x80020008` = SCE_KERNEL_ERROR_ILLEGAL_PERMISSION**
+  （特权原语）→ 能改派发状态的那条路**封死**。原因：线程停在**合法内核等待**里，
+  信号/亲和/优先级都不触碰其等待状态。
+- **sysinfo 的 "cpu0 冻结" 降级为噪声**：cpu0 idle/idleN/switchN 三项 200ms 全冻，但 cpu0 = wd 自己
+  （其 pc 正是自陷那条 DRES），且快照里另有外来系统线程；vm `aff=0x70000` **不含 cpu0**。
+  → 不是独立楔死，不作为证据。
+- **决定性新证据（本轮首次看清）**：site 快照 `active_count=5 async_count=1`，
+  **五个 Java 线程全部 `wait=<对象>`**（4 个 no-timeout），`timer_ticked=1 ev_readiness=0`，
+  **`rt_ticks=1341 ttk=357 jsmp=357` → 约 984 个 tick 被 raise 却从未被消费**；
+  site ring `frozen=yes`，`site[0]=wait_for+0x54`、`site[1]=pump_events_vita+0x8`；
+  `lanes fast=382 slow=0 pump=394 switch=190999`。
+- **与 log23 指纹逐字节复现**（fast/switch/pump==CE/clinit=`com/app/filemanager/UI` 全同）
+  → 长期存在、可复现的同一 bug，**非 v02.09/v02.10 回归**。
+- **根因（源码级）**：`Scheduler::yield()` 无 runnable → park →
+  `wait_for_event_or_timer(sleeper_found=false)`；因 `scheduler_async()` **非空**（`async_count=1`，
+  上游注释"Vita 上恒为空"已不成立）走 **`sleep_time = -1`（睡到有事件为止）** →
+  `master_mode_wait_for_event_or_timer(-1)` → `Os::suspend_ticks()`（**Vita 实现只是
+  `ticker_running=false`，并非真挂起线程**）→ `check_blocked_threads(-1)`
+  → `JVMSPI_CheckEvents(..., -1)` **内核无限阻塞、0 CPU**（= d=0 的直接解释）。
+  **ticker 是独立线程，`real_time_tick` 只在它自己线程置 flag，无法像 Linux ITIMER 信号那样
+  EINTR 打断这次阻塞**——Linux 的 `suspend_ticks()` 本意就是关掉 ITIMER 防止乱打断，
+  Vita 照抄了调用点却**没有对应中断源**。于是 tick 堆积、输入事件无人投递、永久无响应，
+  而内核账本仍记 RUNNING(cpu=2) → **账本幽灵**。
+  （"按键几次就挂死"= MIDlet 消费完手上按键后进入等待，下一个按键事件永远送不达。）
+- **v02.11 首选修复（单点、最小、`#if defined(VITA)` 隔离）**：
+  `master_mode_wait_for_event_or_timer()` 里按 debugger 夹紧先例加钳位——
+  `if (sleep_time < 0 || sleep_time > TickInterval) sleep_time = TickInterval;`
+  → park 每 ≤1 tick 返回，周期性回到 pump/`check_blocked_threads` 排水；顺带不再触发假挂起。
+  加固：`suspend_ticks()/resume_ticks()` 在 Vita 上做**真** `sceKernelSuspendThread/ResumeThread`；
+  在 park 循环加 `vita_site_mark_e` + `sleep_time/sleeper_found/_async_count` 数值打点。
+- 待查（遗留）：`async_count` 的来源（谁注册的 async）；`Main_vita.cpp:78` 对 `timeout=-1` 的
+  实际处理（若 ANI 内部改有限循环，则冻结点需用新打点定位）；q5 两元素环重复打印是 dump 形态还是链表自环。
+
 ## 2026-09-25 log34 分析（v02.09 / build 8bf56ee / b330 实弹）：runstatus 二杀 wd（死在内核）+ site_ring 终局（VM 冻结于 wait_for 停车点）
 
 判决与全部证据链见 `debug/logs/log34/ANALYSIS.md`。要点：
