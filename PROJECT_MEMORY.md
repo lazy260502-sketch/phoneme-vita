@@ -4681,3 +4681,69 @@ ticker 活着（每 10ms `real_time_tick` → `Thread::set_timer_tick` → `_rt_
 
 - `vita_site_java_frame` 在 timer_tick 顶部构造 JavaFrame——若冻结发生在**汇编 berth stub 循环**（无 Java 帧），`f.method()` 可能读到残帧/空帧：探针对 NULL Symbol 已防御，但**名字可能停在冻结前最后一帧**，判读时需与 samples 计数联动（samples 冻结=名字不可全信；samples 攀升=名字可信）。
 - `_rt_timer_ticks` 是 int 非原子，watchdog 跨线程读可能撕裂——仅用于"是否还在攀升"的定性判读，不做精确值。
+
+## 2026-10-14 log30 分析（v02.05 / build 9d221a2 系）：三假说全灭 + 判决转向"内核调度位丢失"
+
+### 定标（per-build 必做）
+
+- 本 build slide = **0x32000**（`symtab = runtime − 0x32000`；MODULE_INFO 里 midp_vita text 基址三处 0x81032000，ELF text 基址 0x81000000，绝对闭合）。
+- 四锚点验证一致：site_ring self=0x81086290↔symtab 0x81054290；tone creator 0x8103eec1↔`javacall_media_initialize+0x5d`；wd creator 0x81040385↔`vita_watchdog_start+0x2d`；ticker creator 0x8108650c↔`JvmOs::start_ticks+0x6c`。
+- log29 是 0x37000——**slide 是 per-build 的，永无通用常数**（log27/28/29 三轮教训的根源）。psp2core dump 是 gzip 包装（非裸 ELF，自写解析器要先 `gzip.decompress`）。
+
+### 关键数据（v02.05 探针全量生效）
+
+watchdog：`HANG ce=401 polls=12 tick=1660` 双时钟健康；VM `RUNNING wait=none`；3 注册线程。wd_snapshot（双重解引用修复后首次）：
+`status=0x0 pending=0x0 jsp=0x81edef60 active_count=5` 全部合理；**核心三值 `rt_ticks=394 ttk=349 jsmp=349`**（ticker 挂死后仍积压 394 tick ≈3.94s；timer_tick 总进入 349 次且每入必采到样）；lanes fast=381 slow=0 **pump=401==ce** switch=189669 sf=0/0/0 gnrt=0/0；timer_ticked=1 ev_readiness=0；clinit=`com/app/filemanager/UI` count=35 depth=0 gc=0 preload=864；`java site=.unknown..preprocess samples=349`；input 最后键 `0x10`(DOWN) 后心跳断（与 log21/22/23/24/29 同触发指纹）。
+
+### 三假说判决（本轮目标，全部证伪）
+
+| 假说 | 判决 | 证据链 |
+|---|---|---|
+| (a) 检查点死（解释器不过 back-branch） | **存活但降级**：不在"纯 Java 循环"形态 | ttk=jsmp=349：第 349 次 timer_tick 进去了且采到了 Java 样；但 rt_ticks=394 说明之后再无第 350 次。若 Java 循环还在转必再进 |
+| (b) timer_tick 永不完成 | **证伪** | VM 线程 pc 不在 timer_tick/任何 C++ 函数内（见下） |
+| (c) yield 早退循环 | **证伪** | ring 尾部 6×`switch_thread+0x28` 无一 pump mark；switch_thread 顶部无条件 `pump_events_vita()`，早退循环必留 pump 痕迹 |
+
+再加 ring 时序（seq=191131，mod 16=11 → 时间序 [10]→…→[11]，尾 6 槽全 switch 无 pump）：**挂死起点的最后动作是纯粹的线程切换**——第 349 次 timer_tick 完成后（rt_ticks 清 0），切到某线程，然后一切冻结。
+
+### VM 线程冻点符号化（本轮决定性证据）
+
+- 寄存器：pc=0x810ee62c→symtab 0x810bc62c = **`start_lightweight_thread_asm+0x18`**；lr=trampoline 入口；fp=0；r0=r3=0x81eddfb4（=wd_snapshot cur_thread ✓）；cpsr=0x40070010（Z=1）；sp=0x8137ffb0。
+- threads27.py 标的 "inflate+0xee0" 是**未减 slide 的假象**（工具无 slide 处理，第三次踩中）。
+- OS 栈（sp→栈顶 0x50 字节内）唯一返回地址 `JVM::start+0x178`——green-thread 模型正常形态（Java 执行全在 Java 栈）。
+- **指令级判读**：+0x18 是 `bleq invoke_pending_entries`，目标 stub 头两条：`pending==NULL ? 返回 : 调 shared_entry`。wd_snapshot 显示该线程 `pending=0x0`、status=0x0——**分支会走且目标立即返回**。冻点与 +0x14 之间无任何可阻塞指令。
+- 语义：这是**新 green 线程首次调度点**（`setup_stack_asm` 布置的返回地址链：lightweight_thread_exit→uncaught→finish→force_terminated→start_lightweight_thread_asm）。VM 冻在"刚切到一个新线程、trampoline 都没走完第一步"处。
+- log29 冻点 `interpreter_timer_tick+0x14` 同为**桩区无害指令**（bl shared_call_vm 后恢复寄存器返回解释器 dispatch 的尾部）——两轮 pc 全部停在"无害指令、下一步本该正常继续"的位置。
+
+### q5 "幽灵环" 勘误（log26 判定作废）
+
+- 打印项恰 **48 = `VITA_SCHED_DUMP_MAX`**：`add_to_list` 上游注释原文 "the list **is circular**"，首元素 `set_next(thread)` 自环，打印循环无环检测只截断到 48。3 线程（id4/3/2）×16 圈 = 48 项。
+- **q5 环形打印是正常形态，不是队列损坏**。log26 "幽灵环/berth stub 环"判决中"环"的部分作废。
+- 取证装置缺陷顺带记录：**`_vita_gnrt_hits` 从未被递增**（v02.01 只写了 `nulls++`，hits 分支漏了），gnrt=0/0 里 hits 位无信息量，只有 nulls=0 有效。
+
+### 综合判决（log30 定案方向）
+
+全部 user-space 证据收敛到同一结论：**冻结瞬间 VM 线程持有 CPU 且停在一条本会正常完成的指令上，没有任何 user-space 循环/等待/异常路径能解释"停在那不动"**。结合：
+
+1. pc 停在无害指令、下一步必走（bleq 条件成立、目标秒回）
+2. OS 栈空、无锁等待（wait=none）、无 pending exception
+3. 双时钟健康（d=100/kd=100063）排除机器暂停
+4. **真机独有**（Vita3K 从不挂）——模拟器无真机内核调度器
+5. HANG 时 VM status=RUNNING——但 Vita 真机双核 per-core runqueue，`sceKernelGetThreadInfo.status` 的 RUNNING 可能实为"READY 且绑定核上没有对手"——**该核调度位从未再给 VM 线程**
+
+→ **新头号假说：内核调度位丢失（thread stuck in READY / per-core runqueue 异常）**——即真机某次上下文切换后，VM 线程被置回 READY 却从未再被 pick（或 affinity/优先级瞬时异常使其饿死在 runqueue 里）。这是纯内核态现象，完美解释：真机挂/Vita3K 不挂、user-space 全冻结、pc 停在任意无害指令、多轮复现同指纹。
+
+### 与旧假说谱系的关系
+
+- log23-24 "纯 Java 计算饿死泵"：v01.99 修复后 pump=ce 依旧冻结，且 log29/30 pc 都停在桩区——**该谱系已不解释 log29/30**（但 log23 时代的 pump 确实死过，修复真实有效）。
+- log26 "幽灵环"：环=正常形态，作废。
+- log27/28 "执行流损坏"：符号化假象，已作废。
+- log19/9 "spawn/die 环"：ring 无 Scheduler::start/start0 mark 残留，本轮排除。
+- 唯一贯穿 log9→log30 不变的核心事实：**挂死指纹完全一致**（同游戏、0x40/0x10 触发、~3-4s、全冻结、pc 停无害指令）——**这是同一个内核级 bug 的稳定复现**。
+
+### 下轮取证计划（v02.06）
+
+1. **watchdog 线程行补 `currentCpuAffinityMask/currentCpuId/lastExecutedCpuId/attr`**（SceKernelThreadInfo 已有字段，只需打印）——HANG 时看 VM 线程是否 READY/affinity 异常。判读表：`affinity=0 或单核 且 cpuid≠lastcpu` → 调度位丢失实锤路径。
+2. HANG 时主动 `sceKernelChangeThreadCpuAffinityMask(vm_tid, 3)` 或 `sceKernelReleaseThreadRenice`/提高优先级，观察是否恢复——**直接治疗性试探**（若恢复=调度位假说实锤，且就是 workaround 本体）。
+3. coredump 之外补一份 `sceKernelGetThreadInfo` 全字段 dump（HANG 链内、abort 前）。
+4. 观察点：VM 主线程创建路径（midp_run / JVM_Start）的 affinity 设置是否有历史遗留（如 `sceKernelCreateThread` attr 未设 affinity 默认单核？查 main.c 创建参数）。
+5. crumb 侧 `[pte] sem create` 洪流（sem_init/pthread_mutex_init，v02.05 前日志）与挂死时间相关性——次要，先不动。

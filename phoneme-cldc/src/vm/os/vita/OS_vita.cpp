@@ -528,7 +528,9 @@ void vita_site_java_frame(void) {
      * tick is always an interpreted Java frame. */
     Thread *thread = Thread::current();
     JavaFrame f(thread);
-    Method m(f.method());
+    /* Raw handles: the () operator (returning the stack-handle view)
+     * only exists on the ::Raw forms, not on Method directly. */
+    Method::Raw m(f.method());
     Symbol::Raw mn = m().name();
     if (mn.not_null()) {
         int len = mn().length();
