@@ -838,7 +838,33 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.09")
+set(VITA_VERSION  "02.10")
+# 02.10 (2026-10-27): log34 verdict + final kick battery.
+#   log34 ran v02.09 on real HW: runClocks d=0 re-confirmed (the vm
+#   thread NEVER executes while the ledger says RUNNING), and the
+#   "safe" 1 KiB static runstatus buffer STILL killed the watchdog -
+#   pc sat on the instruction AFTER the GetThreadRunStatus blx with
+#   the arguments untouched in r0/r1 and the buffer unmodified: the
+#   syscall itself data-aborts in the kernel while dereferencing the
+#   ghost thread's corrupt control block. Probe RETIRED (2 kills).
+#   The site ring finally completed: VM frozen native stack =
+#   Scheduler::wait_for+0x54 <- pump_events_vita+0x8 (the green
+#   scheduler's idle wait), rt_ticks 573 vs timer_tick 350 (ticker
+#   ran 223 ticks the frozen VM never consumed).
+#   v02.10 changes:
+#   - runstatus probe DELETED; replaced by sceKernelGetSystemInfo
+#     per-core ledger (idleClock/comesOutOfIdleCount/threadSwitch
+#     Count, two samples 200 ms apart) - a GLOBAL instrument that
+#     never touches a per-thread TCB. switchN frozen on a core our
+#     own polling thread runs on => per-core scheduler itself stuck;
+#     switchN moving => only the vm thread ghosts.
+#   - KICK battery MOVED UP (right after the audit table, before the
+#     ring/snapshot captures): the kick is now the main experiment.
+#   - new KICK5: SuspendThreadForVM/ResumeThreadForVM (exported by
+#     the stub, absent from SDK headers) - the only forced stop/
+#     restart primitive for the thread's dispatch state. If it trips
+#     the same corrupt-TCB abort, the psp2core dump still fires.
+# 02.09 (2026-10-26): log33 verdict + safe runstatus + kick0/kick4.
 # 02.08 (2026-09-25): log32 verdict + runClocks/run-status instruments.
 #   log32 ran the three-pronged kick on real HW: ALL THREE prongs were
 #   ACCEPTED and took effect (KICK1 aff->0x30000 returned the old mask

@@ -333,88 +333,37 @@ static int wd_thread_routine(SceSize args, void *argp) {
         vita_thread_audit_dump("ux0:/data/J2ME00001/site_ring.log");
         vita_thread_audit_dump_vm_marker("ux0:/data/J2ME00001/site_ring.log");
 
-        /* v01.84: dump the VM's site ring BEFORE the coredump request.
-         * log10 proved the dump cannot name a native loop running on a
-         * green thread's Java stack; the ring can. It writes with
-         * sceIo* (no stdio) and is safe from this thread. */
-        vita_site_dump("ux0:/data/J2ME00001/site_ring.log");
-        /* v01.85: name the class.method the verifier was on when the
-         * hang began (log11 froze inside verify_class itself). */
-        vita_site_dump_verify("ux0:/data/J2ME00001/site_ring.log");
-        /* v01.88: name the class whose <clinit> was executing when the
-         * hang began (log14 froze with the verifier off, spin moved
-         * into clinit execution itself). */
-        vita_site_dump_clinit("ux0:/data/J2ME00001/site_ring.log");
-        /* v02.05: name the Java class.method the interpreter was in at
-         * the last timer tick (log29: every lane/pump counter frozen
-         * while pc sat in Thread::timer_tick - this names the loop
-         * and its sample count separates the surviving hypotheses). */
-        vita_site_dump_java("ux0:/data/J2ME00001/site_ring.log");
-        /* v01.95: live-globals snapshot FIRST (it dereferences VM data
-         * structures; if the VM image ever gets unmapped mid-crash the
-         * ring dumps below still ran). log21: the coredump's capture
-         * holes (.data/.bss head, whole Java heap) hid exactly these
-         * values - read them from the patient, not the corpse. */
-        vita_wd_snapshot("ux0:/data/J2ME00001/site_ring.log");
-
-        /* v02.09: per-core "what is running RIGHT NOW" - SAFELY.
-         * log33 lesson (the hard way): the SDK header's
-         * SceKernelThreadRunStatus is 52 bytes, but the kernel writes
-         * 0x178 bytes regardless of the size field - the coredump's
-         * THREAD_REG_INFO blocks ARE 0x178 each. The v02.08 stack
-         * object got smashed past its return address and the
-         * watchdog died right after the (already logged) runClocks
-         * verdict. Now: a STATIC 1 KiB buffer well past anything the
-         * kernel writes, raw hex dump decoded offline against the
-         * THREAD_REG_INFO layout, plus three samples 200 ms apart -
-         * a moving per-core table means the scheduler is alive and
-         * the vm tid's presence/absence in it is the ghost verdict. */
-        {
-            static unsigned int rs_a[256], rs_b[256];
-            char buf[160];
-            int line, i, rc, moved = 0;
-            memset(rs_a, 0xCC, sizeof(rs_a));
-            rc = sceKernelGetThreadRunStatus(
-                vita_wd_vm_tid, (SceKernelThreadRunStatus *)rs_a);
-            for (line = 0; line < 6; line++) {
-                int n = snprintf(buf, sizeof(buf),
-                                 "[WD] runstatus vm rc=0x%x +%03x:",
-                                 rc, line * 16);
-                for (i = 0; i < 4; i++)
-                    n += snprintf(buf + n, sizeof(buf) - n,
-                                  " %08x", rs_a[line * 4 + i]);
-                n += snprintf(buf + n, sizeof(buf) - n, "\n");
-                wd_log(buf, n);
-            }
-            for (i = 1; i <= 2; i++) {
-                sceKernelDelayThread(200 * 1000);
-                memset(rs_b, 0xCC, sizeof(rs_b));
-                sceKernelGetThreadRunStatus(
-                    vita_wd_vm_tid, (SceKernelThreadRunStatus *)rs_b);
-                if (memcmp(rs_a, rs_b, sizeof(rs_a)) != 0) moved = 1;
-                memcpy(rs_a, rs_b, sizeof(rs_a));
-            }
-            {
-                int n = snprintf(buf, sizeof(buf),
-                                 "[WD] runstatus vm 3-sample %s\n",
-                                 moved ? "MOVING" : "frozen");
-                wd_log(buf, n);
-            }
-        }
-
-        /* v02.06: THERAPEUTIC KICK (log30 hypothesis: kernel scheduler
-         * lost the VM thread's run bit - real HW dual-core per-core
-         * runqueues, thread stuck READY but never picked; Vita3K has
-         * no such scheduler, hence emulator-fine / hardware-dead).
-         * After ALL read-only forensics are on disk, rewrite the VM
-         * thread's CPU affinity (mask 3 = both user cores) and see if
-         * it resumes:
-         *   - ce counter moves again => KICK-RECOVERED: hypothesis
-         *     PROVEN, and this very call is the shipping workaround.
-         *   - no movement in 12 x 250 ms => fall through to the data
-         *     abort and take the coredump as before.
-         * Either outcome advances the case; the kick itself cannot
-         * make things worse (a frozen process is already dead). */
+        /* v02.10: THERAPEUTIC KICK - MOVED UP, before the supplementary
+         * ring/snapshot captures. log33/34 already banked two complete
+         * forensic sets (identical picture: d=0 ghost, site ring
+         * wait_for+0x54<-pump_events_vita+0x8, clinit/UI verify
+         * residue); the kick is now the main experiment and must not
+         * be blocked by anything before it. Order preserved from the
+         * verdict instruments above (comparability with log33/34).
+         * Escalating invasiveness:
+         *   KICK0 sceKernelSendSignal      - signal path, re-mark
+         *   KICK1 aff->0x30000             - forced runqueue migration
+         *   KICK2 aff->0x70000             - migration back
+         *   KICK3 prio->0x99               - priority requeue
+         *   KICK4 ChangeThreadPriority2    - immediate priority apply
+         *   KICK5 Suspend/ResumeThreadForVM- forced stop/restart of
+         *                                    the thread's dispatch
+         *                                    state (v02.10, the only
+         *                                    suspend primitive the
+         *                                    stub exports; ForVM
+         *                                    variants are absent
+         *                                    from SDK headers, hence
+         *                                    extern here). If suspend
+         *                                    or resume trips the same
+         *                                    corrupt-TCB path that
+         *                                    killed the runstatus
+         *                                    probe, the kernel data
+         *                                    abort still produces a
+         *                                    psp2core dump - either
+         *                                    way we learn.
+         * Recovery (ce moves) => RE-ARM and keep the process alive:
+         * the winning kick is the shipping workaround. All prongs
+         * dead => fall through to the remaining captures + abort. */
         {
             unsigned int ce_before = vita_ce_count;
             int moved = 0;
@@ -422,30 +371,6 @@ static int wd_thread_routine(SceSize args, void *argp) {
             char buf[128];
             int n;
             int rc;
-            /* log31 lesson: mask 3 was REJECTED (rc=0x80028025
-             * SCE_KERNEL_ERROR_ILLEGAL_CPU_AFFINITY_MASK). Vita's
-             * affinity encoding is NOT 1<<cpu - the vm thread reports
-             * aff=0x70000 (bits 16..18 = all three user cores), other
-             * threads show 0x0 = MASK_DEFAULT. Merely rewriting the
-             * SAME value could be a kernel no-op, so force a real
-             * runqueue migration: narrow to cores 0+1 (0x30000) first,
-             * restore all-core (0x70000) second - each step must take
-             * the thread OFF its current per-core runqueue and requeue
-             * it, which is exactly what a lost-run-bit thread needs. */
-            /* log33 lesson (rc semantics): KICK1 in log32 returned
-             * 0x70000 and KICK2 returned 0x30000 - the syscall
-             * returns the OLD mask on success; 0x8xxxxxxx is error.
-             * The three kicks all "succeeded" and all did nothing,
-             * which log33's runClocks d=0 finally explains: the
-             * kernel ledger says the vm thread is RUNNING on cpu 1,
-             * so affinity/priority changes never touch a runqueue -
-             * you cannot requeue a thread the kernel believes is
-             * on-core. */
-            /* v02.09 KICK0: sceKernelSendSignal - forces the kernel
-             * down the thread-signal path (sets the thread's signal
-             * pattern and, for a mis-marked thread, re-marks it
-             * runnable). This is the one primitive that touches the
-             * dispatch state of a thread the ledger calls RUNNING. */
             rc = sceKernelSendSignal(vita_wd_vm_tid);
             n = snprintf(buf, sizeof(buf),
                          "[WD] KICK0 signal rc=0x%x\n", rc);
@@ -476,10 +401,6 @@ static int wd_thread_routine(SceSize args, void *argp) {
                 }
             }
             if (!moved) {
-                /* last prong: priority nudge - a scheduler-visible
-                 * change that must requeue the thread (0x99 is one
-                 * step above the 0xa0 every other thread uses);
-                 * restore afterwards either way. */
                 rc = sceKernelChangeThreadPriority(vita_wd_vm_tid, 0x99);
                 n = snprintf(buf, sizeof(buf),
                              "[WD] KICK3 prio->0x99 rc=0x%x\n", rc);
@@ -491,12 +412,6 @@ static int wd_thread_routine(SceSize args, void *argp) {
                 sceKernelChangeThreadPriority(vita_wd_vm_tid, 0xa0);
             }
             if (!moved) {
-                /* v02.09 KICK4: ChangeThreadPriority2 - exported by
-                 * the stub but absent from SDK headers; the "2"
-                 * variant applies the change immediately (vs. the
-                 * plain one which is documented as taking effect at
-                 * the next scheduling point - useless for a thread
-                 * that never reaches one). */
                 extern int sceKernelChangeThreadPriority2(SceUID thid,
                                                           int priority);
                 rc = sceKernelChangeThreadPriority2(vita_wd_vm_tid,
@@ -509,6 +424,22 @@ static int wd_thread_routine(SceSize args, void *argp) {
                     if (vita_ce_count != ce_before) { moved = 1; break; }
                 }
                 sceKernelChangeThreadPriority(vita_wd_vm_tid, 0xa0);
+            }
+            if (!moved) {
+                extern int sceKernelSuspendThreadForVM(SceUID thid);
+                extern int sceKernelResumeThreadForVM(SceUID thid);
+                int rs, rr;
+                rs = sceKernelSuspendThreadForVM(vita_wd_vm_tid);
+                sceKernelDelayThread(WD_POLL_MS * 1000);
+                rr = sceKernelResumeThreadForVM(vita_wd_vm_tid);
+                n = snprintf(buf, sizeof(buf),
+                             "[WD] KICK5 susp/res rc=0x%x/0x%x\n",
+                             rs, rr);
+                wd_log(buf, n);
+                for (kpoll = 0; kpoll < 8; kpoll++) {
+                    sceKernelDelayThread(WD_POLL_MS * 1000);
+                    if (vita_ce_count != ce_before) { moved = 1; break; }
+                }
             }
             n = snprintf(buf, sizeof(buf),
                          "[WD] KICK %s (ce %u -> %u)\n",
@@ -539,7 +470,76 @@ static int wd_thread_routine(SceSize args, void *argp) {
                     wd_log(buf, m);
                 }
             }
-            } /* end KICK0 !moved guard (KICK1..KICK4) */
+            } /* end KICK0 !moved guard (KICK1..KICK5) */
+        }
+
+        /* v01.84: dump the VM's site ring BEFORE the coredump request.
+         * log10 proved the dump cannot name a native loop running on a
+         * green thread's Java stack; the ring can. It writes with
+         * sceIo* (no stdio) and is safe from this thread. */
+        vita_site_dump("ux0:/data/J2ME00001/site_ring.log");
+        /* v01.85: name the class.method the verifier was on when the
+         * hang began (log11 froze inside verify_class itself). */
+        vita_site_dump_verify("ux0:/data/J2ME00001/site_ring.log");
+        /* v01.88: name the class whose <clinit> was executing when the
+         * hang began (log14 froze with the verifier off, spin moved
+         * into clinit execution itself). */
+        vita_site_dump_clinit("ux0:/data/J2ME00001/site_ring.log");
+        /* v02.05: name the Java class.method the interpreter was in at
+         * the last timer tick (log29: every lane/pump counter frozen
+         * while pc sat in Thread::timer_tick - this names the loop
+         * and its sample count separates the surviving hypotheses). */
+        vita_site_dump_java("ux0:/data/J2ME00001/site_ring.log");
+        /* v01.95: live-globals snapshot FIRST (it dereferences VM data
+         * structures; if the VM image ever gets unmapped mid-crash the
+         * ring dumps below still ran). log21: the coredump's capture
+         * holes (.data/.bss head, whole Java heap) hid exactly these
+         * values - read them from the patient, not the corpse. */
+        vita_wd_snapshot("ux0:/data/J2ME00001/site_ring.log");
+
+        /* v02.10: per-core scheduler ledger - SAFELY.
+         * log33/34 verdict: sceKernelGetThreadRunStatus on the ghost
+         * thread kills the CALLER inside the kernel (log34: wd died
+         * with pc on the instruction after the blx, args still in
+         * r0/r1, static 1KiB buffer untouched - a kernel-side data
+         * abort on the ghost's corrupt TCB). That probe is RETIRED
+         * permanently. The replacement is the GLOBAL ledger:
+         * sceKernelGetSystemInfo reports per-core idle clock,
+         * idle-exit count and thread SWITCH count and never
+         * dereferences an individual thread's control block.
+         * Two samples 200 ms apart split the remaining cases:
+         * switchN frozen on the cpu the ledger names while our own
+         * polling thread runs => the per-core scheduler itself is
+         * stuck (worse than a single-thread ghost); switchN moving
+         * => cores dispatch fine, only the vm thread ghosts. */
+        {
+            SceKernelSystemInfo si, si2;
+            char buf[160];
+            int n, rc, i;
+            memset(&si, 0xCC, sizeof(si));
+            si.size = sizeof(si);
+            rc = sceKernelGetSystemInfo(&si);
+            sceKernelDelayThread(200 * 1000);
+            memset(&si2, 0xCC, sizeof(si2));
+            si2.size = sizeof(si2);
+            sceKernelGetSystemInfo(&si2);
+            n = snprintf(buf, sizeof(buf),
+                         "[WD] sysinfo rc=0x%x active=0x%x size=%u\n",
+                         rc, si.activeCpuMask, si.size);
+            wd_log(buf, n);
+            for (i = 0; i < 4; i++) {
+                n = snprintf(buf, sizeof(buf),
+                             "[WD] sysinfo cpu%d idle %llu->%llu "
+                             "idleN %u->%u switchN %u->%u\n",
+                             i,
+                             (unsigned long long)si.cpuInfo[i].idleClock,
+                             (unsigned long long)si2.cpuInfo[i].idleClock,
+                             si.cpuInfo[i].comesOutOfIdleCount,
+                             si2.cpuInfo[i].comesOutOfIdleCount,
+                             si.cpuInfo[i].threadSwitchCount,
+                             si2.cpuInfo[i].threadSwitchCount);
+                wd_log(buf, n);
+            }
         }
 
         /* v01.82: log8 nailed the shape of the hang (VM thread RUNNING,
