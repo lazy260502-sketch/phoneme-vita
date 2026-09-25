@@ -838,7 +838,28 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.07")
+set(VITA_VERSION  "02.08")
+# 02.08 (2026-09-25): log32 verdict + runClocks/run-status instruments.
+#   log32 ran the three-pronged kick on real HW: ALL THREE prongs were
+#   ACCEPTED and took effect (KICK1 aff->0x30000 returned the old mask
+#   0x70000, KICK2 aff->0x70000 returned 0x30000 = KICK1's own write,
+#   KICK3 prio rc=0) yet ce never moved. A live-but-migratable thread
+#   that ignores two forced runqueue migrations is not a scheduler
+#   bookkeeping ghost -> run-bit loss via "lost runqueue entry" is
+#   DEAD. What remains: the thread IS executing but its green-thread
+#   machinery never advances ce (userland livelock whose pc residue
+#   lands in tick/trampoline stubs), or kernel-mode spin invisible to
+#   the pc snapshot. Coredump (slide=0x12000, DRES-calibrated) shows
+#   vm pc inside shared_monitor_exit+0x7c, lr=timer_tick+0x10, cpsr
+#   Z=1 - the SAME Z=1+branch-pending fingerprint as log30/31.
+#   v02.08 instruments the decisive split:
+#   - wd_dump_thread now samples runClocks (accumulated CPU cycles)
+#     twice 500 ms apart inside the hang window: d>0 => really on a
+#     core (kernel-mode spin / userland livelock), d==0 => ledger
+#     ghost (never actually dispatched).
+#   - sceKernelGetThreadRunStatus dumps which tid each core is running
+#     right now: if no core ever names the vm tid, RUNNING is fiction.
+#   Both run before the kick so a kick-recovery cannot contaminate them.
 # 02.07 (2026-10-15): log31 verdict + three-pronged KICK.
 #   log31 ran the full v02.06 apparatus on real HW:
 #   - Verdict-table row 1 MISSED: vm thread aff=0x70000 (healthy

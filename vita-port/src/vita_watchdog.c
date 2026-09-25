@@ -152,6 +152,32 @@ static void wd_dump_thread(const char *tag, SceUID tid) {
                      info.currentCpuId, info.lastExecutedCpuId,
                      info.threadPreemptCount);
     wd_log(buf, n);
+    /* v02.08: runClocks is the thread's accumulated CPU time. Sample
+     * it twice, 500 ms apart, INSIDE the hang window: if the kernel
+     * really has this thread on a core the counter must advance by
+     * hundreds of millions of cycles; if it is a bookkeeping ghost
+     * (READY-but-never-picked / RUNNING-in-ledger-only) the delta is
+     * 0. This is the one instrument that splits "kernel-mode spin"
+     * from "scheduler lost the thread" without another coredump. */
+    {
+        SceUInt64 c0 = info.runClocks;
+        SceUInt64 r0 = info.threadReleaseCount;
+        sceKernelDelayThread(500 * 1000);
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (sceKernelGetThreadInfo(tid, &info) >= 0) {
+            n = snprintf(buf, sizeof(buf),
+                         "[WD] %s runClocks %llu -> %llu (d=%lld) "
+                         "release=%llu->%llu chgcpu=%d\n",
+                         tag, (unsigned long long)c0,
+                         (unsigned long long)info.runClocks,
+                         (long long)(info.runClocks - c0),
+                         (unsigned long long)r0,
+                         (unsigned long long)info.threadReleaseCount,
+                         (int)info.changeCpuCount);
+            wd_log(buf, n);
+        }
+    }
 }
 
 /* v01.90: VM-side progress counters (OS_vita.cpp). A class-load storm
@@ -300,6 +326,34 @@ static int wd_thread_routine(SceSize args, void *argp) {
         wd_dump_thread("tone", vita_tone_tid);
         /* the watchdog itself, as a sanity marker */
         wd_dump_thread("wd", sceKernelGetThreadId());
+        /* v02.08: per-core "what is running RIGHT NOW" - the kernel's
+         * own answer to whether the VM thread is actually on a core.
+         * If cpuInfo[0..3] never names the vm tid while status says
+         * RUNNING, the RUNNING is a bookkeeping ghost. */
+        {
+            SceKernelThreadRunStatus rs;
+            char buf[256];
+            memset(&rs, 0, sizeof(rs));
+            rs.size = sizeof(rs);
+            if (sceKernelGetThreadRunStatus(vita_wd_vm_tid, &rs) >= 0) {
+                int i;
+                int n = snprintf(buf, sizeof(buf),
+                                 "[WD] runstatus vm");
+                for (i = 0; i < 4; i++) {
+                    if (rs.cpuInfo[i].threadId == 0) continue;
+                    n += snprintf(buf + n, sizeof(buf) - n,
+                                  " cpu%d=tid%d(p0x%x)",
+                                  i, (int)rs.cpuInfo[i].threadId,
+                                  rs.cpuInfo[i].priority);
+                }
+                n += snprintf(buf + n, sizeof(buf) - n, "\n");
+                wd_log(buf, n);
+            } else {
+                int n = snprintf(buf, sizeof(buf),
+                                 "[WD] runstatus vm <failed>\n");
+                wd_log(buf, n);
+            }
+        }
         /* v02.02: full registered-thread table + per-core run state.
          * Proves or disproves "VM thread starved by higher-priority
          * natives" in one snapshot - the OS-side evidence the

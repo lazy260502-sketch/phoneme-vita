@@ -4862,3 +4862,65 @@ Skeleton 的 C++ 桩只是声明）。
   hared_monitor_exit 入口（bleq 目标 0x810bc4e4 附近）加 site mark / 计数器插桩
   （v02.08）。
 - KICK rc≠0（再次非法掩码）→ 检查掩码编码假设（可能 firmware 差异）。
+
+## 2026-09-25 log32 分析（v02.07 / build 0ea9500 / b328）：三刺全生效但无效——"调度位丢失"死亡，Z=1 冻点指纹三连
+
+产物链：真机 log32 → v02.08（build 0ea9500+ / b329，`out/vpk/midp_vita_v02.08.vpk`，3654065B，md5 f3470e66452aa1fe85a006f6a843c8f7）。
+
+### KICK 判决（本轮决定性证据）
+
+```
+[WD] KICK1 aff->0x30000 rc=0x70000   ← rc=旧掩码（成功），非 0x8xxxxxxx 错误码
+[WD] KICK2 aff->0x70000 rc=0x30000   ← rc 返回的正是 KICK1 写入值 = KICK1 生效铁证
+[WD] KICK3 prio->0x99 rc=0x0         ← 成功
+[WD] KICK no effect (ce 397 -> 397)
+```
+
+- **rc 语义修正**：`sceKernelChangeThreadCpuAffinityMask` 返回**旧掩码**（正值=成功），不是 0。log31 的 `rc=0x80028025` 是真错误（非法掩码 3）。
+- 三段全部被内核接受并真实作用于 VM 线程（两次强制 runqueue 迁移 + 优先级变更），ce 仍纹丝不动。
+- **判决**：一个能被两次强制迁移、且内核账本持续报 RUNNING 的线程，不可能"READY 但从未被 pick"——**"调度位丢失（runqueue 除名）"假说死亡**。剩下两类解释：
+  1. **内核态烧核自旋**（线程真在核上跑，pc 快照看不到——如轻量锁/信号量内核路径）
+  2. **userland 活锁**（线程真在跑，但 green-thread 机制永远不再推进 ce——pc 残留总落在 tick/trampoline 桩）
+
+### 冻点符号化（slide=0x12000，DRES 指令级定标，b328 velf）
+
+- 锚点：wd 块 +0x480=`'DRES'`/0x81000000；b328 DRES store = Thumb `str r2,[r3]` @section 0x8100e578（wd pc rt=0x81020578）→ **slide=0x12000**（log31 为 0x11000，逐 build 变化，必须每次重定标）。
+- 公式：`nm = rt − slide + 0x81000000`；THREAD_REG_INFO 三元组 `[sp][lr][pc][cpsr]` 位于块尾。
+- VM：sp=0x8157ffb0、lr=**interpreter_timer_tick+0x10**、pc=**shared_monitor_exit+0x7c**（nm 0x1020bc578）、cpsr=0x40070010（Z=1）。
+- **+0x7c 处反汇编**（b328 ARM 代码）：
+  ```
+  810bc574: ldr r0,[pc,#40]   ; → 0x812e1d10 = cur_cell（字面量+data slide，语义闭环 ✓）
+  810bc578: ldr r0,[r0]       ← pc 冻点
+  810bc57c: ldr r1,[r0,#36]   ; pending entries
+  810bc580: cmp r1,#0
+  810bc584: moveq pc,lr       ; 无 pending 秒回
+  ```
+  **无环、无系统调用**——活线程不可能在此停 3 秒。这是 bleq 跳入后的第一条指令（timer_tick+0x28 `bleq` 的目标就是 0x810bc574），pc 与 lr 同族自洽。
+- **Z=1+条件分支冻点三连**：log30 `start_lightweight_thread_asm+0x18 bl,eq` / log31 `timer_tick+0x28 bleq` / log32 `shared_monitor_exit+0x7c`（bleq 目标体内首条 ldr）。**三次都停在"进入 tick/trampoline 桩"的瞬间快照**——这是"pc 快照 ≠ 线程真实位置"的最强提示：真实冻点在别处，pc 只是上次换出时的残留。
+
+### 其余证据
+
+- site_ring：`rt_ticks=408 ttk=348 jsmp=348`、`switch=188601`（log31:193559 同量级）、q5 队列 id=4/3 重复 15 组（log31 一模一样）——**既有形态，非新损坏**。
+- 输入链正常死亡：HEARTBEAT 到 #385，`[ANI] CE #397 ANI OUT` 后无新 CE——与历次同型。
+- 内核行：vm `aff=0x70000 cpu=0 lastcpu=0`（这次在核 0，log31 在核 2——漂移，非钉死）。
+- tone：lr=tone_player_thread+0x6ab（正常 delay 等待侧）。
+
+### 综合判决（log32 定案）
+
+"调度位丢失"已死。幸存两假说：
+1. **内核态烧核自旋**——线程真在跑（内核账本 RUNNING + 可迁移 + 双时钟推进），但烧在内核态（pc 快照残留无关）；userland 状态永不变化 → ce 冻结。
+2. **userland 活锁**——线程真在跑，但 green 机制死循环（如 q5 双线程乒乓），ce 不再推进。
+
+两者的共同点：**线程活着且在执行**；区别在烧核位置（内核 vs 用户）。v02.08 一次实验即可切开。
+
+### v02.08 装置（本轮落地，b329）
+
+- `wd_dump_thread()` 尾部追加 **runClocks 双采样**：间隔 500ms 采样 `SceKernelThreadInfo.runClocks`（线程累计 CPU 周期），d>0 = 真在核上（内核自旋或 userland 活锁），d==0 = 账本幽灵（从未被派发）。同时打 release/chgcpu 计数。
+- HANG 链补 **sceKernelGetThreadRunStatus** 行：每核当前正在运行的 tid——若 4 核无一名指 vm tid 而 status=RUNNING，RUNNING 即虚构。
+- 均在 KICK 之前执行（kick 恢复不会污染采样）。
+
+### 下轮判读表（log33）
+
+- `runClocks d>0` + 某核 tid=vm → **线程真在跑**：转内核态自旋方向（联系 SceKernel 等待链）或 userland 活锁（q5 乒乓破局——给 wait_for 加看门狗）。
+- `runClocks d==0` + 无核持有 vm → **账本幽灵**：调度位丢失复活（但形态变为"账本 RUNNING 却从未派发"），需内核侧取证。
+- `runstatus vm cpuN=tid...` 里 vm 持续在场但 runClocks 不动 → 内核统计自身矛盾，报 Vita 内核 bug 方向。
