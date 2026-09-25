@@ -141,11 +141,16 @@ static void wd_dump_thread(const char *tag, SceUID tid) {
     }
     int n = snprintf(buf, sizeof(buf),
                      "[WD] %s '%s' status=%s wait=%s(0x%x) wid=%d "
-                     "prio=0x%x stack=%d\n",
+                     "prio=0x%x stack=%d attr=0x%x aff=0x%x(init 0x%x) "
+                     "cpu=%d lastcpu=%d preempt=%u\n",
                      tag, info.name, wd_status_name(info.status),
                      wd_wait_type_name(info.waitType), info.waitType,
                      (int)info.waitId, info.currentPriority,
-                     (int)info.stackSize);
+                     (int)info.stackSize,
+                     info.attr,
+                     info.currentCpuAffinityMask, info.initCpuAffinityMask,
+                     info.currentCpuId, info.lastExecutedCpuId,
+                     info.threadPreemptCount);
     wd_log(buf, n);
 }
 
@@ -171,6 +176,7 @@ static int wd_thread_routine(SceSize args, void *argp) {
     int reported = 0;
     int storm_noted = 0;
     int preload_extensions = 0;   /* v01.92: bounded grace for the sweep */
+    int kick_recoveries = 0;      /* v02.06: KICK-RECOVERED count */
 
     for (;;) {
         sceKernelDelayThread(WD_POLL_MS * 1000);
@@ -324,6 +330,65 @@ static int wd_thread_routine(SceSize args, void *argp) {
          * holes (.data/.bss head, whole Java heap) hid exactly these
          * values - read them from the patient, not the corpse. */
         vita_wd_snapshot("ux0:/data/J2ME00001/site_ring.log");
+
+        /* v02.06: THERAPEUTIC KICK (log30 hypothesis: kernel scheduler
+         * lost the VM thread's run bit - real HW dual-core per-core
+         * runqueues, thread stuck READY but never picked; Vita3K has
+         * no such scheduler, hence emulator-fine / hardware-dead).
+         * After ALL read-only forensics are on disk, rewrite the VM
+         * thread's CPU affinity (mask 3 = both user cores) and see if
+         * it resumes:
+         *   - ce counter moves again => KICK-RECOVERED: hypothesis
+         *     PROVEN, and this very call is the shipping workaround.
+         *   - no movement in 12 x 250 ms => fall through to the data
+         *     abort and take the coredump as before.
+         * Either outcome advances the case; the kick itself cannot
+         * make things worse (a frozen process is already dead). */
+        {
+            unsigned int ce_before = vita_ce_count;
+            int rc = sceKernelChangeThreadCpuAffinityMask(
+                vita_wd_vm_tid, 3);
+            int moved = 0;
+            int kpoll;
+            char buf[128];
+            int n = snprintf(buf, sizeof(buf),
+                             "[WD] KICK aff->3 on vm tid=%d rc=0x%x\n",
+                             (int)vita_wd_vm_tid, rc);
+            wd_log(buf, n);
+            for (kpoll = 0; kpoll < 12; kpoll++) {
+                sceKernelDelayThread(WD_POLL_MS * 1000);
+                if (vita_ce_count != ce_before) { moved = 1; break; }
+            }
+            n = snprintf(buf, sizeof(buf),
+                         "[WD] KICK %s (ce %u -> %u)\n",
+                         moved ? "RECOVERED" : "no effect",
+                         ce_before, vita_ce_count);
+            wd_log(buf, n);
+            if (moved) {
+                /* recovered: keep the process alive, re-arm for the
+                 * next hang so we learn whether one kick is enough
+                 * or the loss recurs (recurrence count matters). */
+                reported = 0;
+                stalled_polls = 0;
+                storm_noted = 0;
+                preload_extensions = 0;
+                last_ce = vita_ce_count;
+                last_clinit = vita_clinit_count;
+                last_gc = vita_gc_count;
+                last_preload = vita_preload_count;
+                if (++kick_recoveries < 4) continue;
+                /* >3 recoveries in one session: the bit is being lost
+                 * repeatedly; stop re-arming and take a coredump at
+                 * the next hang so the kernel-side state is captured
+                 * while the phenomenon is fresh. */
+                {
+                    int m = snprintf(buf, sizeof(buf),
+                                     "[WD] KICK recovery #%d - arming "
+                                     "final capture\n", kick_recoveries);
+                    wd_log(buf, m);
+                }
+            }
+        }
 
         /* v01.82: log8 nailed the shape of the hang (VM thread RUNNING,
          * wait=none, both clocks alive) but the kernel API cannot name

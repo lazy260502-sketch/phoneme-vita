@@ -838,7 +838,30 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.05")
+set(VITA_VERSION  "02.06")
+# 02.06 (2026-10-15): log30 verdict + therapeutic apparatus.
+#   log30 closed the book on all three v02.05 hypotheses ((a) downgrade
+#   survival, (b)/(c) falsified via properly-anchored symbolization,
+#   slide=0x32000): the VM thread died in a plain thread switch, pc at
+#   a harmless new-green-thread trampoline that returns in one
+#   instruction. New leading hypothesis: KERNEL SCHEDULER RUN-BIT LOSS -
+#   real HW dual-core per-core runqueues vs Vita3K's host scheduler;
+#   the VM thread ends up READY but never picked, all userland frozen,
+#   both clocks alive.
+#   v02.06 apparatus (to prove/disprove + potentially SHIP the fix):
+#   - wd_dump_thread now prints attr/currentCpuAffinityMask(+init)/
+#     currentCpuId/lastExecutedCpuId/preempt per thread. Verdict table:
+#     aff==0 or single-core AND cpu!=lastcpu => run-bit loss confirmed.
+#   - same fields added to the thread-audit table dump.
+#   - THERAPEUTIC KICK: after all read-only forensics, the watchdog
+#     calls sceKernelChangeThreadCpuAffinityMask(vm_tid, 3) and watches
+#     the ce counter for ~3 s. RECOVERED => hypothesis PROVEN and the
+#     kick itself is the shipping workaround (re-arms, up to 3 times,
+#     then takes a coredump on the next hang). No effect => data abort
+#     + coredump as before.
+#   - links SceKernelThreadMgr_stub (ChangeThreadCpuAffinityMask is not
+#     re-exported by SceLibKernel).
+#   vita-port: vita_watchdog.c + vita_thread_audit.c + CMakeLists.txt.
 # 02.05 (2026-10-14): log29 verdict + forensic upgrade.
 #   log29 RE-ANALYZED the log27/28 coredumps with a properly anchored
 #   symbolization (4 independent anchors incl. the wd "DRES" write):
@@ -1365,6 +1388,12 @@ target_link_libraries(${PROJECT_NAME}
     # v01.67: sceKernelAllocMemBlock/GetMemBlockBase for the CDRAM
     # framebuffers (vita_fbmem.h)
     SceSysmem_stub
+    # v02.06: sceKernelChangeThreadCpuAffinityMask (therapeutic kick in
+    # the hang watchdog) lives only in the ThreadMgr stub; SceLibKernel
+    # re-exports most threadmgr symbols but not this one. Duplicate
+    # symbols across the two stubs are fine: --allow-multiple-definition
+    # is already set above (v01.67).
+    SceKernelThreadMgr_stub
     m
 )
 

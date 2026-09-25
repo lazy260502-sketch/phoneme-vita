@@ -240,13 +240,16 @@ void vita_thread_audit_dump(const char *path) {
         }
         n = snprintf(buf, sizeof(buf),
                      "  [%2d] tid=%d '%s' %s wait=%s(0x%x) wid=%d "
-                     "prio=0x%x(init 0x%x) cpu=%d last=%d "
+                     "prio=0x%x(init 0x%x) aff=0x%x(init 0x%x) attr=0x%x "
+                     "cpu=%d last=%d "
                      "preempt=%u creator=0x%08x\n",
                      i, (int)tid, info.name,
                      audit_status_name(info.status),
                      audit_wait_name(info.waitType), info.waitType,
                      (int)info.waitId,
                      info.currentPriority, info.initPriority,
+                     info.currentCpuAffinityMask, info.initCpuAffinityMask,
+                     info.attr,
                      info.currentCpuId, info.lastExecutedCpuId,
                      info.threadPreemptCount,
                      (unsigned)(uintptr_t)audit_table[i].caller);
