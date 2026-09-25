@@ -4935,3 +4935,14 @@ Skeleton 的 C++ 桩只是声明）。
 - 冻点四连（log30-33 全在 yield/换出路径）：本轮 `interpreter_timer_tick+0x10`（slide=0x16000）——pc 残点=换出残留实锤，与 d=0 互证。
 - v02.09（d013e54）：runstatus 安全化（静态 1KiB 缓冲 + hex dump + 3 采样 MOVING/frozen）后置；KICK0=`sceKernelSendSignal`（对账本 RUNNING 线程唯一能触碰派发状态的原语）；KICK4=`sceKernelChangeThreadPriority2`（stub 有、头文件无，即时生效变体）。
 - log34 判读：KICK0 rc=0+ce 恢复=幽灵治疗成功；4 核表持续无 vm=幽灵终审；全无效则携 hex dump 转内核 bug 方向。
+
+## 2026-09-25 log34 分析（v02.09 / build 8bf56ee / b330 实弹）：runstatus 二杀 wd（死在内核）+ site_ring 终局（VM 冻结于 wait_for 停车点）
+
+判决与全部证据链见 `debug/logs/log34/ANALYSIS.md`。要点：
+
+- **d=0 三连**：vm runClocks 500ms 增量为 0（tone d=1946 / wd d=1671 仪器健康对照）——账本幽灵第三次独立确认。
+- **runstatus 二杀 wd，栈砸理论死亡**：v02.09 静态 1KiB 缓冲 + 0xCC 预填完好，wd 仍死——pc 停在 `blx sceKernelGetThreadRunStatus` 桩的**下一条指令**（wd_thread_routine+0x2f5，b330 slide=0x14000 指令级定标），r0/r1 参数原封、一行输出未打。fault 0x1a92c4b 非用户域。**根因：syscall 对幽灵线程（TCB 损坏）查询触发内核态数据中止，查询者陪葬**。该探针永久退役（log33 栈砸 + log34 内核中止 = 两杀）。
+- **site_ring 终局**（首次完整落盘）：VM 冻结 native 栈 = `Scheduler::wait_for+0x54 ← pump_events_vita+0x8`——green 调度器 idle 等待路径的正常停车点，非自旋非活锁。**rt_ticks=573 vs ttk=350**：ticker 在走、VM 少消费 223 tick——与 d=0 完全自洽（VM 从未再被调度）。
+- **冻点五连**（log30-34 全在 yield/换出路径）：本轮 `interpreter_timer_tick+0x10`。
+- v02.10（b4c6006）：runstatus 删除，换 `sceKernelGetSystemInfo` per-core 账本（idleClock/idleN/switchN 双采样，全局仪表不碰 TCB）；KICK 阵列提前（audit 后、site/snapshot 前）成为主实验；新增 **KICK5**=`SuspendThreadForVM`/`ResumeThreadForVM`（stub 有、头文件无，extern）——唯一强制停止/恢复派发状态的原语。
+- log35 判读：任一 KICK 恢复 ce = workaround 到手；KICK5 rc 错误 = TCB 损坏致 suspend 失败，转内核 bug 方向；sysinfo switchN 分流 per-core 调度器卡死 vs 单线程幽灵。
