@@ -326,34 +326,6 @@ static int wd_thread_routine(SceSize args, void *argp) {
         wd_dump_thread("tone", vita_tone_tid);
         /* the watchdog itself, as a sanity marker */
         wd_dump_thread("wd", sceKernelGetThreadId());
-        /* v02.08: per-core "what is running RIGHT NOW" - the kernel's
-         * own answer to whether the VM thread is actually on a core.
-         * If cpuInfo[0..3] never names the vm tid while status says
-         * RUNNING, the RUNNING is a bookkeeping ghost. */
-        {
-            SceKernelThreadRunStatus rs;
-            char buf[256];
-            memset(&rs, 0, sizeof(rs));
-            rs.size = sizeof(rs);
-            if (sceKernelGetThreadRunStatus(vita_wd_vm_tid, &rs) >= 0) {
-                int i;
-                int n = snprintf(buf, sizeof(buf),
-                                 "[WD] runstatus vm");
-                for (i = 0; i < 4; i++) {
-                    if (rs.cpuInfo[i].threadId == 0) continue;
-                    n += snprintf(buf + n, sizeof(buf) - n,
-                                  " cpu%d=tid%d(p0x%x)",
-                                  i, (int)rs.cpuInfo[i].threadId,
-                                  rs.cpuInfo[i].priority);
-                }
-                n += snprintf(buf + n, sizeof(buf) - n, "\n");
-                wd_log(buf, n);
-            } else {
-                int n = snprintf(buf, sizeof(buf),
-                                 "[WD] runstatus vm <failed>\n");
-                wd_log(buf, n);
-            }
-        }
         /* v02.02: full registered-thread table + per-core run state.
          * Proves or disproves "VM thread starved by higher-priority
          * natives" in one snapshot - the OS-side evidence the
@@ -385,6 +357,51 @@ static int wd_thread_routine(SceSize args, void *argp) {
          * values - read them from the patient, not the corpse. */
         vita_wd_snapshot("ux0:/data/J2ME00001/site_ring.log");
 
+        /* v02.09: per-core "what is running RIGHT NOW" - SAFELY.
+         * log33 lesson (the hard way): the SDK header's
+         * SceKernelThreadRunStatus is 52 bytes, but the kernel writes
+         * 0x178 bytes regardless of the size field - the coredump's
+         * THREAD_REG_INFO blocks ARE 0x178 each. The v02.08 stack
+         * object got smashed past its return address and the
+         * watchdog died right after the (already logged) runClocks
+         * verdict. Now: a STATIC 1 KiB buffer well past anything the
+         * kernel writes, raw hex dump decoded offline against the
+         * THREAD_REG_INFO layout, plus three samples 200 ms apart -
+         * a moving per-core table means the scheduler is alive and
+         * the vm tid's presence/absence in it is the ghost verdict. */
+        {
+            static unsigned int rs_a[256], rs_b[256];
+            char buf[160];
+            int line, i, rc, moved = 0;
+            memset(rs_a, 0xCC, sizeof(rs_a));
+            rc = sceKernelGetThreadRunStatus(
+                vita_wd_vm_tid, (SceKernelThreadRunStatus *)rs_a);
+            for (line = 0; line < 6; line++) {
+                int n = snprintf(buf, sizeof(buf),
+                                 "[WD] runstatus vm rc=0x%x +%03x:",
+                                 rc, line * 16);
+                for (i = 0; i < 4; i++)
+                    n += snprintf(buf + n, sizeof(buf) - n,
+                                  " %08x", rs_a[line * 4 + i]);
+                n += snprintf(buf + n, sizeof(buf) - n, "\n");
+                wd_log(buf, n);
+            }
+            for (i = 1; i <= 2; i++) {
+                sceKernelDelayThread(200 * 1000);
+                memset(rs_b, 0xCC, sizeof(rs_b));
+                sceKernelGetThreadRunStatus(
+                    vita_wd_vm_tid, (SceKernelThreadRunStatus *)rs_b);
+                if (memcmp(rs_a, rs_b, sizeof(rs_a)) != 0) moved = 1;
+                memcpy(rs_a, rs_b, sizeof(rs_a));
+            }
+            {
+                int n = snprintf(buf, sizeof(buf),
+                                 "[WD] runstatus vm 3-sample %s\n",
+                                 moved ? "MOVING" : "frozen");
+                wd_log(buf, n);
+            }
+        }
+
         /* v02.06: THERAPEUTIC KICK (log30 hypothesis: kernel scheduler
          * lost the VM thread's run bit - real HW dual-core per-core
          * runqueues, thread stuck READY but never picked; Vita3K has
@@ -415,6 +432,29 @@ static int wd_thread_routine(SceSize args, void *argp) {
              * restore all-core (0x70000) second - each step must take
              * the thread OFF its current per-core runqueue and requeue
              * it, which is exactly what a lost-run-bit thread needs. */
+            /* log33 lesson (rc semantics): KICK1 in log32 returned
+             * 0x70000 and KICK2 returned 0x30000 - the syscall
+             * returns the OLD mask on success; 0x8xxxxxxx is error.
+             * The three kicks all "succeeded" and all did nothing,
+             * which log33's runClocks d=0 finally explains: the
+             * kernel ledger says the vm thread is RUNNING on cpu 1,
+             * so affinity/priority changes never touch a runqueue -
+             * you cannot requeue a thread the kernel believes is
+             * on-core. */
+            /* v02.09 KICK0: sceKernelSendSignal - forces the kernel
+             * down the thread-signal path (sets the thread's signal
+             * pattern and, for a mis-marked thread, re-marks it
+             * runnable). This is the one primitive that touches the
+             * dispatch state of a thread the ledger calls RUNNING. */
+            rc = sceKernelSendSignal(vita_wd_vm_tid);
+            n = snprintf(buf, sizeof(buf),
+                         "[WD] KICK0 signal rc=0x%x\n", rc);
+            wd_log(buf, n);
+            for (kpoll = 0; kpoll < 4; kpoll++) {
+                sceKernelDelayThread(WD_POLL_MS * 1000);
+                if (vita_ce_count != ce_before) { moved = 1; break; }
+            }
+            if (!moved) {
             rc = sceKernelChangeThreadCpuAffinityMask(vita_wd_vm_tid,
                                                       0x30000);
             n = snprintf(buf, sizeof(buf),
@@ -443,6 +483,26 @@ static int wd_thread_routine(SceSize args, void *argp) {
                 rc = sceKernelChangeThreadPriority(vita_wd_vm_tid, 0x99);
                 n = snprintf(buf, sizeof(buf),
                              "[WD] KICK3 prio->0x99 rc=0x%x\n", rc);
+                wd_log(buf, n);
+                for (kpoll = 0; kpoll < 4; kpoll++) {
+                    sceKernelDelayThread(WD_POLL_MS * 1000);
+                    if (vita_ce_count != ce_before) { moved = 1; break; }
+                }
+                sceKernelChangeThreadPriority(vita_wd_vm_tid, 0xa0);
+            }
+            if (!moved) {
+                /* v02.09 KICK4: ChangeThreadPriority2 - exported by
+                 * the stub but absent from SDK headers; the "2"
+                 * variant applies the change immediately (vs. the
+                 * plain one which is documented as taking effect at
+                 * the next scheduling point - useless for a thread
+                 * that never reaches one). */
+                extern int sceKernelChangeThreadPriority2(SceUID thid,
+                                                          int priority);
+                rc = sceKernelChangeThreadPriority2(vita_wd_vm_tid,
+                                                    0x99);
+                n = snprintf(buf, sizeof(buf),
+                             "[WD] KICK4 prio2->0x99 rc=0x%x\n", rc);
                 wd_log(buf, n);
                 for (kpoll = 0; kpoll < 4; kpoll++) {
                     sceKernelDelayThread(WD_POLL_MS * 1000);
@@ -479,6 +539,7 @@ static int wd_thread_routine(SceSize args, void *argp) {
                     wd_log(buf, m);
                 }
             }
+            } /* end KICK0 !moved guard (KICK1..KICK4) */
         }
 
         /* v01.82: log8 nailed the shape of the hang (VM thread RUNNING,

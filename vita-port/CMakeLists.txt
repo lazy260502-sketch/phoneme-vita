@@ -838,7 +838,7 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.08")
+set(VITA_VERSION  "02.09")
 # 02.08 (2026-09-25): log32 verdict + runClocks/run-status instruments.
 #   log32 ran the three-pronged kick on real HW: ALL THREE prongs were
 #   ACCEPTED and took effect (KICK1 aff->0x30000 returned the old mask
