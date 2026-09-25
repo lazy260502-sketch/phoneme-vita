@@ -838,7 +838,29 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.06")
+set(VITA_VERSION  "02.07")
+# 02.07 (2026-10-15): log31 verdict + three-pronged KICK.
+#   log31 ran the full v02.06 apparatus on real HW:
+#   - Verdict-table row 1 MISSED: vm thread aff=0x70000 (healthy
+#     three-core mask), cpu=2==lastcpu=2, preempt=0. The "affinity
+#     corruption" simple form is DEAD.
+#   - Row 2 INCONCLUSIVE: the kick was a dud - mask 3 rejected with
+#     rc=0x80028025 SCE_KERNEL_ERROR_ILLEGAL_CPU_AFFINITY_MASK. Vita's
+#     affinity encoding is NOT 1<<cpu; it is bits 16..18 (0x70000 =
+#     all three user cores; 0x0 = MASK_DEFAULT).
+#   - coredump symbolization (slide=0x11000, calibrated against the
+#     DRES self-abort pc at instruction level): VM pc frozen at
+#     interpreter_timer_tick+0x28 (bleq, cpsr Z=1, pending=0 => the
+#     branch returns in one instruction), SAME family as log30's
+#     start_lightweight_thread_asm+0x18. Kernel says RUNNING, both
+#     clocks advance, yet ce/gc/clinit never move: the thread is NOT
+#     executing, but the kernel believes it is. => KERNEL RUN-BIT LOSS
+#     is the last hypothesis standing.
+#   v02.07: replace the dud kick with a forced-migration kick:
+#   KICK1 aff->0x30000 (cores 0+1: real runqueue migration OFF cpu2),
+#   KICK2 aff->0x70000 (restore), KICK3 prio->0x99 then back (last
+#   resort requeue). Any prong recovering ce => hypothesis PROVEN and
+#   the kick ships as the workaround.
 # 02.06 (2026-10-15): log30 verdict + therapeutic apparatus.
 #   log30 closed the book on all three v02.05 hypotheses ((a) downgrade
 #   survival, (b)/(c) falsified via properly-anchored symbolization,

@@ -346,18 +346,55 @@ static int wd_thread_routine(SceSize args, void *argp) {
          * make things worse (a frozen process is already dead). */
         {
             unsigned int ce_before = vita_ce_count;
-            int rc = sceKernelChangeThreadCpuAffinityMask(
-                vita_wd_vm_tid, 3);
             int moved = 0;
             int kpoll;
             char buf[128];
-            int n = snprintf(buf, sizeof(buf),
-                             "[WD] KICK aff->3 on vm tid=%d rc=0x%x\n",
-                             (int)vita_wd_vm_tid, rc);
+            int n;
+            int rc;
+            /* log31 lesson: mask 3 was REJECTED (rc=0x80028025
+             * SCE_KERNEL_ERROR_ILLEGAL_CPU_AFFINITY_MASK). Vita's
+             * affinity encoding is NOT 1<<cpu - the vm thread reports
+             * aff=0x70000 (bits 16..18 = all three user cores), other
+             * threads show 0x0 = MASK_DEFAULT. Merely rewriting the
+             * SAME value could be a kernel no-op, so force a real
+             * runqueue migration: narrow to cores 0+1 (0x30000) first,
+             * restore all-core (0x70000) second - each step must take
+             * the thread OFF its current per-core runqueue and requeue
+             * it, which is exactly what a lost-run-bit thread needs. */
+            rc = sceKernelChangeThreadCpuAffinityMask(vita_wd_vm_tid,
+                                                      0x30000);
+            n = snprintf(buf, sizeof(buf),
+                         "[WD] KICK1 aff->0x30000 rc=0x%x\n", rc);
             wd_log(buf, n);
-            for (kpoll = 0; kpoll < 12; kpoll++) {
+            for (kpoll = 0; kpoll < 4; kpoll++) {
                 sceKernelDelayThread(WD_POLL_MS * 1000);
                 if (vita_ce_count != ce_before) { moved = 1; break; }
+            }
+            if (!moved) {
+                rc = sceKernelChangeThreadCpuAffinityMask(vita_wd_vm_tid,
+                                                          0x70000);
+                n = snprintf(buf, sizeof(buf),
+                             "[WD] KICK2 aff->0x70000 rc=0x%x\n", rc);
+                wd_log(buf, n);
+                for (kpoll = 0; kpoll < 8; kpoll++) {
+                    sceKernelDelayThread(WD_POLL_MS * 1000);
+                    if (vita_ce_count != ce_before) { moved = 1; break; }
+                }
+            }
+            if (!moved) {
+                /* last prong: priority nudge - a scheduler-visible
+                 * change that must requeue the thread (0x99 is one
+                 * step above the 0xa0 every other thread uses);
+                 * restore afterwards either way. */
+                rc = sceKernelChangeThreadPriority(vita_wd_vm_tid, 0x99);
+                n = snprintf(buf, sizeof(buf),
+                             "[WD] KICK3 prio->0x99 rc=0x%x\n", rc);
+                wd_log(buf, n);
+                for (kpoll = 0; kpoll < 4; kpoll++) {
+                    sceKernelDelayThread(WD_POLL_MS * 1000);
+                    if (vita_ce_count != ce_before) { moved = 1; break; }
+                }
+                sceKernelChangeThreadPriority(vita_wd_vm_tid, 0xa0);
             }
             n = snprintf(buf, sizeof(buf),
                          "[WD] KICK %s (ce %u -> %u)\n",

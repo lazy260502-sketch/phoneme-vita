@@ -4771,3 +4771,94 @@ watchdog：`HANG ce=401 polls=12 tick=1660` 双时钟健康；VM `RUNNING wait=n
 - `[WD] KICK RECOVERED (ce X -> Y)` → **假说实锤 + kick 即 shipping workaround**（恢复后 watchdog 重新武装，最多 3 次；第 4 次挂起改走 data abort 拿 coredump，捕捉复发现场的内核侧状态）。
 - `KICK no effect` → 假说存疑，按原流程 coredump；affinity 字段仍提供旁证。
 - 注意：KICK 恢复场景下 ring/snapshot dump 已先行落盘（kick 前执行），不影响取证完整性；但 abort 前的 `requesting coredump via data abort` 日志不会出现，属预期。
+
+## 2026-10-15 log31 分析（v02.06 / build 9ff6fe2 / b326）：判读表①未命中、KICK 哑弹、冻点=timer_tick+0x28（调度位丢失成为唯一幸存假说）
+
+产物链：真机 log31（watchdog/site_ring/input/midp_stderr + psp2core coredump）→ v
+02.07（build 149b3ce / b328，`out/vpk/midp_vita_v02.07.vpk`，3653717B，md5 e029c2
+dc9f6860747796bf22388ba46e）。
+
+### 判读表结果（v02.06 装置实弹首跑）
+
+- **① affinity 行：未命中**。vm 行 `status=RUNNING wait=none prio=0xa0 attr=0x800
+00000 aff=0x70000(init 0x70000) cpu=2 lastcpu=2 preempt=0`——三核掩码健康、cpu=
+=lastcpu。"mask 损坏"简单形态死亡。
+- **② KICK：哑弹（假说仍未测）**。`rc=0x80028025` = `SCE_KERNEL_ERROR_ILLEGAL_C
+PU_AFFINITY_MASK`（error.h:172）。我传的 mask=3 非法：**Vita affinity 编码不是
+1<<cpu，而是 bit16 起**——vm 线程报 aff=0x70000（bit16|17|18=三用户核），tone/w
+d/ticker 报 0x0（MASK_DEFAULT，threadmgr.h:20）。`KICK no effect (ce 398 -> 398
+)` 因此无效，不能作为假说证伪。
+- 装置其余部分运转正常：ring/snapshot dump 先行落盘，DRES data abort 精确自杀
+（pc=wd_thread_routine+0x3ea = `mov.w r3,#0x81000000; str r2,[r3]`），coredump 产
+出并被 Vita 写盘。
+
+### 符号化（本轮方法论收获：DRES 指令级定标法）
+
+- coredump 的 `.text` 段不被捕获（GAP 0x81000000-0x81329000），pc 符号化必须借
+velf。velf 双域：objdump section 域 0x810xxxxx，nm 域 0x102xxxxxxx，`nm = sectio
+n + 0x81000000`。
+- **slide=0x11000**，锚点 = DRES 自杀指令双重定标：wd pc rt=0x8101f42a → sectio
+n 0x8100e42a = `mov.w r3,#0x81000000; str r2,[r3]`（DRES store 本尊）✓，与 MO
+DULE_INFO text 基 0x81011000 页对齐一致。**最终公式：`nm_addr = rt − 0x11000 +
+0x81000000`**。
+- 教训（已计入记忆）：锚点法（creator 0x8101f51d 对 vita_watchdog_start nm 0x10
+200e530）算出非页对齐 slide=0x7f010fed，产出过 `primordial_to_current_thread+0
+xf` 的**错误结论**——内核 slide 必页对齐，非页对齐即算术错误信号。DRES 指令级
+定标是唯一可信方法，且每次 dump 都有该锚点。
+
+### 冻点符号化结果（交叉验证自洽）
+
+| 线程 | rt | 符号化 |
+|---|---|---|
+| vm pc | 0x810cd7d4 | **interpreter_timer_tick+0x28**（`bleq 810bc4e4`） |
+| vm lr | 0x810cd7bc | interpreter_timer_tick+0x10 |
+| bleq 目标 | 0x810bc4e4 | L433+0x2c ∈ **shared_monitor_exit+0x78**（nm 0x1020bc46c） |
+| ring0 | 0x81094a4c | JVMScheduler::wait_for(JVMThread*, long long)+0x54 |
+| ring1 | 0x81094a4c→0x810929bc | JVMScheduler::pump_events_vita()+0x8 |
+| ringSelf | 0x81065438 | ticker_thread_routine+0x50 |
+| tone lr | — | tone_player_thread+0x6ab |
+
+VM 线程寄存器：r0=0x81ede328（=wd_snapshot cur_thread，green id=4）、r5+0x40c=
+cur_cell ✓、cpsr=0x40070010（**Z=1，user mode**）。timer_tick+0x10..+0x28 序列：
+`ldr r5,[pc,#120]; ldr r0,[r5,#1036](=cur_cell); ldr r1,[r0,#104](=thread statu
+s); tst r1,#0x40000000; strne r2,[r0,#36]; bleq shared_monitor_exit`；wd_snapsh
+ot 显示 status=0x00000000 → Z=1 → strne 不执行、**bleq 必然跳走**。
+
+### 冻点指纹家族（连续两轮同型，强指纹）
+
+- log30：`start_lightweight_thread_asm+0x18 = bl invoke_pending_entries,eq`
+- log31：`interpreter_timer_tick+0x28 = bleq shared_monitor_exit`
+- 共性：**cpsr Z=1、pc 停在"即将进入的条件分支"上、目标都是 trampoline/tick 家族
+无害代码**（pending=0 时一两条指令即返回）。log29 也停在 timer_tick 内（+0x14）
+——假说 (b) "timer_tick entered but never completes" 家族复燃。
+- shared_monitor_exit 实现已定位：`cpu/arm/SharedStubs_arm.cpp` 汇编生成体（Sha
+redStubs::generate_shared_monitor_exit，随 SharedStubs::generate_all 顺序生成，
+Skeleton 的 C++ 桩只是声明）。
+
+### 综合判决（log31 定案）
+
+内核视角 VM 线程 RUNNING、affinity 健康、双时钟健康，但 ce 在 12×250ms 内纹丝
+不动；pc 停在一条会立即返回的条件分支上。若线程真在核上，3 秒=数十亿条指令，ce
+/gc/clinit（全在 .data）必动。**线程没在执行，但内核以为它在跑 → 调度账本丢失
+（runqueue 除名/从未重新派发）假说是唯一幸存者**。两种细分解释仍并列：userland
+在 shared_monitor_exit 内自旋（可能性低：目标是无害 trampoline）vs 内核 RUNNING
+是快照假象（调度位丢失，KICK 哑弹未测）。
+
+### v02.07 装置（本轮落地，build 149b3ce / b328）
+
+- **KICK 三段式**（替换哑弹单 kick，vita_watchdog.c）：
+  - KICK1 `aff->0x30000`（核0+1，强制离开 cpu2 的 per-core runqueue）
+  - KICK2 `aff->0x70000`（恢复三核）
+  - KICK3 `prio->0x99` 后回 0xa0（最后手段 requeue）
+  - 任一刺恢复 ce → 假说实锤 + kick 即 shipping workaround；恢复后重新武装（≤3
+次），第 4 次挂起走 data abort 拿 coredump。
+- CMakeLists.txt 版本 02.07 + log31 判决注释。
+
+### 下轮判读表（log32）
+
+- `[WD] KICK1 aff->0x30000 rc=0` + `KICK RECOVERED` → **调度位丢失实锤**，kick
+  即 workaround，v02.08 转向"自动 kick 守护 + 复发率统计"。
+- KICK1/2/3 全部 `no effect` → 调度位假说被证伪，转回 userland 自旋方向：在 s
+  hared_monitor_exit 入口（bleq 目标 0x810bc4e4 附近）加 site mark / 计数器插桩
+  （v02.08）。
+- KICK rc≠0（再次非法掩码）→ 检查掩码编码假设（可能 firmware 差异）。
