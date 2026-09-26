@@ -5639,3 +5639,145 @@ t0（`tid=0x40010003`）寄存器与 `primordial_to_current_thread`（link 0x810
   注意该块在 Java 堆（0x81exxxxx），**coredump 不含堆**，所以对 log41 返回"未映射"。
 - `abscheck.py <elf>`：静态列 `.data`/`.rodata` 里"疑似绝对地址但无重定位覆盖"的字
   （用于复查"装载器漏重定位"类真机专属 bug）。
+
+---
+
+## v02.17（2026-09-26）：一次性插桩 + 运行期 A/B
+
+**提交**：`cba7bac`（`feat(j2me): v02.17 一次性插桩 ...`）
+**产物**：`vita-port/out/vpk/midp_vita_v02.17.vpk`（3658851 B）+ `.sym`（4293268 B，
+对比 v02.16 的 4290424 → +2844 B，与新增代码量吻合）
+
+### 0. 动机（用户原话）
+
+> "建议能调式的东西，一次性都加上，真机调试比较麻烦"
+
+真机一轮成本 = 重编 + 重装 + 重启 + 取日志，远高于任何探针的运行时开销。
+所以 v02.17 把**剩下所有问题需要的一次性全部加上**，并让多个假设能在
+**不重编**的前提下 A/B（改 `ux0:` 上的小文件即可）。
+
+### 1. 核心设计：每个读数打印两次（delta 取代单帧猜测）
+
+`site_ring.log` 现在每个样本出现两遍，中间 `sceKernelDelayThread(400*1000)`：
+
+```
+===== v02.17 sample 1 =====
+===== v02.17 sample 2 (+400ms) =====
+```
+
+**log36..log41 六轮全部倒在同一个歧义上**：单个冻结样本无法区分"死锁"与
+"只是慢"，为此反复追加日志、反复上机。现在看 delta：
+
+| 现象 | 结论 |
+|---|---|
+| 两个样本完全相同 | 该路径彻底停住 |
+| `switch`/`loops`/`ticks` 在涨，`pump`/`ttk` 不动 | 有东西在跑，但不是有用调度 |
+| `ticker loops` 不涨 | **ticker 线程本身没被调度**（直接检验 v02.14 同核改动 / log40-41 "cpu1 scheduler DEAD"） |
+
+实现：`vita_wd_snapshot()` 拆成 `vita_wd_snapshot_one(fd)` ×2（`OS_vita.cpp`）。
+看门狗线程本来就是活的，所以在看门狗线程上做双采样是安全的 —— **绝不对外来
+TCB 发系统调用**（log33/log34 就是这么把看门狗搞死的）。
+
+### 2. 新增探针清单
+
+| 探针 | 埋点 | 回答 |
+|---|---|---|
+| `vita_run_count` | `JVM::run()`（`JVM.cpp`） | VM 主循环是否进入过（log41 的冻结函数） |
+| `vita_sched_start_count` | `Scheduler::start()`（`Scheduler.cpp`，v01.94 站点旁） | 环只有 16 槽会被覆盖，这里是永不丢的分母 |
+| `vita_thread_start_count` + `vita_tc_note()` | `Thread::start()`（`Thread.cpp`） | 线程创建数 + **名字** |
+| `vita_thread_finish_count` | `Thread::finish()`（`Thread.cpp`） | debugger 路径的线程结束 |
+| `vita_lw_exit_count` | `Thread::lightweight_thread_exit()`（`Thread.cpp`） | ARM 路径上**真正**的最后一口气 |
+| `vita_start0_count` | `Java_java_lang_Thread_start0`（`Natives.cpp`） | Java 层 `Thread.start()` 调用数 |
+| `vita_justborn_dispatch` | `switch_thread()` 的 `THREAD_JUST_BORN` 分支（`Scheduler.cpp`） | 与 `th_start` 相减 ⇒ "创建了但从没被派发" |
+| Java 线程名环 `vita_tc_class/method[8][40]` | `Thread::start()` | 创建/死亡自旋会**重复同一对** `Class.run` ⇒ 不需要 Java 堆就能点名 Java 代码 |
+| 调度环 `_vita_disp_ring[32][4]` | `switch_thread()` 顶部 | 冻结前在哪些线程间轮转（`id/pri/st/pe`，`pe`= 是否还有待执行入口） |
+| `_next_runnable_thread` 缓存 | `switch_thread` 之外 | `nrt cell/obj` + `id/pri/st/jsp/wait`；非 NULL 缓存指向死对象 ≠ NULL 缓存 |
+| **Java 栈顶 16 字** | `vita_sched_dump_stack()` | coredump **只含 native 栈**，`setup_stack_asm` 的引导帧（fp=0、`start_lightweight_thread_asm`、`TestCompiler`）此前**从未可观测**。栈顶仍符合模板 ⇒ 该线程**从没进过 Java**。带 `0x81000000..0xa0000000` 范围保护。 |
+| ticker 活性 `vita_ticker_loops` / `vita_ticker_last_ms` | `ticker_thread_routine`（`OS_vita.cpp`） | ticker 是否还活着；`ago_ms` 两采样增长 ⇒ 完全没被调度 |
+| `vita_tickgate_mode` | `vita_jit_tick_compile_enabled()` | 当前 tick 编译门模式（0/1/2） |
+
+### 3. 运行期 A/B 开关（`vita_cfg_flag` / `vita_cfg_digit`）
+
+`ux0:/data/J2ME00001/<name>`，**文件不存在 = 行为与 v02.16 完全一致**：
+
+| 文件 | 值 | 含义 |
+|---|---|---|
+| `tickgate` | `1` | ticker >1 s 没刷新（VM 独占 CPU）⇒ **跳过** tick 触发的同步 JIT 编译（这既是探针也是**修复**） |
+| `tickgate` | `2` | 完全不在 tick 上编译（= `tick_compile.cfg` 写 `0`） |
+| `ticker_cpu` | `0`/`1`/`2` | ticker 用全部用户核 / 钉 cpu1 / 钉 cpu2 |
+| `tick_compile.cfg` | `0` | v02.11 原开关，语义未变 |
+
+`vita_cfg_flag` 带按名缓存（单次上机只读一次文件），`vita_cfg_digit` 返回数字。
+**教训**：第一版缓存查找用 `const char*` 指针比较（`vita_cfg_names[i] == name`），
+两个内容相同但地址不同的字面量会误回落到默认值 —— 已修成 `vita_cfg_name_eq()`
+（先指针相等快路径，再逐字符循环）。
+
+样例文件：`vita-port/ab/tickgate.{1,2}`、`ticker_cpu.{0,1,2}`（复制到真机时**去掉
+扩展名**）。完整跑法见 `vita-port/ab/README.md`。
+
+### 4. 关键文件修改记录（v02.17）
+
+| 文件 | 改动 | 规模 |
+|---|---|---|
+| `phoneme-cldc/src/vm/os/vita/Globals_vita.hpp` | v02.17 计数器/环/`vita_tc_note`/`vita_cfg_flag`/`vita_cfg_digit`/`vita_jit_tick_compile_enabled`/`vita_tickgate_mode` 声明 | +62 |
+| `phoneme-cldc/src/vm/os/vita/OS_vita.cpp` | 状态定义 + `vita_tc_note` + `vita_cfg_*` + tick 编译门 + ticker 活性戳 + `ticker_cpu` A/B + `vita_wd_snapshot` 拆双采样并新增 7 个读段 | +338/-5 |
+| `phoneme-cldc/src/vm/share/runtime/Scheduler.cpp` | 调度环宏 + `Scheduler::start` 计数 + `justborn` 计数 + `nrt/dispatch/stack` 访问器与 dump | +151 |
+| `phoneme-cldc/src/vm/share/runtime/Thread.cpp` | `th_start`+名字环 / `th_finish` / `lw_exit` | +29 |
+| `phoneme-cldc/src/vm/share/runtime/JVM.cpp` | `run` 计数 | +8 |
+| `phoneme-cldc/src/vm/share/natives/Natives.cpp` | `start0` 计数 | +4 |
+| `phoneme-cldc/src/vm/share/compiler/Compiler.cpp` | 追加 `vita_jit_tick_compile_enabled()` 门 | +9 |
+| `vita-port/CMakeLists.txt` | 版本 → `02.17` + 注释块 | +36 |
+
+**总计 +632 / −5，8 个文件**；共享文件只插 `#if defined(VITA)` 块 + 一行自增，
+无格式重排、无 `phoneme_source/` 改动、无 `cldc/build/share/` 改动。
+
+### 5. 构建与验证（实际命令）
+
+```bash
+source /home/zyb/vitasdk/vitasdk.sh
+
+# 1) VM（PRODUCT 配方必须完整；尾部 loopgen 宿主链接错误是预期噪音）
+cd /home/zyb/vitasdk/samples/j2me && ./rebuild_vm.sh build
+#    -> "== 33 ARM objects OK ==" / "== library packed: 29 members =="
+#    产物 phoneme-cldc/build/vita_arm/dist/lib/libcldc_vm.a（vita-port 实际链接的就是它）
+
+# 2) 校验插桩符号（C 链接、无 mangling）
+arm-vita-eabi-nm --defined-only .../dist/lib/libcldc_vm.a | grep -E 'vita_run_count|vita_tc_note|vita_cfg_flag|vita_jit_tick_compile_enabled|vita_tickgate_mode|vita_sched_dump_stack'
+#    -> 全部为 T/B（非 mangled）✓
+
+# 3) VPK（需要 JDK8 在 PATH，build_jar.sh 依赖 javac）
+export PATH=/home/zyb/tools/jdk8u502-b07/bin:$PATH
+cd /home/zyb/vitasdk/samples/j2me && bash vita-port/build.sh
+#    -> "Build successful" / out/vpk/midp_vita_v02.17.vpk
+
+# 4) 确认插桩进了最终镜像（.sym 是未 strip 的 ELF；最终 midp_vita 本身被 strip）
+strings -a out/vpk/midp_vita_v02.17.sym | grep -E 'vita_run_count|vita_tc_note|vita_jit_tick_compile_enabled|vita_tickgate_mode|vita_sched_dump_stack|vita_cfg_digit|vita_justborn_dispatch'
+#    -> 7/7 命中 ✓
+```
+
+**坑（重复踩过）**：`bash vita-port/build.sh` 若 PATH 里没有 JDK，会在
+`build_jar.sh: line 22: javac: command not found` 处 `exit=127` —— 报错点离
+根因很远，先看是不是 JDK 没在 PATH。
+
+### 6. 建议的上机顺序（一个 VPK 回答多个问题）
+
+1. **基线**：只放 `launch.cfg` = `launch.cfg.hello`（4 行，jar 路径**相对**，
+   末行 `menu=0`）。取双采样基线，确认冻结是否仍在
+   `start_lightweight_thread_asm` 附近。
+2. **`ticker_cpu.2`**（ticker 挪离 VM 核）：冻结消失 ⇒ v02.14 的"同核"
+   就是原因；`ticker loops` 仍在涨而 VM 不复活 ⇒ ticker 与冻结无关。
+3. **`tickgate.2`**：真正跑一次 v02.11 那个**从未生效**的假设
+   （历史各轮日志都是 `launch.cfg not found, defaults in use`，A/B 从未触发）。
+
+每轮只换 `ux0:` 上的小文件 + 重开应用，**不需要重装 VPK**。
+
+### 7. 遗留风险
+
+- `vita_sched_dump_stack()` / `vita_sched_nrt_info()` 会解引用句柄；若句柄被
+  撕裂（写入方已冻结、正常情况不会），理论上可能让看门狗异常。已加地址范围
+  保护，但这是刻意接受的取证风险。
+- 双采样让看门狗在 HANG 后多停留 400 ms（原 ~200 ms 的 site 活性测试之外），
+  对"尽快抓 coredump"有一点影响；`WD_STALL_POLLS` 等阈值未改。
+- `vita_cfg_digit` 未做按名缓存（只在看门狗 dump 与 tick 门里各调一次，tick 门
+  自身有 `_vita_tickgate_mode` 一次性缓存），所以没有额外 I/O 负担。
+- 所有开关默认关闭 ⇒ v02.17 的**行为与 v02.16 一致**，差异只在取证输出。
