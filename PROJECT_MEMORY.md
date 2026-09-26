@@ -118,7 +118,7 @@ ring 按写入序还原 = `switch×13, pump, pump, switch`（无 `wait_for_event
 时间账自洽：`vita_tick_count=1118 × 10ms ≈ 11.18s`（ticker 寿命）、`pump_runs=216 × 50ms ≈ 10.8s`
 （泵寿命）、`ttk=116` 且 stage 1..7 全 116（冻结前每个 tick 都完整跑完）。
 
-### 6. 下一步（v02.15 判定实验，~20 行）
+### 6. v02.15 判定实验（已实现并构建，待真机）
 
 让 watchdog 在 hang 后对 **VM 侧计数器做双采样**（间隔 500ms），打印 delta：
 `_vita_switch_count`、`_vita_pump_runs`、`_vita_ttk_count`、`vita_tick_count`、`vita_site_seq`；
@@ -130,6 +130,20 @@ ring 按写入序还原 = `switch×13, pump, pump, switch`（无 `wait_for_event
 | 涨 | 不涨 | VM 在跑且独占 cpu1（ticker 同优先级被饿死）→ 内核调度策略 |
 | **不涨** | **不涨** | **cpu1 彻底停摆（预计结果）→ 转方向 B（kubridge）** |
 | 不涨 | 涨 | cpu1 健康但内核丢了 VM 线程 → 内核 TCB 问题 |
+
+**实现状态（`1c2fae4`）**：
+- `vita-port/src/vita_watchdog.c` +89：`wd_dump_vm_progress()` 双采样 + 判决行，调用点放在
+  **KICK 序列之前**（避免 affinity/priority 变更污染基线）。日志行前缀 `[WD] VMPROG-A/B/verdict`。
+- `phoneme-cldc/src/vm/os/vita/OS_vita.cpp` +35/-1：`vita_site_dump()` 里 `s`/`s2` 之间插入
+  `sceKernelDelayThread(200*1000)`，使 `frozen=` 恢复真实语义（该函数跑在存活的 watchdog 线程上，
+  所以延迟重读可行）。
+- `vita-port/CMakeLists.txt`：`VITA_VERSION` → `02.15` + 版本说明注释。
+- 构建验证：`rebuild_vm.sh` 33 objects / 29 members、`jvm_fast_globals` 恰好 1 个 D 定义、0 个
+  C 解释器符号；`build.sh` 成功，产物 `out/vpk/midp_vita_v02.15.vpk`（3655693B）+
+  `midp_vita_v02.15.sym`（4290144B），版本串 `J2ME Player v02.15 b344 (1274c64)`。
+
+**读日志要点**：`[WD] VMPROG verdict exec=0 tick=0 -> NEITHER -> cpu1 scheduler DEAD (direction B: kubridge)`
+即预计结果 —— 届时用户态探针到此为止，直接上 kubridge。
 
 ## 2026-09-26 log38：**停摆核严格跟随 vm 宿主核 → "vm 毒核"坐实，内核级单核停摆**——v02.13 换核钉死（CPU1）
 
