@@ -38,6 +38,12 @@
   差异，`chgcpu=2839` 表明 vm 死前在多核迁移过。
 - **下一步：单 CPU 亲和性对照**（vm 限 `aff=0x10000`），若冻结消失 → 坐实 Vita
   内核多核调度 bug；仍冻结则需内核层手段（kubridge/内核日志）。
+- **已实现 v02.12（b339, `f5df64e`）**：`vita_main.c` main() 最早处把 vm 主线程钉到
+  CPU0（`VITA_VM_CPU_AFFINITY_MASK=0x10000`，宏在 `CMakeLists.txt` 导出，0=关 A/B）。
+  调用链已确认链入：main@0x81000142 `blx` → fstub `sceKernelChangeThreadCpuAffinityMask`
+  @0x811068d0；pin rc 写 crumb.log + boot_log.txt。VPK:
+  `vita-port/out/vpk/midp_vita_v02.12.vpk`。判据：真机不再卡 → 坐实跨核迁移 bug +
+  钉核即 workaround；仍卡 → 排除多核，转内核层（kubridge/内核日志），Vita3K 无法复现。
 
 ### 工具教训（新增）
 
