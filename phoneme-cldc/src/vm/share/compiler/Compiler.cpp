@@ -209,6 +209,20 @@ void Compiler::set_hint(int hint) {
 }
 
 void Compiler::on_timer_tick(bool is_real_time_tick JVM_TRAPS) {
+#if defined(VITA)
+  /* v02.11: the tick-driven compile is the prime suspect for the
+   * long-standing "VM thread frozen with CE/ttk stuck while the ticker
+   * keeps raising ticks" hang (log9/log10/log35). This runs on the VM
+   * thread inside Thread::timer_tick(), i.e. exactly in the window the
+   * ttk/jsmp freeze pinned down, and it is a full synchronous compile
+   * with no safepoint in between. The switch is read once from
+   * ux0:/data/J2ME00001/tick_compile.cfg (absent = enabled, the b332
+   * behaviour) so one build can A/B the hypothesis without a recompile:
+   * write "0" into that file and gameplay stops compiling on ticks. */
+  if (!vita_tick_compile_enabled()) {
+    return;
+  }
+#endif
   if( !UseCompiler || !Universe::is_compilation_allowed() ) {
     return;
   }

@@ -4936,7 +4936,10 @@ Skeleton 的 C++ 桩只是声明）。
 - v02.09（d013e54）：runstatus 安全化（静态 1KiB 缓冲 + hex dump + 3 采样 MOVING/frozen）后置；KICK0=`sceKernelSendSignal`（对账本 RUNNING 线程唯一能触碰派发状态的原语）；KICK4=`sceKernelChangeThreadPriority2`（stub 有、头文件无，即时生效变体）。
 - log34 判读：KICK0 rc=0+ce 恢复=幽灵治疗成功；4 核表持续无 vm=幽灵终审；全无效则携 hex dump 转内核 bug 方向。
 
-## 2026-09-25 log35 分析（v02.10 / build b332）：**根因找到——VM 卡在绿灯无界 park，tick 无法打断等待（移植层丢失 EINTR 语义）**
+## 2026-09-25 log35 分析（v02.10 / build b332）：**Phase-1 判决已推翻 —— 真凶指向 tick 内同步 JIT 编译（`Compiler::on_timer_tick`），v02.11 已装阶段探针 + A/B 开关**
+
+> ⚠️ 本节曾给出的"绿灯无界 park / `suspend_ticks()` 非真挂起"结论**已撤回**（证据见下文"根因（源码级，v02.11 修正）"）。
+> 保留在 git 历史中的 `69ea4b0` 记录的是**错误结论**，勿再据此行事。
 
 判决与全部证据链见 `debug/logs/log35/ANALYSIS.md`。要点：
 
@@ -4960,25 +4963,53 @@ Skeleton 的 C++ 桩只是声明）。
   `lanes fast=382 slow=0 pump=394 switch=190999`。
 - **与 log23 指纹逐字节复现**（fast/switch/pump==CE/clinit=`com/app/filemanager/UI` 全同）
   → 长期存在、可复现的同一 bug，**非 v02.09/v02.10 回归**。
-- **根因（源码级）**：`Scheduler::yield()` 无 runnable → park →
-  `wait_for_event_or_timer(sleeper_found=false)`；因 `scheduler_async()` **非空**（`async_count=1`，
-  上游注释"Vita 上恒为空"已不成立）走 **`sleep_time = -1`（睡到有事件为止）** →
-  `master_mode_wait_for_event_or_timer(-1)` → `Os::suspend_ticks()`（**Vita 实现只是
-  `ticker_running=false`，并非真挂起线程**）→ `check_blocked_threads(-1)`
-  → `JVMSPI_CheckEvents(..., -1)` **内核无限阻塞、0 CPU**（= d=0 的直接解释）。
-  **ticker 是独立线程，`real_time_tick` 只在它自己线程置 flag，无法像 Linux ITIMER 信号那样
-  EINTR 打断这次阻塞**——Linux 的 `suspend_ticks()` 本意就是关掉 ITIMER 防止乱打断，
-  Vita 照抄了调用点却**没有对应中断源**。于是 tick 堆积、输入事件无人投递、永久无响应，
-  而内核账本仍记 RUNNING(cpu=2) → **账本幽灵**。
-  （"按键几次就挂死"= MIDlet 消费完手上按键后进入等待，下一个按键事件永远送不达。）
-- **v02.11 首选修复（单点、最小、`#if defined(VITA)` 隔离）**：
-  `master_mode_wait_for_event_or_timer()` 里按 debugger 夹紧先例加钳位——
-  `if (sleep_time < 0 || sleep_time > TickInterval) sleep_time = TickInterval;`
-  → park 每 ≤1 tick 返回，周期性回到 pump/`check_blocked_threads` 排水；顺带不再触发假挂起。
-  加固：`suspend_ticks()/resume_ticks()` 在 Vita 上做**真** `sceKernelSuspendThread/ResumeThread`；
-  在 park 循环加 `vita_site_mark_e` + `sleep_time/sleeper_found/_async_count` 数值打点。
-- 待查（遗留）：`async_count` 的来源（谁注册的 async）；`Main_vita.cpp:78` 对 `timeout=-1` 的
-  实际处理（若 ANI 内部改有限循环，则冻结点需用新打点定位）；q5 两元素环重复打印是 dump 形态还是链表自环。
+- **根因（源码级，v02.11 修正）**：先前 Phase-1 判决"绿灯无界 park（`sleep_time=-1`）+
+  `suspend_ticks()` 非真挂起 → 内核无限阻塞"**被本轮证据推翻，现予撤回**：
+  - `slow=0` → `Scheduler::yield()` 的慢车道（park 路径）**从未被走过**；
+  - **master 模式实锤**（构建产物 `midp_master_mode_events.o` 存在、`slavemode_port/` 无 vita 端口、
+    `midp_slave_mode_events.c` 未编译）→ `wait_for_event_or_timer()` 的 `sleep_time=-1` 分支**不可达**；
+  - `rt_ticks=1341 ≫ ttk=357` → v02.00 的 `sleep_forever` 空闲环确实在跑，不是"卡在内核阻塞"；
+  - `vita_checkevents.c` 早已把 ANI 等待钳到 ≤50ms；`Main_vita.cpp` 的 slave 模式 `JVM_TimeSlice()`
+    循环未被使用（遗留风险 ② 结案）；
+  - `pump=394 == CE=394` + 冻结前输入心跳正常 → 泵不是饿死，而是"VM 再没回来调用它"。
+- **真实形态**：`ttk == jsmp == 357` 且 `rt_ticks` 持续上涨 → **第 357 次 tick 的 tick 体进入了、
+  但永不返回**；`gnrt=0/0`（空队列退出计数为 0）= runnable 队列从未空过；
+  `ani_mark.log = "CE #394 ANI OUT"`（下一次 IN 从未发生）= log19/20/22/23 一脉相承的指纹
+  （长期 bug，非 v02.09/v02.10 回归）。内核保存的 pc 停在 `interpreter_timer_tick+0x24`
+  （tick 桩内部，**不是**任何 syscall 入口桩 → VM 不在内核里等），故
+  **VM 线程卡在 `Thread::timer_tick()` 的 tick 体内部：过了 java-frame 采样、未到 `Scheduler::yield()`。**
+- **头号嫌疑（v02.11 主攻）**：该窗口内唯一的重活是 **tick 上的同步 JIT 编译** ——
+  `Thread::timer_tick()` 在 `#if ENABLE_COMPILER` 下直接调用
+  `Compiler::on_timer_tick(_real_time_has_ticked)`（`Compiler.cpp:211` 起的完整编译入口：
+  采样当前方法 → `_compilation_abstinence_ticks` 倒数 → 真的编译），**中间没有 safepoint**；
+  且本构建**编译器确实编进去了**（`midp_vita.velf`：`_ZN11JVMCompiler13on_timer_tickEi`=`102074a30`、
+  `_ZN22JVMCompiledMethodCache13on_timer_tickEv`=`1020b4df0`；`crumb.log`：`vm UseCompiler(pre)=1`）。
+  与"按键几次就挂死"吻合：方法跑热 → tick 采样到它 → 进入编译 → 不返回。
+- **site ring 归属（0x40 差异未结）**：热点槽（16 槽里 15 个同址）`0x810fad0c`/vma `0x81083d0c`
+  落在 nm 的 `JVMScheduler::wait_for`(0x102083cb8)..`switch_thread`(0x102083d24) 区间内，但该处
+  **没有** `vita_site_mark()` 调用点（Scheduler.cpp 仅 744/1341/2171 三处），且其前一条 `bl`
+  目标为 `0x81054bf8` = `Os::check_compiler_timer`(0x102054bb4)+0x44 —— **编译期时间预算检查的调用点**
+  （与 JIT 假说同向）；`vita_site_mark` 自身 nm 值 `0x102054c38` 比它高 0x40，此差异本轮未解，
+  v02.11 让 `site_ring.log` 直接打印 `mark=0x%08x`（`&vita_site_mark` 运行地址）以彻底消除滑移猜测。
+- **v02.11 已实现（b335，本工作树）**：
+  1. `Thread.cpp`：**tick 阶段探针**（stage 1..7 + 各阶段命中数：1=进入 tick、2=java-frame 采样后、
+     3=进编译器前、4=编译器返回后、5=`is_stopping` 后、6=`yield()` 后、7=`clear_timer_tick()` 后），
+     wd 快照输出 `ttk_stage=N hits 1..7=...`；判读规则：stage 冻结在 N 且 `hits[N]==hits[N-1]` 即卡点
+     （3/4⇒JIT 编译中；5/6⇒换出路径；7⇒tick 已完成）。下一次挂死**直接点名**，不再符号考古。
+  2. `Compiler.cpp`：**tick 编译 A/B 开关** `vita_tick_compile_enabled()`，读
+     `ux0:/data/J2ME00001/tick_compile.cfg`（文件不存在=启用=b332 行为；写入 `0`/`n` 即关闭 tick 上编译）。
+     一个 vpk 两种行为：写 `0` 后挂死消失 ⇒ JIT 假说实锤，正式修法改为 safepoint/显式入口驱动编译。
+  3. `Scheduler.cpp`：优先级队列 dump 加**环检测** —— 队列是**环形单链表**，定长走法把 log35 的 q5
+     打成 ~32 组 id=4/id=3（缓冲写满即停，还静默吞掉了之后所有队列）。现在遇头结点即打
+     `CYCLE(n)`，并显式标注 `(buffer full)`/`(max)`。
+  4. `OS_vita.cpp`：`site_ring.log` 增打印 `mark=0x%08x`。
+- **遗留风险结案**：① `async_count=1` 结构上已定位 —— `_async_count` 只在
+  `Scheduler::add_to_asynchronous()` 自增，唯一调用者 `block_current_thread()`
+  （上游另见 `sni.cpp:50`），MIDP 侧经 `midpEvents.c:356 blockMonitorThread()`；
+  运行期具体线程名未点名（优先级低）。② `Main_vita.cpp:78`/`timeout=-1`：master 模式下不可达
+  且 `vita_checkevents.c` 有钳位 → **结案**。③ q5 两元素环：**dump 形态，结案**。
+- 下一次实弹判读顺序：先看 `ttk_stage`/`hits` → 若卡在 3/4 则写 `tick_compile.cfg=0` 复跑验证 JIT；
+  若卡在 5/6 转 `Scheduler::yield()` 深处；`mark=0x...` 让 ring 槽位可直接 addr2line。
 
 ## 2026-09-25 log34 分析（v02.09 / build 8bf56ee / b330 实弹）：runstatus 二杀 wd（死在内核）+ site_ring 终局（VM 冻结于 wait_for 停车点）
 

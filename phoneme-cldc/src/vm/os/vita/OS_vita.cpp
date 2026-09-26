@@ -312,6 +312,42 @@ bool Os::check_compiler_timer() {
 
 extern "C" {
 
+/*=========================================================================
+ * v02.11 tick-driven JIT compile switch.
+ *
+ * log35's freeze fingerprint - _rt_timer_ticks climbing while the tick
+ * body entry count ttk and the Java-site sample count jsmp sat frozen
+ * at 357, with the slow lane at 0 and the event pump frozen at the
+ * same value as CE - puts the VM thread INSIDE Thread::timer_tick(),
+ * past the Java-site sample and short of Scheduler::yield(). The only
+ * heavy work in that window is the synchronous compile on the tick
+ * (Compiler::on_timer_tick under #if ENABLE_COMPILER; that symbol is
+ * in midp_vita.velf and crumb.log says UseCompiler=1).
+ * One build, two behaviours: this returns 1 unless the file
+ * ux0:/data/J2ME00001/tick_compile.cfg exists and starts with '0'
+ * (or 'n'/'N'). Read once and cached; called from the tick on the VM
+ * thread, so the file is opened at most once per process.
+ *=========================================================================*/
+
+static int _vita_tick_compile = -1; /* -1 = not decided yet */
+
+int vita_tick_compile_enabled(void) {
+    if (_vita_tick_compile < 0) {
+        _vita_tick_compile = 1;  /* default = b332 behaviour */
+        SceUID fd = sceIoOpen("ux0:/data/J2ME00001/tick_compile.cfg",
+                              SCE_O_RDONLY, 0);
+        if (fd >= 0) {
+            char c = 0;
+            if (sceIoRead(fd, &c, 1) == 1 &&
+                (c == '0' || c == 'n' || c == 'N')) {
+                _vita_tick_compile = 0;
+            }
+            sceIoClose(fd);
+        }
+    }
+    return _vita_tick_compile;
+}
+
 volatile unsigned int vita_site_seq = 0;
 
 #define VITA_SITE_RING_SIZE 16
@@ -590,10 +626,16 @@ void vita_site_dump(const char *path) {
     int n;
     unsigned int s = vita_site_seq;
     unsigned int s2 = vita_site_seq;
+    /* v02.11: also print the address of vita_site_mark itself. Ring
+     * slots hold return addresses inside THIS image, and log35's hot
+     * slot decoded 0x40 below the nm value for vita_site_mark - with
+     * the marker's own runtime address in the same file every future
+     * slot is directly addr2line-able without guessing a slide. */
     n = snprintf(buf, sizeof(buf),
-                 "site seq=%u frozen=%s self=0x%08x\n", s,
+                 "site seq=%u frozen=%s self=0x%08x mark=0x%08x\n", s,
                  s == s2 ? "yes" : "NO",
-                 (unsigned int)(unsigned long)&vita_site_dump);
+                 (unsigned int)(unsigned long)&vita_site_dump,
+                 (unsigned int)(unsigned long)&vita_site_mark);
     sceIoWrite(fd, buf, n);
     for (int i = 0; i < VITA_SITE_RING_SIZE; i++) {
         int idx = (int)((s - 1 - (unsigned int)i) &
@@ -647,6 +689,9 @@ extern "C" {
      * _rt_timer_ticks snapshot + Thread::timer_tick entry count. */
     unsigned int vita_sched_rt_ticks(void);
     unsigned int vita_sched_ttk_count(void);
+    /* v02.11: tick-stage probe readouts (state in Thread.cpp). */
+    unsigned int vita_sched_ttk_stage(void);
+    unsigned int vita_sched_ttk_hits(int i);
     int  vita_sched_dump_threads(char *out, int out_size);
 }
 
@@ -715,6 +760,19 @@ void vita_wd_snapshot(const char *path) {
                  "  rt_ticks=%u ttk=%u jsmp=%u\n",
                  vita_sched_rt_ticks(), vita_sched_ttk_count(),
                  vita_java_sample_count);
+    sceIoWrite(fd, buf, n);
+    /* v02.11: which step of the last tick is the VM thread inside?
+     * stage 0 = not inside a tick (a completed tick ends at 7). A
+     * frozen stage N with hits[N] == hits[N-1] names the wedged step:
+     * 2 = after java-frame sample, 3 = inside the JIT compile, 5 = in
+     * the yield/switch path, 7 = tick completed. */
+    n = snprintf(buf, sizeof(buf),
+                 "  ttk_stage=%u hits 1..7=%u/%u/%u/%u/%u/%u/%u\n",
+                 vita_sched_ttk_stage(),
+                 vita_sched_ttk_hits(1), vita_sched_ttk_hits(2),
+                 vita_sched_ttk_hits(3), vita_sched_ttk_hits(4),
+                 vita_sched_ttk_hits(5), vita_sched_ttk_hits(6),
+                 vita_sched_ttk_hits(7));
     sceIoWrite(fd, buf, n);
     /* v01.98: log22 quantified the ping-pong but could not separate
      * "pump starving in the fast lane" from "pump running but

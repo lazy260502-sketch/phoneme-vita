@@ -67,6 +67,10 @@ static unsigned int _vita_gnrt_nulls  = 0;
  * to the Java-site sampling probe) - read through the accessor bridge
  * at the bottom of this file. */
 extern unsigned int _vita_ttk_count;
+/* v02.11: tick-stage probe state, defined in Thread.cpp next to the
+ * counter above - same accessor bridge. */
+extern volatile unsigned int _vita_ttk_stage;
+extern volatile unsigned int _vita_ttk_hits[8];
 #endif
 
 OopDesc*   Scheduler::_gc_global_head;
@@ -2529,6 +2533,15 @@ extern "C" unsigned int vita_sched_rt_ticks(void) {
 extern "C" unsigned int vita_sched_ttk_count(void) {
   return _vita_ttk_count;
 }
+/* v02.11: tick-stage readouts (state in Thread.cpp, see the probe note
+ * there). A frozen stage with hits[N] == hits[N-1] names the step of
+ * Thread::timer_tick() the VM thread is wedged in. */
+extern "C" unsigned int vita_sched_ttk_stage(void) {
+  return _vita_ttk_stage;
+}
+extern "C" unsigned int vita_sched_ttk_hits(int i) {
+  return (i >= 0 && i < 8) ? _vita_ttk_hits[i] : 0u;
+}
 
 /* v01.98: log22 left the central question open - active_count=5 but the
  * VM does no useful work (pure stub ping-pong). WHO are the 5 threads
@@ -2619,14 +2632,44 @@ extern "C" int vita_sched_dump_threads(char *out, int out_size) {
                      "  q%d:", priority);
         if (n > 0) pos += n;
         int count = 0;
+        /* v02.11: the priority queues are CIRCULAR singly-linked lists,
+         * so a fixed-count walk reprints the same 1-2 entries until the
+         * output buffer fills. log35 read q5 as ~32 id=4/id=3 pairs and
+         * looked like a 2-element-ring anomaly: it is a dump-walk
+         * artifact (the buffer ran out first, which also silently
+         * dropped every later queue). Stop when the walk returns to the
+         * head, and say which bound stopped it. */
+        Thread::Raw head = t;
+        void *head_obj = (void*)head.obj();
         while (!t.is_null() && count < VITA_SCHED_DUMP_MAX) {
           jint st = t().status();
           n = snprintf(out + pos, out_size - pos,
                        " t%p(id=%d,st=%08x)",
                        (void*)t.obj(), t().id(), (unsigned int)st);
-          if (n > 0 && pos + n < out_size) pos += n; else { t = Thread::Raw(); break; }
+          if (n > 0 && pos + n < out_size) {
+            pos += n;
+          } else {
+            if (pos + 64 < out_size) {
+              n = snprintf(out + pos, out_size - pos, " (buffer full)");
+              if (n > 0) pos += n;
+            }
+            t = Thread::Raw();
+            break;
+          }
           t = t().next();
           count++;
+          if (!t.is_null() && (void*)t.obj() == head_obj) {
+            if (pos + 64 < out_size) {
+              n = snprintf(out + pos, out_size - pos, " CYCLE(%d)", count);
+              if (n > 0) pos += n;
+            }
+            break;
+          }
+        }
+        if (!t.is_null() && count >= VITA_SCHED_DUMP_MAX &&
+            pos + 64 < out_size) {
+          n = snprintf(out + pos, out_size - pos, " (max)");
+          if (n > 0) pos += n;
         }
         n = snprintf(out + pos, out_size - pos, "\n");
         if (n > 0) pos += n;

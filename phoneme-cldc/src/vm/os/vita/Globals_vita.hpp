@@ -49,6 +49,11 @@
 extern "C" {
     void vita_site_mark(void) __attribute__((noinline));
     void vita_site_dump(const char *path);
+    /* v02.11: tick-driven JIT compile switch (defined in OS_vita.cpp).
+     * Read once from ux0:/data/J2ME00001/tick_compile.cfg; absent or
+     * unreadable = enabled (the b332 behaviour). Consulted by
+     * Compiler::on_timer_tick() under #if defined(VITA). */
+    int vita_tick_compile_enabled(void);
     /* v01.85 verifier deep tracing - names the class.method being
      * verified at hang time (see OS_vita.cpp). v01.86: explicit length
      * - Symbols are length-prefixed, NOT NUL-terminated. */

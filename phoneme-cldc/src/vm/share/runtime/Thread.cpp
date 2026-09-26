@@ -550,11 +550,34 @@ void Thread::stack_overflow(Thread *thread, address stack_pointer) {
  * OS_vita.cpp. Read by the watchdog through the extern "C" accessor
  * vita_sched_ttk_count (Scheduler.cpp accesssor bridge). */
 unsigned int _vita_ttk_count = 0;
+/* v02.11 tick-stage probe: log35 froze with ttk==jsmp==357 (the tick
+ * body was entered and never returned) while _rt_timer_ticks kept
+ * climbing, and the slow-lane/pump counters (slow=0, pump==CE==394)
+ * exclude Scheduler::yield()'s wait lane and the event pump. The pair
+ * ttk/jsmp cannot say WHICH step of the tick wedged, and every
+ * candidate step is plain C++ on the green thread's Java stack -
+ * invisible to the coredump. The prime suspect is the synchronous JIT
+ * compile on the tick (Compiler::on_timer_tick; UseCompiler=1 in
+ * b332's crumb.log, and JVMCompiler::on_timer_tick(int) is linked
+ * into midp_vita.velf), so record the last stage reached plus a
+ * per-stage hit count; the watchdog reads them via
+ * vita_sched_ttk_stage()/vita_sched_ttk_hits(). Stages:
+ *   1 tick entry          5 after is_stopping()
+ *   2 after java_frame    6 after Scheduler::yield()
+ *   3 before Compiler     7 after clear_timer_tick() (tick complete)
+ *   4 after  Compiler
+ * A frozen stage N with hits[N] == hits[N-1] names the wedged step. */
+volatile unsigned int _vita_ttk_stage = 0;
+volatile unsigned int _vita_ttk_hits[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+#define VITA_TTK_STAGE(n) (_vita_ttk_stage = (n), _vita_ttk_hits[(n)] += 1)
+#else
+#define VITA_TTK_STAGE(n) ((void)0)
 #endif
 
 void Thread::timer_tick() {
   SETUP_ERROR_CHECKER_ARG;
   Thread *thread = Thread::current();
+  VITA_TTK_STAGE(1);
 #ifndef PRODUCT
   if( TraceCompiledMethodCache ) {
     TTY_TRACE_CR(( "\n*** Timer tick beg ***" ));
@@ -570,6 +593,7 @@ void Thread::timer_tick() {
    * static text buffers through sceIo. */
   _vita_ttk_count++;
   vita_site_java_frame();
+  VITA_TTK_STAGE(2);
 #endif
 
 #if ENABLE_PROFILER
@@ -594,7 +618,9 @@ void Thread::timer_tick() {
 #if ENABLE_COMPILER
 
   ObjectHeap::accumulate_current_task_memory_usage();
+  VITA_TTK_STAGE(3);
   Compiler::on_timer_tick(_real_time_has_ticked JVM_MUST_SUCCEED);
+  VITA_TTK_STAGE(4);
   _real_time_has_ticked = false;
 #endif
 
@@ -603,11 +629,14 @@ void Thread::timer_tick() {
       Throw::uncatchable(JVM_SINGLE_ARG_THROW);
     }
   }
+  VITA_TTK_STAGE(5);
   // Do the preemption. yield will transfer the control
   // to the next ready thread in the scheduler.
   ObjectHeap::accumulate_current_task_memory_usage();
   Scheduler::yield();
+  VITA_TTK_STAGE(6);
   Thread::clear_timer_tick();
+  VITA_TTK_STAGE(7);
 
 #if ENABLE_CPU_VARIANT
   if (EnableCPUVariant) {

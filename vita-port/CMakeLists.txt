@@ -838,7 +838,49 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.10")
+set(VITA_VERSION  "02.11")
+# 02.11 (2026-10-28): log35 verdict (CORRECTED) + the probe it needs.
+#   The Phase-1 verdict ("unbounded park: Scheduler::yield's slow lane
+#   with sleep_time=-1 because Os::suspend_ticks() is a Vita no-op")
+#   is WRONG and is retracted here. log35's own numbers refute it:
+#   slow=0 (that lane was never taken), master mode is proven by the
+#   build artifacts (midp_master_mode_events.o present, no vita
+#   slavemode_port), so wait_for_event_or_timer()'s sleep_time=-1
+#   branch is unreachable; rt_ticks=1341 >> ttk=357 proves the v02.00
+#   sleep_forever idle loop ran; vita_checkevents.c already clamps the
+#   ANI wait to <=50 ms; pump==CE==394 and the input heartbeat ran
+#   right up to the freeze. The real clue is ttk==jsmp==357: the tick
+#   BODY was entered 357 times and the 357th never returned =>
+#   the VM thread is inside Thread::timer_tick(), past the java-frame
+#   sample and short of Scheduler::yield(); gnrt=0/0 says the runnable
+#   queue never emptied; ani_mark.log=="CE #394 ANI OUT" is the
+#   log19/20/22/23 fingerprint (long-standing, not a v02.10
+#   regression). ENABLE_COMPILER IS on in this build
+#   (JVMCompiler::on_timer_tick(int) is in midp_vita.velf, crumb.log
+#   says UseCompiler=1) and Compiler::on_timer_tick() compiles
+#   SYNCHRONOUSLY on the tick - that is the prime suspect.
+#   v02.11 changes:
+#   - Thread.cpp: tick-stage probe (stages 1..7 + per-stage hit counts)
+#     so the next hang names the wedged step instead of a symbol hunt;
+#     the watchdog prints "ttk_stage=N hits 1..7=...".
+#   - Compiler::on_timer_tick: VITA-only switch
+#     (vita_tick_compile_enabled(), file
+#     ux0:/data/J2ME00001/tick_compile.cfg, absent = enabled = b332
+#     behaviour). One build can A/B the JIT hypothesis: write "0" into
+#     that file and tick-driven compilation stops; if the hang goes
+#     away, the diagnosis is confirmed and the fix is a
+#     safepoint-driven compile policy.
+#   - Scheduler.cpp: priority queues are CIRCULAR lists, so the
+#     fixed-count q walk printed log35's q5 as ~32 id=4/id=3 pairs
+#     (a buffer-full artifact that also silently dropped every later
+#     queue). The walk now stops at the head and prints CYCLE(n) /
+#     (buffer full) / (max) - residual Risk 3 closed.
+#   - OS_vita.cpp: site_ring.log also prints mark=0x%08x
+#     (&vita_site_mark) so ring slots are addr2line-able without slide
+#     guessing. log35's hot slot decoded inside an unnamed
+#     Scheduler-side static whose callee is Os::check_compiler_timer
+#     +0x44 - a JIT compile-time-budget call site, consistent with the
+#     compiler hypothesis.
 # 02.10 (2026-10-27): log34 verdict + final kick battery.
 #   log34 ran v02.09 on real HW: runClocks d=0 re-confirmed (the vm
 #   thread NEVER executes while the ledger says RUNNING), and the
