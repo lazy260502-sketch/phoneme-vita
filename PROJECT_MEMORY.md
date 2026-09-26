@@ -1,6 +1,162 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-26
 
+## 2026-09-26 log40：**v02.15 判决 = NEITHER（预注册命中）——cpu1 内核调度器死亡，方向 A 穷尽；core dump 把死点钉死在"第一次切入 MIDlet Java 代码"的第 7 条指令**
+
+> v02.15（b345, `1c2fae4`）真机日志。目录 `debug/logs/log40/`。
+
+### 1. 判决：NEITHER —— 与 log39 §6 预注册的判据矩阵完全一致
+
+```
+[WD] VMPROG verdict exec=0 tick=0 -> NEITHER -> cpu1 scheduler DEAD (direction B: kubridge)
+[WD] VMPROG-A vm-exec  switch=218008->218008(d=0) fast=131->131(d=0) site=219277->219277(d=0) jsmp=107->107(d=0)
+[WD] VMPROG-B tick-ch  tick=1071->1071(d=0) ttk=107->107(d=0) pump=208->208(d=0)
+```
+
+- VM 在 500ms 内 **一次 `switch_thread` 检查点都没走**（正常约 21.8 万次/轮）；
+- 与 VM **同核同优先级 0xa0** 的 ticker **一次 tick 都没发**；
+- cpu1 内核账本三项全冻（`idle 12563428788` / `idleN 25786546` / `switchN 51653795`，全 d=0），
+  同时 cpu0 `idleN 8575529->8575576`、`switchN 17608682->17608776`，cpu2/cpu3 同样在涨；
+- 同轮 `vm runClocks 10438483->10438483 (d=0)` vs `wd runClocks d=1754`、`tone runClocks d=1930`；
+- 内核仍报 `vm status=RUNNING wait=none(0x0) cpu=1 lastcpu=1`（幽灵态）；KICK0..5 全无效，
+  KICK5 `susp/res rc=0x80020008` = `ILLEGAL_PERMISSION`。
+
+**⟹ cpu1 的内核调度器整体停摆。方向 A（用户态观测）彻底穷尽。**
+
+### 2. core dump 重建（本轮最重要的新材料）
+
+**解析布局修正**：`THREAD_REG_INFO`(note 0x1004) = 8 字节头 + N×0x178 块，
+`+0x00` size_field / `+0x04` SceUID / `+0x08..+0x44` r0..r15 / `+0x48` cpsr。
+log39 用的解析器把寄存器当在 `+0x00`，整体错位 2 字 —— 现用解析器 `/tmp/log40/regs.py`。
+
+**5 个线程（`THREAD_INFO` 记录与 entry 反推 slide 交叉验证）**：
+
+| 线程 | uid | entry | 栈 | prio | attr | 冻结 pc |
+|---|---|---|---|---|---|---|
+| **J2ME00001（vm 主线程）** | 0x40010003 | `_start+1` | 0x81341000 +256K | 0xa0 | 0x80000000 JOINABLE | **`start_lightweight_thread_asm+0x18`** |
+| SceCommonDialogWorker | 0x400100c3 | 0xe018f57d | 0xd0001000 +64K | — | 0 | 0xe00073a4 |
+| j2me_tone | 0x4001015d | `tone_player_thread+1` | 0x813b5000 +16K | 0xa0 | 0 | `sceKernelDelayThread+0x8` |
+| j2me_watchdog | 0x40010161 | `wd_thread_routine+1` | 0x813bd000 +16K | 0xa0 | 0 | `wd_thread_routine+0x884`（Thumb，正在写 sysinfo） |
+| cldc_ticker | 0x400101c7 | `ticker_thread_routine+0` | 0x813d1000 +64K | 0xa0 | 0 | `sceKernelDelayThread+0x8`，r0=0x2710 |
+
+⇒ **vm 线程就是主 OS 线程**（与 `vita_main.c` 注释 "this thread becomes the VM's main
+interpreter thread inside runMidlet" 一致）；**没有为 MIDlet 新建 OS 线程** ⟹ Java 线程是在
+primordial 线程上复用的 green thread。
+
+**vm 线程保存的用户上下文**：
+
+```
+pc   = 0x810fd03c  -> start_lightweight_thread_asm+0x18   (bleq invoke_pending_entries)
+lr   = 0x810fd024  -> start_lightweight_thread_asm+0x00
+sp   = 0x8137ff70
+cpsr = 0x40070010  User, ARM, IRQ/FIQ 使能, Z=1
+r0 = r3 = 0x81ede328 (当前 Thread oop)   r5 = 0x81401904 (GP)   r6 = 0x81edf390 (jsp)
+```
+
+**`lr` 为何等于 stub 入口（机制，非偶然）**：`JVM::start()+0x174` 处 `bl primordial_to_current_thread`
+（0x810bd000），该 thunk 只有 9 条指令：
+
+```asm
+push {r3-r9,sl,fp} ; push {lr}
+ldr  r5, =GP ; ldr r1,[r5,#1036] ( _current_thread )
+str  sp,[r5,#1252]                 ; 保存 primordial sp
+ldr  r6,[r1,#100]                  ; r6 = jsp
+ldr  lr,[r6,#4]                    ; ← 从 Java 栈取出"恢复 PC"
+ldr  fp,[r6],#8
+mov  pc, lr                        ; ← 跳过去，lr 留在目标地址
+```
+
+所以 `lr == 跳转目标 == stub 入口` 是这套"primordial→Java"切换的必然产物，**并证明线程是被
+`primordial_to_current_thread` 切进 Java 执行后只跑了 6 条指令就停住**。全程无 `svc`。
+
+**OS 栈把调用链钉死，且每个栈字都可解释**：
+
+```
+sp+0x00 (0x8137ff70): 810f068c  JVM::start()+0x178   ← 正是 bl primordial_to_current_thread 的返回地址
+sp+0x34:              810f0804  JVM_Start+0xa4
+sp+0x54:              810830dc  midp_run_midlet_with_args_cp+0x95c
+```
+
+`primordial_to_current_thread` 的 `push {lr}` 把返回地址放在 frame_base，`str sp,[gp+0x4e4]`
+保存的正是 frame_base，而 `start_lightweight_thread_asm` 前 7 条指令**没有任何 push**
+⟹ `sp == frame_base`、`[sp] == JVM::start()+0x178`。**寄存器与栈完全自洽。**
+
+### 3. 死点语义：冻结发生在"本地原生代码第一次切入 MIDlet 的 Java 代码"那一瞬间
+
+`runmidlet_debug.log` 全部内容以两行收尾：
+
+```
+*** runMidlet: midpInitialize OK
+*** runMidlet: calling midp_run_midlet_with_args_cp now    ← 此后无任何输出
+```
+
+`crumb.log` 末尾：`menu hb: flips=130` → `menu exit: have_sel=1` → `round begin` →
+`launch: games/app (1)/game.jar` → `runMidlet enter` → `vm UseCompiler(pre)=1`。
+`input_debug.log` 最后一次交互 `buttons=0x00000040`（选择键）。
+
+⇒ **`tick=1071`（10.7s）与 `ce=208`（10.4s）不是"MIDlet 跑了 10 秒"，而是 VM 启动 +
+`midpInitialize` + 原生菜单等待的总时长。冻结就在进入 MIDlet 的第一条 Java 代码路径上。**
+（此前各轮"进入 MIDlet 后约 11s 冻结"的表述按此修正。）
+
+**指令级**：已执行的 6 条 = 3×load + `mov r2,#0` + `tst` + `strne`（Z=1 → 未执行），
+**无系统调用、不写共享内存** ⟹ 线程不可能由此主动进内核。`cpsr` 为 User 且 IRQ/FIQ 使能，
+`pc` 停在 `bleq` 本身、`lr` 未被覆盖 ⟹ **`bl` 尚未执行**。
+
+⇒ **线程刚被切换进 Java（第 7 条指令处）就被中断打断，此后 cpu1 内核再未恢复。**
+log39 同位置为 `+0x8`（第 3 条）、`lr` 同样是 stub 入口 —— **两次独立运行都停在同一个 stub 的
+前 7 条指令内，不可能是巧合的定时器抢占。**
+
+### 4. 五轮复现签名（闭合）
+
+| 轮次 | 版本 | 钉核 | 死点 | 宿主核调度器 | ticker | rt_ticks | KICK |
+|---|---|---|---|---|---|---|---|
+| log36 | v02.11 | 无 | stub 前沿 | 停摆 | 独立 | — | 无效 |
+| log37 | v02.12 | CPU0 | 同上 | 停摆 | 独立 | — | 无效 |
+| log38 | v02.13 | 无 | stub+0xc/0x14/0x18 | 停摆 | cpu0 独立 | 1400 | 无效 |
+| log39 | v02.14 | CPU1+ticker 同核 | stub+0x8 | 停摆 | 同核饿死 | 0 | 无效 |
+| **log40** | **v02.15** | CPU1+ticker 同核 | **stub+0x18** | **停摆（VMPROG 双采样证实）** | **同核饿死** | 0 | 无效 |
+
+### 5. 顺带修正 / 新增事实
+
+- **`site seq=219277 frozen=yes` 本版已是真值**（200ms 窗口 + `VMPROG-A site d=0` 500ms 独立
+  复核，三重复核一致）⟹ log39 §2 的 `frozen` 假探针问题已修掉。
+- `q5: t0x81ede328(id=4) t0x81edc2ec(id=3) CYCLE(2)` —— 2 元素队列，再次确认 `CYCLE(n)` = 元素数，
+  **不是队列损坏**。
+- ticker 创建者 = `JVMOs::start_ticks()+0x78`，只在 pthread-init 路径创建一次，**非线程累积**。
+- **JIT 已排除**：`vita_jit_policy` 默认 0 ⟹ `runMidlet` 会传 `-int`（`Arguments.cpp:129` 置
+  `UseCompiler=false`），本轮是**纯解释器**。crumb 的 `UseCompiler(pre)=1` 是 `Globals.hpp:231`
+  默认值，`vita_main.c` 注释已警告其不可信。
+- **⚠ 地址校准坑（务必记住）：本版 `text/rodata` slide = `+0x40000`，`data/.bss`（GP 全局区）
+  slide = `+0x120000`，两者不等！** 依据：`vita_site_dump` 自打的 `self=0x81094958`（nm
+  0x81054958，5 处独立吻合）；而 `[r5+0x40c] = 0x81401d10` = `wd_snapshot` 的 `cur_cell`，
+  r5 取自 `.word 0x812e1904`（+0x120000）。**用错 slide 会把数据地址解析成 `g_net_mem+0x…`
+  这类假符号。core dump 与 velf 必须分别校准。**
+
+### 6. 局限
+
+- Java 堆段（0x81edf390 等）在 core 里**未保存**（`filesz < memsz`），无法读出 `[jsp+8]`
+  （切换后本应执行的目标）与 `[gp+0x4e4]`（保存的 primordial sp）；
+- `SYSTEM_INFO2` 有 4.1MB 内核系统信息未挖掘（若需确认"cpu1 上是否还有可运行线程"可再挖）。
+
+### 7. 下一步（按性价比）
+
+1. **零成本 A/B（最推荐）**：菜单里换一个游戏 / 用 launcher 内置 `Hello.jar` 再跑一轮。
+   所有 jar 都冻在同一处 ⟹ 通用适配缺陷（`JVM::start` / `primordial_to_current_thread` /
+   `start_lightweight_thread_asm` 这条路径）；只有 `game.jar` 冻 ⟹ 该 jar 内容/类初始化相关。
+2. **零成本调度 A/B**：`cldc_ticker` 优先级 0xa0 → 0x9f/0xa1（或钉 cpu0），vm 线程不钉核 ——
+   检验"同核同优先级 + 定时器中断"是否为触发条件。
+3. **方向 B（需 taihen+henkaku CFW 真机，Vita3K 不加载内核插件）**：kubridge +
+   `kuKernelCpuUnrestrictedMemcpy` / `kuKernelRegisterAbortHandler`，直接读 cpu1 停摆处的内核态
+   （锁 / runnable 队列 / 定时器中断路径），把"cpu1 停在哪个内核函数"点名。
+
+### 8. 与"代码没适配好"框架的调和
+
+触发点、死点、调用链**全在我们的移植代码路径上**（`midp_run_midlet_with_args_cp` →
+`JVM_Start` → `JVM::start()` → `primordial_to_current_thread` → `start_lightweight_thread_asm`），
+这正是 phoneME ARM 移植里最"手写汇编、最平台相关"的一段（`str sp,[gp+0x4e4]` 保存 primordial sp、
+`ldr lr,[jsp+4]; mov pc,lr` 手工跳转）。**即：我们的移植执行模式把 cpu1 的 Vita 内核带进了停摆，
+用户态已无法再观测** ⟹ 必须转内核侧（方向 B）。
+
 ## 2026-09-26 v02.14：**方向 A 审计落地——green-thread sp 安全 + 事件泵正常 + 跨核 ticker 竞态修复（钉核）**
 
 > 用户方向 A 选择：先做代码审查 + 最小修复，无效再上 kubridge（方向 B）。
@@ -118,7 +274,7 @@ ring 按写入序还原 = `switch×13, pump, pump, switch`（无 `wait_for_event
 时间账自洽：`vita_tick_count=1118 × 10ms ≈ 11.18s`（ticker 寿命）、`pump_runs=216 × 50ms ≈ 10.8s`
 （泵寿命）、`ttk=116` 且 stage 1..7 全 116（冻结前每个 tick 都完整跑完）。
 
-### 6. v02.15 判定实验（已实现并构建，待真机）
+### 6. v02.15 判定实验（已实现并构建，真机判决见顶部 log40 节）
 
 让 watchdog 在 hang 后对 **VM 侧计数器做双采样**（间隔 500ms），打印 delta：
 `_vita_switch_count`、`_vita_pump_runs`、`_vita_ttk_count`、`vita_tick_count`、`vita_site_seq`；
@@ -144,6 +300,8 @@ ring 按写入序还原 = `switch×13, pump, pump, switch`（无 `wait_for_event
 
 **读日志要点**：`[WD] VMPROG verdict exec=0 tick=0 -> NEITHER -> cpu1 scheduler DEAD (direction B: kubridge)`
 即预计结果 —— 届时用户态探针到此为止，直接上 kubridge。
+
+**真机结果（log40）：判据矩阵第三行命中 = NEITHER，用户态探针到此为止。详见顶部 log40 节。**
 
 ## 2026-09-26 log38：**停摆核严格跟随 vm 宿主核 → "vm 毒核"坐实，内核级单核停摆**——v02.13 换核钉死（CPU1）
 
