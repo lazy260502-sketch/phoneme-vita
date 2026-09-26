@@ -838,7 +838,32 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.15")
+# 02.16 (2026-09-26): log40 verdict (VMPROG NEITHER - cpu1 kernel scheduler
+#   DEAD) + launcher-side A/B infrastructure. Direction A (user-space
+#   observation) is exhausted, so the only remaining question user space
+#   can answer is "is the freeze tied to WHAT the MIDlet does, or to the
+#   path EVERY MIDlet takes?".
+#   - read_launch_cfg() now also parses an optional line-start "menu=0"
+#     and reports it. When set, the round skips vita_menu_run() entirely
+#     and launches the cfg's jar/class directly, so an A/B run carries no
+#     menu state (2 MB fb, touch init, fs scan) that could be blamed.
+#     Line absent -> behaviour byte-identical to 02.15.
+#   - read_launch_cfg() no longer writes its out-params while parsing. A
+#     jit-only launch.cfg ("jit=0", written by the menu's JIT setting)
+#     used to leave jar="jit=0" behind even though the function returned
+#     -1, so the "fall back to the bundled defaults" path actually tried
+#     to load a jar literally named "jit=0". Now parsed into locals and
+#     copied out only on success.
+#   A/B recipe (real hw), ux0:/data/J2ME00001/launch.cfg:
+#       Hello.jar
+#       HelloMIDlet
+#       portrait
+#       menu=0
+#   -> boots straight into the smallest self-built MIDlet (pure LCDUI,
+#   no audio/network/RecordStore). If it freezes with the same
+#   start_lightweight_thread_asm + cpu1-stall signature the freeze is
+#   path-generic, not jar-content driven.
+set(VITA_VERSION  "02.16")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows

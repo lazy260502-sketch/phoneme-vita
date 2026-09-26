@@ -163,14 +163,38 @@ static void copy_file(const char *src, const char *dst) {
 }
 
 /* Read launch.cfg:
- *   line 1: game jar absolute path
+ *   line 1: game jar path RELATIVE to the data dir (NOT absolute!)
  *   line 2: MIDlet class name
  *   line 3: optional orientation "portrait" / "landscape" (default portrait)
- * Returns 0 when jar+class were read. */
+ *   any line starting with "menu=0" -> *skip_menu = 1 (skip the native menu)
+ * Returns 0 when jar+class were read.
+ *
+ * The jar path MUST be relative: main chdir()s to DATA_DIR and the VM
+ * classpath is ':'-separated, so an "ux0:/data/..." entry would be cut
+ * at the colon into "ux0" + "/data/..." (see the chdir note in main). */
 static int read_launch_cfg(char *jar, size_t jar_sz,
                            char *cls, size_t cls_sz,
-                           char *orient, size_t orient_sz) {
-    SceUID fd = sceIoOpen(CFG_PATH, SCE_O_RDONLY, 0);
+                           char *orient, size_t orient_sz,
+                           int *skip_menu) {
+    /* v02.16: parse into locals and copy out only on SUCCESS. The old
+     * code wrote jar/cls as it parsed, so a jit-only launch.cfg
+     * ("jit=0", written by the menu's JIT setting) left jar="jit=0"
+     * behind even though the function returned -1 - and the caller's
+     * "fall back to the bundled defaults" path then tried to load a jar
+     * literally named "jit=0". */
+    char tjar[256];
+    char tcls[128];
+    char torient[32];
+    SceUID fd;
+
+    if (skip_menu != NULL) {
+        *skip_menu = 0;
+    }
+    tjar[0] = '\0';
+    tcls[0] = '\0';
+    snprintf(torient, sizeof(torient), "portrait");
+
+    fd = sceIoOpen(CFG_PATH, SCE_O_RDONLY, 0);
     if (fd < 0) {
         return -1;
     }
@@ -179,13 +203,33 @@ static int read_launch_cfg(char *jar, size_t jar_sz,
     (void)sceIoRead(fd, buf, sizeof(buf) - 1);
     sceIoClose(fd);
 
+    /* v02.16 (log40 A/B infra): optional line-start "menu=0" -> the
+     * caller skips the native menu and goes straight to this cfg's
+     * jar/class. Scanned on the raw buffer, BEFORE the line parsing
+     * below turns newlines into NULs. Keeping the menu out of the run
+     * means no 2 MB framebuffer alloc / touch init / filesystem scan
+     * can be blamed for a hang. */
+    if (skip_menu != NULL) {
+        char *p = buf;
+        while (p != NULL && *p != '\0') {
+            if (strncmp(p, "menu=0", 6) == 0) {
+                *skip_menu = 1;
+                break;
+            }
+            p = strpbrk(p, "\r\n");
+            if (p != NULL) {
+                p += strspn(p, "\r\n");
+            }
+        }
+    }
+
     /* line 1: jar path */
     char *nl = strpbrk(buf, "\r\n");
     if (nl == NULL) {
         return -1;
     }
     *nl = '\0';
-    snprintf(jar, jar_sz, "%s", buf);
+    snprintf(tjar, sizeof(tjar), "%s", buf);
 
     /* line 2: class name */
     char *p2 = nl + 1 + strspn(nl + 1, "\r\n");
@@ -193,13 +237,12 @@ static int read_launch_cfg(char *jar, size_t jar_sz,
     if (nl2 != NULL) {
         *nl2 = '\0';
     }
-    snprintf(cls, cls_sz, "%s", p2);
-    if (jar[0] == '\0' || cls[0] == '\0') {
+    snprintf(tcls, sizeof(tcls), "%s", p2);
+    if (tjar[0] == '\0' || tcls[0] == '\0') {
         return -1;
     }
 
     /* line 3 (optional): orientation */
-    snprintf(orient, orient_sz, "portrait");
     if (nl2 != NULL) {
         char *p3 = nl2 + 1 + strspn(nl2 + 1, "\r\n");
         char *nl3 = strpbrk(p3, "\r\n");
@@ -207,9 +250,13 @@ static int read_launch_cfg(char *jar, size_t jar_sz,
             *nl3 = '\0';
         }
         if (p3[0] != '\0') {
-            snprintf(orient, orient_sz, "%s", p3);
+            snprintf(torient, sizeof(torient), "%s", p3);
         }
     }
+
+    snprintf(jar, jar_sz, "%s", tjar);
+    snprintf(cls, cls_sz, "%s", tcls);
+    snprintf(orient, orient_sz, "%s", torient);
     return 0;
 }
 
@@ -382,43 +429,65 @@ int main(int argc, char *argv[]) {
             snprintf(class_name, sizeof(class_name), "ToneTest");
             snprintf(orient, sizeof(orient), "portrait");
 
-            /* Native game menu: pick an installed game (see vita_menu.c
-             * for the games/ + inbox/ layout). Falls through to
-             * launch.cfg / Hello when the user quits without a selection.
-             * v01.78h: the menu exits via longjmp (see vita_menu.h) -
-             * never through its epilogue pop, which read a zeroed
-             * saved-register block on quit in v01.78g. main never
-             * returns either (for(;;)), so the jmp lands in a frame
-             * that stays valid for the whole process. */
-            vita_menu_result = 0;
-            if (setjmp(vita_menu_escape) == 0) {
-                vita_menu_run(&sel);
-                /* not reached: the menu always longjmps */
-            }
-            if (vita_menu_result) {
-                snprintf(jar_path, sizeof(jar_path), "%s", sel.jar);
-                snprintf(class_name, sizeof(class_name), "%s", sel.cls);
-                snprintf(orient, sizeof(orient), "%s", sel.orient);
-                /* VM classpath splits on ':' - strip "ux0:/data/J2ME00001/"
-                 * so the entry is RELATIVE (see chdir above) */
-                {
-                    size_t plen = strlen(DATA_DIR "/");
-                    if (strncmp(jar_path, DATA_DIR "/", plen) == 0) {
-                        memmove(jar_path, jar_path + plen,
-                                strlen(jar_path) - plen + 1);
+            /* v02.16 (log40 A/B infra): read launch.cfg ONCE here, so
+             * its optional "menu=0" line can skip the native menu and
+             * launch the cfg's jar/class directly. Pinning the target
+             * this way makes an A/B run reproducible: no menu
+             * framebuffer/touch/fs-scan state participates, so a hang
+             * cannot be blamed on menu leftovers. When the line is
+             * absent the menu keeps deciding exactly as in 02.15. */
+            {
+                int cfg_skip_menu = 0;
+                int cfg_ok = (read_launch_cfg(jar_path, sizeof(jar_path),
+                                              class_name, sizeof(class_name),
+                                              orient, sizeof(orient),
+                                              &cfg_skip_menu) == 0);
+                if (cfg_ok && cfg_skip_menu) {
+                    dlog_str("launch.cfg jar (menu=0): ", jar_path);
+                    dlog_str("launch.cfg class (menu=0): ", class_name);
+                    dlog_str("launch.cfg orientation: ", orient);
+                } else {
+                    /* Native game menu: pick an installed game (see
+                     * vita_menu.c for the games/ + inbox/ layout). Falls
+                     * through to launch.cfg / Hello when the user quits
+                     * without a selection.
+                     * v01.78h: the menu exits via longjmp (see
+                     * vita_menu.h) - never through its epilogue pop,
+                     * which read a zeroed saved-register block on quit in
+                     * v01.78g. main never returns either (for(;;)), so
+                     * the jmp lands in a frame that stays valid for the
+                     * whole process. */
+                    vita_menu_result = 0;
+                    if (setjmp(vita_menu_escape) == 0) {
+                        vita_menu_run(&sel);
+                        /* not reached: the menu always longjmps */
+                    }
+                    if (vita_menu_result) {
+                        snprintf(jar_path, sizeof(jar_path), "%s", sel.jar);
+                        snprintf(class_name, sizeof(class_name), "%s",
+                                 sel.cls);
+                        snprintf(orient, sizeof(orient), "%s", sel.orient);
+                        /* VM classpath splits on ':' - strip the
+                         * "ux0:/data/J2ME00001/" prefix so the entry is
+                         * RELATIVE (see chdir above) */
+                        {
+                            size_t plen = strlen(DATA_DIR "/");
+                            if (strncmp(jar_path, DATA_DIR "/", plen) == 0) {
+                                memmove(jar_path, jar_path + plen,
+                                        strlen(jar_path) - plen + 1);
+                            }
+                        }
+                        dlog_str("menu jar: ", jar_path);
+                        dlog_str("menu class: ", class_name);
+                        dlog_str("menu orientation: ", orient);
+                    } else if (cfg_ok) {
+                        dlog_str("launch.cfg jar: ", jar_path);
+                        dlog_str("launch.cfg class: ", class_name);
+                        dlog_str("launch.cfg orientation: ", orient);
+                    } else {
+                        dlog("launch.cfg not found, defaults in use");
                     }
                 }
-                dlog_str("menu jar: ", jar_path);
-                dlog_str("menu class: ", class_name);
-                dlog_str("menu orientation: ", orient);
-            } else if (read_launch_cfg(jar_path, sizeof(jar_path),
-                                       class_name, sizeof(class_name),
-                                       orient, sizeof(orient)) == 0) {
-                dlog_str("launch.cfg jar: ", jar_path);
-                dlog_str("launch.cfg class: ", class_name);
-                dlog_str("launch.cfg orientation: ", orient);
-            } else {
-                dlog("launch.cfg not found, defaults in use");
             }
 
             {
