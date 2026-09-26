@@ -4991,7 +4991,8 @@ Skeleton 的 C++ 桩只是声明）。
   目标为 `0x81054bf8` = `Os::check_compiler_timer`(0x102054bb4)+0x44 —— **编译期时间预算检查的调用点**
   （与 JIT 假说同向）；`vita_site_mark` 自身 nm 值 `0x102054c38` 比它高 0x40，此差异本轮未解，
   v02.11 让 `site_ring.log` 直接打印 `mark=0x%08x`（`&vita_site_mark` 运行地址）以彻底消除滑移猜测。
-- **v02.11 已实现（b335，本工作树）**：
+- **v02.11 已实现（探针提交 `12ce198`；由该提交链接产出的 vpk banner =
+  `J2ME Player v02.11 b336 (12ce198)`；产物 `vita-port/out/vpk/midp_vita_v02.11.vpk`）**：
   1. `Thread.cpp`：**tick 阶段探针**（stage 1..7 + 各阶段命中数：1=进入 tick、2=java-frame 采样后、
      3=进编译器前、4=编译器返回后、5=`is_stopping` 后、6=`yield()` 后、7=`clear_timer_tick()` 后），
      wd 快照输出 `ttk_stage=N hits 1..7=...`；判读规则：stage 冻结在 N 且 `hits[N]==hits[N-1]` 即卡点
