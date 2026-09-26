@@ -5520,3 +5520,122 @@ Skeleton 的 C++ 桩只是声明）。
 - **冻点五连**（log30-34 全在 yield/换出路径）：本轮 `interpreter_timer_tick+0x10`。
 - v02.10（b4c6006）：runstatus 删除，换 `sceKernelGetSystemInfo` per-core 账本（idleClock/idleN/switchN 双采样，全局仪表不碰 TCB）；KICK 阵列提前（audit 后、site/snapshot 前）成为主实验；新增 **KICK5**=`SuspendThreadForVM`/`ResumeThreadForVM`（stub 有、头文件无，extern）——唯一强制停止/恢复派发状态的原语。
 - log35 判读：任一 KICK 恢复 ce = workaround 到手；KICK5 rc 错误 = TCB 损坏致 suspend 失败，转内核 bug 方向；sysinfo switchN 分流 per-core 调度器卡死 vs 单线程幽灵。
+
+## 2026-09-26 log41 分析（v02.16 / build b348 9b3952e）：slide 双向定标结案 + VM 冻结于"新线程派发"路径 + 纠正 CYCLE(4) 误读
+
+对应 coredump：`debug/logs/log41/psp2core-1790442481-0x0001c92af3-eboot.bin.psp2dmp`
+（141760 字节，解压后 5183052；49 程序头 / 25 PT_LOAD / 5 线程寄存器块）。
+
+### 1. slide 定标（本次最大收获，此前 3 轮取证都建立在未定标的 slide 上）
+
+**代码 slide = 0x37000，7/7 无歧义收敛**（判别式：`lr−4` 必须是 ARM `BL`（top nibble 0xB）
+或 `BLX`（0xFA/0xFB），Thumb `(h & 0xF800) == 0xF000`）。用**栈上 6 个独立锚点交叉复核**，
+全部精确落位（`runtime − 0x37000` = `nm`/`objdump` 给出的链接期地址）：
+
+| 栈上值（运行时） | − 0x37000 | 符号 |
+|---|---|---|
+| 0x810376c7 | 0x810006c7 | `main+0x667`（`main`@link 0x81000060）|
+| 0x81037a63 | 0x81000a63 | `_start+0x5b`（`_start`@0x81000a08）|
+| 0x810e776c | 0x810b076c | `JVM::start+0x178`（`JVM::start`@0x810b05f4）|
+| 0x810e78e4 | 0x810b08e4 | `JVM_Start+0xa4`（@0x810b0840）|
+| 0x8107a1bc | 0x810431bc | `midp_run_midlet_with_args_cp+0x95c`（@0x81042860）|
+| 0x81088c28 | 0x81051828 | `runMidlet+0x8e8`（@0x81051340）|
+
+**闭环铁证**：`JVM::start` 在 link 0x810b0768 处 `bl primordial_to_current_thread`
+⇒ 返回地址 = `JVM::start+0x178`，而 coredump 里 t0 的 `[sp] = 0x810e776c = JVM::start+0x178`
+**逐位相等**。反过来也证明布局读法（块 +0x08..+0x44 = r0..r15）正确。
+
+**数据 slide = 0x120000（与代码不同！）**：`primordial_to_current_thread`/`start_lightweight_thread_asm`
+都用 `ldr r5,[pc,#…]` 取 link 0x810bd184 的字面量；文件里该字值 = 0x812e1904，而
+coredump 里 **r5 = 0x81401904 = 0x812e1904 + 0x120000**。与段表吻合：
+
+| 段 | 链接 VMA | 真机运行基址 | 搬移 |
+|---|---|---|---|
+| `.text`（0x81000040，AX） | 0x81000040 | 0x81037040 | +0x37000 |
+| `.rodata`（0x81106e10，A，同 RX 段）| 0x81106e10 | — | +0x37000 |
+| `.data`（0x812e0018，WA） | 0x812e0018 | 0x81400018 | **+0x120000** |
+| `.bss`（0x812e2b58，WA） | 0x812e2b58 | 0x81402b58 | +0x120000 |
+
+⇒ **内核把第二个 LOAD 段按独立 4MB 边界重排**，code 与 data 的段间距离比链接期大了 0xe9000。
+这条解释了一切"真机挂 / Vita3K 好"的候选（Vita3K 固定 0x81000000 加载，代码与数据一起不动）。
+
+### 2. 冻结现场：VM 主线程正卡在"新线程派发"路径（寄存器逐条对上）
+
+t0（`tid=0x40010003`）寄存器与 `primordial_to_current_thread`（link 0x810bd0e0）逐条对齐：
+
+```
+810bd0e8: ldr  r5,[pc,#148]  → r5 = &globals      dump r5 = 0x81401904   ✓
+810bd0f0: str  sp,[r5,#1252] → 保存 primordial sp dump sp = 0x813bfdd0   ✓
+810bd0f4: ldr  r6,[r1,#100]  → r6 = 线程保存上下文 dump r6 = 0x81ec4e5c   ✓
+810bd0f8: ldr  lr,[r6,#4]    → lr = 该线程入口 pc  dump lr = 0x810f4104
+                                                  = start_lightweight_thread_asm ✓
+810bd0fc: ldr  fp,[r6],#8    → fp = 保存的 fp      dump fp = 0x00000000   ✓
+810bd100: mov  pc, lr
+```
+
+- `[r6+4] = start_lightweight_thread_asm` + `fp = 0` 正是 `setup_stack_asm`
+  （`InterpreterRuntime_arm.cpp:120-140`）给**全新**轻量线程搭的初始帧（帧尾是 `0` 当 frame pointer）。
+  ⇒ **被恢复的是一个从未运行过的 Java 线程**（老线程的 `[r6+4]` 会是它上次被换出的地址）。
+- 调用链（栈扫描）：`main → runMidlet → midp_run_midlet_with_args_cp → JVM_Start → JVM::start
+  → primordial_to_current_thread → start_lightweight_thread_asm → invoke_pending_entries`，
+  且栈里还有 `_start+0x5b`/`pte_osTlsAlloc`/`__sinit` ⇒ 这段就是**主 OS 线程自己的 C 运行栈**。
+- **结构洞察**：`JVM::start` 里那一句 `bl primordial_to_current_thread`（@0x810b0768）就是
+  **primordial 派发环**——`switch_thread` 尾部 `b current_thread_to_primordial`（0x81084364）
+  把控制权交回原始栈、回到 `JVM::start+0x178`，再由 `JVM::start` 重新 `bl primordial_to_current_thread`
+  派发下一个线程。所以"`[sp] == JVM::start+0x178`"是**稳态**，不是异常。
+- `invoke_pending_entries`（link 0x810bce2c，**只有 0x34 字节**，不可能自旋）：
+  `ldr r0,&_next_runnable_thread / ldr r0,[r0] / ldr r1,[r0,#36] / cmp r1,#0 / moveq pc,lr / … bl shared_entry`。
+  coredump 报的 pc = 0x810f3e38 = link 0x810bce38（`cmp r1,#0`，即该函数第 3 条），
+  但 `lr` 与该调用点不自洽（`bleq` 应把 lr 置成 `+0x120`，实测仍是入口值）
+  ⇒ **t0 的 pc 字段不可当作单一程序点使用**；可信的是 `sp/fp/r5/r6/lr` 这套（五个寄存器同时吻合）。
+
+### 3. 与"真机挂 / 模拟器好"的关系：能证伪的与不能证伪的
+
+- **重定位漏字假说 → 降级（不是主因）**：`debug/tools/abscheck.py` 静态核查——
+  `.data` 里"疑似绝对地址"共 975 字，**975/975 全部被 `.rel.data` 覆盖**（干净）；
+  `.rodata` 里有 234 字"疑似绝对地址却未重定位"，但抽样 `0x81140b1c = 0x81108d81`
+  → `0x81108d80` 落在**字符串常量 `.LC13`（0x81108d68~0x81108d90）中间**，不是函数；
+  其余同型 ⇒ 全部是 1 字节字符串数据里的 4 字节窗口偶然撞上地址区间，**误报**。
+  （`-Wl,-q` 保留了重定位，`readelf -r` 共 100644 条：ABS32 68386 / CALL 9746 / THM_CALL 7034 …）
+- **`svc 0x009f0001`（phoneME 断点）→ 结案**：二进制里 13 处 + `svc 0x9f0002` 1 处，
+  逐条反汇编确认**全部是不可达的断言占位**（`mov pc,lr` 返回之后的填充、跳转表 default）。
+  且 `OsMisc_flush_icache` 走 `__builtin___clear_cache`，`arm_flush_icache`/`user_mode_flush`
+  整条路不可达。**不要再追这两个 svc。**
+- **`CYCLE(4)` → 纠正（我一度当成队列成环真凶，是误读）**：它是 `Scheduler.cpp:2663`
+  的**环检测**输出，而 v02.11 的注释（`Scheduler.cpp:2640` 附近）已明确写出
+  **优先级队列本来就是环形单链表**，定长走法会重复打印，遇头节点即打 `CYCLE(n)` 是**正常**结果。
+  log41 的 `q5: t0x81eeedfc(id=6) t0x81eed958(id=5) t0x81ec3e60(id=3) t0x81e9e934(id=1) CYCLE(4)`
+  = **4 个元素的环形运行队列，结构完好**。**不是**成环故障。
+- **coredump 覆盖范围（新事实）**：25 个 PT_LOAD **只含线程栈**（t0 0x81381000+0x40000、
+  t2 0x813e5000+0x4000、t3 0x813ed000+0x4000、t4 0x81621000+0x10000）与 0xe0xxxxxx/0xd0xxxxxx
+  内核区，**不含 0x81000000（代码）和 0x81400000（数据）** ⇒ 以后**不能**从 coredump 验数据段内容，
+  只能靠栈 + 寄存器。
+
+### 4. 由此得到的判读与下一步（尚未执行）
+
+冻结形态 = **所有 VM 推进停止**（`_vita_switch_count=84794` 冻结、cpu1 `idleN/switchN`
+冻结、`vm runClocks` d=0、`tick` 冻在 1071、ticker 线程却健康地停在 `sceKernelDelayThread`）
+**而 cpu1 一直在用户态忙**——即"**不是**在跑一个长 Java 循环（否则 ticker 会走），
+**而是** VM 停了、且有一个用户态自旋"。结合 v01.83/v01.93 注释（log9/log19 两次
+"pc 冻在 `start_lightweight_thread_asm`，反复重入这条**永不经过 yield** 的路径"），
+**冻结位置集中在"新线程启动引导"这一段**。
+
+下一步（按性价比排序，**均未执行**）：
+1. 在 `primordial_to_current_thread` / `start_lightweight_thread_asm` / `invoke_pending_entries`
+   / `Thread::finish` 各加计数器（复用 `vita_site_mark` 或独立 static），
+   下一次卡死即可区分"卡在启动引导"vs"卡在 Java 解释器"。
+2. snapshot 增打 `_next_runnable_thread` 与 `*((u32*)_next_runnable_thread + 0x24)`
+   —— 后者正是 `invoke_pending_entries` 的判定字（`[thread+36]`），若非 0 说明待处理项无限续期。
+3. `menu=0` 的 A/B 至今**从未生效**（log41 日志里是 `launch.cfg not found, defaults in use`）。
+   要跑必须把 `launch.cfg` 放到 `ux0:/data/J2ME00001/`（4 行，jar 路径**相对**目录，末行 `menu=0`；
+   模板见 `vita-port/ab/launch.cfg.*`）。
+
+### 5. 本次新增取证工具（`debug/tools/`）
+
+- `stack41.py <dmp> <elf> [tid_hex] [slide_hex]`：从 coredump 的 PT_LOAD 里**读线程栈**
+  并符号化（fp 链 + 裸扫 sp..sp+0x4000 里的代码指针）。**这是拿到"冻结调用链"的正确办法**，
+  此前只看寄存器永远只能猜。
+- `ctx41.py <dmp> <elf> <r6_hex> <slide_hex>`：读线程保存上下文块（`[r6]=fp [r6+4]=入口 pc`）。
+  注意该块在 Java 堆（0x81exxxxx），**coredump 不含堆**，所以对 log41 返回"未映射"。
+- `abscheck.py <elf>`：静态列 `.data`/`.rodata` 里"疑似绝对地址但无重定位覆盖"的字
+  （用于复查"装载器漏重定位"类真机专属 bug）。
