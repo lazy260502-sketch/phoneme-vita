@@ -1,6 +1,33 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-26
 
+## 2026-09-26 log38：**停摆核严格跟随 vm 宿主核 → "vm 毒核"坐实，内核级单核停摆**——v02.13 换核钉死（CPU1）
+
+> v02.13（b342, `16bb120`）换核钉死对照实验。完整分析见 `debug/logs/log38/ANALYSIS.md`。
+
+### 结论（决定性）
+
+1. **停摆核 == vm 宿主核，双点确认**：
+   - log37 钉 CPU0（0x10000）→ cpu0 停摆（`switchN/idleN/idle` 全 d=0）；
+   - log38 钉 CPU1（0x20000）→ cpu1 停摆；
+   - log36 三核时 vm 迁移过（chgcpu=2839），停摆核 cpu1 是它"曾停靠并触发、随后迁离"的核。
+2. **死点三次稳定在 green-thread 切换桩入口**（`start_lightweight_thread_asm` 的 +0xc/+0x14
+   /+0x18 内部，全是普通用户态指令，`cpsr=User mode`），lr 恒 `+0x0`，site_ring 回溯恒
+   `switch_thread ← pump_events_vita`。
+3. **因果链**：vm 在宿主核高频 green-thread 切换（switch=185223，纯用户态）+ 跨核 ticker
+   交互 + pump 的 wait syscall → 触发宿主核**内核调度器整体停摆**（switchN d=0 = 该核再无
+   上下文切换，idle 也不推进）→ vm 作为该核用户态线程不再被调度 → 冻结。
+4. **排除用户态死锁**：`lanes fast=386 slow=0`（yield 慢路径未进）、`pump=418`、`gnrt=0/0`、
+   `sf=0/0/0` 全健康——vm 是受害者，不是凶手。
+
+### 判决 + 下一步
+
+- **"vm 毒核"坐实，是 Vita 内核 bug**：某核内核调度器/中断处理在 vm 高频活动下停摆。
+- **下一步（首选）kubridge 内核取证**：读停摆核内核态，定位卡在哪个内核函数/锁（定时器中断？
+  runqueue 锁？lwmutex？）。用户态探针已到极限（死点全是普通指令）。
+- 次选：降低 `TickInterval` / `pump_events_vita` 50ms 窗口，看停摆延迟是否随频率变化，反推触发源。
+- 佐证：查 SceKernelThreadMgr lwmutex/调度器/定时器官方 SDK 已知 bug。
+
 ## 2026-09-26 log37：**钉核成功仍卡死 → 跨核迁移假说推翻，故障升级为"内核级单核冻结"**——v02.12 对照实验
 
 > v02.12（b339, `f5df64e`）单核钉死对照实验。完整分析见 `debug/logs/log37/ANALYSIS.md`。
