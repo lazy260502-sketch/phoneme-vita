@@ -143,6 +143,7 @@ log39 同位置为 `+0x8`（第 3 条）、`lr` 同样是 stub 入口 —— **�
 1. **零成本 A/B（最推荐）**：菜单里换一个游戏 / 用 launcher 内置 `Hello.jar` 再跑一轮。
    所有 jar 都冻在同一处 ⟹ 通用适配缺陷（`JVM::start` / `primordial_to_current_thread` /
    `start_lightweight_thread_asm` 这条路径）；只有 `game.jar` 冻 ⟹ 该 jar 内容/类初始化相关。
+   **（v02.16 已把这步做成不经过菜单的确定性路径，配方见下节）**
 2. **零成本调度 A/B**：`cldc_ticker` 优先级 0xa0 → 0x9f/0xa1（或钉 cpu0），vm 线程不钉核 ——
    检验"同核同优先级 + 定时器中断"是否为触发条件。
 3. **方向 B（需 taihen+henkaku CFW 真机，Vita3K 不加载内核插件）**：kubridge +
@@ -156,6 +157,62 @@ log39 同位置为 `+0x8`（第 3 条）、`lr` 同样是 stub 入口 —— **�
 这正是 phoneME ARM 移植里最"手写汇编、最平台相关"的一段（`str sp,[gp+0x4e4]` 保存 primordial sp、
 `ldr lr,[jsp+4]; mov pc,lr` 手工跳转）。**即：我们的移植执行模式把 cpu1 的 Vita 内核带进了停摆，
 用户态已无法再观测** ⟹ 必须转内核侧（方向 B）。
+
+## 2026-09-26 v02.16：**A/B 基础设施——launch.cfg `menu=0` 跳过原生菜单**（提交 `3ddccf0`）
+
+log40 判决后要回答的下一个问题是"所有 jar 都冻在同一处吗"。但 log40 那轮**是走菜单**
+选的 jar（`menu jar: games/app (1)/game.jar`），而菜单本身（2MB framebuffer、触摸初始化、
+`games/` 扫描）是每轮共有的变量，直接在菜单里换 jar 会让 A/B 结果无法归因。所以先把
+"目标 MIDlet"做成一条**不经过菜单**的确定性路径。
+
+### 代码改动（仅 launcher，VM 源码未动）
+
+`vita-port/src/vita_main.c`：
+
+- `read_launch_cfg()` 增加出参 `int *skip_menu`；在**换行被改成 NUL 之前**扫原始缓冲区，
+  找**行首** `"menu=0"`；
+- `main()` 把 `read_launch_cfg()` 提到菜单之前调用一次：
+  - `cfg_ok && skip_menu` → 完全跳过 `vita_menu_run()`，直接用 cfg 的 jar/class；
+    日志打 `launch.cfg jar (menu=0): …`；
+  - 否则 → 与 v02.15 **逐字节相同**（菜单 → 失败回落 launch.cfg → 再回落内置默认）。
+- **顺带修 bug**：旧 `read_launch_cfg()` 边解析边写 out 参数，一份只有 `jit=0` 的
+  launch.cfg（菜单保存 JIT 设置时写出）会让函数返回 -1 却留下 `jar="jit=0"`，于是
+  "回落内置默认值"的分支真的去加载一个名为 `jit=0` 的 jar。现改为解析到局部变量、
+  成功才拷出。
+- 注释明确：**jar 路径必须相对**（main `chdir(DATA_DIR)` + classpath 以 `:` 分隔，
+  绝对路径会在第一个冒号处被切成 `ux0` + `/data/...`）。
+
+`vita-port/ab/`：四份样例 cfg（`launch.cfg.hello` / `.tonetest` / `.canvas` / `.game`）
++ `README.md`（部署步骤 + 判读判据）。
+
+### A/B 配方（真机，`ux0:/data/J2ME00001/launch.cfg`）
+
+```
+Hello.jar
+HelloMIDlet
+portrait
+menu=0
+```
+
+`Hello.jar` 是自编测试包里**最小**的 MIDlet（纯 LCDUI，无音频/网络/RecordStore），
+执行画像与 `com.app.filemanager.FileManagerMIDlet` 相差最大。
+
+### 判读
+
+- 冻结签名与 log36..log40 逐项相同（死点在 `start_lightweight_thread_asm+0x18` 附近、
+  `runClocks d=0`、cpu1 `idleN/switchN d=0`、`VMPROG NEITHER`、KICK 无效）
+  ⟹ **通用路径**问题，与 MIDlet 内容无关，方向 A 的"换 jar"分支关闭；
+- 不冻 ⟹ 与 `game.jar` 内容 / 类初始化相关，转去比对两者启动路径。
+
+### 构建验证
+
+`J2ME Player v02.16 b348 (9b3952e)`；`out/vpk/midp_vita_v02.16.vpk`（3655912 B）；
+`strings` 确认 `menu=0` / `launch.cfg jar (menu=0): ` 已进 ELF。
+
+> 坑：`CMakeLists.txt` 里 `set(VITA_VERSION …)` 必须排在它自己的注释块**之后**。
+> v02.16 第一次编辑把 `set(VITA_VERSION "02.16")` 写在注释前面、后面又跟着
+> `set(VITA_VERSION "02.15")`，被后者覆盖 —— 构建出的 VPK 仍叫 `v02.15`。
+> 已把 `set()` 移到注释块末尾（866 行）。
 
 ## 2026-09-26 v02.14：**方向 A 审计落地——green-thread sp 安全 + 事件泵正常 + 跨核 ticker 竞态修复（钉核）**
 
