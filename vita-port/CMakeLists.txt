@@ -838,7 +838,23 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.12")
+set(VITA_VERSION  "02.13")
+# 02.13 (2026-10-28): log37 verdict + change-core pin A/B.
+#   log37 ran v02.12's CPU0 pin: pin SUCCEEDED (rc=0x70000 is the OLD
+#   affinity mask returned by sceKernelChangeThreadCpuAffinityMask, not
+#   an error; watchdog KICK1/KICK2 return old masks too) - confirmed
+#   aff=0x10000(init 0x70000) cpu=0 chgcpu=5 (vs log36 2839). Yet the
+#   VM still froze (runClocks d=0, KICK no effect, ce 412->412) AND one
+#   WHOLE CORE stalled (sysinfo 100ms window: cpu0 idle/idleN/switchN all
+#   d=0; log36 stalled cpu1 instead). Dead point same green-thread switch
+#   stub cluster (pc=start_lightweight_thread_asm+0x14, a plain userland
+#   str of NULL into pending_entries) -> cross-core migration hypothesis
+#   RETRACTED; fault upgraded to "kernel-level single-core stall".
+#   v02.13 change: pin to CPU1 (0x20000) instead of CPU0. If the stalled
+#   core FOLLOWS the VM -> the VM's execution (or its kernel interaction)
+#   poisons its host core; if the stalled core is fixed/random and
+#   unrelated to the VM -> an independent kernel bug and the VM is just a
+#   starved victim (then go kernel-side: kubridge).
 # 02.12 (2026-10-28): log36 verdict + single-core pin experiment.
 #   v02.11's tick-stage probe (ttk_stage=7 hits 1..7=309x7) proved the
 #   tick body ran to completion 309/309 times -> JIT-on-tick hypothesis
@@ -1425,12 +1441,12 @@ add_dependencies(${PROJECT_NAME} gen_version)
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
-# v02.12: VM main thread single-core pin (log36 cross-core hang
-# experiment). 0x10000=CPU0 (default, pin ON); set to 0 to A/B against
-# the three-core default (Vita3K unaffected either way - it masks the
-# bug). Mirrored in vita_main.c via #ifndef.
+# v02.13: VM main thread single-core pin (log37 change-core A/B).
+# 0x20000=CPU1 this round (0x10000=CPU0 was v02.12, 0x40000=CPU2 is the
+# next candidate); set to 0 to fall back to three-core default (Vita3K
+# masks the bug either way). Mirrored in vita_main.c via #ifndef.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
-    VITA_VM_CPU_AFFINITY_MASK=0x10000)
+    VITA_VM_CPU_AFFINITY_MASK=0x20000)
 
 add_dependencies(${PROJECT_NAME} libobj_target)
 

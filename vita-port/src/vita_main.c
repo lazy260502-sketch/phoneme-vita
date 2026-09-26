@@ -41,18 +41,17 @@ extern int runMidlet(int argc, char **argv);
 #include "vita_version.h"
 #include "vita_crumb.h"
 
-/* log36 real-HW experiment: pin the VM main thread to a single core
- * BEFORE any VM code runs. log36 froze the VM main thread (status=RUNNING,
- * runClocks d=0, cpu1 fully idle) with aff=0x70000 (all three cores) as
- * its ONLY difference from the healthy tone/wd/ticker threads (aff=0x0).
- * Vita3K never hangs: its single host scheduler masks the cross-core
- * migration bug that real HW's per-core runqueues expose.
+/* log37 real-HW experiment: pin the VM main thread to a single core
+ * BEFORE any VM code runs. log37 (CPU0 pin) SUCCEEDED (chgcpu=5) but the
+ * VM STILL froze and one WHOLE CORE stalled -> cross-core migration
+ * hypothesis retracted, fault upgraded to kernel-level single-core stall.
+ * v02.13 A/B: move the pin to CPU1 (0x20000) to learn whether the stalled
+ * core follows the VM (VM poisons its host core) or is independent (an
+ * unrelated kernel bug).
  *   0x10000 = CPU0, 0x20000 = CPU1, 0x40000 = CPU2 (bits 16..18)
- *   0       = disabled (A/B control; falls back to MASK_DEFAULT = 3 cores)
- * If the hang disappears when pinned, the cross-core runqueue bug is
- * PROVEN and this pin is the shipping workaround. */
+ *   0       = disabled (A/B control; falls back to MASK_DEFAULT = 3 cores) */
 #ifndef VITA_VM_CPU_AFFINITY_MASK
-#define VITA_VM_CPU_AFFINITY_MASK 0x10000
+#define VITA_VM_CPU_AFFINITY_MASK 0x20000
 #endif
 
 /* Baked in by build_jar.sh -> cmake (HELLO_JAR_SIZE): size of the
