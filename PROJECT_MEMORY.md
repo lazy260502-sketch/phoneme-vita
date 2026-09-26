@@ -1,6 +1,34 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-26
 
+## 2026-09-26 log37：**钉核成功仍卡死 → 跨核迁移假说推翻，故障升级为"内核级单核冻结"**——v02.12 对照实验
+
+> v02.12（b339, `f5df64e`）单核钉死对照实验。完整分析见 `debug/logs/log37/ANALYSIS.md`。
+
+### 结论（三条证据交叉闭合）
+
+1. **钉核成功，rc 语义澄清**：`pin vm cpu mask=0x10000 rc=0x70000` 的 rc 是**旧 affinity
+   mask**（`sceKernelChangeThreadCpuAffinityMask` 返回旧值，非错误码）。交叉证据：watchdog
+   KICK1 `aff->0x30000 rc=0x10000`、KICK2 `aff->0x70000 rc=0x30000` 全返回旧值。watchdog 确认
+   `aff=0x10000(init 0x70000) cpu=0 chgcpu=5`（log36 是 2839）→ vm 全程未跨核迁移。
+2. **依然卡死**：`vm runClocks d=0` + `status=RUNNING` + KICK 全无效（ce 412→412），与 log36 同构。
+3. **新现象：单核整体停摆**。sysinfo 100ms 采样窗口内，恰好一个核的 idle/idleN/switchN 全 d=0
+   （log36 停摆 cpu1，log37 停摆 cpu0），其余三核正常涨。→ 内核级核心冻结，非用户态线程死锁。
+4. **死点同簇**：vm pc=`start_lightweight_thread_asm+0x14`（`strne r2,[r0,#36]`，普通内存写，
+   检查 THREAD_TERMINATING 清 pending_entries），lr=`start_lightweight_thread_asm+0x0`；log36 是
+   pc=`invoke_pending_entries+0x10`。site_ring 回溯两轮都在 `switch_thread ← pump_events_vita`。
+5. **排除**：线程 `[1]`（tid=0x400100c3, IRQ 模式, pc=0xe00073a4）log36/log37 逐寄存器一致，
+   是 coredump 固定背景，非线索。
+
+### 判决 + 下一步
+
+- **跨核迁移假说推翻**（钉核 chgcpu=5 仍卡死）。死点指令是普通用户态内存写，vm 不是"毒指令"
+  毒死内核，而是**被内核冻结**；停摆核在两次实验间不同（cpu1→cpu0），指向独立内核 bug。
+- **下一步：换核钉死对照**（v02.13）：`VITA_VM_CPU_AFFINITY_MASK=0x20000`(CPU1)/`0x40000`(CPU2)。
+  - 停摆核跟随 vm → vm 执行毒死所在核，追查切换桩附近的内核交互；
+  - 停摆核固定/随机与 vm 无关 → 独立内核 bug，转 kubridge 内核取证。
+- 怀疑点：`switch=188262`（18.8 万次 green-thread 切换）高频切换 + 内核交互竞态。
+
 ## 2026-09-26 log36：**JIT-on-tick 假说证伪，死点转到内核调度层**——v02.11 首次实弹
 
 > v02.11（b336, `12ce198`）带 tick-stage 探针 + JIT A/B 开关首跑。完整分析见
