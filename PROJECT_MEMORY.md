@@ -1,6 +1,136 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-09-26
 
+## 2026-09-26 v02.14：**方向 A 审计落地——green-thread sp 安全 + 事件泵正常 + 跨核 ticker 竞态修复（钉核）**
+
+> 用户方向 A 选择：先做代码审查 + 最小修复，无效再上 kubridge（方向 B）。
+>
+> **⚠ 实测判决（log39 真机）：钉核生效但无效——假说排除。**
+> `cldc_ticker aff=0x20000(init 0x20000) cpu=32767 last=1` 证明 ticker 已与 vm 同核
+> （v02.14 设计目标达成），但死机签名与 log38 **逐项一致**（vm runClocks d=0、cpu1
+> switchN/idleN d=0、vm `RUNNING wait=none cpu=1`、KICK no effect、死点
+> `start_lightweight_thread_asm+0x8`）。**⟹ 跨核 ticker 竞态不是根因。**
+> 副产物：钉核把唯一的独立心跳源也拖进 cpu1 —— log38 ticker 在 cpu0 时 `rt_ticks=1400`
+> （tick 持续到达），log39 同核后 `rt_ticks=0` 且 `vita_tick_count` 冻结在 1118。
+> 详见下方 log39 节。
+
+### 方向 A 审计结论
+
+1. **green-thread sp 切换架构安全（非缺陷）**：ARM 上 `jsp=r6`（堆上 Java 栈）与 `sp=r13`
+   （OS/primordial 栈）是不同寄存器；所有 native C++（含事件泵的 pthread 等待）通过
+   `get_primordial_sp(sp)` 切回 OS 栈执行，syscall 全在 OS 栈。改 sp 不指向堆，不构成
+   "内核 TCB 损坏"路径。
+2. **事件泵链路正确（非缺陷）**：`JVMSPI_CheckEvents → ANI_WaitForThreadUnblocking →
+   PoolThread_WaitForFinishOrTimeout → Os_WaitForEventOrTimeout → pthread_cond_timedwait`
+   跑在 OS 栈；`ANI_Initialize()` 已在 vita_main.c 显式调用（PROJECT_MEMORY 3006 的历史
+   bug 已修）；log38 `ani_mark "CE #418 ANI OUT"` 证明最后一次泵正常退出，未卡 pthread。
+3. **唯一明确的"代码未适配"缺陷 = 跨核 ticker 竞态**：上游 linux 用 `setitimer+SIGVTALRM`
+   在 vm 自身线程（同核）递 tick；vita 移植改成独立 `cldc_ticker` 线程，创建时
+   `cpuAffinityMask=0`（继承），log38 thread audit 显示它落在 cpu0（`last=0`），而 vm 钉
+   cpu1（0x20000）→ `real_time_tick()` 跨核非原子写 `_rt_timer_ticks`/`_real_time_has_ticked`
+   /`_compiler_stack_limit`/`_timer_has_ticked`，是上游同线程模型不存在的数据竞态。
+
+### v02.14 修复（最小 diff）
+
+- **OS_vita.cpp**：`cldc_ticker` 创建时 affinity 从 `0` 改为
+  `sceKernelGetThreadCpuAffinityMask(sceKernelGetThreadId())`（继承 vm 主线程当前核），
+  失败回退 `SCE_KERNEL_CPU_MASK_USER_ALL`。恢复上游"tick 与 vm 同核"语义，消除跨核可见性
+  问题。`+23` 行（含注释），`#include <psp2/kernel/cpu.h>`。
+- **CMakeLists.txt**：VITA_VERSION 02.13 → 02.14 + 版本注释。
+
+### 构建验证
+
+- `rebuild_vm.sh`：33 ARM 对象 OK（OS_vita.o 已重编，`nm` 确认引用
+  `sceKernelGetThreadCpuAffinityMask`）；libcldc_vm.a 29 members repack 成功。
+- `vita-port/build.sh`：链接 + 打包成功，产物 `out/vpk/midp_vita_v02.14.vpk`（3655860B）
+  + `.sym`（4289648B）；ELF 内 `sceKernelGetThreadCpuAffinityMask@811069b0` 在位。
+
+### 遗留风险 / 下一步
+
+- **钉核消除的是竞态，不保证根治内核停摆**：若真机仍死机，说明根因在"green-thread 高频
+  切换 + pump wait syscall"模式触发的内核 bug（非 ticker 竞态），需上 kubridge（方向 B）
+  读停摆核内核态定位卡点。
+- 次选：降低 TickInterval / pump 50ms 窗口（log38 已列），观察停摆延迟是否随频率变化。
+
+## 2026-09-26 log39：**v02.14 判决 + core dump 内核侧视角——cpu1 取走定时器中断后再未返回调度器**
+
+> v02.14（b344, `1274c64`）真机日志。目录 `debug/logs/log39/`。
+
+### 1. 判决：v02.14 钉核生效但无效（见 v02.14 节顶部）
+
+### 2. **两条旧结论必须作废（探针自身有 bug）**
+
+- **`frozen=yes` 是无意义常量**：`OS_vita.cpp::vita_site_dump()` 里
+  `s = vita_site_seq;` 后**紧邻**又读 `s2 = vita_site_seq;`（无任何延时）→ `s == s2` 恒真
+  → 永远打印 `yes`。log35~log39 所有基于 "ring frozen" 的推论**全部无效**。
+- **`q5 ... CYCLE(3)` 不是环损坏**：`Scheduler.cpp:2635-2680` 注释与实现写明优先队列是
+  **环形单链表**，walk 回到 head 即停并打印 `CYCLE(count)`，`count` = 该队列元素数。
+  `q5: id=4, id=1, id=3, CYCLE(3)` = q5 有 3 个线程，**正常**。log36 同名输出同理。疑点关闭。
+
+### 3. core dump 首次给出内核侧视角（决定性新材料）
+
+标定：`vita_site_mark` nm=`0x81054730`、运行时=`0x81055730` ⟹ **slide = 0x1000**
+（`self`/`mark`/`ticker_thread_routine` 三处互验一致）。
+
+`THREAD_REG_INFO`(note 0x1004) = 8 字节头 + 5 × 0x178 块，块 1 = vm 主线程（uid `0x40010003`）：
+
+```
+vm  : r0=0x81ede328(=cur_thread)  r6/jsp=0x81edf390  sp=0x8137ff70(primordial栈 0x81341000+0x40000)
+      lr = 0x810bde14 -> start_lightweight_thread_asm + 0x0
+      pc = 0x810bde1c -> start_lightweight_thread_asm + 0x8   (ldr r1,[r0,#104] 读 status)
+      cpsr = 0x60070010 -> User mode, IRQ/FIQ 均使能, ARM 态
+      r6/r10/fp 等与 site_ring 的 jsp 一致
+ tone: pc = sceKernelDelayThread + 0x8      (正常睡在 10ms 延时里)
+ tick: pc = sceKernelDelayThread + 0x8      (同上; lr = ticker_thread_routine+0x48)
+ wd  : pc = wd_thread_routine + 0x69a       (正常跑, 正在请求 dump)
+ cdw : pc = 0xe00073a4                      (SceCommonDialogWorker, 系统模块)
+```
+
+**5 个线程里 4 个健康，只有 vm 冻在普通用户态指令上，且内核保存的是 User 模式、中断使能上下文。**
+
+### 4. 修订后的根因模型（比 log38 更硬）
+
+> cpu1 在 **vm 线程位于 `start_lightweight_thread_asm+0x8` 时取走定时器中断**（用户态、
+> IRQ 使能，属正常抢占），**此后 cpu1 再也没有回到调度器**。
+
+判据：ticker 是 `READY`、优先级 `0xa0`，**与 vm 完全相同**，且钉死在 cpu1。只要 cpu1 调度器
+活着，10ms 内必轮转调度 ticker、`vita_tick_count` 必推进。它冻结在 1118 ⟹ **cpu1 不再执行
+"中断返回 → 调度"这条内核路径**。这不是用户态活锁，是内核侧停摆。
+
+### 5. 地址符号化（slide=0x1000）
+
+| 裸地址 | 符号 |
+|---|---|
+| `0x810bde1c` (pc) | `start_lightweight_thread_asm + 0x8` |
+| `0x810bde14` (lr) | `start_lightweight_thread_asm + 0x0` |
+| `0x81085010` ring[0],[3..15] | `switch_thread + 0x28`（Scheduler.cpp:2175 mark） |
+| `0x81082e04` ring[1],[2] | `pump_events_vita + 0x48`（Scheduler.cpp:748 mark） |
+| `0x8100f7c2` | `wd_thread_routine + 0x69a` |
+| `0x81107948` | `sceKernelDelayThread + 0x8` |
+| `0x810556a0` | `ticker_thread_routine + 0x0` |
+
+ring 按写入序还原 = `switch×13, pump, pump, switch`（无 `wait_for_event_or_timer` mark ⟹ 慢通道从未使用，与 slow=0 一致）。
+
+**`switch=225264` 不是"切换次数"，而是解释器 `shared_call_vm` 的线程检查点次数**
+（`SharedStubs_arm.cpp:508` 的 `bl("switch_thread")`），纯 Java 执行量指标——这解释了它为何比
+`yield()`（141）大 1600 倍。
+
+时间账自洽：`vita_tick_count=1118 × 10ms ≈ 11.18s`（ticker 寿命）、`pump_runs=216 × 50ms ≈ 10.8s`
+（泵寿命）、`ttk=116` 且 stage 1..7 全 116（冻结前每个 tick 都完整跑完）。
+
+### 6. 下一步（v02.15 判定实验，~20 行）
+
+让 watchdog 在 hang 后对 **VM 侧计数器做双采样**（间隔 500ms），打印 delta：
+`_vita_switch_count`、`_vita_pump_runs`、`_vita_ttk_count`、`vita_tick_count`、`vita_site_seq`；
+顺带修掉 `frozen` 假探针（`s2` 延迟重读）。判据矩阵：
+
+| switch (VM 执行) | tick (cpu1 调度) | 结论 |
+|---|---|---|
+| 涨 | 涨 | VM 在跑 Java，cpu1 健康 → VM/Java 层活锁（回 VM 侧找循环） |
+| 涨 | 不涨 | VM 在跑且独占 cpu1（ticker 同优先级被饿死）→ 内核调度策略 |
+| **不涨** | **不涨** | **cpu1 彻底停摆（预计结果）→ 转方向 B（kubridge）** |
+| 不涨 | 涨 | cpu1 健康但内核丢了 VM 线程 → 内核 TCB 问题 |
+
 ## 2026-09-26 log38：**停摆核严格跟随 vm 宿主核 → "vm 毒核"坐实，内核级单核停摆**——v02.13 换核钉死（CPU1）
 
 > v02.13（b342, `16bb120`）换核钉死对照实验。完整分析见 `debug/logs/log38/ANALYSIS.md`。
