@@ -838,7 +838,61 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.13")
+set(VITA_VERSION  "02.15")
+# 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
+#   VM-side liveness experiment.
+#   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
+#   'cldc_ticker' aff=0x20000(init 0x20000) cpu=32767 last=1, i.e. the
+#   ticker is now on the VM's core exactly as designed - yet the hang
+#   signature is IDENTICAL to log38 item by item (vm runClocks d=0,
+#   cpu1 idleN/switchN d=0, vm 'RUNNING wait=none cpu=1', KICK no
+#   effect, dead pc = start_lightweight_thread_asm+0x8). The cross-core
+#   ticker race is therefore EXCLUDED as root cause. Side effect worth
+#   recording: pinning moved the ONLY independent heartbeat onto cpu1,
+#   so log39 shows rt_ticks=0 and vita_tick_count frozen at 1118 where
+#   log38 (ticker on cpu0) showed rt_ticks=1400 - the pin cost us the
+#   one probe that could still see a live cpu1 from outside.
+#   Two probe defects found while re-reading the evidence (both
+#   invalidate earlier conclusions, and both are fixed in this build):
+#   - vita_site_dump() read vita_site_seq twice with no delay, so
+#     'frozen=yes' was a tautology in log35..log39: every frozen-ring
+#     inference from those logs is void. Now: a real 200 ms liveness
+#     test on the (alive) watchdog thread.
+#   - The 'q5 CYCLE(3)' queue print is normal - Scheduler.cpp's dump
+#     walks the circular priority list and stops on head re-encounter,
+#     printing element count; log36's identical output is the same
+#     healthy state, not a corrupt ring.
+#   v02.15 change (launcher only, no VM source): wd_dump_vm_progress()
+#   dual-samples the VM's OWN counters 500 ms apart at hang time and
+#   prints a verdict, splitting the last four hypotheses:
+#     switch/fast/site/jsmp moving -> VM thread executing Java
+#     tick (cldc_ticker) moving    -> cpu1 still dispatching
+#   Both -> VM/Java livelock. VM only -> ticker starved on a live core.
+#   tick only -> VM stuck in a kernel wait. Neither -> cpu1 scheduler
+#   dead (then direction B: kubridge kernel forensics).
+# 02.14 (2026-10-28): direction-A audit + ticker pin to the VM core.
+#   log38 verdict (change-core pin A/B) proved the stalled core FOLLOWS
+#   the VM host core (vm runClocks d=0 + cpu1 switchN d=0 => kernel-level
+#   single-core stall, not a userland livelock). Direction-A audit of the
+#   green-thread SP switch + kernel-interaction windows concluded:
+#   - green-thread SP model is architecturally sound: jsp=r6 (heap Java
+#     stack) / sp=r13 (OS/primordial stack) are separate registers, every
+#     syscall runs on the OS stack via get_primordial_sp(sp) - not a bug.
+#   - event-pump chain (JVMSPI_CheckEvents -> ANI -> pthread_cond_timedwait)
+#     runs on the OS stack and log38's ani_mark "OUT" proves the last pump
+#     exited normally (not stuck inside pthread).
+#   - the ONE remaining Vita-port-specific defect is the cross-core
+#     ticker race: upstream linux delivers ticks via setitimer+SIGVTALRM
+#     (handler on the VM's own thread/core); the vita port's standalone
+#     'cldc_ticker' thread was created with affinity=0 and landed on cpu0
+#     (log38 last=0) while the VM is pinned to cpu1, so real_time_tick()
+#     does non-atomic cross-core writes to _rt_timer_ticks /
+#     _real_time_has_ticked / _compiler_stack_limit / _timer_has_ticked.
+#   v02.14 change:
+#   - OS_vita.cpp: pin 'cldc_ticker' to the VM thread's core
+#     (sceKernelGetThreadCpuAffinityMask of the creating thread) to
+#     restore the upstream same-core tick semantics and remove the
+#     cross-core data race. Fallback = SCE_KERNEL_CPU_MASK_USER_ALL.
 # 02.13 (2026-10-28): log37 verdict + change-core pin A/B.
 #   log37 ran v02.12's CPU0 pin: pin SUCCEEDED (rc=0x70000 is the OLD
 #   affinity mask returned by sceKernelChangeThreadCpuAffinityMask, not

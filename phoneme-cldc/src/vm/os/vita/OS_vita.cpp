@@ -34,6 +34,7 @@
 // Vita-specific headers
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>   /* v02.14: SCE_KERNEL_CPU_MASK_* for ticker pinning */
 #include <psp2/io/fcntl.h> /* v01.84 site ring: sceIoOpen for vita_site_dump */
 
 /*=========================================================================
@@ -143,8 +144,31 @@ bool Os::start_ticks() {
     ticker_stopping = false;
     if (!ticker_created) {
         ticker_created = true;
+        /* v02.14: pin the ticker to the SAME core as the VM thread.
+         *
+         * Upstream linux delivers timer ticks via setitimer+SIGVTALRM, i.e.
+         * the signal handler runs on the VM's own thread (and therefore the
+         * VM's own core). The vita port replaced that with a standalone
+         * thread created with cpuAffinityMask=0 (inherit), which let the
+         * ticker land on cpu0 (log38 thread audit: 'cldc_ticker' last=0)
+         * while the VM is pinned to cpu1 (0x20000).
+         *
+         * real_time_tick() then performs non-atomic cross-core writes to
+         * _rt_timer_ticks / _real_time_has_ticked / _compiler_stack_limit /
+         * _timer_has_ticked - a data race that the upstream same-thread
+         * model never had. Pinning the ticker to the VM's core restores the
+         * upstream "tick delivered on the same core as the VM" semantics and
+         * removes the cross-core visibility problem. */
+        int vm_aff = sceKernelGetThreadCpuAffinityMask(sceKernelGetThreadId());
+        if (vm_aff < 0) {
+            /* Query failed (should not happen): fall back to all user cores.
+             * Still strictly better than the old affinity=0 only if 0 meant
+             * "inherit"; here we are explicit. */
+            vm_aff = SCE_KERNEL_CPU_MASK_USER_ALL;
+        }
         ticker_thread_id = sceKernelCreateThread(
-            "cldc_ticker", ticker_thread_routine, 0x10000100, 0x10000, 0, 0, NULL);
+            "cldc_ticker", ticker_thread_routine, 0x10000100, 0x10000, 0,
+            vm_aff, NULL);
         if (ticker_thread_id < 0) {
             return false;
         }
@@ -624,7 +648,17 @@ void vita_site_dump(const char *path) {
     if (fd < 0) return;
     char buf[128];
     int n;
+    /* v02.15: the v02.11 form read vita_site_seq twice back-to-back with
+     * NO delay between the reads, so s == s2 was a tautology and every
+     * log printed "frozen=yes" (log35..log39 all inherit the artifact -
+     * which is why every frozen-ring inference drawn from those logs is
+     * void). This helper runs on the WATCHDOG thread, which is alive
+     * even when the VM thread is not, so a real liveness test IS
+     * possible here: 200 ms between the two reads makes the flag mean
+     * what it always claimed - "the VM produced no new site mark in
+     * 200 ms". Keep the wording so old logs stay comparable. */
     unsigned int s = vita_site_seq;
+    sceKernelDelayThread(200 * 1000);
     unsigned int s2 = vita_site_seq;
     /* v02.11: also print the address of vita_site_mark itself. Ring
      * slots hold return addresses inside THIS image, and log35's hot

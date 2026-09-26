@@ -180,6 +180,89 @@ static void wd_dump_thread(const char *tag, SceUID tid) {
     }
 }
 
+/* v02.15: VM-side progress, dual-sampled INSIDE the hang window.
+ * log39 verdict: the per-core ledger froze (cpu1 idleN/switchN d=0) and
+ * the vm thread's runClocks delta was 0 - but both of those are KERNEL
+ * bookkeeping, and the VM's own scheduler counters had only ever been
+ * read ONCE (in vita_wd_snapshot), where a frozen value is
+ * indistinguishable from "healthy but slow". Sampling the VM's own
+ * counters twice, 500 ms apart, separates the surviving hypotheses:
+ *   switch/fast/site/jsmp move -> the VM thread IS executing Java
+ *   tick (cldc_ticker) moves    -> cpu1's scheduler still dispatches
+ * The ticker is pinned to the VM's core at the SAME priority 0xa0
+ * (v02.14), so a frozen tick with a live cpu1 is impossible unless the
+ * core itself stopped. Four combinations, four named failures - see
+ * the verdict line. All counters are written by other threads
+ * (single-writer, torn values tolerated) and reach this C TU through
+ * C-linkage symbols (OS_vita.cpp / Scheduler.cpp). */
+extern volatile unsigned int vita_site_seq;
+extern volatile unsigned int vita_java_sample_count;
+extern unsigned int vita_sched_yield_fast(void);
+extern unsigned int vita_sched_pump_runs(void);
+extern unsigned int vita_sched_switch_count(void);
+extern unsigned int vita_sched_ttk_count(void);
+
+static void wd_dump_vm_progress(void) {
+    char buf[256];
+    int n;
+    unsigned int sw0, sf0, s0, jm0, tc0, tk0, pm0;
+    unsigned int sw1, sf1, s1, jm1, tc1, tk1, pm1;
+    int exec_moved, tick_moved;
+    const char *verdict;
+
+    sw0 = vita_sched_switch_count();
+    sf0 = vita_sched_yield_fast();
+    s0  = vita_site_seq;
+    jm0 = vita_java_sample_count;
+    tc0 = vita_tick_count;
+    tk0 = vita_sched_ttk_count();
+    pm0 = vita_sched_pump_runs();
+
+    sceKernelDelayThread(500 * 1000);
+
+    sw1 = vita_sched_switch_count();
+    sf1 = vita_sched_yield_fast();
+    s1  = vita_site_seq;
+    jm1 = vita_java_sample_count;
+    tc1 = vita_tick_count;
+    tk1 = vita_sched_ttk_count();
+    pm1 = vita_sched_pump_runs();
+
+    n = snprintf(buf, sizeof(buf),
+                 "[WD] VMPROG-A vm-exec switch=%u->%u(d=%d) "
+                 "fast=%u->%u(d=%d) site=%u->%u(d=%d) "
+                 "jsmp=%u->%u(d=%d)\n",
+                 sw0, sw1, (int)(sw1 - sw0), sf0, sf1,
+                 (int)(sf1 - sf0), s0, s1, (int)(s1 - s0),
+                 jm0, jm1, (int)(jm1 - jm0));
+    wd_log(buf, n);
+
+    n = snprintf(buf, sizeof(buf),
+                 "[WD] VMPROG-B tick-ch tick=%u->%u(d=%d) "
+                 "ttk=%u->%u(d=%d) pump=%u->%u(d=%d)\n",
+                 tc0, tc1, (int)(tc1 - tc0), tk0, tk1,
+                 (int)(tk1 - tk0), pm0, pm1, (int)(pm1 - pm0));
+    wd_log(buf, n);
+
+    /* The verdict: which of the two liveness sources survived. */
+    exec_moved = (sw1 != sw0) || (sf1 != sf0) ||
+                 (s1 != s0) || (jm1 != jm0);
+    tick_moved = (tc1 != tc0);
+    if (exec_moved && tick_moved) {
+        verdict = "BOTH ALIVE -> VM/Java-layer livelock";
+    } else if (exec_moved) {
+        verdict = "VM RUNS, ticker STARVED -> core1 dispatches, ticker starved";
+    } else if (tick_moved) {
+        verdict = "ticker RUNS, VM NOT EXECUTING -> VM stuck in a kernel wait";
+    } else {
+        verdict = "NEITHER -> cpu1 scheduler DEAD (direction B: kubridge)";
+    }
+    n = snprintf(buf, sizeof(buf),
+                 "[WD] VMPROG verdict exec=%d tick=%d -> %s\n",
+                 exec_moved, tick_moved, verdict);
+    wd_log(buf, n);
+}
+
 /* v01.90: VM-side progress counters (OS_vita.cpp). A class-load storm
  * (log14..16) or a GC cycle advances these while the CE pump is starved:
  * that is "pathologically slow", not "dead" - the watchdog must not
@@ -321,6 +404,12 @@ static int wd_thread_routine(SceSize args, void *argp) {
                              (long long)(k1 - k0));
             wd_log(buf, n);
         }
+
+        /* v02.15: VM-side dual sampling FIRST - before the runClocks
+         * dumps and, critically, before the KICK block below mutates
+         * the VM thread's affinity/priority. This is the baseline that
+         * says whether the VM thread or the core died. */
+        wd_dump_vm_progress();
 
         wd_dump_thread("vm", vita_wd_vm_tid);
         wd_dump_thread("tone", vita_tone_tid);
