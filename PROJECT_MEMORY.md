@@ -1,5 +1,54 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-22
+> Last Updated: 2026-09-26
+
+## 2026-09-26 log36：**JIT-on-tick 假说证伪，死点转到内核调度层**——v02.11 首次实弹
+
+> v02.11（b336, `12ce198`）带 tick-stage 探针 + JIT A/B 开关首跑。完整分析见
+> `debug/logs/log36/ANALYSIS.md`。
+
+### 结论（三条证据交叉闭合）
+
+1. **tick 体完整跑完 309 次**：`ttk_stage=7 hits 1..7=309×7`（7 个 stage 全命中
+   309）。stage 3→4 包住 `Compiler::on_timer_tick`，同样 309/309 → **JIT-on-tick
+   假说被推翻**，冻结点不在 tick 体、不在 JIT 编译。
+2. **A/B 开关工作正常**：`round 0: jit cfg=0 -> policy=0`；`vm UseCompiler(pre)=1
+   (jit policy=0)`。本轮 JIT 处于禁用态，进一步排除 JIT。
+3. **vm 被内核冻结，不是用户态死锁**：
+   - `vm runClocks 9517268->9517268 (d=0)`，而 tone d=1964 / wd d=1658 都在涨；
+   - `vm status=RUNNING`（内核视角仍在 runqueue）+ `4 个 CPU idle 全在涨`（无死循环）
+     + `cpsr=0x60070010`（User mode，不在 syscall）三者并存；
+   - `gnrt=0/0`（`get_next_runnable_thread` 从不返回 NULL，runnable 从不空）、
+     `lanes fast=346 slow=0`、`sf=0/0/0`（sleep_forever 空转没进过）→ 排除
+     "全线程等待→空转"经典死锁。
+   - **定性：vm 原生线程在用户态 green-thread 切换路径被内核抢占后不再被调度。**
+     KICK0~5（signal/aff/prio/suspend）全无效（`ce 382->382`）。
+
+### 死点定位
+
+- vm `pc=invoke_pending_entries+0x10`（`moveq pc,lr`，pending 为空），
+  `lr=start_lightweight_thread_asm`（换出残留帧），与 log21/log35 **同簇**
+  （green-thread 桩簇：`primordial_to_current_thread → start_lightweight_thread_asm
+  → invoke_pending_entries`）。
+- vm 栈回溯：`main → midp_run_midlet_with_args_cp+0x95c → JVM_Start+0xa4 →
+  JVM::start+0x178`（`bl primordial_to_current_thread` 之后）→ 桩簇。
+
+### 根因推断 + 下一步
+
+- vm `aff=0x70000`（允许 CPU 0/1/2）与 tone/wd/ticker 的 `aff=0x0` 是唯一显著
+  差异，`chgcpu=2839` 表明 vm 死前在多核迁移过。
+- **下一步：单 CPU 亲和性对照**（vm 限 `aff=0x10000`），若冻结消失 → 坐实 Vita
+  内核多核调度 bug；仍冻结则需内核层手段（kubridge/内核日志）。
+
+### 工具教训（新增）
+
+- **coredump 字段映射**（`THREAD_REG_INFO` 块，`stride=0x178`，desc 头 16 字节
+  `"NFO\0"|type=0x11|count|stride`，块从 `+0x10` 起）：
+  `+0x00` tid，`+0x04..+0x34` r0..r12，`+0x38` sp，`+0x3c` lr，`+0x40` pc，
+  `+0x44` cpsr。（log35 手记的 `+0x34=pc/+0x40=lr` 是错的。）
+- NOTE name 实际为 `b"\x04\x10\x00\x00THREAD_REG_I"`（带 4 字节前缀且后缀被截断），
+  匹配必须用子串 `b"THREAD_REG_I" in name`，不能 `== "THREAD_REG_INFO"`。
+- 脚本已修：`debug/tools/parse_core36.py`（跑法 `python3 debug/tools/parse_core36.py
+  /tmp/log36.core`，符号表 `/tmp/velf336_nm.txt`）。
 
 ## 2026-09-22 目录整治：**VPK 输出目录统一为 `vita-port/out/vpk/`（唯一出口）**
 
