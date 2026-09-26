@@ -4936,16 +4936,19 @@ Skeleton 的 C++ 桩只是声明）。
 - v02.09（d013e54）：runstatus 安全化（静态 1KiB 缓冲 + hex dump + 3 采样 MOVING/frozen）后置；KICK0=`sceKernelSendSignal`（对账本 RUNNING 线程唯一能触碰派发状态的原语）；KICK4=`sceKernelChangeThreadPriority2`（stub 有、头文件无，即时生效变体）。
 - log34 判读：KICK0 rc=0+ce 恢复=幽灵治疗成功；4 核表持续无 vm=幽灵终审；全无效则携 hex dump 转内核 bug 方向。
 
-## 2026-09-25 log35 分析（v02.10 / build b332）：**Phase-1 判决已推翻 —— 真凶指向 tick 内同步 JIT 编译（`Compiler::on_timer_tick`），v02.11 已装阶段探针 + A/B 开关**
+## 2026-09-25 log35 分析（v02.10 / build b332）：**Phase-1 判决已推翻 —— 头号嫌疑是 tick 内同步 JIT 编译（`Compiler::on_timer_tick`），v02.11 已装阶段探针 + A/B 开关**
 
-> ⚠️ 本节曾给出的"绿灯无界 park / `suspend_ticks()` 非真挂起"结论**已撤回**（证据见下文"根因（源码级，v02.11 修正）"）。
-> 保留在 git 历史中的 `69ea4b0` 记录的是**错误结论**，勿再据此行事。
+> ⚠️ 本节经历**两轮修正**：① "绿灯无界 park / `suspend_ticks()` 非真挂起"（即 git 里的 `69ea4b0`）**已撤回**；
+> ② 一切按 `nm − 0x81000000` 换算出的符号归属**全部作废**（正确常数是 `0x81000040`，见下文"site ring 归属"）。
+> JIT 编译只是**嫌疑**，未证；v02.11 的两件装置就是为判定它。
 
 判决与全部证据链见 `debug/logs/log35/ANALYSIS.md`。要点：
 
 - **地址映射钉死**：slide=0x77000，两条**指令级**锚点互证——① wd 自己的 DRES
   `0x8108578a`→vma `0x8100e78a` = `str r2,[r3,#0]`（r3=0x81000000）；② vm pc `0x81133a90`→`0x810bca90`
-  = `interpreter_timer_tick+0x24`。核心转储 `THREAD_REG_INFO` 布局解出：块基址 0x1e9c、步长 0x178、
+  = **`start_lightweight_thread_asm+0x14`**（green-thread 启动桩簇；`tst r1,#0x40000000` /
+  `strne r2,[r0,#36]` / `bleq invoke_pending_entries`）——**不是** `interpreter_timer_tick`
+  （初版按错误的 `−0x81000000` 换算得出 `interpreter_timer_tick+0x24`，见下文 0x40 修正）。核心转储 `THREAD_REG_INFO` 布局解出：块基址 0x1e9c、步长 0x178、
   **`+0x040` = saved PC**；5 线程全部符号化（vm / 外来系统线程 tid=0x400100c3 / tone / wd=DRES / ticker），
   tone+ticker 的 pc 都落在 `SceThreadmgr` fstub（各自在 delay 里）→ 交叉验证换算正确。
 - **d=0 四连**（`vm runClocks 10227223 -> 10227223`；tone d=2002 / wd d=1642 健康对照）。
@@ -4959,8 +4962,8 @@ Skeleton 的 C++ 桩只是声明）。
 - **决定性新证据（本轮首次看清）**：site 快照 `active_count=5 async_count=1`，
   **五个 Java 线程全部 `wait=<对象>`**（4 个 no-timeout），`timer_ticked=1 ev_readiness=0`，
   **`rt_ticks=1341 ttk=357 jsmp=357` → 约 984 个 tick 被 raise 却从未被消费**；
-  site ring `frozen=yes`，`site[0]=wait_for+0x54`、`site[1]=pump_events_vita+0x8`；
-  `lanes fast=382 slow=0 pump=394 switch=190999`。
+  site ring `frozen=yes`，`site[0]=switch_thread+0x28`（= `vita_site_mark()` 返回地址）、
+  `site[1]=pump_events_vita+0x48`；`lanes fast=382 slow=0 pump=394 switch=190999`。
 - **与 log23 指纹逐字节复现**（fast/switch/pump==CE/clinit=`com/app/filemanager/UI` 全同）
   → 长期存在、可复现的同一 bug，**非 v02.09/v02.10 回归**。
 - **根因（源码级，v02.11 修正）**：先前 Phase-1 判决"绿灯无界 park（`sleep_time=-1`）+
@@ -4968,29 +4971,47 @@ Skeleton 的 C++ 桩只是声明）。
   - `slow=0` → `Scheduler::yield()` 的慢车道（park 路径）**从未被走过**；
   - **master 模式实锤**（构建产物 `midp_master_mode_events.o` 存在、`slavemode_port/` 无 vita 端口、
     `midp_slave_mode_events.c` 未编译）→ `wait_for_event_or_timer()` 的 `sleep_time=-1` 分支**不可达**；
-  - `rt_ticks=1341 ≫ ttk=357` → v02.00 的 `sleep_forever` 空闲环确实在跑，不是"卡在内核阻塞"；
+  - `rt_ticks ≫ ttk` **不是**本次特有证据，而是全部留存挂死日志的共有形态（log30 394/349、
+    log31 357/353、log32 408/348、log34 573/350、log35 1341/357），它只说明 **ticker 线程健在
+    而 VM 线程不再消费 tick**；
+  - **新线索：`ttk` 冻结值在所有日志都落在 349–357**（≈3.5 s VM 运行），而 `rt_ticks` 从 357 到 1341 不等
+    → **挂死点由 tick 计数而非用户时序决定**，跨 v02.08–v02.10、与 log19/20/22/23 同指纹
+    → 与"首次 JIT 编译被策略在固定 tick 数触发"高度吻合，但同样未经证实；
   - `vita_checkevents.c` 早已把 ANI 等待钳到 ≤50ms；`Main_vita.cpp` 的 slave 模式 `JVM_TimeSlice()`
     循环未被使用（遗留风险 ② 结案）；
   - `pump=394 == CE=394` + 冻结前输入心跳正常 → 泵不是饿死，而是"VM 再没回来调用它"。
-- **真实形态**：`ttk == jsmp == 357` 且 `rt_ticks` 持续上涨 → **第 357 次 tick 的 tick 体进入了、
-  但永不返回**；`gnrt=0/0`（空队列退出计数为 0）= runnable 队列从未空过；
+- **真实形态**：`ttk == jsmp == 357` 且（由独立 ticker 线程累加的）`rt_ticks` 继续上涨
+  → **第 357 次 tick 体进入过（ttk 自增），此后不再有任何 tick 体进入**；`gnrt=0/0`（空队列退出计数为 0）= runnable 队列从未空过；
   `ani_mark.log = "CE #394 ANI OUT"`（下一次 IN 从未发生）= log19/20/22/23 一脉相承的指纹
-  （长期 bug，非 v02.09/v02.10 回归）。内核保存的 pc 停在 `interpreter_timer_tick+0x24`
-  （tick 桩内部，**不是**任何 syscall 入口桩 → VM 不在内核里等），故
-  **VM 线程卡在 `Thread::timer_tick()` 的 tick 体内部：过了 java-frame 采样、未到 `Scheduler::yield()`。**
+  （长期 bug，非 v02.09/v02.10 回归）。内核保存的 pc 停在 **`start_lightweight_thread_asm+0x14`**
+  （green-thread 启动桩簇，**不是**任何 syscall 入口桩 → VM 不在内核里等；但也不再支持
+  "pc 在 tick 桩里"的旧说法）—— 故 **"VM 线程不再消费 tick**（= 不再执行解释器回边检查）"
+  成立，而"卡在 tick 体内部**具体哪一步**"要等 v02.11 阶段探针点名。
 - **头号嫌疑（v02.11 主攻）**：该窗口内唯一的重活是 **tick 上的同步 JIT 编译** ——
   `Thread::timer_tick()` 在 `#if ENABLE_COMPILER` 下直接调用
   `Compiler::on_timer_tick(_real_time_has_ticked)`（`Compiler.cpp:211` 起的完整编译入口：
   采样当前方法 → `_compilation_abstinence_ticks` 倒数 → 真的编译），**中间没有 safepoint**；
-  且本构建**编译器确实编进去了**（`midp_vita.velf`：`_ZN11JVMCompiler13on_timer_tickEi`=`102074a30`、
+  且本构建**编译器确实编进去了**（`midp_vita.velf`（b332 nm）：`_ZN11JVMCompiler13on_timer_tickEi`=`102074a30`、
   `_ZN22JVMCompiledMethodCache13on_timer_tickEv`=`1020b4df0`；`crumb.log`：`vm UseCompiler(pre)=1`）。
-  与"按键几次就挂死"吻合：方法跑热 → tick 采样到它 → 进入编译 → 不返回。
-- **site ring 归属（0x40 差异未结）**：热点槽（16 槽里 15 个同址）`0x810fad0c`/vma `0x81083d0c`
-  落在 nm 的 `JVMScheduler::wait_for`(0x102083cb8)..`switch_thread`(0x102083d24) 区间内，但该处
-  **没有** `vita_site_mark()` 调用点（Scheduler.cpp 仅 744/1341/2171 三处），且其前一条 `bl`
-  目标为 `0x81054bf8` = `Os::check_compiler_timer`(0x102054bb4)+0x44 —— **编译期时间预算检查的调用点**
-  （与 JIT 假说同向）；`vita_site_mark` 自身 nm 值 `0x102054c38` 比它高 0x40，此差异本轮未解，
-  v02.11 让 `site_ring.log` 直接打印 `mark=0x%08x`（`&vita_site_mark` 运行地址）以彻底消除滑移猜测。
+  再加"挂死点恒定在 ~350 tick"这条横向线索，这是当前最强假说，但**仍属嫌疑**：
+  pc/ring 两个老定位器都已作废，需要 v02.11 探针/A-B 开关来判定。
+- **site ring 归属（已结）**：热点槽（16 槽里 15 个同址）raw `0x810fad0c` − slide `0x77000` =
+  0x81083d0c，在 **b332 的 `switch_thread`(VMA `0x81083ce4`, 长 492) + 0x28** 处，
+  即 `Scheduler.cpp:2175` 的 `vita_site_mark()` 调用**返回地址**（其前一条 `bl` 目标
+  `0x81054bf8` = `vita_site_mark` 本身，b332 VMA）。**上一轮把它算成
+  `Os::check_compiler_timer+0x44`、以及"落在 wait_for 区间内且无 mark 调用点"
+  都是 nm→VMA 常数取错的产物，该"同向证据"作废。**
+  更正：**nm 值 = VMA + `0x81000040`**（不是 `0x81000000`！`.text` VMA = `0x81000040`，
+  nm 把 .text 基址当 0）。这就是困扰多轮的"0x40 差异"。**以后取真实 VMA 一律用
+  `arm-vita-eabi-readelf -sW <velf>`**（`out/vpk/midp_vita_v0X.YY.sym` 其实是 velf 副本，
+  可直接 readelf 回查历史版本符号）；`nm` 输出只用于相对比较。
+  ring 的真实含义：它是"**最后一个 mark 站点**"记录器 —— `switch_thread` 是每量子必经之路，
+  只要 VM 在跑 Java，16 槽就会被它刷满，**故 ring 内容不能定位冻结点**（log23 已得出同一结论）。
+- **v02.11 装置自检（已在最终 velf 闭环验证）**：`readelf -sW midp_vita.velf` →
+  `on_timer_tick` VMA `0x81074b20`、`vita_tick_compile_enabled` VMA `0x81054c2c`；
+  反汇编 `0x81074b2c: bl 0x81054c2c` —— **A/B 开关确实被 `Compiler::on_timer_tick` 调用**（全 velf 唯一调用点）；
+  探针符号 `_vita_ttk_stage`(B `0x10279570c`)、`vita_sched_ttk_stage`(T `0x102082b00`)、
+  `vita_sched_ttk_hits`(T `0x102082b10`) 均在 `.sym` 中。
 - **v02.11 已实现（探针提交 `12ce198`；由该提交链接产出的 vpk banner =
   `J2ME Player v02.11 b336 (12ce198)`；产物 `vita-port/out/vpk/midp_vita_v02.11.vpk`）**：
   1. `Thread.cpp`：**tick 阶段探针**（stage 1..7 + 各阶段命中数：1=进入 tick、2=java-frame 采样后、
@@ -5013,6 +5034,14 @@ Skeleton 的 C++ 桩只是声明）。
   若卡在 5/6 转 `Scheduler::yield()` 深处；`mark=0x...` 让 ring 槽位可直接 addr2line。
 
 ## 2026-09-25 log34 分析（v02.09 / build 8bf56ee / b330 实弹）：runstatus 二杀 wd（死在内核）+ site_ring 终局（VM 冻结于 wait_for 停车点）
+
+> ⚠️ **本节的符号归属与结论已按 `0x40` 换算修正**（原因见下方 log35 章节"第 2 轮修正"）：
+> `nm` 值 = `VMA + 0x81000040`，本节所有用 `− 0x81000000` 算出的 `xxx+0xNN` 都要 `+0x40` 重新归位；
+> 其中 `site[0]/site[1]` 实为 **`switch_thread+0x28` / `pump_events_vita+0x48`**，
+> 即 `vita_site_mark()` 的返回地址 —— ring **不是** "VM 冻结 native 栈"，只是"最后一次 mark 站点"，
+> 因此下面的"green 调度器 idle 等待路径停车点 / 冻结于 wait_for"读法**作废**；
+> 同理"冻点五连"里的 `interpreter_timer_tick+0x10` 等偏移全部无效，需重算。
+> 仍然成立的是 **d=0 三连** 与 **runstatus 二杀 wd（内核态数据中止）** 这两条与地址无关的事实。
 
 判决与全部证据链见 `debug/logs/log34/ANALYSIS.md`。要点：
 
