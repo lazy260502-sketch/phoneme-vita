@@ -222,6 +222,15 @@ void Compiler::on_timer_tick(bool is_real_time_tick JVM_TRAPS) {
   if (!vita_tick_compile_enabled()) {
     return;
   }
+  /* v02.17: second, self-diagnosing gate. The static switch above is
+   * all-or-nothing; this one also refuses to start a synchronous
+   * compile when the ticker has gone stale (VM thread monopolising the
+   * core), which is the actual freeze signature. Mode from
+   * ux0:/data/J2ME00001/tickgate - see vita_jit_tick_compile_enabled()
+   * in OS_vita.cpp; absent = no gate, i.e. unchanged behaviour. */
+  if (!vita_jit_tick_compile_enabled()) {
+    return;
+  }
 #endif
   if( !UseCompiler || !Universe::is_compilation_allowed() ) {
     return;

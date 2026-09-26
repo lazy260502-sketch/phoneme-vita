@@ -214,6 +214,11 @@ void Thread::lightweight_thread_uncaught_exception() {
 void Thread::lightweight_thread_exit() {
 #if defined(VITA)
   vita_site_mark(); /* v01.84: log10 - ring must see thread death */
+  /* v02.17: the REAL last breath of a Java thread on the ARM path (the
+   * finish() site above is the debugger/other-platform path). If this
+   * climbs while the dispatch ring keeps showing the same thread, the
+   * VM is cycling create -> run -> exit through Java. */
+  vita_lw_exit_count++;
 #endif
   SETUP_ERROR_CHECKER_ARG;
   Thread *thread = Thread::current();
@@ -392,12 +397,36 @@ void Thread::start(JVM_SINGLE_ARG_TRAPS) {
   run_entry().obj_at_put(0, &receiver);
   append_pending_entry(&run_entry);
 
+#if defined(VITA)
+  /* v02.17: name the Java thread being created (Class.run). A create/
+   * die spin shows the SAME pair repeating in the watchdog's creation
+   * ring, which identifies the responsible Java code without needing
+   * the (never-captured) Java heap. Bounded raw copies of the length-
+   * prefixed Symbols - no allocation, PRODUCT-safe, same idiom as
+   * vita_site_java_frame() in OS_vita.cpp. */
+  {
+    const char *cn = NULL; int cl = 0;
+    const char *mn = NULL; int ml = 0;
+    Symbol::Raw cs = thread_class().name();
+    if (cs.not_null()) { cn = cs().base_address(); cl = cs().length(); }
+    Symbol::Raw ms = run_method().name();
+    if (ms.not_null()) { mn = ms().base_address(); ml = ms().length(); }
+    vita_tc_note(cn, cl, mn, ml);
+    vita_thread_start_count++;
+  }
+#endif
+
   Scheduler::start(this JVM_NO_CHECK_AT_BOTTOM);
 }
 
 void Thread::finish() {
 #if defined(VITA)
   vita_site_mark(); /* v01.84: log10 - ring must see thread finish */
+  /* v02.17: denominator for the create/die-spin question. finish()
+   * without the thread ever appearing in the dispatch ring means the
+   * thread died before its first quantum - i.e. inside the new-thread
+   * entry path that log41 froze on. */
+  vita_thread_finish_count++;
 #endif
   SETUP_ERROR_CHECKER_ARG;
   Thread *thread = Thread::current();

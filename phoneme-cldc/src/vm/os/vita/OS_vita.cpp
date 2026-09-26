@@ -126,6 +126,14 @@ extern "C" volatile unsigned int vita_tick_count = 0;
 static int ticker_thread_routine(SceSize args, void *argp) {
     while (!ticker_stopping) {
         ticker_running = true;
+        /* v02.17: liveness stamp. vita_tick_count already counts ticks
+         * that reached real_time_tick(), but a single sample cannot tell
+         * "frozen" from "slow"; the watchdog takes TWO samples 400 ms
+         * apart (see vita_wd_snapshot) and compares, and this stamp says
+         * how long ago the ticker thread last ran at all (even a ticker
+         * stuck BEFORE real_time_tick would still update it). */
+        vita_ticker_loops++;
+        vita_ticker_last_ms = sceKernelGetProcessTimeWide() / 1000;
         sceKernelDelayThread(TickInterval * 1000);
         if (ticker_running && !ticker_stopping) {
             vita_tick_count++;
@@ -165,6 +173,24 @@ bool Os::start_ticks() {
              * Still strictly better than the old affinity=0 only if 0 meant
              * "inherit"; here we are explicit. */
             vm_aff = SCE_KERNEL_CPU_MASK_USER_ALL;
+        }
+        /* v02.17 runtime A/B for the v02.14 pinning. If the file
+         * ux0:/data/J2ME00001/ticker_cpu exists and starts with '0' the
+         * ticker goes back to the pre-v02.14 behaviour (cpu0 / all user
+         * cores = "0"); '1' or '2' pin it explicitly to that cpu. Absent
+         * = keep the v02.14 "same core as the VM thread" default. This
+         * tests, in ONE build, whether the log40/log41 "cpu1 scheduler
+         * DEAD" picture is caused or cured by putting the ticker on the
+         * VM's core. */
+        {
+            int ab = vita_cfg_digit("ticker_cpu", -1);
+            if (ab == 0) {
+                vm_aff = SCE_KERNEL_CPU_MASK_USER_ALL;
+            } else if (ab == 1) {
+                vm_aff = SCE_KERNEL_CPU_MASK_USER_1;
+            } else if (ab == 2) {
+                vm_aff = SCE_KERNEL_CPU_MASK_USER_2;
+            }
         }
         ticker_thread_id = sceKernelCreateThread(
             "cldc_ticker", ticker_thread_routine, 0x10000100, 0x10000, 0,
@@ -372,6 +398,54 @@ int vita_tick_compile_enabled(void) {
     return _vita_tick_compile;
 }
 
+/*=========================================================================
+ * v02.17 VM-side tick-compile gate.
+ *
+ * v02.11 added a static switch for the tick-driven JIT compile, but the
+ * hypothesis it tests (log35: freeze inside the synchronous compile
+ * that Thread::timer_tick() runs on the VM thread) needs a second,
+ * self-diagnosing form: compile only when the ticker is keeping up.
+ * The ticker stamps vita_ticker_last_ms every loop iteration (10 ms
+ * cadence), so "the ticker has not run for >1 s" means the VM thread is
+ * monopolising the core and a long synchronous compile is exactly the
+ * worst thing to start. Mode is read once from
+ * ux0:/data/J2ME00001/tickgate:
+ *   absent / 0 -> disabled (the v02.11 behaviour, no gate at all)
+ *   1          -> skip the compile when the ticker is >1 s stale
+ *   2          -> never compile on ticks (same as tick_compile.cfg "0")
+ * One file, three behaviours, no rebuild - and the watchdog dump prints
+ * the mode so the log says which one was active.
+ *=======================================================================*/
+static int _vita_tickgate_mode = -1;
+
+int vita_jit_tick_compile_enabled(void) {
+    int mode = _vita_tickgate_mode;
+    if (mode < 0) {
+        mode = vita_cfg_digit("tickgate", 0);
+        if (mode < 0 || mode > 2) mode = 0;
+        _vita_tickgate_mode = mode;
+    }
+    if (mode == 0) {
+        return 1;
+    }
+    if (mode == 2) {
+        return 0;
+    }
+    /* mode 1: a stale ticker means the VM is hogging the core. */
+    if (vita_ticker_last_ms > 0) {
+        long long now_ms = sceKernelGetProcessTimeWide() / 1000;
+        if (now_ms - vita_ticker_last_ms > 1000) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int vita_tickgate_mode(void) {
+    (void)vita_jit_tick_compile_enabled(); /* force the one-time read */
+    return _vita_tickgate_mode;
+}
+
 volatile unsigned int vita_site_seq = 0;
 
 #define VITA_SITE_RING_SIZE 16
@@ -384,6 +458,130 @@ __attribute__((noinline)) void vita_site_mark(void) {
     vita_site_ring[s & (VITA_SITE_RING_SIZE - 1)] =
         __builtin_return_address(0);
     vita_site_seq = s + 1;
+}
+
+/*=========================================================================
+ * v02.17 one-shot forensics - state.
+ *
+ * Real-hardware iterations are expensive, so v02.17 puts every probe the
+ * remaining open questions need into ONE build. All state here is plain
+ * volatile data written by VM threads and read by the launcher watchdog
+ * after a HANG; no syscalls, no locks, no allocation - the two probe
+ * designs that did touch foreign TCBs (log33 GetThreadRunStatus, log34)
+ * each killed the watchdog thread we depend on.
+ *
+ * The counters answer, in one glance at the hang log:
+ *   - did the ticker thread keep running after the freeze?  (ticker_loops
+ *     frozen while the thread is alive == ticker starved, i.e. the core it
+ *     is pinned to is no longer scheduling)
+ *   - is the VM cycling through the SAME Java thread creation repeatedly?
+ *     (tc_hist ring: same class.method 8/8 == create/die spin)
+ *   - does the bootstrap path advance at all (run/sched_start/start0) or
+ *     does it stop exactly at the first new-thread dispatch?
+ *=========================================================================*/
+
+volatile unsigned int vita_run_count = 0;
+volatile unsigned int vita_sched_start_count = 0;
+volatile unsigned int vita_thread_start_count = 0;
+volatile unsigned int vita_thread_finish_count = 0;
+volatile unsigned int vita_lw_exit_count = 0;
+volatile unsigned int vita_start0_count = 0;
+volatile unsigned int vita_justborn_dispatch = 0;
+volatile unsigned int vita_ticker_loops = 0;
+volatile long long   vita_ticker_last_ms = 0;
+
+volatile unsigned int vita_tc_count = 0;
+volatile char vita_tc_class[VITA_TC_HIST][40];
+volatile char vita_tc_method[VITA_TC_HIST][40];
+
+void vita_tc_note(const char *cls, int clen, const char *mth, int mlen) {
+    unsigned int s = vita_tc_count;
+    int slot = (int)(s & (VITA_TC_HIST - 1));
+    int i;
+    if (clen < 0) clen = 0;
+    if (clen > 39) clen = 39;
+    if (mlen < 0) mlen = 0;
+    if (mlen > 39) mlen = 39;
+    for (i = 0; i < clen && cls; i++) vita_tc_class[slot][i] = cls[i];
+    vita_tc_class[slot][i] = 0;
+    for (i = 0; i < mlen && mth; i++) vita_tc_method[slot][i] = mth[i];
+    vita_tc_method[slot][i] = 0;
+    vita_tc_count = s + 1;
+}
+
+/*=========================================================================
+ * v02.17 runtime A/B switch reader.
+ *
+ * Same idea as vita_tick_compile_enabled(), generalised: a file named
+ * ux0:/data/J2ME00001/<name> whose first byte is '0'/'n'/'N' turns the
+ * named behaviour OFF. A single build can therefore test several
+ * hypotheses by editing tiny files on the memory card - the alternative
+ * (one build per hypothesis) is what makes real-hardware work painful.
+ * Names are looked up in a small static cache so each file is opened at
+ * most once per process; the lookup runs on the VM thread.
+ *=========================================================================*/
+#define VITA_CFG_MAX 8
+static const char *vita_cfg_names[VITA_CFG_MAX];
+static int         vita_cfg_vals[VITA_CFG_MAX];
+static int         vita_cfg_used = 0;
+
+static int vita_cfg_name_eq(const char *a, const char *b) {
+    if (a == b) return 1;
+    if (a == NULL || b == NULL) return 0;
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+int vita_cfg_flag(const char *name, int dflt) {
+    int i;
+    for (i = 0; i < vita_cfg_used; i++) {
+        if (vita_cfg_name_eq(vita_cfg_names[i], name)) return vita_cfg_vals[i];
+    }
+    {
+        int val = dflt;
+        char path[64];
+        SceUID fd;
+        int n = snprintf(path, sizeof(path), "ux0:/data/J2ME00001/%s", name);
+        if (n > 0 && n < (int)sizeof(path)) {
+            fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+            if (fd >= 0) {
+                char c = 0;
+                if (sceIoRead(fd, &c, 1) == 1 &&
+                    (c == '0' || c == 'n' || c == 'N')) {
+                    val = 0;
+                }
+                sceIoClose(fd);
+            }
+        }
+        if (vita_cfg_used < VITA_CFG_MAX) {
+            vita_cfg_names[vita_cfg_used] = name;
+            vita_cfg_vals[vita_cfg_used] = val;
+            vita_cfg_used++;
+        }
+        return val;
+    }
+}
+
+/* v02.17: same file protocol but returns the VALUE as a small integer, so
+ * one switch can select among several variants (ticker_cpu: 0/1/2).
+ * Absent / unreadable / not a digit => dflt. Not cached separately from
+ * vita_cfg_flag's table, because the returned value is what matters. */
+int vita_cfg_digit(const char *name, int dflt) {
+    int val = dflt;
+    char path[64];
+    SceUID fd;
+    int n = snprintf(path, sizeof(path), "ux0:/data/J2ME00001/%s", name);
+    if (n > 0 && n < (int)sizeof(path)) {
+        fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+        if (fd >= 0) {
+            char c = 0;
+            if (sceIoRead(fd, &c, 1) == 1 && c >= '0' && c <= '9') {
+                val = c - '0';
+            }
+            sceIoClose(fd);
+        }
+    }
+    return val;
 }
 
 /*=========================================================================
@@ -727,13 +925,31 @@ extern "C" {
     unsigned int vita_sched_ttk_stage(void);
     unsigned int vita_sched_ttk_hits(int i);
     int  vita_sched_dump_threads(char *out, int out_size);
+    /* v02.17: next-runnable thread state, dispatch ring, Java-stack top,
+     * JUST_BORN dispatch counter (all defined in Scheduler.cpp). */
+    unsigned int vita_sched_nrt_cell(void);
+    unsigned int vita_sched_nrt_obj(void);
+    int  vita_sched_nrt_info(char *out, int out_size);
+    unsigned int vita_sched_justborn(void);
+    int  vita_sched_dump_dispatch(char *out, int out_size);
+    int  vita_sched_dump_stack(char *out, int out_size);
 }
 
-void vita_wd_snapshot(const char *path) {
-    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
-                          0777);
-    if (fd < 0) return;
-    char buf[160];
+/* v02.17: one text-append helper (avoid the hand-counted sceIoWrite
+ * lengths that made older dumps hard to extend). */
+static void vita_wd_puts(SceUID fd, const char *s) {
+    int l = 0;
+    if (s == NULL) return;
+    while (s[l]) l++;
+    if (l > 0) sceIoWrite(fd, s, l);
+}
+
+/* v02.17: ONE snapshot pass. Called twice by vita_wd_snapshot() with a
+ * 400 ms gap so every counter appears with its delta in the same file -
+ * a single sample cannot separate "frozen" from "slow", which is exactly
+ * the ambiguity that made log36..log41 hard to read. */
+static void vita_wd_snapshot_one(SceUID fd) {
+    char buf[256];
     int n;
 
     /* Thread::current() expands to (Thread*)&_current_thread, i.e.
@@ -823,6 +1039,102 @@ void vita_wd_snapshot(const char *path) {
                  vita_sched_sf_last_ms(),
                  vita_sched_gnrt_hits(), vita_sched_gnrt_nulls());
     sceIoWrite(fd, buf, n);
+
+    /*-------------------------------------------------------------------
+     * v02.17 read-outs.
+     *-----------------------------------------------------------------*/
+
+    /* (1) Ticker liveness. vita_tick_count counts ticks that REACHED
+     * real_time_tick(); vita_ticker_loops counts ticker loop iterations
+     * (stamped BEFORE the delay), so a ticker alive but stuck inside or
+     * just after real_time_tick() still advances loops. ago_ms is how
+     * long ago the ticker last ran: growing between the two samples ==
+     * the ticker thread is not being scheduled at all (starved / its
+     * pinned core no longer schedules). This is the direct test of the
+     * "ticker pinned to the same core as the VM (v02.14)" hypothesis. */
+    {
+        long long now_ms = sceKernelGetProcessTimeWide() / 1000;
+        long long ago = (vita_ticker_last_ms > 0)
+                        ? (now_ms - vita_ticker_last_ms) : -1;
+        n = snprintf(buf, sizeof(buf),
+                     "  ticker loops=%u tick_count=%u last_ms=%lld ago_ms=%lld"
+                     " cpu_cfg=%d tickgate=%d tick_compile=%d\n",
+                     vita_ticker_loops, (unsigned int)vita_tick_count,
+                     vita_ticker_last_ms, ago,
+                     vita_cfg_digit("ticker_cpu", -1),
+                     vita_tickgate_mode(), vita_tick_compile_enabled());
+        sceIoWrite(fd, buf, n);
+    }
+
+    /* (2) Bootstrap / teardown path counters - the log41 freeze site was
+     * the new-thread entry path (primordial_to_current_thread ->
+     * start_lightweight_thread_asm -> invoke_pending_entries). These
+     * separate "the dispatcher stopped producing threads" from "threads
+     * are produced and die in a spin". */
+    n = snprintf(buf, sizeof(buf),
+                 "  boot run=%u sched_start=%u th_start=%u th_finish=%u"
+                 " lw_exit=%u start0=%u justborn=%u\n",
+                 vita_run_count, vita_sched_start_count,
+                 vita_thread_start_count, vita_thread_finish_count,
+                 vita_lw_exit_count, vita_start0_count,
+                 vita_sched_justborn());
+    sceIoWrite(fd, buf, n);
+
+    /* (3) The last 8 Java threads created (class.method). A create/die
+     * spin prints the same pair over and over - which names the Java
+     * code responsible without needing the (unavailable) Java heap. */
+    {
+        unsigned int c = vita_tc_count;
+        unsigned int start = (c >= VITA_TC_HIST) ? (c - VITA_TC_HIST) : 0;
+        n = snprintf(buf, sizeof(buf), "  last %d java threads created:\n",
+                     VITA_TC_HIST);
+        sceIoWrite(fd, buf, n);
+        for (unsigned int k = start; k < c; k++) {
+            int slot = (int)(k & (VITA_TC_HIST - 1));
+            n = snprintf(buf, sizeof(buf), "    [%u] %s.%s\n", k,
+                         vita_tc_class[slot][0] ? (const char *)&vita_tc_class[slot]
+                                                : "(?)",
+                         vita_tc_method[slot][0] ? (const char *)&vita_tc_method[slot]
+                                                 : "(?)");
+            sceIoWrite(fd, buf, n);
+        }
+    }
+
+    /* (4) Next-runnable cache: the scheduler's own answer to "who should
+     * run". _next_runnable_thread is a handle cell; print the cell, the
+     * object and the object's fields (id/pri/status/pending/jsp/wait). */
+    n = snprintf(buf, sizeof(buf),
+                 "  nrt cell=0x%08x obj=0x%08x\n",
+                 vita_sched_nrt_cell(), vita_sched_nrt_obj());
+    sceIoWrite(fd, buf, n);
+    {
+        static char nrt_info[256];
+        int len = vita_sched_nrt_info(nrt_info, (int)sizeof(nrt_info));
+        if (len > 0) sceIoWrite(fd, nrt_info, len);
+    }
+
+    /* (5) Dispatch ring: the last N threads switch_thread() switched AWAY
+     * from, newest first. Tells which threads the dispatcher cycles
+     * through right before the freeze (same id repeating == a hot loop
+     * through one thread; a fixed rotation == a real round-robin). */
+    {
+        static char disp_dump[2048];
+        int len = vita_sched_dump_dispatch(disp_dump, (int)sizeof(disp_dump));
+        if (len > 0) sceIoWrite(fd, disp_dump, len);
+    }
+
+    /* (6) Top of the Java stacks. The coredump never contains the Java
+     * heap, so the bootstrap frame built by setup_stack_asm (frame
+     * pointer 0 + start_lightweight_thread_asm + TestCompiler) has never
+     * been visible. The watchdog CAN read it - it runs in the same
+     * process. A top-of-stack matching setup_stack_asm proves the thread
+     * has never executed; anything else shows how far it got. */
+    {
+        static char stack_dump[1024];
+        int len = vita_sched_dump_stack(stack_dump, (int)sizeof(stack_dump));
+        if (len > 0) sceIoWrite(fd, stack_dump, len);
+    }
+
     /* v01.98: WHO are the active_count threads? Walk the global thread
      * list (ground truth) and the priority queues (scheduler's runnable
      * opinion) - see vita_sched_dump_threads in Scheduler.cpp. Buffer
@@ -834,6 +1146,22 @@ void vita_wd_snapshot(const char *path) {
         if (len > 0)
             sceIoWrite(fd, thread_dump, len);
     }
+}
+
+void vita_wd_snapshot(const char *path) {
+    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                          0777);
+    if (fd < 0) return;
+    /* v02.17: every counter is printed TWICE, 400 ms apart, in one file.
+     * The delta between the two blocks is what carries the information
+     * (which counter still advances after the VM froze); without it a
+     * single sample is ambiguous and cost several log rounds to
+     * disambiguate. */
+    vita_wd_puts(fd, "\n===== v02.17 sample 1 =====\n");
+    vita_wd_snapshot_one(fd);
+    sceKernelDelayThread(400 * 1000);
+    vita_wd_puts(fd, "===== v02.17 sample 2 (+400ms) =====\n");
+    vita_wd_snapshot_one(fd);
     sceIoClose(fd);
 }
 

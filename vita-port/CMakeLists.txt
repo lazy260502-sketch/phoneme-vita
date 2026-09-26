@@ -864,6 +864,42 @@ set(VITA_VERSION  "01.86")
 #   start_lightweight_thread_asm + cpu1-stall signature the freeze is
 #   path-generic, not jar-content driven.
 set(VITA_VERSION  "02.16")
+# 02.17: one-shot forensics - EVERY remaining probe in ONE build, because
+#   a real-hardware round (rebuild + reinstall + relaunch + capture) is
+#   the expensive part, not the CPU time.
+#   Rationale: log36..log41 all died on the same ambiguity - a single
+#   frozen sample cannot say whether a counter stopped because the VM
+#   deadlocked or because it is merely slow. v02.17 therefore prints
+#   everything TWICE (400 ms apart, one file) and adds the counters that
+#   name the path instead of the symptom:
+#   - lifecycle counters: run / sched_start / th_start / th_finish /
+#     lw_exit / start0 / justborn (JVM.cpp, Scheduler.cpp, Thread.cpp,
+#     Natives.cpp). "Created but never dispatched" and "dispatched but
+#     never finished" are now distinguishable numbers.
+#   - Java thread-name ring (last 8 Class.run created): a create/die
+#     spin prints the SAME pair over and over -> names the responsible
+#     Java code without the (never-captured) Java heap.
+#   - dispatch ring (last 16 threads switched away from) with status +
+#     pending_entries bits: shows WHAT the scheduler was cycling through
+#     right before the freeze.
+#   - next-runnable cache (cell/object + id/pri/status/jsp/wait).
+#   - Java-stack top of the current thread (16 words): the bootstrap
+#     frame built by setup_stack_asm has never been observable before
+#     (coredumps hold only native stacks); if the top still matches the
+#     template the thread never entered Java at all.
+#   - ticker liveness: loops + last_ms + ago_ms, sampled twice, plus the
+#     pinned cpu. Directly tests the v02.14 "ticker on the VM's core"
+#     change and the log40/log41 "cpu1 scheduler DEAD" picture.
+#   - runtime A/B switches (ux0:/data/J2ME00001/<name>, no rebuild):
+#       ticker_cpu  = 0 | 1 | 2   (all user cores | cpu1 | cpu2)
+#       tickgate    = 1 | 2       (skip JIT compile while the ticker is
+#                                  >1 s stale | never compile on ticks)
+#       tick_compile.cfg "0"      (v02.11 switch, unchanged)
+#     Absent files = current behaviour exactly.
+#   Still no syscalls on foreign threads (that killed the watchdog in
+#   log33/log34): every probe is a volatile read from the watchdog's own
+#   thread.
+set(VITA_VERSION  "02.17")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows

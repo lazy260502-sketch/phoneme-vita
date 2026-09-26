@@ -1282,6 +1282,10 @@ void Java_java_lang_Thread_start0(JVM_SINGLE_ARG_TRAPS) {
    * loop re-enters start0 but the pump gate stays shut; if the ring
    * ends on the pump site instead, the loop bypasses start0 entirely. */
   vita_site_mark();
+  /* v02.17: readout-visible denominator for the same question. A
+   * climbing start0 with a frozen dispatch ring means Java keeps
+   * creating threads that never get a quantum. */
+  vita_start0_count++;
 #endif
   UsingFastOops fast_oops;
   ThreadObj::Fast receiver = GET_PARAMETER_AS_OOP(0);

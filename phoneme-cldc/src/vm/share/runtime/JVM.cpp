@@ -277,6 +277,14 @@ void JVM::run() {
   // Java thread, and the GC will be very confused.
   GUARANTEE(_last_handle == NULL, "No handles");
   GUARANTEE(last_raw_handle == NULL, "No Raw handles");
+#if defined(VITA)
+  /* v02.17: the log41 coredump froze the VM thread exactly on this call
+   * (return address in JVM::start = this function's caller). run() is
+   * entered once per VM execution, so this counter never moves again
+   * after the freeze - it is the "did the VM ever get here at all"
+   * anchor for the bootstrap counters. */
+  vita_run_count++;
+#endif
   primordial_to_current_thread();
 }
 

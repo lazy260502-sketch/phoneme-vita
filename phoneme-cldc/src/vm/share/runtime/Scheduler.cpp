@@ -71,6 +71,34 @@ extern unsigned int _vita_ttk_count;
  * counter above - same accessor bridge. */
 extern volatile unsigned int _vita_ttk_stage;
 extern volatile unsigned int _vita_ttk_hits[8];
+/* v02.17: dispatch ring - the last N threads switch_thread() switched
+ * AWAY from, with the fields that matter for the create/die-spin
+ * question (status + whether pending_entries is non-NULL, i.e. whether
+ * the thread still has a Java body waiting to be entered). A single
+ * frozen sample says where the VM stopped; the ring says WHAT it was
+ * cycling through just before - which is the part log36..log41 could
+ * not answer. Single writer (the VM thread), reader tolerates torn
+ * values (the writer is frozen by the time the watchdog reads). */
+#define VITA_DISP_RING 32
+volatile unsigned int _vita_disp_ring[VITA_DISP_RING][4]; /* id,pri,st,pe */
+volatile unsigned int _vita_disp_seq = 0;
+#define VITA_DISP_REC(t)                                                   \
+  do {                                                                     \
+    unsigned int s_ = _vita_disp_seq;                                      \
+    (void)s_;                                                              \
+    {                                                                      \
+      Thread *tp_ = (t);                                                   \
+      _vita_disp_ring[s_ & (VITA_DISP_RING - 1)][0] =                      \
+        (unsigned int)tp_->id();                                           \
+      _vita_disp_ring[s_ & (VITA_DISP_RING - 1)][1] =                      \
+        (unsigned int)tp_->priority();                                     \
+      _vita_disp_ring[s_ & (VITA_DISP_RING - 1)][2] =                      \
+        (unsigned int)tp_->status();                                       \
+      _vita_disp_ring[s_ & (VITA_DISP_RING - 1)][3] =                      \
+        (tp_->pending_entries() != NULL) ? 1u : 0u;                        \
+    }                                                                      \
+    _vita_disp_seq = s_ + 1;                                               \
+  } while (0)
 #endif
 
 OopDesc*   Scheduler::_gc_global_head;
@@ -1343,6 +1371,9 @@ void Scheduler::start(Thread* thread JVM_TRAPS) {
    * "loop re-enters Scheduler::start" from "loop reaches start0" and
    * "loop dies threads" - naming the cycle directly on next hang. */
   vita_site_mark();
+  /* v02.17: visible-through-the-watchdog denominator for the same
+   * question (the ring above only keeps 16 slots and is overwritten). */
+  vita_sched_start_count++;
 #endif
   if (!Universe::is_bootstrapping()) {
     allocate_blocked_threads_buffer(_active_count+1 JVM_CHECK);
@@ -2176,6 +2207,11 @@ extern "C" void switch_thread(Thread* thread) {
   /* v01.98: denominator for the lane/pump counters. switch_thread is
    * extern "C" (outside the class), so qualify the static explicitly. */
   Scheduler::_vita_switch_count++;
+  /* v02.17: who is this quantum's outgoing thread? The ring keeps the
+   * last 16 dispatch decisions with their status/pending bits, so a
+   * create-and-die spin (same id, alternating status) is visibly
+   * different from a genuine round-robin over the 7 Java threads. */
+  VITA_DISP_REC(thread);
   /* v01.99 FIX: log23 (v01.98 forensics) closed the chain: at hang the
    * ring holds ONLY switch_thread marks (16x), lanes freeze at fast=377
    * slow=0 while switch=512169 keeps climbing, and pump stops at 370 ==
@@ -2217,6 +2253,14 @@ extern "C" void switch_thread(Thread* thread) {
   // set, clear it and send an event.  The stack pointers are now
   // set in the thread structure.
   if (_debugger_active && thread->status() & THREAD_JUST_BORN) {
+#if defined(VITA)
+    /* v02.17: count JUST_BORN dispatches separately from Thread::start()
+     * calls. A thread created but never dispatched (start count climbs,
+     * this stays flat) points at the VM thread never reaching the
+     * interpeter after spawn - which is exactly the log41 freeze site
+     * (primordial_to_current_thread -> invoke_pending_entries). */
+    vita_justborn_dispatch++;
+#endif
     thread->set_status(thread->status() & ~THREAD_JUST_BORN);
     VMEvent::thread_event(thread, true);
     // more than likely we suspended all threads so null this out so we
@@ -2541,6 +2585,113 @@ extern "C" unsigned int vita_sched_ttk_stage(void) {
 }
 extern "C" unsigned int vita_sched_ttk_hits(int i) {
   return (i >= 0 && i < 8) ? _vita_ttk_hits[i] : 0u;
+}
+
+/* v02.17: next-runnable cache readouts. _next_runnable_thread is the
+ * scheduler's cached answer to "who runs next"; it is the value
+ * switch_thread() consumes BEFORE calling get_next_runnable_thread().
+ * A frozen non-NULL cache with a dead/terminated object is a different
+ * failure from a frozen NULL cache (which means the last dispatch had
+ * to walk the priority queues). */
+extern "C" unsigned int vita_sched_nrt_cell(void) {
+  return (unsigned int)(unsigned long)&_next_runnable_thread;
+}
+extern "C" unsigned int vita_sched_nrt_obj(void) {
+  return (unsigned int)(unsigned long)_next_runnable_thread;
+}
+extern "C" unsigned int vita_sched_justborn(void) {
+  return vita_justborn_dispatch;
+}
+
+extern "C" int vita_sched_nrt_info(char *out, int out_size) {
+  int pos = 0;
+  int n;
+  Thread::Raw t = (Thread *)_next_runnable_thread;
+  if (t.is_null()) {
+    n = snprintf(out + pos, out_size - pos, "  nrt: (null)\n");
+    if (n > 0) pos += n;
+    return pos;
+  }
+  {
+    jint st = t().status();
+    ReturnOop wo = t().wait_obj();
+    n = snprintf(out + pos, out_size - pos,
+                 "  nrt id=%d pri=%d st=%08x%s%s%s jsp=0x%08x wait=%p\n",
+                 t().id(), (int)t().priority(), (unsigned int)st,
+                 (st & THREAD_TERMINATING) ? " TERM" : "",
+                 (st & THREAD_JUST_BORN)   ? " NEW"  : "",
+                 (st & THREAD_DEAD)        ? " DEAD" : "",
+                 (unsigned int)(unsigned long)t().stack_pointer(),
+                 (void*)(unsigned long)wo);
+    if (n > 0 && pos + n < out_size) pos += n;
+  }
+  return pos;
+}
+
+/* v02.17: dispatch ring dump - newest first. */
+extern "C" int vita_sched_dump_dispatch(char *out, int out_size) {
+  int pos = 0;
+  int n;
+  unsigned int seq = _vita_disp_seq;
+  unsigned int i;
+  n = snprintf(out + pos, out_size - pos,
+               "dispatch ring (last %d, newest first):\n", VITA_DISP_RING / 2);
+  if (n > 0) pos += n;
+  for (i = 0; i < VITA_DISP_RING && i < (VITA_DISP_RING / 2); i++) {
+    unsigned int idx = (seq - 1u - i) & (VITA_DISP_RING - 1u);
+    n = snprintf(out + pos, out_size - pos,
+                 "  [%2u] id=%u pri=%u st=%08x%s%s%s%s pe=%u\n", i,
+                 _vita_disp_ring[idx][0], _vita_disp_ring[idx][1],
+                 _vita_disp_ring[idx][2],
+                 (_vita_disp_ring[idx][2] & THREAD_TERMINATING) ? " TERM":"",
+                 (_vita_disp_ring[idx][2] & THREAD_JUST_BORN)   ? " NEW":"",
+                 (_vita_disp_ring[idx][2] & THREAD_DEAD)        ? " DEAD":"",
+                 (_vita_disp_ring[idx][2] & THREAD_NOT_ACTIVE_MASK) ? " INA":"",
+                 _vita_disp_ring[idx][3]);
+    if (n > 0 && pos + n < out_size) pos += n; else break;
+  }
+  return pos;
+}
+
+/* v02.17: top of the CURRENT thread's Java stack, word by word. The
+ * coredump only ever contains NATIVE (pthread) stacks, so the Java
+ * bootstrap frame described in InterpreterRuntime_arm.cpp:setup_stack_asm
+ * (frame pointer 0, then start_lightweight_thread_asm, ..., TestCompiler)
+ * has never been observable. If the top words still match that template
+ * the thread never entered Java at all; any other shape says how far it
+ * got. 16 words is enough to cover the whole template. */
+extern "C" int vita_sched_dump_stack(char *out, int out_size) {
+  int pos = 0;
+  int n;
+  Thread *ct = Thread::current();
+  n = snprintf(out + pos, out_size - pos, "java-stack-top (current):\n");
+  if (n > 0) pos += n;
+  if (ct == NULL) {
+    n = snprintf(out + pos, out_size - pos, "  (no current thread)\n");
+    if (n > 0) pos += n;
+    return pos;
+  }
+  {
+    unsigned int jsp = (unsigned int)ct->stack_pointer();
+    unsigned int i;
+    if (jsp < 0x81000000 || jsp >= 0xa0000000) {
+      n = snprintf(out + pos, out_size - pos,
+                   "  jsp=0x%08x out of range (skip)\n", jsp);
+      if (n > 0) pos += n;
+      return pos;
+    }
+    n = snprintf(out + pos, out_size - pos,
+                 "  stack_pointer()=0x%08x stack_limit()=0x%08x\n", jsp,
+                 (unsigned int)ct->stack_limit());
+    if (n > 0) pos += n;
+    for (i = 0; i < 16; i++) {
+      unsigned int w = *(volatile unsigned int *)(jsp + i * 4);
+      n = snprintf(out + pos, out_size - pos, "  [jsp+%02u] 0x%08x\n",
+                   i * 4, w);
+      if (n > 0 && pos + n < out_size) pos += n; else break;
+    }
+  }
+  return pos;
 }
 
 /* v01.98: log22 left the central question open - active_count=5 but the
