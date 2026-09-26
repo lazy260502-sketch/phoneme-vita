@@ -41,6 +41,20 @@ extern int runMidlet(int argc, char **argv);
 #include "vita_version.h"
 #include "vita_crumb.h"
 
+/* log36 real-HW experiment: pin the VM main thread to a single core
+ * BEFORE any VM code runs. log36 froze the VM main thread (status=RUNNING,
+ * runClocks d=0, cpu1 fully idle) with aff=0x70000 (all three cores) as
+ * its ONLY difference from the healthy tone/wd/ticker threads (aff=0x0).
+ * Vita3K never hangs: its single host scheduler masks the cross-core
+ * migration bug that real HW's per-core runqueues expose.
+ *   0x10000 = CPU0, 0x20000 = CPU1, 0x40000 = CPU2 (bits 16..18)
+ *   0       = disabled (A/B control; falls back to MASK_DEFAULT = 3 cores)
+ * If the hang disappears when pinned, the cross-core runqueue bug is
+ * PROVEN and this pin is the shipping workaround. */
+#ifndef VITA_VM_CPU_AFFINITY_MASK
+#define VITA_VM_CPU_AFFINITY_MASK 0x10000
+#endif
+
 /* Baked in by build_jar.sh -> cmake (HELLO_JAR_SIZE): size of the
  * Hello.jar bundled in the VPK, used for the runtime copy check. */
 #ifndef HELLO_JAR_SIZE
@@ -252,6 +266,22 @@ int main(int argc, char *argv[]) {
      * the last bar, which pins the failing subsystem without stdio. */
     crumb_marker("launcher start");
     crumb_printf("version: %s", VITA_PORT_VERSION_STRING);
+
+#if VITA_VM_CPU_AFFINITY_MASK != 0
+    {
+        /* log36 experiment: pin this (VM main) thread to one core before
+         * the VM starts. Log the pin result for the A/B verdict. */
+        int pin_rc = sceKernelChangeThreadCpuAffinityMask(
+            sceKernelGetThreadId(), VITA_VM_CPU_AFFINITY_MASK);
+        char pin_buf[64];
+        snprintf(pin_buf, sizeof(pin_buf),
+                 "pin vm cpu mask=0x%x rc=0x%x\n",
+                 VITA_VM_CPU_AFFINITY_MASK, pin_rc);
+        dlog(pin_buf);
+        crumb_printf("pin vm cpu mask=0x%x rc=0x%x",
+                     VITA_VM_CPU_AFFINITY_MASK, pin_rc);
+    }
+#endif
 
     vita_net_early_init();
     crumb_marker("net early init done");

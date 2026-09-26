@@ -838,7 +838,28 @@ set(VITA_VERSION  "01.86")
 #   Scheduler::start (spawn registration). Next hang's site_ring.log
 #   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
 #   lines, all inside #if defined(VITA).
-set(VITA_VERSION  "02.11")
+set(VITA_VERSION  "02.12")
+# 02.12 (2026-10-28): log36 verdict + single-core pin experiment.
+#   v02.11's tick-stage probe (ttk_stage=7 hits 1..7=309x7) proved the
+#   tick body ran to completion 309/309 times -> JIT-on-tick hypothesis
+#   RETRACTED (log36's JIT was off anyway: jit cfg=0 -> policy=0).
+#   log36 froze the VM main thread INSIDE a green-thread switch stub
+#   (pc=invoke_pending_entries+0x10, lr=start_lightweight_thread_asm,
+#   pending==NULL => one-instruction return) with status=RUNNING,
+#   runClocks d=0, cpu1 fully idle, cpsr=User-mode: the thread is NOT
+#   spinning, NOT in a syscall, NOT in a userland livelock (gnrt=0/0,
+#   lanes slow=0, sf=0/0/0) - the real-HW kernel simply never re-
+#   dispatches it. Its aff=0x70000 (all three cores) is the only
+#   difference from the healthy tone/wd/ticker threads (aff=0x0); the
+#   KICK battery (signal/aff/prio/suspend) all failed. Vita3K never
+#   reproduces it because its single host scheduler masks cross-core
+#   migration bugs.
+#   v02.12 change:
+#   - vita_main.c: pin the VM main thread to CPU0 (aff=0x10000) BEFORE
+#     the VM starts, gated by VITA_VM_CPU_AFFINITY_MASK (0=off A/B).
+#     If the hang disappears on real HW, the cross-core runqueue bug is
+#     proven and the pin ships as the workaround. Pin rc logged into
+#     crumb.log + boot_log.txt.
 # 02.11 (2026-10-28): log35 verdict (CORRECTED) + the probe it needs.
 #   The Phase-1 verdict ("unbounded park: Scheduler::yield's slow lane
 #   with sleep_time=-1 because Os::suspend_ticks() is a Vita no-op")
@@ -1403,6 +1424,13 @@ add_custom_target(gen_version ALL
 add_dependencies(${PROJECT_NAME} gen_version)
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# v02.12: VM main thread single-core pin (log36 cross-core hang
+# experiment). 0x10000=CPU0 (default, pin ON); set to 0 to A/B against
+# the three-core default (Vita3K unaffected either way - it masks the
+# bug). Mirrored in vita_main.c via #ifndef.
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    VITA_VM_CPU_AFFINITY_MASK=0x10000)
 
 add_dependencies(${PROJECT_NAME} libobj_target)
 
