@@ -65,6 +65,14 @@ extern int kuKernelCpuUnrestrictedMemcpy(void *dst, const void *src,
 #define KF_MAX_LINE 128
 
 static int g_ku_ok = -1;             /* -1 unknown, 0 absent, 1 present */
+/* v02.21 diagnostics for the ABSENT case: tells apart "plugin not
+ * installed" from "installed but invisible to the userspace module
+ * list" (the v02.20 real-hardware outcome: process booted fine, so the
+ * strong fstubs import RESOLVED - the kernel module was there - yet the
+ * enum saw nothing). Enum rc and module count come from the LAST list
+ * attempt; the name-match verdict is ORed across all flags. */
+static int g_ku_enum_rc = 0;         /* last sceKernelGetModuleList rc  */
+static unsigned int g_ku_nmod = 0;   /* modules returned by that call   */
 
 /* --------------------------------------------------------------- */
 /* kubridge presence: enumerate kernel modules, look for kubridge.  */
@@ -74,31 +82,34 @@ static int g_ku_ok = -1;             /* -1 unknown, 0 absent, 1 present */
 static int ku_probe(void)
 {
     SceUID uids[128];
-    SceSize num = 128;
-    int rc;
-    int i;
+    SceSize num;
+    /* fw semantics of the list flags differ across SDK docs/tools;
+     * v02.20 proved 0x00 alone can come back blind even when the module
+     * is resident, so try every documented class and OR the verdict. */
+    static const unsigned int flags[] = { 0x00, 0x01, 0x02, 0x04 };
+    int rc = -1, f, i;
 
     if (g_ku_ok >= 0)
         return g_ku_ok;
 
-    memset(uids, 0, sizeof(uids));
-    rc = sceKernelGetModuleList(0x00, uids, &num);
-    if (rc < 0) {
-        /* Some firmwares want 0x01 first for process modules; a failure
-         * here only means we cannot VERIFY kubridge - do not call any
-         * ku* function afterwards. */
-        g_ku_ok = 0;
-        return 0;
-    }
-    for (i = 0; (SceSize)i < num; i++) {
-        SceKernelModuleInfo mi;
-        memset(&mi, 0, sizeof(mi));
-        mi.size = sizeof(mi);
-        if (sceKernelGetModuleInfo(uids[i], &mi) < 0)
+    for (f = 0; f < (int)(sizeof(flags) / sizeof(flags[0])); f++) {
+        num = sizeof(uids) / sizeof(uids[0]);
+        memset(uids, 0, sizeof(uids));
+        rc = sceKernelGetModuleList(flags[f], uids, &num);
+        g_ku_enum_rc = rc;
+        if (rc < 0)
             continue;
-        if (strcmp(mi.module_name, "kubridge") == 0) {
-            g_ku_ok = 1;
-            return 1;
+        g_ku_nmod = num;
+        for (i = 0; (SceSize)i < num; i++) {
+            SceKernelModuleInfo mi;
+            memset(&mi, 0, sizeof(mi));
+            mi.size = sizeof(mi);
+            if (sceKernelGetModuleInfo(uids[i], &mi) < 0)
+                continue;
+            if (strcmp(mi.module_name, "kubridge") == 0) {
+                g_ku_ok = 1;
+                return 1;
+            }
         }
     }
     g_ku_ok = 0;
@@ -211,8 +222,12 @@ void vita_kf_dump(const char *path)
     n = snprintf(line, sizeof(line), "kubridge: %s\n",
                  ku_probe() ? "present" : "ABSENT (kernel probes skipped)");
     sceIoWrite(fd, line, n);
-
     if (!ku_probe()) {
+        /* v02.21: enum diagnostics - separates "no plugin" from
+         * "plugin invisible to the userspace module list". */
+        n = snprintf(line, sizeof(line),
+                     "enum rc=%d nmod=%u\n", g_ku_enum_rc, g_ku_nmod);
+        sceIoWrite(fd, line, n);
         kf_puts(fd, "note: kubridge ABSENT - copy kubridge.skprx to ux0:tai/, "
                     "add '*KERNEL ux0:tai/kubridge.skprx' to config.txt\n");
         sceIoClose(fd);
@@ -289,6 +304,23 @@ void vita_kf_dump(const char *path)
  * itself failed - probe power unknown, log says so). */
 const char *vita_kf_precheck(void)
 {
-    return ku_probe() ? "present"
-                      : "ABSENT"; /* enumeration failure maps here too */
+    SceIoStat st;
+
+    if (ku_probe())
+        return "present";
+
+    /* v02.21: the real-hardware v02.20 case. The process booted, so the
+     * strong kubridge fstubs import RESOLVED at load time - the kernel
+     * module IS resident; the enum just cannot see kernel modules from
+     * userspace. If the plugin file exists on either tai dir and the
+     * enum succeeded but listed no kubridge, that distinction is now
+     * decidable from boot_log.txt: the path forward is a different
+     * readout route (kernel-side dumper plugin), NOT re-installing. */
+    if (g_ku_enum_rc >= 0 && g_ku_nmod > 0) {
+        memset(&st, 0, sizeof(st));
+        if (sceIoGetstat("ux0:tai/kubridge.skprx", &st) >= 0 ||
+            sceIoGetstat("ur0:tai/kubridge.skprx", &st) >= 0)
+            return "installed-NOT-visible";
+    }
+    return "ABSENT"; /* no plugin file: install it (or enum failed) */
 }

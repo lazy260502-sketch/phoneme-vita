@@ -946,6 +946,19 @@ set(VITA_VERSION  "02.19")
 #   so kernel-visibility is decidable from boot alone - no wasted
 #   hardware round.
 set(VITA_VERSION  "02.20")
+# 02.21 (2026-09-27): precheck upgrade after the v02.20 real-hardware
+#   result "kubridge precheck: ABSENT". Decisive fact: the process BOOTED,
+#   and kuKernelCpuUnrestrictedMemcpy is a STRONG fstubs import - had the
+#   kubridge module been missing the module loader would have refused to
+#   start the process at all. Conclusion: the plugin IS resident; the
+#   userspace module-list enum (flag 0x00) simply cannot see kernel
+#   modules. v02.21 precheck: (a) try every documented list flag
+#   (0x00/0x01/0x02/0x04) and OR the verdict; (b) cache enum rc + module
+#   count; (c) tri-state becomes four-state - present /
+#   installed-NOT-visible (enum blind but skprx file exists on either
+#   tai dir -> readout route must change to a kernel-side dumper,
+#   NOT reinstall) / ABSENT (no file) / enum-failure->ABSENT.
+set(VITA_VERSION  "02.21")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows

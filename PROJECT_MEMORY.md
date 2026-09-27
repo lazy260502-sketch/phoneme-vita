@@ -6027,3 +6027,33 @@ log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其�
    直接看停摆核的内核路径，定位死锁点的唯一手段。
 2. v02.20 候选：VM 侧零文件 I/O 对照轮（日志静默 + jar 预载入内存），
    不冻→锁定 sceIo 死锁；仍冻→转向调度器本身。
+
+## 2026-09-27 v02.21 — kubridge 预检升级：ABSENT 实锤为枚举盲区
+
+### 判决（v02.20 真机 + 静态证据链）
+- v02.20 真机 boot_log：`kubridge precheck: ABSENT`（kubridge.skprx 已部署 ur0:tai/）。
+- 决定性推理：eboot.bin(FSELF) 解包验证 `kuKernelCpuUnrestrictedMemcpy` 为
+  **强符号 fstubs 导入**（.vitalink.fstubs.kubridge）——若 kubridge 模块真缺席，
+  模块加载器在 main 之前就拒绝拉起进程；实际进程正常启动并打出 precheck。
+- 结论：**kubridge 模块在内核中且 syscall 可用**；`sceKernelGetModuleList(0x00)`
+  从用户态**枚举不到内核模块**（boot-config 加载的内核插件对用户态模块表不可见）。
+  v02.20 预检假设的风险实锤。
+
+### v02.21 改动（vita_kernel_forensics.c 最小补丁，三处）
+1. ku_probe()：依次尝试全部 list 旗标 0x00/0x01/0x02/0x04（fw 语义不一），
+   名字命中按旗标 OR；缓存末次 enum rc + 返回模块数（g_ku_enum_rc/g_ku_nmod）。
+2. vita_kf_precheck() 升四态：present /
+   **installed-NOT-visible**（enum 成功但无 kubridge 且 ux0/ur0:tai/kubridge.skprx
+   文件存在 → 盲区实锤，路线换内核侧 dumper 插件，不是重装）/
+   ABSENT（文件都没有）/ 枚举失败归 ABSENT。
+3. vita_kf_dump() ABSENT 分支加 `enum rc=%d nmod=%u` 诊断行。
+
+### 判读表（v02.21 boot_log）
+- `kubridge precheck: present` → 取证路线不变，HANG 后等 kernel_forensics.log。
+- `installed-NOT-visible` → 用户态读内核路线判死，v02.22 转内核 dumper 插件
+  （ taihen 模块内读 threadmgr + 文件落盘）或第 2 步零-I/O 对照提前。
+- `ABSENT` → 插件真没装上（检查 config.txt *KERNEL 段）。
+
+### 遗留
+- kernel_forensics.log 的内核读数仍未拿到（盲区未突破前不指望本轮出）。
+- 低优：VITA_DISP_REC 16x id=3 疑点；OS_linux.cpp.bak 清理。
