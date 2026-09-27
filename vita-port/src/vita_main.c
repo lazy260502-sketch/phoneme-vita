@@ -41,17 +41,20 @@ extern int runMidlet(int argc, char **argv);
 #include "vita_version.h"
 #include "vita_crumb.h"
 
-/* log37 real-HW experiment: pin the VM main thread to a single core
- * BEFORE any VM code runs. log37 (CPU0 pin) SUCCEEDED (chgcpu=5) but the
- * VM STILL froze and one WHOLE CORE stalled -> cross-core migration
- * hypothesis retracted, fault upgraded to kernel-level single-core stall.
- * v02.13 A/B: move the pin to CPU1 (0x20000) to learn whether the stalled
- * core follows the VM (VM poisons its host core) or is independent (an
- * unrelated kernel bug).
- *   0x10000 = CPU0, 0x20000 = CPU1, 0x40000 = CPU2 (bits 16..18)
- *   0       = disabled (A/B control; falls back to MASK_DEFAULT = 3 cores) */
+/* log37..log42 verdict: pinning NEVER changed the freeze - unpinned
+ * (log1..log36), CPU0 (log37) and CPU1 (log38..log42) all froze with
+ * the SAME signature, and each pin merely chose WHICH core stalls (the
+ * stalled core follows the VM). v02.18 therefore defaults to UNPINNED
+ * (mask 0 = kernel default 3-core mask) and adds a runtime switch
+ * ux0:/data/J2ME00001/vm_cpu so a pin can still be requested for an
+ * A/B round WITHOUT a rebuild:
+ *   '0' or file absent = unpinned (0x70000 user cores, default)
+ *   '1'                = pin to CPU1 (0x20000, the v02.13..02.17 behaviour)
+ *   '2'                = pin to CPU2 (0x40000)
+ * The pin still happens BEFORE any VM code runs.
+ *   bit masks: 0x10000 = CPU0, 0x20000 = CPU1, 0x40000 = CPU2 */
 #ifndef VITA_VM_CPU_AFFINITY_MASK
-#define VITA_VM_CPU_AFFINITY_MASK 0x20000
+#define VITA_VM_CPU_AFFINITY_MASK 0
 #endif
 
 /* Baked in by build_jar.sh -> cmake (HELLO_JAR_SIZE): size of the
@@ -115,6 +118,26 @@ static int read_jit_policy(void) {
         sceIoClose(fd);
     }
     return policy;
+}
+
+/* v02.18: runtime pin switch. File absent/unreadable = compiled-in
+ * default (0 = unpinned). '0' = unpinned, '1' = CPU1, '2' = CPU2,
+ * anything else = leave the compiled default. Runs BEFORE the VM so the
+ * pin ordering of the v02.13..02.17 experiments is preserved. */
+static unsigned int read_vm_cpu_mask(void) {
+    SceUID fd = sceIoOpen(DATA_DIR "/vm_cpu", SCE_O_RDONLY, 0);
+    char c = 0;
+    if (fd >= 0) {
+        if (sceIoRead(fd, &c, 1) == 1) {
+            sceIoClose(fd);
+            if (c == '0') return 0;            /* explicitly unpinned  */
+            if (c == '1') return 0x20000;      /* CPU1 (02.13..02.17)  */
+            if (c == '2') return 0x40000;      /* CPU2                 */
+            return VITA_VM_CPU_AFFINITY_MASK;  /* malformed: compiled  */
+        }
+        sceIoClose(fd);
+    }
+    return VITA_VM_CPU_AFFINITY_MASK;         /* absent: compiled dflt */
 }
 
 static FILE *g_log = NULL;
@@ -313,21 +336,25 @@ int main(int argc, char *argv[]) {
     crumb_marker("launcher start");
     crumb_printf("version: %s", VITA_PORT_VERSION_STRING);
 
-#if VITA_VM_CPU_AFFINITY_MASK != 0
     {
-        /* log36 experiment: pin this (VM main) thread to one core before
-         * the VM starts. Log the pin result for the A/B verdict. */
-        int pin_rc = sceKernelChangeThreadCpuAffinityMask(
-            sceKernelGetThreadId(), VITA_VM_CPU_AFFINITY_MASK);
-        char pin_buf[64];
-        snprintf(pin_buf, sizeof(pin_buf),
-                 "pin vm cpu mask=0x%x rc=0x%x\n",
-                 VITA_VM_CPU_AFFINITY_MASK, pin_rc);
-        dlog(pin_buf);
-        crumb_printf("pin vm cpu mask=0x%x rc=0x%x",
-                     VITA_VM_CPU_AFFINITY_MASK, pin_rc);
+        /* v02.18: pin request now comes from ux0:/data/J2ME00001/vm_cpu
+         * (default 0 = unpinned, see read_vm_cpu_mask). Log BOTH the
+         * requested mask and the pin result so a round's pin state is
+         * always reconstructible from boot_log.txt alone. */
+        unsigned int pin_mask = read_vm_cpu_mask();
+        if (pin_mask != 0) {
+            int pin_rc = sceKernelChangeThreadCpuAffinityMask(
+                sceKernelGetThreadId(), pin_mask);
+            char pin_buf[64];
+            snprintf(pin_buf, sizeof(pin_buf),
+                     "pin vm cpu mask=0x%x rc=0x%x\n", pin_mask, pin_rc);
+            dlog(pin_buf);
+            crumb_printf("pin vm cpu mask=0x%x rc=0x%x", pin_mask, pin_rc);
+        } else {
+            dlog("vm cpu: unpinned (mask=0, kernel default 3-core)\n");
+            crumb_printf("vm cpu: unpinned (mask=0)");
+        }
     }
-#endif
 
     vita_net_early_init();
     crumb_marker("net early init done");

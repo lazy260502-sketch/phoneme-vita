@@ -2604,25 +2604,56 @@ extern "C" unsigned int vita_sched_justborn(void) {
 }
 
 extern "C" int vita_sched_nrt_info(char *out, int out_size) {
+  /* v02.18 FIX (the log42 probe self-wound): this used to build a
+   * Thread::Raw handle and call t().priority() - which chains through
+   * thread_obj (+32) into the object header, and wait_obj() the same
+   * way. The watchdog thread has NO GC frame; when the cached object
+   * was mid-teardown the chained deref data-aborted INSIDE the probe
+   * (vita_sched_nrt_info+0x38, ldr r7,[r3,#4] with r3 = stale
+   * thread_obj), killing the process and eating sample 2 + the
+   * dispatch ring + the java-stack dump. Rewrite: raw word reads at
+   * the ThreadDesc offsets the class accessors themselves use
+   * (Thread::*_offset() is FIELD_OFFSET(ThreadDesc, _field) - no
+   * handle, no chained deref), each guarded by a range check. A torn
+   * read is fine: the thread under the freeze is not moving. */
   int pos = 0;
   int n;
-  Thread::Raw t = (Thread *)_next_runnable_thread;
-  if (t.is_null()) {
+  unsigned int obj = (unsigned int)(unsigned long)_next_runnable_thread;
+  if (obj == 0) {
     n = snprintf(out + pos, out_size - pos, "  nrt: (null)\n");
     if (n > 0) pos += n;
     return pos;
   }
-  {
-    jint st = t().status();
-    ReturnOop wo = t().wait_obj();
+  if (obj < 0x81000000u || obj >= 0xa0000000u) {
     n = snprintf(out + pos, out_size - pos,
-                 "  nrt id=%d pri=%d st=%08x%s%s%s jsp=0x%08x wait=%p\n",
-                 t().id(), (int)t().priority(), (unsigned int)st,
+                 "  nrt obj=0x%08x out of range (skip)\n", obj);
+    if (n > 0) pos += n;
+    return pos;
+  }
+  {
+    /* volatile: the VM thread may in principle still be writing these
+     * words; we accept a torn snapshot over a chained deref. */
+    volatile unsigned int *td = (volatile unsigned int *)obj;
+    unsigned int id    = td[Thread::id_offset() / 4];
+    unsigned int tobj  = td[Thread::thread_obj_offset() / 4];
+    unsigned int wait  = td[Thread::wait_obj_offset() / 4];
+    unsigned int pe    = td[Thread::pending_entries_offset() / 4];
+    unsigned int jsp   = td[Thread::stack_pointer_offset() / 4];
+    unsigned int lim   = td[Thread::stack_limit_offset() / 4];
+    unsigned int st    = td[Thread::status_offset() / 4];
+    (void)lim;
+    /* priority lives on the java.lang.Thread mirror (thread_obj ->
+     * ThreadObj::priority()); the log42 crash was EXACTLY this chain,
+     * so print the raw pointer and let the reader decide - one fewer
+     * deref on the watchdog's head. */
+    n = snprintf(out + pos, out_size - pos,
+                 "  nrt obj=0x%08x id=%u st=%08x%s%s%s jsp=0x%08x "
+                 "wait=0x%08x pe=0x%08x tobj=0x%08x\n",
+                 obj, id, st,
                  (st & THREAD_TERMINATING) ? " TERM" : "",
                  (st & THREAD_JUST_BORN)   ? " NEW"  : "",
                  (st & THREAD_DEAD)        ? " DEAD" : "",
-                 (unsigned int)(unsigned long)t().stack_pointer(),
-                 (void*)(unsigned long)wo);
+                 jsp, wait, pe, tobj);
     if (n > 0 && pos + n < out_size) pos += n;
   }
   return pos;
@@ -2729,17 +2760,22 @@ extern "C" int vita_sched_dump_threads(char *out, int out_size) {
     for (Thread::Raw t = Universe::global_threadlist()->obj();
          t.not_null() && count < VITA_SCHED_DUMP_MAX;
          t = t().global_next(), count++) {
+      /* v02.18 FIX: status()/wait_obj()/wakeup_time() are plain word
+       * reads at FIELD_OFFSET(ThreadDesc, _field) - safe on the raw
+       * handle. But priority() chains through thread_obj exactly the
+       * way the log42 nrt probe crashed, so drop it here too and keep
+       * the raw pointer instead. */
       jint st = t().status();
-      ReturnOop wo = t().wait_obj();
+      unsigned int wo =
+          (unsigned int)(unsigned long)t().wait_obj();
       jlong wt = t().wakeup_time();
       n = snprintf(out + pos, out_size - pos,
-                   "  t%p id=%d pri=%d st=%08x%s%s%s wait=%p %s\n",
-                   (void*)t.obj(), t().id(),
-                   (int)t().priority(), (unsigned int)st,
+                   "  t%p id=%d st=%08x%s%s%s wait=0x%08x %s\n",
+                   (void*)t.obj(), t().id(), (unsigned int)st,
                    (st & THREAD_TERMINATING) ? " TERM" : "",
                    (st & THREAD_JUST_BORN)   ? " NEW"  : "",
                    (st & THREAD_DEAD)        ? " DEAD" : "",
-                   (void*)(unsigned long)wo,
+                   wo,
                    (wt == 0) ? "no-timeout" : "timed");
       if (n > 0 && pos + n < out_size) pos += n; else break;
     }

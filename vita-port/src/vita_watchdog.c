@@ -37,6 +37,8 @@
 #include "vita_watchdog.h"
 /* v02.02: OS-side thread forensics (--wrap= registration table). */
 #include "vita_thread_audit.h"
+/* v02.18: kubridge kernel-side forensics (HANG path). */
+#include "vita_kernel_forensics.h"
 
 typedef int64_t wd_jlong;
 
@@ -630,6 +632,17 @@ static int wd_thread_routine(SceSize args, void *argp) {
                 wd_log(buf, n);
             }
         }
+
+        /* v02.18: kernel-side forensics via kubridge. The sysinfo block
+         * above can NAME the stalled core but says nothing about WHY it
+         * stopped; the coredump's SYSTEM_INFO2 is hashed so the kernel
+         * half was never readable offline. If the kubridge plugin is
+         * installed this reads the threadmgr's per-core context from
+         * kernel memory (twice, 400 ms apart, same discipline as every
+         * other probe); without the plugin it degrades to one explicit
+         * "kubridge ABSENT" line so the log states WHY there is no
+         * kernel data this round. */
+        vita_kf_dump("ux0:/data/J2ME00001/kernel_forensics.log");
 
         /* v01.82: log8 nailed the shape of the hang (VM thread RUNNING,
          * wait=none, both clocks alive) but the kernel API cannot name

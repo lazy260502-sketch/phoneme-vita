@@ -1042,7 +1042,53 @@ static void vita_wd_snapshot_one(SceUID fd) {
 
     /*-------------------------------------------------------------------
      * v02.17 read-outs.
+     * v02.18 REORDER: the ring (5) and the java-stack top (6) now come
+     * FIRST. log42's snapshot died inside the nrt probe (4) before it
+     * ever reached them, and the post-mortem could not tell "not yet
+     * reached" from "probe crashed" - with a [rdN ok] line after every
+     * section a truncated file names the exact section that died.
      *-----------------------------------------------------------------*/
+
+    /* (5) Dispatch ring: the last N threads switch_thread() switched AWAY
+     * from, newest first. Tells which threads the dispatcher cycles
+     * through right before the freeze (same id repeating == a hot loop
+     * through one thread; a fixed rotation == a real round-robin). */
+    {
+        static char disp_dump[2048];
+        int len = vita_sched_dump_dispatch(disp_dump, (int)sizeof(disp_dump));
+        if (len > 0) sceIoWrite(fd, disp_dump, len);
+        vita_wd_puts(fd, "[rd1 dispatch ok]\n");
+    }
+
+    /* (6) Top of the Java stacks. The coredump never contains the Java
+     * heap, so the bootstrap frame built by setup_stack_asm (frame
+     * pointer 0 + start_lightweight_thread_asm + TestCompiler) has never
+     * been visible. The watchdog CAN read it - it runs in the same
+     * process. A top-of-stack matching setup_stack_asm proves the thread
+     * has never executed; anything else shows how far it got. */
+    {
+        static char stack_dump[1024];
+        int len = vita_sched_dump_stack(stack_dump, (int)sizeof(stack_dump));
+        if (len > 0) sceIoWrite(fd, stack_dump, len);
+        vita_wd_puts(fd, "[rd2 stacktop ok]\n");
+    }
+
+    /* (4) Next-runnable cache: the scheduler's own answer to "who should
+     * run". _next_runnable_thread is a handle cell; print the cell, the
+     * object and the object's fields (id/status/pending/jsp/wait).
+     * v02.18: the field read is now raw-offset (see Scheduler.cpp) - a
+     * stale object DEGRADES to a garbage line instead of a data abort
+     * that kills the whole snapshot. */
+    n = snprintf(buf, sizeof(buf),
+                 "  nrt cell=0x%08x obj=0x%08x\n",
+                 vita_sched_nrt_cell(), vita_sched_nrt_obj());
+    sceIoWrite(fd, buf, n);
+    {
+        static char nrt_info[256];
+        int len = vita_sched_nrt_info(nrt_info, (int)sizeof(nrt_info));
+        if (len > 0) sceIoWrite(fd, nrt_info, len);
+        vita_wd_puts(fd, "[rd3 nrt ok]\n");
+    }
 
     /* (1) Ticker liveness. vita_tick_count counts ticks that REACHED
      * real_time_tick(); vita_ticker_loops counts ticker loop iterations
@@ -1064,6 +1110,7 @@ static void vita_wd_snapshot_one(SceUID fd) {
                      vita_cfg_digit("ticker_cpu", -1),
                      vita_tickgate_mode(), vita_tick_compile_enabled());
         sceIoWrite(fd, buf, n);
+        vita_wd_puts(fd, "[rd4 ticker ok]\n");
     }
 
     /* (2) Bootstrap / teardown path counters - the log41 freeze site was
@@ -1098,41 +1145,7 @@ static void vita_wd_snapshot_one(SceUID fd) {
                                                  : "(?)");
             sceIoWrite(fd, buf, n);
         }
-    }
-
-    /* (4) Next-runnable cache: the scheduler's own answer to "who should
-     * run". _next_runnable_thread is a handle cell; print the cell, the
-     * object and the object's fields (id/pri/status/pending/jsp/wait). */
-    n = snprintf(buf, sizeof(buf),
-                 "  nrt cell=0x%08x obj=0x%08x\n",
-                 vita_sched_nrt_cell(), vita_sched_nrt_obj());
-    sceIoWrite(fd, buf, n);
-    {
-        static char nrt_info[256];
-        int len = vita_sched_nrt_info(nrt_info, (int)sizeof(nrt_info));
-        if (len > 0) sceIoWrite(fd, nrt_info, len);
-    }
-
-    /* (5) Dispatch ring: the last N threads switch_thread() switched AWAY
-     * from, newest first. Tells which threads the dispatcher cycles
-     * through right before the freeze (same id repeating == a hot loop
-     * through one thread; a fixed rotation == a real round-robin). */
-    {
-        static char disp_dump[2048];
-        int len = vita_sched_dump_dispatch(disp_dump, (int)sizeof(disp_dump));
-        if (len > 0) sceIoWrite(fd, disp_dump, len);
-    }
-
-    /* (6) Top of the Java stacks. The coredump never contains the Java
-     * heap, so the bootstrap frame built by setup_stack_asm (frame
-     * pointer 0 + start_lightweight_thread_asm + TestCompiler) has never
-     * been visible. The watchdog CAN read it - it runs in the same
-     * process. A top-of-stack matching setup_stack_asm proves the thread
-     * has never executed; anything else shows how far it got. */
-    {
-        static char stack_dump[1024];
-        int len = vita_sched_dump_stack(stack_dump, (int)sizeof(stack_dump));
-        if (len > 0) sceIoWrite(fd, stack_dump, len);
+        vita_wd_puts(fd, "[rd5 threads ok]\n");
     }
 
     /* v01.98: WHO are the active_count threads? Walk the global thread
@@ -1145,6 +1158,7 @@ static void vita_wd_snapshot_one(SceUID fd) {
                                           (int)sizeof(thread_dump));
         if (len > 0)
             sceIoWrite(fd, thread_dump, len);
+        vita_wd_puts(fd, "[rd6 dumpthreads ok]\n");
     }
 }
 
@@ -1157,10 +1171,10 @@ void vita_wd_snapshot(const char *path) {
      * (which counter still advances after the VM froze); without it a
      * single sample is ambiguous and cost several log rounds to
      * disambiguate. */
-    vita_wd_puts(fd, "\n===== v02.17 sample 1 =====\n");
+    vita_wd_puts(fd, "\n===== v02.18 sample 1 =====\n");
     vita_wd_snapshot_one(fd);
     sceKernelDelayThread(400 * 1000);
-    vita_wd_puts(fd, "===== v02.17 sample 2 (+400ms) =====\n");
+    vita_wd_puts(fd, "===== v02.18 sample 2 (+400ms) =====\n");
     vita_wd_snapshot_one(fd);
     sceIoClose(fd);
 }

@@ -5804,3 +5804,130 @@ strings -a out/vpk/midp_vita_v02.17.sym | grep -E 'vita_run_count|vita_tc_note|v
 - `vita_cfg_digit` 未做按名缓存（只在看门狗 dump 与 tick 门里各调一次，tick 门
   自身有 `_vita_tickgate_mode` 一次性缓存），所以没有额外 I/O 负担。
 - 所有开关默认关闭 ⇒ v02.17 的**行为与 v02.16 一致**，差异只在取证输出。
+
+## 2026-09-27 log42 分析（v02.17 / build b354 f9965d7）：探针自伤实锤 + 钉核历史澄清 + 三类证据收官方案（v02.18）
+
+判决素材：`debug/logs/log42/`（第 6 轮真机独立复现，钉 CPU1）。
+
+### 1. log42 核心事实
+
+- **卡死照旧**：`HANG ce=222 polls=12`，KICK0~5 全部无效（`KICK5 susp/res
+  rc=0x80020008/0x80020008` —— 对幽灵线程 suspend 依旧失败），`kclock kd=100270
+  us` 看门狗仪器健康。
+- **d=0 四连**：`VMPROG-A switch=234186->234186(d=0) fast=150->150(d=0)
+  site=235469->235469(d=0) jsmp=123->123(d=0)` + `VMPROG-B tick d=0 ttk d=0
+  pump d=0` —— 与 log36~41 完全同款：**VM 所在核的调度器整体死亡**（idle
+  clock / idle-exit / switch count 三冻结），其余核正常跑 tone/wd。
+- **vm 线程状态**：`status=RUNNING wait=none aff=0x20000(init 0x70000) cpu=1
+  lastcpu=1` —— 内核眼里 VM 线程"正在运行"、无等待对象、亲和性曾被改成
+  CPU1（v02.13 起的钉核），但它所在的 cpu1 调度器死了，所以这个"RUNNING"
+  永远不会被真正执行。**内核账本说它在跑、硬件说它没跑——这就是幽灵线程
+  的完整定义**。
+- **ticker 迁核成功但无效**：`cldc_ticker ... aff=0x20000 cpu=32767 last=1
+  READY` + `ticker loops=1140 ... ago_ms=14492` —— ticker 挪到 cpu2 后自己
+  活着（loops 在涨），但 VM 死不复活 ⇒ **v02.14 的"ticker 同核抢占"假设
+  正式排除**。
+
+### 2. 探针自伤实锤（v02.17 快照死因）
+
+`site_ring.log` **恰好 61 行，最后一行是 `nrt cell=0x815d3848 obj=0x81ede328`**，
+之后 dispatch ring、java-stack-top、sample 2 全部消失——watchdog 线程死在
+`vita_sched_nrt_info()` 内部：`obj=0x81ede328` 之后要打 `id/st/pri/jsp/wait`，
+旧实现走 `t().priority()` → `thread_obj()`(+32) → `ThreadObj::priority()`(+4)
+链式解引用，**watchdog 线程没有 GC 安全帧**，stale thread_obj 触发 data
+abort → 进程死亡 → coredump 吃掉快照剩余部分。
+
+反汇编定位（v02.17 .sym）：`vita_sched_nrt_info+0x38` 是 `ldr r7,[r3,#4]`
+（r3=stale thread_obj）——与"恰好死在 nrt 行后"互证。
+
+**教训（写进探针设计准则）**：看门狗线程上的探针**只准裸字读 + 范围检查，
+禁止链式解引用任何对象方法**——GC 安全帧之外没有 WriteBarrier/读屏障保护。
+
+### 3. 钉核历史澄清（git 考古结论，写进 v02.18 注释）
+
+| 版本 | 钉核 | 结果 |
+|---|---|---|
+| v01.x ~ v02.11（log1~36） | 不钉 | 全部卡死 |
+| v02.12（log37） | CPU0 | 卡死，cpu0 停摆 |
+| v02.13~v02.17（log38~42） | CPU1 | 卡死，cpu1 停摆 |
+
+**钉核从未改变冻结，停摆核永远跟随 VM 所在核**。钉核是诊断对照不是起因；
+v02.18 恢复默认不钉，把"不钉核下停摆核是否仍跟随 VM"作为第 (a) 类证据。
+
+### 4. v02.18 三类证据设计（用户要求"一次性做好"）
+
+| 证据 | 载体 | 判读 |
+|---|---|---|
+| (a) 不钉核停摆核跟随 | `vm_boot.log` 的 `vm cpu:` 行 + watchdog sysinfo per-core | unpinned 下停摆核号 == VM `lastcpu` ⇒ 跟随实锤（第 7 轮） |
+| (b) 完整调度器双采样 | `site_ring.log` 6 段 `[rdN ... ok]` 标记 | rd1 dispatch ring / rd2 java-stack-top **提前**，探针自伤也吃不掉；缺哪段标记=死在哪段 |
+| (c) 内核态 dump | `kernel_forensics.log`（kubridge） | `kubridge: present` + per-core `cur_tid` 双采样；停摆核的 cur_tid 400ms 不变 = 内核侧同款冻结 |
+
+## v02.18（2026-09-27）：不钉核默认 + vm_cpu 运行时开关 + kubridge 内核取证 + 探针自伤修复
+
+**用户原话**："不钉核 + 分析内核态，一次性做好，真机调试很麻烦，不想来回折腾"
+
+### 1. 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_main.c` | `VITA_VM_CPU_AFFINITY_MASK` 默认 0x20000→**0**（不钉）；新增 `read_vm_cpu_mask()` 读 `ux0:/data/J2ME00001/vm_cpu`（'0'=不钉/'1'=CPU1/'2'=CPU2/缺省=编译默认）；启动日志 + crumb 记录 |
+| `phoneme-cldc/.../Scheduler.cpp` | `vita_sched_nrt_info` 完全重写：`Thread::*_offset()` 编译期偏移 + 裸 volatile 字读（id/st/jsp/wait/pe/tobj），obj 范围检查（0x81000000..0xa0000000 外打 skip），**丢弃 priority()**；`dump_threads` 全局链表段去 priority()、wait_obj 改字读 |
+| `phoneme-cldc/.../OS_vita.cpp` | `vita_wd_snapshot_one` 重排：**rd1 dispatch ring + rd2 java-stack-top 提前** → rd3 nrt → rd4 ticker/boot → rd5 线程名历史 → rd6 dump_threads；每段尾 `[rdN ... ok]` 标记；sample 头 v02.18 |
+| `vita-port/src/vita_kernel_forensics.c/.h`（新） | kubridge 探测（模块枚举 type 0x00，找 "kubridge"，失败即置 absent **绝不调 ku\***）+ threadmgr 定位（segments[1] 数据段）+ `tmgr+0x54` per-core ctx 指针数组双采样（400ms）+ `kf_kaddr_plausible()` 双窗口门控（K0 direct 0x81000000..0x83ffffff / kernel vm 0x88800000..0x8b000000，越界 skip 不 deref） |
+| `vita-port/src/vita_watchdog.c` | HANG 路径 sysinfo 双采样后、coredump 自杀请求前插 `vita_kf_dump()` |
+| `vita-port/CMakeLists.txt` | 版本 02.18 + `SceKernelModulemgr_stub`/`kubridge_stub` 链接 + `kernel/kubridge.skprx` 打进 VPK 根 + 新源文件 |
+
+### 2. kubridge 安全设计（读源码后的关键决策）
+
+`kuKernelCpuUnrestrictedMemcpy`（kubridge main.c:62）实现 = 存 DACR → 写
+0x15450FC3 → 逐字节 `ldrbt/strbt` → 恢复 DACR。**无任何容错：读未映射内核
+地址 = 内核态 data abort = 主机 panic 风险，用户态不可捕获**。因此：
+
+1. **模块枚举先行**：只信 `sceKernelGetModuleInfo` 返回的段地址（内核自己
+   报告的），不信任何硬编码基址；
+2. ** kf_kaddr_plausible() 双窗口**：只允许 K0 direct map 与 kernel vm 两
+   个窗口，`tmgr+0x54` 偏移若因固件差异指向窗口外 → skip 行，不 deref；
+3. **absent 即静默**：模块列表里没有 kubridge ⇒ 之后绝不调任何 ku\* 函数
+   （无插件时 syscall trap 是致命的），log 写一行 ABSENT + 部署提示。
+
+### 3. 上机步骤（一轮拿全三类证据）
+
+1. 安装 `midp_vita_v02.18.vpk`（默认不钉核）；
+2. （可选，复现钉核对照）放 `vm_cpu.1`；
+3. （可选，内核取证）从 VPK 解出 `kubridge.skprx` → `ux0:/tai/` +
+   `config.txt` `*KERNEL` 段加 `ux0:tai/kubridge.skprx` → 重启；
+4. 正常进游戏等冻结 → watchdog HANG 自动落盘三类证据。
+
+### 4. 判读表
+
+| 现象 | 结论 |
+|---|---|
+| `vm cpu: unpinned` + 停摆核 == VM lastcpu | 停摆跟随 VM 实锤（第 7 轮独立确认） |
+| `[rd1..rd6 ok]` 全在 | 快照完整，按 v02.17 判读表走 |
+| 缺某段 rd 标记 | 探针死在那一段（不会再发生：已无链式解引用） |
+| `kernel_forensics.log`: `kubridge: present` + 停摆核 cur_tid 双采样不变 | 内核侧调度器冻结实锤 → 方向转内核 bug（固件/taiHEN 中断屏蔽类） |
+| `kubridge: ABSENT` | 插件未部署，本轮只有 (a)(b) 两类证据 |
+
+### 5. 构建验证记录（2026-09-27）
+
+- `./rebuild_vm.sh`：33 ARM objects / 29 members 重打包（Scheduler.cpp 的
+  `wait_obj().obj()` 编译错误已修——ReturnOop 本身是指针，去掉 `.obj()`；
+  尾部 loopgen 链接 `fast_memclear` undefined 是**预期噪音**，PROJECT_MEMORY
+  607 行已有记录）；
+- `bash vita-port/build.sh`：`Build successful`，`out/vpk/midp_vita_v02.18.vpk`
+  (3671892 B) + `.sym` (4295948 B)；
+- 产物核对：`vita_kf_dump` 符号在位（0x8100f26c T）；`kubridge ABSENT`/
+  `SceKernelThreadmgr data`/`corectx read FAILED` 字符串在位；`vm cpu:
+  unpinned (mask=0, kernel default 3-core)` 在位；`[rd1 dispatch ok]` ~
+  `[rd6 dumpthreads ok]` 六段标记在位；VPK 内 `kubridge.skprx` 在位；
+  版本串 `J2ME Player v02.18 b354 (f9965d7)`（提交后需重编刷新 commit 号）。
+
+### 6. 遗留风险
+
+- `tmgr+0x54` 是 fw 3.60/3.65 社区 RE 偏移未在本机验证——plausibility 门控
+  使错误偏移降级为 skip 行而非 panic，风险已缓解但取证可能空手而归；
+- per-core ctx 内 `cur_tid` 之外的 w1/w2/w3 语义未定（idle counter 猜测），
+  首轮以"400ms 不变"为判据，不靠语义；
+- kubridge 读内核窗口 0x88800000..0x8b000000 是保守包络——若 threadmgr 数据
+  段落在窗口外（几乎不可能，K0 direct 映射内核镜像），kf_find_threadmgr
+  返回的段地址会因 plausibility 失败而整体 skip。

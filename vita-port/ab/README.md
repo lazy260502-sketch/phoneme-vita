@@ -157,3 +157,57 @@ snprintf(path, sizeof(path), "ux0:/data/J2ME00001/%s", name);
    从未真正跑过的假设。
 
 每轮只需换 `ux0:` 上的小文件 + 重开应用，不需要重装 VPK。
+
+## 5. v02.18 新增：`vm_cpu` 开关 + 内核态取证
+
+### `vm_cpu`：运行时钉核开关（v02.12~v02.17 的钉核改为可选）
+
+v02.18 起**默认不钉核**（v01.x~v02.11 的原始行为；log1~36 的卡死全部发生
+在不钉核下，v02.12~02.17 的钉核实验证明钉不钉都卡，停摆核永远跟随 VM 所
+在核——钉核是诊断对照，不是起因）。要复现 v02.13~v02.17 的"钉 CPU1"行为，
+放 `vm_cpu.1`：
+
+| 文件（去扩展名放到 `ux0:/data/J2ME00001/`） | 效果 |
+|---|---|
+| `vm_cpu.0` | 显式不钉（同默认） |
+| `vm_cpu.1` | 钉 CPU1（= v02.13~v02.17 行为） |
+| `vm_cpu.2` | 钉 CPU2 |
+| 不放 / 畸形内容 | 不钉（编译默认） |
+
+判读：启动日志 `vm cpu:` 行——`unpinned (mask=0, kernel default 3-core)`
+或 `pin vm cpu mask=0x... rc=0x...`。
+
+### kubridge 内核态取证（第三类证据）
+
+VPK 根部已捆绑 `kubridge.skprx`。**打包 ≠ 加载**——要真正读到内核，需
+一次性部署插件：
+
+1. 从 VPK 里解出 `kubridge.skprx`（Vita3K 直接浏览 VPK 内容；真机用
+   FTP/VitaShell 复制），放到 `ux0:/tai/kubridge.skprx`。
+2. 编辑 `ux0:/tai/config.txt`，在 `*KERNEL` 段加一行：
+   `*KERNEL` 换行 `ux0:tai/kubridge.skprx`（若已有 `*KERNEL` 段则在段内
+   追加该行）。
+3. 重启主机。
+
+**没装插件的机器也能正常跑**：HANG 时 `kernel_forensics.log` 只写一行
+`kubridge: ABSENT (kernel probes skipped)` + 部署提示，其余全部取证照旧。
+
+### v02.18 一轮判读表（三类证据一次拿全）
+
+| 证据 | 文件/日志段 | 关键行 | 说明 |
+|---|---|---|---|
+| (a) 不钉核下停摆核 | `vm_boot.log` + watchdog 快照 sysinfo | `vm cpu: unpinned` + 停摆核号 | 回答"停摆核是否仍跟随 VM" |
+| (b) 完整调度器双采样 | watchdog 快照 6 段 `[rdN ... ok]` | `[rd1 dispatch ok]` … `[rd6 dumpthreads ok]` | 缺哪段标记=截断在哪段，rd1/rd2 最重要（log42 就死在它们前面） |
+| (c) 内核态 | `kernel_forensics.log` | `kubridge: present` + `core0..3: cur_tid=...` 双采样 | present 但全 0/skip=偏移不对；ABSENT=插件未部署 |
+
+### log42 教训（探针自伤修复）
+
+log42 的快照死在 `vita_sched_nrt_info` 内部——watchdog 线程没有 GC 安全帧，
+`priority()` 链式解引用 stale thread_obj 触发 data abort，进程死亡吃掉了
+sample 2 + dispatch ring + java-stack-top。v02.18 修复：
+
+- `nrt obj=... id=... st=... tobj=0x...`：全部改为 `Thread::*_offset()`
+  编译期偏移 + 裸 volatile 字读，**不再解引用任何对象方法**；
+- 快照段重排：dispatch ring（rd1）与 java-stack-top（rd2）**提前**，
+  探针自伤也吃不掉它们；
+- 每段落尾 `[rdN ... ok]` 标记：截断文件能直接点名死在哪段。

@@ -900,6 +900,33 @@ set(VITA_VERSION  "02.16")
 #   log33/log34): every probe is a volatile read from the watchdog's own
 #   thread.
 set(VITA_VERSION  "02.17")
+# 02.18 (2026-11-06): unpinned by default + kernel-side forensics + the
+#   log42 probe self-wound fixed. One build, one hardware round, three
+#   questions answered (a real-hardware round is the expensive part):
+#   1. UNPINNED by default. log37..log42 proved pinning never changed
+#      the freeze - unpinned(1..36), CPU0(37), CPU1(38..42) all froze
+#      with the same signature and the stalled core always FOLLOWS the
+#      VM. Default mask is now 0 (kernel 3-core default). Runtime A/B
+#      WITHOUT rebuild: ux0:/data/J2ME00001/vm_cpu containing '1' or
+#      '2' pins to CPU1/CPU2 for a comparison round; absent/'0' =
+#      unpinned. The pin state is logged in boot_log.txt every round.
+#   2. KERNEL forensics via kubridge: the coredump's SYSTEM_INFO2 is
+#      hashed (4 MB, zero plaintext thread names) so the kernel half
+#      was never readable offline. With the kubridge plugin installed,
+#      vita_kernel_forensics.c reads the threadmgr per-core context
+#      from kernel memory at HANG time (twice, 400 ms apart) into
+#      kernel_forensics.log. Without the plugin: one explicit "kubridge
+#      ABSENT" line (the build still works, all v02.17 readouts kept).
+#      kubridge.skprx is bundled in the VPK root for one-stop install
+#      (copy to ux0:tai/ and add to *KERNEL in config.txt by hand).
+#   3. log42 probe self-wound FIXED: the watchdog died inside
+#      vita_sched_nrt_info dereferencing thread_obj (priority()
+#      chains through it) - the process was killed and sample 2 +
+#      dispatch ring + java-stack-top never reached the file. All
+#      scheduler probes now do raw-offset word reads with range
+#      checks, and every snapshot section ends with a [rdN ok] line
+#      so a truncated file names the section that died.
+set(VITA_VERSION  "02.18")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
@@ -1533,6 +1560,8 @@ add_executable(${PROJECT_NAME}
     src/vita_watchdog.c
     src/vita_crumb.c
     src/vita_thread_audit.c
+    # v02.18: kubridge-backed kernel-side stall forensics (HANG path)
+    src/vita_kernel_forensics.c
 )
 
 # Size of the bundled jar, baked into the binary for the runtime
@@ -1664,6 +1693,16 @@ target_link_libraries(${PROJECT_NAME}
     # symbols across the two stubs are fine: --allow-multiple-definition
     # is already set above (v01.67).
     SceKernelThreadMgr_stub
+    # v02.18: sceKernelGetModuleList/GetModuleInfo - the kernel-forensics
+    # probe enumerates KERNEL modules (type 0x00) to find kubridge and
+    # SceKernelThreadmgr before any ku* call is issued.
+    SceKernelModulemgr_stub
+    # v02.18: kuKernelCpuUnrestrictedMemcpy (kernel-side stall
+    # forensics at HANG time, vita_kernel_forensics.c). The call is
+    # only issued AFTER sceKernelGetModuleList(0x00,...) verified the
+    # kubridge plugin is actually loaded - on a console without it the
+    # probe degrades to a log line instead of a fatal syscall trap.
+    kubridge_stub
     m
 )
 
@@ -1744,6 +1783,12 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
     FILE     ${MIDP_SYSTEM_JAR}                  data/J2ME00001/midp_system.jar
     FILE     ${PORT_DIR}/config/fontbitmap.bin    data/J2ME00001/fontbitmap.bin
     FILE     ${MIDLET_JAR}                       data/J2ME00001/Hello.jar
+    # v02.18: kubridge plugin bundled for one-stop install - copy to
+    # ux0:tai/kubridge.skprx and add "kubridge.skprx" under *KERNEL in
+    # ux0:tai/config.txt (see ab/README.md). Bundling it here does NOT
+    # load it; the app only ever CALLS ku* after verifying the module
+    # is present (vita_kernel_forensics.c).
+    FILE     ${PORT_DIR}/kernel/kubridge.skprx   kubridge.skprx
     ${VITA_SKIN_FILE_ARGS}
 )
 
