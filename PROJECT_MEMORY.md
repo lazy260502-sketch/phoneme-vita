@@ -5931,3 +5931,66 @@ v02.18 恢复默认不钉，把"不钉核下停摆核是否仍跟随 VM"作为�
 - kubridge 读内核窗口 0x88800000..0x8b000000 是保守包络——若 threadmgr 数据
   段落在窗口外（几乎不可能，K0 direct 映射内核镜像），kf_find_threadmgr
   返回的段地址会因 plausibility 失败而整体 skip。
+
+## 2026-09-28 log43 分析（v02.18 / build b355 4ecee3b）：三类证据一次拿全 + "任意点冻结"形态坐实
+
+判决素材：`debug/logs/log43/`（第 7 轮真机独立复现，钉核形态——卡上有 `vm_cpu` 文件，内容为字符 `'1'`）。
+
+### 1. v02.18 三项设计验收（全部生效）
+- 探针自伤修复：site_ring.log 6409B 完整，6 段 rd 标记×2 采样全落盘（log42 只活到 61 行）
+- 停摆核跟随 VM：watchdog cpu1 idle/idleN/switchN 全 d=0，cpu0/2/3 活跃；vm cpu=1 lastcpu=1 aff=0x20000
+- kubridge ABSENT 分支合规返回（skprx 未部署），内核侧 WHY 证据本轮缺失
+
+### 2. 核心证据链（各环节全有数据）
+vm_cpu.1 → VM+ticker 双双钉 CPU1 → CPU1 内核停摆 → VM 冻在任意点 + ticker READY 永不派发
+→ timer_ticked=0 → VM 调度器停转（ttk 117 冻结、switch=221083 d=0）→ watchdog CPU0 幸存取证。
+
+### 3. 冻结签名漂移 = "任意点冻结"铁证（本轮最重要结论）
+- log41: bc_impl_fast_igetfield（v02.16）
+- log42: png_do_strip_channel（v02.17）
+- log43: native_stringbuffer_append_entry / bc_impl_fast_anewarray_internal（v02.18，StringBuffer.append 路径）
+三个完全无关的站点命中同一形态 → 排除 VM 代码死循环路线，问题在内核/底层夺走 CPU 不归还。
+（log43 site ring slide=0：站点地址未滑直接命中符号表。）
+
+### 4. 新证据细读
+- q5: id4→id3→CYCLE(2) 是正常形态（循环单链表 2 元素），log35 的 32 对才是 dump-walk 伪影
+- dispatch ring 16× id=3：冻结前 32 次切换全从 id3 切走，最终 cur=id4 冻结；id4 切换疑似不走
+  VITA_DISP_REC 分支——待查记录点分支条件（低优）
+- 线程 wait 状态自洽：id0=0x81eda000, id1/id2=0x81eb6ee4(同对象), id3=0/no-timeout, id4=0/timed
+- coredump thread[0]（pc=_fseeko_r+0x124, r0=0x81ede328, r1=0）判定存疑：与自杀路径（写
+  0x81000000）不符，r0 把 ThreadDesc 当 _reent* 不合法——倾向寄存器窗口错位（本轮 psp2core
+  note 布局有变化，slide42.py 对 log43 失败、threads note 为空，旁证）。遗留：人工重定窗口 offset。
+
+### 5. 下一步
+1. 删卡上 `ux0:/data/J2ME00001/vm_cpu` 文件跑不钉核对照轮（判定钉核是否必要条件；boot_log 出现 "vm cpu: unpinned" 即生效）
+2. 部署 kubridge.skprx（ux0:tai/ + config.txt *KERNEL 段 + 重启）——CPU1 停摆的 WHY 靠它
+3. 低优：VITA_DISP_REC 分支核查 / coredump 窗口重定 / OS_linux.cpp.bak 清理
+
+## 2026-09-27 v02.19（49cf496）：修正 02.18 残缺的不钉核默认值 —— log43 钉核来源纠偏
+
+### 1. 事故：02.18 的"默认不钉核"只改了一半
+- vita_main.c 的 #ifndef 兜底改成了 0，但 CMakeLists.txt:1593 的
+  target_compile_definitions 仍带 v02.13 的 VITA_VM_CPU_AFFINITY_MASK=0x20000
+- 预处理器守卫永不生效 → 02.18 每次启动仍钉 CPU1
+- **log43 boot_log "pin vm cpu mask=0x20000" 来自编译常量，不是 vm_cpu 文件——
+  卡上从未存在过该文件**（此前"删 vm_cpu.1"的指引是错的，用户发现"没有 vm_cpu"属实）
+
+### 2. 修复（vita-port/CMakeLists.txt，两处）
+- 编译默认 VITA_VM_CPU_AFFINITY_MASK=0x20000 → **0**（真正不钉核）
+- VITA_VERSION 02.18 → 02.19
+- vm_cpu 运行时开关不动，仍是免重编的 A/B 旋钮（'1'=CPU1/'2'=CPU2）
+
+### 3. 验证（反汇编级）
+- main 中 sceIoOpen(vm_cpu) 失败分支：02.18 blt → mov r4,#0x20000（缺失=钉核）；
+  02.19 直接走 dlog("vm cpu: unpinned...")（缺失=三核默认）
+- 产物：out/vpk/midp_vita_v02.19.vpk (3671937B) + .sym，版本串
+  "J2ME Player v02.19 b356 (49cf496)"
+
+### 4. 语义纠偏（影响 log43 判决的一处）
+log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其成因是编译默认
+而非用户放置的 vm_cpu 文件——这不改变停摆跟随 VM 核的结论，只纠正证据来源描述。
+
+### 5. 下一轮（v02.19 上机）
+1. 装新版 VPK，什么都不放 → 首次真正的不钉核对照轮（boot_log 应出现
+   "vm cpu: unpinned (mask=0, kernel default 3-core)"）
+2. 部署 kubridge.skprx（ux0:tai/ + config.txt *KERNEL 段 + 重启）拿内核侧证据
