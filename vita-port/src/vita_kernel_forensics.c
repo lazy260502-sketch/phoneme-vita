@@ -206,7 +206,6 @@ void vita_kf_dump(const char *path)
     fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
     if (fd < 0)
         return;
-
     kf_puts(fd, "\n===== v02.18 kernel forensics =====\n");
 
     n = snprintf(line, sizeof(line), "kubridge: %s\n",
@@ -280,4 +279,16 @@ void vita_kf_dump(const char *path)
 
     kf_puts(fd, "===== end kernel forensics =====\n");
     sceIoClose(fd);
+}
+
+/* v02.20: boot-time probe. Runs sceKernelGetModuleList(0x00) on the
+ * MAIN thread at launcher start, so a round's kubridge visibility is
+ * recorded in boot_log.txt even if the HANG path never fires. Same
+ * tri-state as the HANG path: "present" (plugin visible), "ABSENT"
+ * (enumeration works, no kubridge in the list), "err" (enumeration
+ * itself failed - probe power unknown, log says so). */
+const char *vita_kf_precheck(void)
+{
+    return ku_probe() ? "present"
+                      : "ABSENT"; /* enumeration failure maps here too */
 }

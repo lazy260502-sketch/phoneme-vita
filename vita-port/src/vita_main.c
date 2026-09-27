@@ -26,6 +26,7 @@
 #include <psp2/kernel/threadmgr.h> /* v01.72: sceKernelGetThreadId */
 
 #include "vita_watchdog.h" /* v01.72: hang forensics */
+#include "vita_kernel_forensics.h" /* v02.20: boot-time kubridge precheck */
 
 /* MIDP headers */
 #include <midpAMS.h>
@@ -354,6 +355,20 @@ int main(int argc, char *argv[]) {
             dlog("vm cpu: unpinned (mask=0, kernel default 3-core)\n");
             crumb_printf("vm cpu: unpinned (mask=0)");
         }
+    }
+
+    /* v02.20: kubridge visibility precheck. kubridge.skprx may live on
+     * ux0:tai/ OR ur0:tai/ - TaiHEN loads both identically, so the
+     * INSTALL PATH does not matter; what matters is whether the
+     * module-list probe can see it. Recording the tri-state here makes
+     * a round's kernel-visibility decidable from boot_log.txt alone,
+     * instead of only after a HANG fires kernel_forensics.log. */
+    {
+        const char *kc = vita_kf_precheck();
+        char kc_buf[64];
+        snprintf(kc_buf, sizeof(kc_buf), "kubridge precheck: %s\n", kc);
+        dlog(kc_buf);
+        crumb_printf("kubridge %s", kc);
     }
 
     vita_net_early_init();
