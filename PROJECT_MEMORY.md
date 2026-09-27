@@ -5629,6 +5629,12 @@ t0（`tid=0x40010003`）寄存器与 `primordial_to_current_thread`（link 0x810
 3. `menu=0` 的 A/B 至今**从未生效**（log41 日志里是 `launch.cfg not found, defaults in use`）。
    要跑必须把 `launch.cfg` 放到 `ux0:/data/J2ME00001/`（4 行，jar 路径**相对**目录，末行 `menu=0`；
    模板见 `vita-port/ab/launch.cfg.*`）。
+   **更正（v02.17 后补）**：这条只是"少跑了一个可选实验"，**不是故障、也不是复现
+   冻结的前提**。`launch.cfg not found, defaults in use` 是正常输出——没有它时默认
+   就是 `Hello.jar` / `ToneTest` / `portrait`，六轮 log36..log41 都是在这条默认路径
+   上复现的。`menu=0` 唯一的作用是跳过原生菜单、省掉每轮手点。真正需要卡上文件的
+   是 v02.17 的运行期开关（`tickgate` / `ticker_cpu`），而它们是硬编码绝对路径，
+   与 `launch.cfg` 无依赖关系。
 
 ### 5. 本次新增取证工具（`debug/tools/`）
 
@@ -5715,6 +5721,18 @@ TCB 发系统调用**（log33/log34 就是这么把看门狗搞死的）。
 样例文件：`vita-port/ab/tickgate.{1,2}`、`ticker_cpu.{0,1,2}`（复制到真机时**去掉
 扩展名**）。完整跑法见 `vita-port/ab/README.md`。
 
+**这些开关与 `launch.cfg` 无关**（这一点曾经被写重，特此更正）：
+
+- `OS_vita.cpp` 里的路径是**硬编码绝对路径** `ux0:/data/J2ME00001/<name>`，
+  不经过 `chdir()`、不读 `launch.cfg`、不看菜单选了哪个游戏。
+- 因此"本轮日志里 `launch.cfg not found, defaults in use`"**完全不影响**
+  开关能否生效——没有 `launch.cfg` 时默认值是 `Hello.jar` / `ToneTest` /
+  `portrait`，走的是同一条冻结路径，冻结照旧复现。
+- 唯一要求：**开关文件必须在应用启动前存在**（每进程只读一次并缓存，
+  运行中补放无效）。
+- `launch.cfg` 里那行 `menu=0` 的唯一作用是**跳过原生菜单**（省一次手点），
+  属可选便利，不是复现冻结的前提。
+
 ### 4. 关键文件修改记录（v02.17）
 
 | 文件 | 改动 | 规模 |
@@ -5761,13 +5779,18 @@ strings -a out/vpk/midp_vita_v02.17.sym | grep -E 'vita_run_count|vita_tc_note|v
 
 ### 6. 建议的上机顺序（一个 VPK 回答多个问题）
 
-1. **基线**：只放 `launch.cfg` = `launch.cfg.hello`（4 行，jar 路径**相对**，
-   末行 `menu=0`）。取双采样基线，确认冻结是否仍在
-   `start_lightweight_thread_asm` 附近。
+> **前提澄清**：`launch.cfg` **不必准备**。没有它时内置默认就是
+> `Hello.jar` / `ToneTest` / `portrait`，冻结路径一模一样；
+> `launch.cfg not found, defaults in use` 是正常输出，不是故障。
+> 放 `launch.cfg`（`launch.cfg.hello`，4 行、jar 路径**相对**、末行 `menu=0`）
+> 只是为了**跳过原生菜单**、省掉每轮手点，属可选。
+> 下面三个开关全是硬编码绝对路径，**不依赖** `launch.cfg`。
+
+1. **基线**：卡上**什么都不放**（只有上一版 VPK 本身）。取双采样基线，
+   确认冻结是否仍在 `start_lightweight_thread_asm` 附近。
 2. **`ticker_cpu.2`**（ticker 挪离 VM 核）：冻结消失 ⇒ v02.14 的"同核"
    就是原因；`ticker loops` 仍在涨而 VM 不复活 ⇒ ticker 与冻结无关。
-3. **`tickgate.2`**：真正跑一次 v02.11 那个**从未生效**的假设
-   （历史各轮日志都是 `launch.cfg not found, defaults in use`，A/B 从未触发）。
+3. **`tickgate.2`**：真正跑一次 v02.11 那个**从未生效**的假设。
 
 每轮只换 `ux0:` 上的小文件 + 重开应用，**不需要重装 VPK**。
 

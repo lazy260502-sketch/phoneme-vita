@@ -127,13 +127,33 @@ cp ticker_cpu.2 /mnt/ux0/data/J2ME00001/ticker_cpu
 
 ## 4. 建议的一轮跑法（一个 VPK 回答多个问题）
 
-1. **第一轮：什么都不放**（只用 `launch.cfg.hello`）。拿到双采样基线，
+**先澄清一件事：`launch.cfg` 不是必需的。** 没有它时 launcher 用内置默认
+（`Hello.jar` / `ToneTest` / `portrait`），走的是**完全同一条**冻结路径。
+历史日志里那句 `launch.cfg not found, defaults in use` 是**正常输出**，
+不是故障——它只表示没人在卡上放过手动配置。
+
+`launch.cfg` 唯一的用处是里面那一行 `menu=0`：让启动**跳过原生菜单**。
+这只省掉每轮一次手点，属于可选便利；不加就是照旧先点进菜单再选游戏，
+冻结一样复现。
+
+**同理，下面的运行期开关（`tickgate` / `ticker_cpu`）与 `launch.cfg` 没有任何
+关系。** 它们在 `OS_vita.cpp` 里是硬编码绝对路径：
+
+```c
+snprintf(path, sizeof(path), "ux0:/data/J2ME00001/%s", name);
+```
+
+不经过 `chdir()`、不读 `launch.cfg`、不看菜单选了什么。唯一的要求是
+**文件必须在应用启动前就躺在卡上**——这些开关每个进程只读一次并缓存
+（`vita_cfg_flag` 有按名缓存，tick 门有 `_vita_tickgate_mode` 一次性缓存），
+运行中再放进去是没有用的。
+
+1. **第一轮：什么都不放**（连 `launch.cfg` 都可以不放）。拿到双采样基线，
    确认冻结是否仍在 `start_lightweight_thread_asm` 附近。
 2. **第二轮：`ticker_cpu.2`**（ticker 挪离 VM 核）。若冻结消失 ⇒
    v02.14 的"同核"就是原因；若 `ticker loops` 现在仍在涨而 VM 死不复活 ⇒
    ticker 与冻结无关，方向转 `tickgate`。
 3. **第三轮：`tickgate.2`**（完全不在 tick 上编译）。这是 v02.11 那个
-   从未真正跑过的假设（日志里 `launch.cfg not found, defaults in use`，
-   说明历史各轮**都没有**真正触发过 A/B）。
+   从未真正跑过的假设。
 
 每轮只需换 `ux0:` 上的小文件 + 重开应用，不需要重装 VPK。
