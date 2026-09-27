@@ -927,6 +927,16 @@ set(VITA_VERSION  "02.17")
 #      checks, and every snapshot section ends with a [rdN ok] line
 #      so a truncated file names the section that died.
 set(VITA_VERSION  "02.18")
+# 02.19 (2026-09-27): the unpinned default was INCOMPLETE in 02.18 -
+#   vita_main.c's #ifndef fallback was set to 0 but THIS compile
+#   definition still carried v02.13's 0x20000, so the preprocessor
+#   guard never took effect and every 02.18 boot was still pinned to
+#   CPU1 (log43 boot_log "pin vm cpu mask=0x20000" came from HERE, not
+#   from any vm_cpu file - the file never existed on the card). Fix:
+#   default is now truly 0 (unpinned, kernel 3-core). The vm_cpu
+#   runtime switch (read_vm_cpu_mask) is unchanged and remains the A/B
+#   knob: create ux0:/data/J2ME00001/vm_cpu containing '1'/'2' to pin.
+set(VITA_VERSION  "02.19")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
@@ -1586,11 +1596,15 @@ add_dependencies(${PROJECT_NAME} gen_version)
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 # v02.13: VM main thread single-core pin (log37 change-core A/B).
-# 0x20000=CPU1 this round (0x10000=CPU0 was v02.12, 0x40000=CPU2 is the
-# next candidate); set to 0 to fall back to three-core default (Vita3K
-# masks the bug either way). Mirrored in vita_main.c via #ifndef.
+# 0x20000=CPU1 (v02.12 used 0x10000=CPU0, both pinned the hang core
+# in log37..log43). v02.19: DEFAULT IS NOW 0 = unpinned three-core -
+# the 02.18 "unpinned default" only edited the #ifndef fallback in
+# vita_main.c while this definition kept 0x20000 alive, so log43 ran
+# pinned despite no vm_cpu file on the card. To re-pin for an A/B
+# round, either set this back to 0x20000/0x40000 or drop a vm_cpu
+# file on the card ('1'/'2') - the runtime switch needs no rebuild.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
-    VITA_VM_CPU_AFFINITY_MASK=0x20000)
+    VITA_VM_CPU_AFFINITY_MASK=0)
 
 add_dependencies(${PROJECT_NAME} libobj_target)
 
