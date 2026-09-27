@@ -52,6 +52,7 @@
 #include <psp2/io/fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "vita_kernel_forensics.h"
 
@@ -99,6 +100,23 @@ static int ku_clock_probe(void)
     return g_ku_clock;
 }
 
+static int ku_probe(void); /* defined below the flag-matrix comment */
+
+/* v02.24: the REAL availability gate. log47 proved the module enum is
+ * structurally blind to taiHEN kernel plugins (flag 0x81 lists 15
+ * modules, no kubridge) while the module IS resident - the direct
+ * clock call returned 190 and the kernel boot log said "Starting...OK".
+ * v02.23 and earlier gated kf_read/vita_kf_dump on ku_probe() alone,
+ * so the kernel reads were SKIPPED on a console where they would have
+ * worked. Availability is now: enum sees it OR the direct call returns
+ * a sane clock (>= 41, lowest Vita bus clock). */
+static int ku_available(void)
+{
+    if (ku_probe())
+        return 1;
+    return ku_clock_probe() >= 41;
+}
+
 /* v02.23: a kubridge.skprx rides INSIDE our own VPK (app0:), deployed
  * by the installer to ux0:app/J2ME00001/. taiHEN never loads it (it
  * only reads tai config.txt), but its presence makes the fix a single
@@ -110,6 +128,20 @@ static int ku_bundled_probe(void)
     memset(&st, 0, sizeof(st));
     return sceIoGetstat("app0:kubridge.skprx", &st) >= 0;
 }
+
+/* v02.24: cross-domain module query via taiHEN itself. log47 proved
+ * sceKernelGetModuleList is structurally blind to taiHEN-loaded kernel
+ * plugins AND to system kernel modules from userspace - but taiHEN
+ * exports taihenModuleUtils to USER mode with a pid argument, and
+ * KERNEL_PID (0x10005) addresses the kernel's own module table. These
+ * are weak stub imports: without taiHEN they return an error code and
+ * we fall back to the (blind) enum. */
+#define KF_KERNEL_PID 0x10005
+#define KF_IGNORE_NID 0xFFFFFFFFu
+extern int module_get_by_name_nid(int pid, const char *name,
+                                  unsigned int nid, void *info);
+extern int module_get_offset(int pid, int modid, int segidx,
+                             unsigned int offset, uintptr_t *addr);
 
 /* --------------------------------------------------------------- */
 /* kubridge presence: enumerate kernel modules, look for kubridge.  */
@@ -191,7 +223,7 @@ static int kf_kaddr_plausible(unsigned int a) {
 
 static int kf_read(void *dst, unsigned int kaddr, unsigned int len)
 {
-    if (!ku_probe())
+    if (!ku_available())
         return -1;
     if (!kf_kaddr_plausible(kaddr) ||
         !kf_kaddr_plausible(kaddr + len - 1))
@@ -224,19 +256,49 @@ static void kf_puts(SceUID fd, const char *s)
     if (l > 0) sceIoWrite(fd, s, l);
 }
 
-/* Find SceKernelThreadmgr's kernel data segment via the module list.
- * The returned address comes from the kernel's OWN module table (not
- * from any hardcoded base), so a firmware shift moves it with us. */
+/* Find SceKernelThreadmgr's kernel data segment. v02.24: PRIMARY
+ * route is taiHEN's cross-domain query (module_get_by_name_nid with
+ * KERNEL_PID + module_get_offset segidx=1), which reads the kernel's
+ * OWN module table - the userspace sceKernelGetModuleList is blind to
+ * kernel modules (log46/47 flag matrix proved it). Fallback: the old
+ * enum, kept for a taiHEN-less console (returns 0 there anyway). */
 static unsigned int kf_find_threadmgr(void)
 {
     SceUID uids[128];
     SceSize num = 128;
     int rc, i;
     static unsigned int cached = 0;
+    static int tried = 0;
 
-    if (cached)
+    if (cached || tried)
         return cached;
+    tried = 1;
 
+    /* Route 1 (v02.24): taiHEN cross-domain. info layout mirrors
+     * tai_module_info_t (taihen.h): size, modid, module_nid, name[27],
+     * exports/imports pointers. We only need modid, then ask for
+     * segment 1's base via module_get_offset. */
+    {
+        unsigned char info[64];
+        int modid;
+        uintptr_t addr = 0;
+        memset(info, 0, sizeof(info));
+        *(size_t *)info = sizeof(info);
+        if (module_get_by_name_nid(KF_KERNEL_PID, "SceKernelThreadmgr",
+                                   KF_IGNORE_NID, info) >= 0) {
+            modid = *(int *)(info + sizeof(size_t));
+            if (modid > 0 &&
+                module_get_offset(KF_KERNEL_PID, modid, 1, 0,
+                                  &addr) >= 0 &&
+                kf_kaddr_plausible((unsigned int)addr)) {
+                cached = (unsigned int)addr;
+                return cached;
+            }
+        }
+    }
+
+    /* Route 2: pre-v02.24 userspace enum (blind to kernel modules on
+     * log46/47 firmware, kept as the taiHEN-less fallback). */
     rc = sceKernelGetModuleList(0x00, uids, &num);
     if (rc < 0)
         return 0;
@@ -274,7 +336,7 @@ void vita_kf_dump(const char *path)
     kf_puts(fd, "\n===== v02.18 kernel forensics =====\n");
 
     n = snprintf(line, sizeof(line), "kubridge: %s\n",
-                 ku_probe() ? "present" : "ABSENT (kernel probes skipped)");
+                 ku_available() ? "present" : "ABSENT (kernel probes skipped)");
     sceIoWrite(fd, line, n);
     /* v02.23: direct-call probe runs FIRST - it works even when the
      * module enum is blind, and its result outranks the enum verdict. */
@@ -284,7 +346,7 @@ void vita_kf_dump(const char *path)
                      clk);
         sceIoWrite(fd, line, n);
     }
-    if (!ku_probe()) {
+    if (!ku_available()) {
         /* v02.21: enum diagnostics - separates "no plugin" from
          * "plugin invisible to the userspace module list". v02.22 adds
          * the flag domain that actually produced the modules. */

@@ -990,6 +990,18 @@ set(VITA_VERSION  "02.22")
 #   (app0:kubridge.skprx): one config.txt line (*KERNEL
 #   app0:kubridge.skprx) loads it, no file hunting needed.
 set(VITA_VERSION  "02.23")
+# 02.24 (2026-09-27): log47 verdict - kubridge IS loaded, my gate was wrong.
+#   User's config.txt worked (app0:kubridge.skprx line - the skprx bundled
+#   in our own VPK since v02.18). Three proofs: precheck "CALLABLE (enum
+#   blind)", kuPowerGetSysClockFrequency=190, and the kernel boot log in
+#   the coredump "[kubridge]:Starting... OK". But BOTH gates - kf_read()
+#   and kf_find_threadmgr() - still used the BLIND userspace enum, so the
+#   kernel reads printed "ABSENT (kernel probes skipped)" and never ran.
+#   Fix: (a) availability = enum OR direct clock call >= 41;
+#   (b) threadmgr lookup PRIMARY route = taiHEN taihenModuleUtils
+#   (module_get_by_name_nid + module_get_offset with KERNEL_PID 0x10005),
+#   which reads the kernel's OWN module table; enum kept as fallback.
+set(VITA_VERSION  "02.24")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
@@ -1770,6 +1782,12 @@ target_link_libraries(${PROJECT_NAME}
     # kubridge plugin is actually loaded - on a console without it the
     # probe degrades to a log line instead of a fatal syscall trap.
     kubridge_stub
+    # v02.24: cross-domain module query (module_get_by_name_nid /
+    # module_get_offset with KERNEL_PID) - the userspace module enum is
+    # structurally blind to kernel modules (log46/47), so the threadmgr
+    # lookup goes through taiHEN's own kernel module table. Weak stub:
+    # without taiHEN the calls return an error and the probe degrades.
+    taihenModuleUtils_stub
     m
 )
 
