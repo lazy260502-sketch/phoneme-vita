@@ -937,6 +937,15 @@ set(VITA_VERSION  "02.18")
 #   runtime switch (read_vm_cpu_mask) is unchanged and remains the A/B
 #   knob: create ux0:/data/J2ME00001/vm_cpu containing '1'/'2' to pin.
 set(VITA_VERSION  "02.19")
+# 02.20 (2026-09-27): boot-time kubridge precheck (vita_kf_precheck).
+#   kubridge.skprx deployed on ur0:tai/ (path is irrelevant to TaiHEN);
+#   the real risk is that the userspace module-list probe might not see
+#   kernel modules at all, which would only surface after a HANG before.
+#   The precheck runs the same probe at launcher start and logs the
+#   tri-state into boot_log.txt ("kubridge precheck: present/ABSENT"),
+#   so kernel-visibility is decidable from boot alone - no wasted
+#   hardware round.
+set(VITA_VERSION  "02.20")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
