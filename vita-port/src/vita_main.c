@@ -369,6 +369,9 @@ int main(int argc, char *argv[]) {
         snprintf(kc_buf, sizeof(kc_buf), "kubridge precheck: %s\n", kc);
         dlog(kc_buf);
         crumb_printf("kubridge %s", kc);
+        /* v02.22: full module table (flag domain x names) into
+         * kernel_forensics.log at boot - one log answers visibility. */
+        vita_kf_list_modules("ux0:/data/J2ME00001/kernel_forensics.log");
     }
 
     vita_net_early_init();

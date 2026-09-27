@@ -16,6 +16,7 @@ extern "C" {
  */
 void vita_kf_dump(const char *path);
 const char *vita_kf_precheck(void); /* "present" / "ABSENT" / "err" */
+void vita_kf_list_modules(const char *path); /* v02.22: module table dump */
 
 #ifdef __cplusplus
 }

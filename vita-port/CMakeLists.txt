@@ -959,6 +959,23 @@ set(VITA_VERSION  "02.20")
 #   tai dir -> readout route must change to a kernel-side dumper,
 #   NOT reinstall) / ABSENT (no file) / enum-failure->ABSENT.
 set(VITA_VERSION  "02.21")
+# 02.22 (2026-09-27): log45 double verdict.
+#   (a) "ABSENT" root cause found - MY enum flags were wrong: bare
+#   0x00..0x04 are user-domain selectors that list NOTHING (log45:
+#   rc=0 nmod=0 for all four); the SDK's own prx_loader sample uses
+#   0x80|0x1 ("0x80 = system") and sees ~13 modules from userspace.
+#   Probe now walks the 0x80|0x1..4 system-domain matrix, records the
+#   winning flag, and vita_kf_list_modules() dumps the whole module
+#   table into kernel_forensics.log at boot.
+#   (b) "whole-core scheduler dead" hypothesis RETIRED: log45 shows VM
+#   thread frozen on cpu2 (runClocks d=0) while cpu2 itself stays alive
+#   (idle d=199129, switchN d=90); cpu1's all-zero window was an
+#   unrelated core. The stall is a THREAD-level uninterruptible kernel
+#   wait (KICK signal accepted-but-ignored + suspend 0x80020008 fit),
+#   and the freeze signature stays in the stdio->sceIo path for the
+#   4th round running (site=interpreter_fast_method_entry_4, C stack
+#   =inflate/png decode; log43 _fseeko_r, log44 _vfprintf/__ssvfscanf).
+set(VITA_VERSION  "02.22")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows

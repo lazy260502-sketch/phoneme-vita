@@ -73,6 +73,7 @@ static int g_ku_ok = -1;             /* -1 unknown, 0 absent, 1 present */
  * attempt; the name-match verdict is ORed across all flags. */
 static int g_ku_enum_rc = 0;         /* last sceKernelGetModuleList rc  */
 static unsigned int g_ku_nmod = 0;   /* modules returned by that call   */
+static unsigned int g_ku_flag = 0;   /* which list flag produced them   */
 
 /* --------------------------------------------------------------- */
 /* kubridge presence: enumerate kernel modules, look for kubridge.  */
@@ -83,10 +84,17 @@ static int ku_probe(void)
 {
     SceUID uids[128];
     SceSize num;
-    /* fw semantics of the list flags differ across SDK docs/tools;
-     * v02.20 proved 0x00 alone can come back blind even when the module
-     * is resident, so try every documented class and OR the verdict. */
-    static const unsigned int flags[] = { 0x00, 0x01, 0x02, 0x04 };
+    /* v02.22: the v02.21 real-hardware verdict "rc=0 nmod=0" exposed the
+     * real bug - the FLAG DOMAIN was wrong, not the visibility. The SDK's
+     * own sample (samples/prx_loader/main.c) uses 0x80|0x1 ("0/1 = user,
+     * 0x80 = system") and sees ~13 modules from a plain userspace app;
+     * bare 0x00..0x04 list nothing. So try the full system-domain matrix
+     * and remember which flag produced how many modules. */
+    static const unsigned int flags[] = {
+        0x00,
+        0x01, 0x02, 0x04,
+        0x80 | 0x01, 0x80 | 0x02, 0x80 | 0x03, 0x80 | 0x04
+    };
     int rc = -1, f, i;
 
     if (g_ku_ok >= 0)
@@ -96,10 +104,17 @@ static int ku_probe(void)
         num = sizeof(uids) / sizeof(uids[0]);
         memset(uids, 0, sizeof(uids));
         rc = sceKernelGetModuleList(flags[f], uids, &num);
-        g_ku_enum_rc = rc;
-        if (rc < 0)
+        if (rc < 0) {
+            g_ku_enum_rc = rc;
             continue;
-        g_ku_nmod = num;
+        }
+        /* remember the first flag that yields ANY module - the log line
+         * "enum flag=0x81 nmod=13" is the sanity anchor for the probe. */
+        if (g_ku_nmod == 0) {
+            g_ku_enum_rc = rc;
+            g_ku_nmod = num;
+            g_ku_flag = flags[f];
+        }
         for (i = 0; (SceSize)i < num; i++) {
             SceKernelModuleInfo mi;
             memset(&mi, 0, sizeof(mi));
@@ -108,6 +123,9 @@ static int ku_probe(void)
                 continue;
             if (strcmp(mi.module_name, "kubridge") == 0) {
                 g_ku_ok = 1;
+                g_ku_enum_rc = rc;
+                g_ku_nmod = num;
+                g_ku_flag = flags[f];
                 return 1;
             }
         }
@@ -224,9 +242,11 @@ void vita_kf_dump(const char *path)
     sceIoWrite(fd, line, n);
     if (!ku_probe()) {
         /* v02.21: enum diagnostics - separates "no plugin" from
-         * "plugin invisible to the userspace module list". */
+         * "plugin invisible to the userspace module list". v02.22 adds
+         * the flag domain that actually produced the modules. */
         n = snprintf(line, sizeof(line),
-                     "enum rc=%d nmod=%u\n", g_ku_enum_rc, g_ku_nmod);
+                     "enum rc=%d flag=0x%02x nmod=%u\n",
+                     g_ku_enum_rc, g_ku_flag, g_ku_nmod);
         sceIoWrite(fd, line, n);
         kf_puts(fd, "note: kubridge ABSENT - copy kubridge.skprx to ux0:tai/, "
                     "add '*KERNEL ux0:tai/kubridge.skprx' to config.txt\n");
@@ -323,4 +343,57 @@ const char *vita_kf_precheck(void)
             return "installed-NOT-visible";
     }
     return "ABSENT"; /* no plugin file: install it (or enum failed) */
+}
+
+/* v02.22: dump the module table itself (first entries) so ONE boot log
+ * answers "what does the userspace enum actually see" - flag domain,
+ * module count and names, no further round needed. */
+void vita_kf_list_modules(const char *path)
+{
+    static const unsigned int flags[] = {
+        0x80 | 0x01, 0x80 | 0x02, 0x80 | 0x03, 0x80 | 0x04
+    };
+    SceUID uids[128];
+    SceIoStat st;
+    SceUID fd;
+    char line[KF_MAX_LINE];
+    int n, f, i, shown;
+
+    fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    if (fd < 0)
+        return;
+    kf_puts(fd, "\n===== v02.22 module table =====\n");
+
+    for (f = 0; f < (int)(sizeof(flags) / sizeof(flags[0])); f++) {
+        SceSize num = sizeof(uids) / sizeof(uids[0]);
+        memset(uids, 0, sizeof(uids));
+        if (sceKernelGetModuleList(flags[f], uids, &num) < 0 || num == 0) {
+            n = snprintf(line, sizeof(line), "flag 0x%02x: empty\n",
+                         flags[f]);
+            sceIoWrite(fd, line, n);
+            continue;
+        }
+        n = snprintf(line, sizeof(line), "flag 0x%02x: %u modules\n",
+                     flags[f], (unsigned int)num);
+        sceIoWrite(fd, line, n);
+        shown = 0;
+        for (i = 0; (SceSize)i < num && shown < 24; i++) {
+            SceKernelModuleInfo mi;
+            memset(&mi, 0, sizeof(mi));
+            mi.size = sizeof(mi);
+            if (sceKernelGetModuleInfo(uids[i], &mi) < 0)
+                continue;
+            n = snprintf(line, sizeof(line), "  %s\n", mi.module_name);
+            sceIoWrite(fd, line, n);
+            shown++;
+        }
+    }
+    memset(&st, 0, sizeof(st));
+    n = snprintf(line, sizeof(line),
+                 "tai ux0:%d ur0:%d\n",
+                 sceIoGetstat("ux0:tai/kubridge.skprx", &st) >= 0,
+                 sceIoGetstat("ur0:tai/kubridge.skprx", &st) >= 0);
+    sceIoWrite(fd, line, n);
+    kf_puts(fd, "===== end module table =====\n");
+    sceIoClose(fd);
 }

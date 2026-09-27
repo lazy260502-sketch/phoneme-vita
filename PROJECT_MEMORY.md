@@ -6057,3 +6057,38 @@ log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其�
 ### 遗留
 - kernel_forensics.log 的内核读数仍未拿到（盲区未突破前不指望本轮出）。
 - 低优：VITA_DISP_REC 16x id=3 疑点；OS_linux.cpp.bak 清理。
+
+## 2026-09-27 log45（v02.21）— 双判决：枚举旗标错杀 + 整核死假设判死
+
+### 判决 A：v02.20/21 "ABSENT" 是枚举姿势错，非盲区非未装
+- log45 kernel_forensics.log：`enum rc=0 nmod=0` —— 四旗标全部 API 成功但 0 模块。
+- 对照 SDK 示例 samples/prx_loader/main.c:47：`sceKernelGetModuleList(0x80|0x1,…)`
+  （0/1=user，0x80=system 域）用户态可见 ~13 模块。裸 0x00..0x04 全空。
+- 强符号 fstubs 导入 + 进程正常启动 ⇒ kubridge 一直在内核（v02.21 推理仍成立）。
+
+### 判决 B："整核调度器死"假设判死（重要反转）
+- log45：VM cpu=2/lastcpu=2 且 runClocks d=0（线程死），但 cpu2 本身
+  idle d=199129 / switchN d=90 —— **宿主核调度器活著**。cpu1 全 d=0 是无关键。
+- 停摆本质＝**线程级内核不可中断等待**：KICK0 signal rc=0 却无效、
+  KICK5 suspend 0x80020008（非法状态）全部自洽。
+- log43/44 的核冻结判读系 sysinfo 短窗口误判；ticker 本轮活着（rt 1412→1473）。
+- 冻结签名第 4 轮收敛 stdio→sceIo：site=interpreter_fast_method_entry_4，
+  VM C 栈=inflate（png 解码，audit png_read_image calls=5）；
+  历史：log43 _fseeko_r、log44 _vfprintf_r/__ssvfscanf_r。
+- **主假设唯一化：VM 线程的 sceIo* 内核路径不可中断阻塞（死锁/损坏页等待）。**
+
+### v02.22 改动
+1. ku_probe() 旗标矩阵改 0x80|0x1..4 system 域，记命中 flag（g_ku_flag）。
+2. 新增 vita_kf_list_modules()：boot 时把模块表（旗标×模块名×24 条）+ tai
+   目录探测落入 kernel_forensics.log —— 一轮看清用户态可见性。
+3. precheck 四态语义不变，但 ABSENT 分支诊断行加 flag。
+
+### 判读表（v02.22）
+- `kubridge precheck: present` → HANG 后 kernel_forensics.log 直接出内核读数。
+- `installed-NOT-visible` → 系统域枚举可见但无 kubridge → 换内核 dumper 路线。
+- `ABSENT` + module 表里无 kubridge 但 tai 探测 1 → 同上换路线。
+- 模块表 flag 行全 empty → 枚举仍全盲 → 直接上内核 dumper，不再试用户态。
+
+### 遗留
+- cpu1 全零窗口成因待定（tone/wd 均 lastcpu=1 且活，非本问题阻塞项）。
+- VITA_DISP_REC 16x id=3 疑点；OS_linux.cpp.bak 清理（低优）。
