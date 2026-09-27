@@ -5994,3 +5994,36 @@ log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其�
 1. 装新版 VPK，什么都不放 → 首次真正的不钉核对照轮（boot_log 应出现
    "vm cpu: unpinned (mask=0, kernel default 3-core)"）
 2. 部署 kubridge.skprx（ux0:tai/ + config.txt *KERNEL 段 + 重启）拿内核侧证据
+
+## 2026-09-27 log44 分析（v02.19 / b356 49cf496）：钉核假设判死 + 冻结签名统一收敛到 stdio/sceIo
+
+判决素材：`debug/logs/log44/`（第 8 轮真机独立复现，首次真正不钉核轮）。
+
+### 1. 两大决定性事实
+- **钉核不是必要条件**：boot_log "unpinned (mask=0)"（v02.19 修复生效），
+  vm aff=0x70000 三核漫游，cpu=0 lastcpu=0；cpu0 idle/idleN/switchN 全 d=0
+  （整核停摆，idle clock 停 = 调度器死），cpu1/2/3 活跃。
+  停摆核跟随 VM 宿主核：log37~43 钉哪冻哪，log44 不钉冻在漫游落点 cpu0。
+- **冻结签名收敛到 newlib stdio**：
+  log43 coredump pc=_fseeko_r+0x124（当时误判"窗口错位存疑"——纠偏：真实冻结点）
+  log44 site ring=_vfprintf_r+0x1260 / __ssvfscanf_r+0x9f4
+  三函数底层全走 sceIoRead/Write/Lseek —— VM 线程卡在文件 syscall 未归。
+
+### 2. 内核态硬事实与新主假设
+- idle clock 停止 = 该核不再执行任何代码（用户态不可为）。
+- KICK0~5 全无效（signal/affinity/prio/suspend 均失败）——线程在内核不可中断路径。
+- 主假设：VM 线程的 sceIo* 进入内核互斥/文件系统驱动路径后死锁（持锁自旋或
+  关中断死循环）拖死整核。与三轮全冻在 I/O 函数完全自洽。
+- ticker 本轮 rt_ticks=1616（不钉核轮与 VM 同核组，观测性好于 log43 的 0），
+  冻结前 ago_ms=2 最后殉葬；watchdog/tone 在他核存活完整取证。
+
+### 3. 遗留
+- log44 coredump thread[0] pc=_rom_text_block8+0xc638 与 site ring stdio 签名不一致
+  （自杀窗口快照局限，note 加密窗口归属未定）——以 site ring 为准。
+- kernel_forensics.log 仍 ABSENT（kubridge 未部署），内核 WHY 证据缺。
+
+### 4. 下一步
+1. 部署 kubridge.skprx（ux0:tai/ + *KERNEL 段）——读 threadmgr per-core ctx/runq，
+   直接看停摆核的内核路径，定位死锁点的唯一手段。
+2. v02.20 候选：VM 侧零文件 I/O 对照轮（日志静默 + jar 预载入内存），
+   不冻→锁定 sceIo 死锁；仍冻→转向调度器本身。
