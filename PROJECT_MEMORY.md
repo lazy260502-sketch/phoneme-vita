@@ -6151,3 +6151,57 @@ log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其�
 - cpu1 计数器歧义标注（见判决 2）。
 - 下一步候选：若 kubridge 修好后 threadmgr 读数到手，对照 VM 冻结时刻
   的 cur_tid/runqueue 状态定性「不可中断等待」的具体内核对象。
+
+## 2026-09-27 log47（v02.23）— 判决：kubridge 已加载！门控 bug 在我方
+
+### 判决：用户的 config.txt 修好了，kubridge 真的在内核里跑
+- 三条铁证：
+  1. boot_log：`kubridge precheck: CALLABLE (enum blind)`（v02.23 直调探针
+     成功）；
+  2. kernel_forensics：`kuPowerGetSysClockFrequency: 190`（合法时钟值）；
+  3. **core dump EVENT_LOG 段内内核侧启动日志**：
+     `[kubridge ]:Starting... OK 1758usec`（taiHEN 开机加载成功记录）。
+- 生效的是 `app0:kubridge.skprx` 行（VPK 自带文件）；`ur0:tai/kubridge.skprx`
+  行实际无效（`tai ux0:0 ur0:0`，ur0:tai/ 里没有该文件）。
+- 模块枚举 flag 0x81 依旧 15 模块无 kubridge——**用户态枚举对 taiHEN 内核
+  插件结构性失明**，与加载状态无关，log46 "ABSENT" 与本轮 "CALLABLE" 的
+  矛盾由 v02.23 直调探针解决。
+
+### 本轮冻结形态（第 6 轮，签名继续收敛 I/O）
+- watchdog：VM runClocks d=0、exec 三计数全零、ticker 活（rt 1629→1678）、
+  KICK 五连无效、suspend 0x80020008——与前五轮完全一致。
+- VM 落 cpu1 且 cpu1 三计数 d=0（与 log45 cpu2 活形成对照——cpu1 计数器
+  歧义依旧：log45/46 cpu1 恒零与 VM 落点无关，本轮 VM 恰在 cpu1）。
+- site ring 全窗 `png_do_read_transformations`（[0]/[1]=810d8930/810d6414，
+  归属 png_do_read_transformations+0x377c/+0x1260，符号区间 0x484c 内合法）
+  ——第 6 轮冻结在 libpng 变换循环，仍走 stdio→sceIo 读图路径。
+- THREAD_REG_INFO 布局部分破解：头 0x28 + 6 条目×0x178；VM 条目
+  （tid 0x40010003）用户代码指针全 deadbeef/0 → VM 冻结时**不在用户态**，
+  寄存器上下文在内核栈——与"内核不可中断等待"判读自洽。
+
+### v02.24 修复（3d0e6f6）：门控 bug——内核读数一轮都没跑
+- log47 暴露：kubridge 已在但 `vita_kf_dump` 打印 "ABSENT (kernel probes
+  skipped)" 后直接 return——**kf_read/vita_kf_dump 门控用的是盲枚举
+  ku_probe()**，直调成功也进不去。
+- 修复 1：`ku_available()` = 枚举 OR 直调 ≥41（最低 Vita 总线时钟）。
+- 修复 2（连锁）：`kf_find_threadmgr()` 同样依赖盲枚举（flag 0x00 永远找不到
+  内核模块）。主路改走 **taihenModuleUtils 跨域查询**：
+  `module_get_by_name_nid(KERNEL_PID=0x10005,"SceKernelThreadmgr",...)` +
+  `module_get_offset(pid,modid,segidx=1,0,&addr)`——taiHEN 自己导出的用户态
+  API，读内核自己的模块表，绕过用户态枚举盲区。旧枚举留作无 taiHEN 兜底。
+  （已核对 taiHEN 源码 module.c：module_get_by_name_nid 用
+  ksceKernelGetModuleList(pid,0xff,1) 查全表；module_get_offset 直接给
+  segments[segidx].vaddr+offset。stub 库 taihenModuleUtils_stub 4 函数全
+  GEN_WEAK_EXPORTS 弱导入，无 taiHEN 时返回错误码安全降级。）
+- CMakeLists 链接 `taihenModuleUtils_stub`。
+- 产物 `out/vpk/midp_vita_v02.24.vpk`，版本串 `J2ME Player v02.24 b365
+  (3d0e6f6)` 已验证。
+
+### 下一轮预期（v02.24 真机）
+- boot：precheck 应仍为 `CALLABLE (enum blind)`。
+- HANG 后 kernel_forensics.log 首次应出现：
+  `kubridge: present` + `SceKernelThreadmgr data @ 0x88xxxxxx` +
+  core0..3 ctx ptr + 双采样 cur_tid/计数。若 taiHEN 查询失败则退回
+  "threadmgr module not found"（说明 fw 偏移/权限另有问题）。
+- 拿到 per-core 双采样后，可对 VM 所在核判定：runqueue 空转？cur_tid
+  恒为 VM？idle 不走字？——定性"不可中断等待"的具体内核对象。
