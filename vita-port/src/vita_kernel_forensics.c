@@ -61,6 +61,13 @@
  * has actually succeeded through the module list. */
 extern int kuKernelCpuUnrestrictedMemcpy(void *dst, const void *src,
                                          unsigned int len);
+/* v02.23: the TERMINAL presence probe. kuPowerGetSysClockFrequency is
+ * a plain kubridge export - if the module is resident the call crosses
+ * the (weak) fstubs import and returns a sane clock (111/166/222/333/
+ * 444 MHz); if the import was never resolved it returns 0 or a machine
+ * error code. This needs NO module enumeration and NO file stat - it
+ * answers "is the code in kernel memory" in one call. */
+extern int kuPowerGetSysClockFrequency(void);
 
 #define KF_MAX_LINE 128
 
@@ -74,6 +81,35 @@ static int g_ku_ok = -1;             /* -1 unknown, 0 absent, 1 present */
 static int g_ku_enum_rc = 0;         /* last sceKernelGetModuleList rc  */
 static unsigned int g_ku_nmod = 0;   /* modules returned by that call   */
 static unsigned int g_ku_flag = 0;   /* which list flag produced them   */
+/* v02.23: direct-call probe result, cached (the call is cheap but we
+ * only ever want one line in the log). -1 = not run, else the raw
+ * return of kuPowerGetSysClockFrequency(). */
+static int g_ku_clock = -1;
+
+/* v02.23: why a WEAK import can coexist with "ABSENT" - the VitaSDK
+ * stub libraries emit GEN_WEAK_EXPORTS symbols, so an unresolved
+ * kubridge import does NOT block process start; the v02.21 inference
+ * "strong import + process boots => module resident" was WRONG and is
+ * formally retired here. The only decisive probe is CALLING one. */
+static int ku_clock_probe(void)
+{
+    if (g_ku_clock >= 0)
+        return g_ku_clock;
+    g_ku_clock = kuPowerGetSysClockFrequency();
+    return g_ku_clock;
+}
+
+/* v02.23: a kubridge.skprx rides INSIDE our own VPK (app0:), deployed
+ * by the installer to ux0:app/J2ME00001/. taiHEN never loads it (it
+ * only reads tai config.txt), but its presence makes the fix a single
+ * config.txt line away. Probed at boot so the log teaches the exact
+ * line to add. */
+static int ku_bundled_probe(void)
+{
+    SceIoStat st;
+    memset(&st, 0, sizeof(st));
+    return sceIoGetstat("app0:kubridge.skprx", &st) >= 0;
+}
 
 /* --------------------------------------------------------------- */
 /* kubridge presence: enumerate kernel modules, look for kubridge.  */
@@ -240,6 +276,14 @@ void vita_kf_dump(const char *path)
     n = snprintf(line, sizeof(line), "kubridge: %s\n",
                  ku_probe() ? "present" : "ABSENT (kernel probes skipped)");
     sceIoWrite(fd, line, n);
+    /* v02.23: direct-call probe runs FIRST - it works even when the
+     * module enum is blind, and its result outranks the enum verdict. */
+    {
+        int clk = ku_clock_probe();
+        n = snprintf(line, sizeof(line), "kuPowerGetSysClockFrequency: %d\n",
+                     clk);
+        sceIoWrite(fd, line, n);
+    }
     if (!ku_probe()) {
         /* v02.21: enum diagnostics - separates "no plugin" from
          * "plugin invisible to the userspace module list". v02.22 adds
@@ -248,6 +292,15 @@ void vita_kf_dump(const char *path)
                      "enum rc=%d flag=0x%02x nmod=%u\n",
                      g_ku_enum_rc, g_ku_flag, g_ku_nmod);
         sceIoWrite(fd, line, n);
+        /* v02.23: the skprx ships inside our own VPK; if it survived
+         * install, the fix is ONE config.txt line away - say so with
+         * the exact line instead of telling the user to hunt files. */
+        if (ku_bundled_probe()) {
+            kf_puts(fd, "fix: add to tai config.txt (*KERNEL section):\n"
+                        "  *KERNEL app0:kubridge.skprx\n"
+                        "  (or copy to ux0:tai/ and use "
+                        "*KERNEL ux0:tai/kubridge.skprx)\n");
+        }
         kf_puts(fd, "note: kubridge ABSENT - copy kubridge.skprx to ux0:tai/, "
                     "add '*KERNEL ux0:tai/kubridge.skprx' to config.txt\n");
         sceIoClose(fd);
@@ -329,6 +382,16 @@ const char *vita_kf_precheck(void)
     if (ku_probe())
         return "present";
 
+    /* v02.23: the enum says ABSENT, but the enum has been wrong before
+     * (v02.20 wrong flags, v02.21 wrong inference). The direct call is
+     * the tiebreaker: a sane clock (>= 41, the lowest Vita bus clock)
+     * means the module IS resident regardless of what the enum sees. */
+    {
+        int clk = ku_clock_probe();
+        if (clk >= 41)
+            return "CALLABLE (enum blind)";
+    }
+
     /* v02.21: the real-hardware v02.20 case. The process booted, so the
      * strong kubridge fstubs import RESOLVED at load time - the kernel
      * module IS resident; the enum just cannot see kernel modules from
@@ -390,9 +453,10 @@ void vita_kf_list_modules(const char *path)
     }
     memset(&st, 0, sizeof(st));
     n = snprintf(line, sizeof(line),
-                 "tai ux0:%d ur0:%d\n",
+                 "tai ux0:%d ur0:%d bundled(app0):%d\n",
                  sceIoGetstat("ux0:tai/kubridge.skprx", &st) >= 0,
-                 sceIoGetstat("ur0:tai/kubridge.skprx", &st) >= 0);
+                 sceIoGetstat("ur0:tai/kubridge.skprx", &st) >= 0,
+                 ku_bundled_probe());
     sceIoWrite(fd, line, n);
     kf_puts(fd, "===== end module table =====\n");
     sceIoClose(fd);

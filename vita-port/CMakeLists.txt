@@ -976,6 +976,20 @@ set(VITA_VERSION  "02.21")
 #   4th round running (site=interpreter_fast_method_entry_4, C stack
 #   =inflate/png decode; log43 _fseeko_r, log44 _vfprintf/__ssvfscanf).
 set(VITA_VERSION  "02.22")
+# 02.23 (2026-09-27): log46 verdict - kubridge really ABSENT.
+#   v02.22's module table settled it: flag 0x81 lists 15 modules incl.
+#   taiHEN-injected oclockvita/Framecounter (taiHEN itself works), but
+#   NO kubridge; sceIoGetstat finds kubridge.skprx on NEITHER tai dir.
+#   The v02.21 inference "strong fstubs import + process boots =>
+#   module resident" is RETIRED: VitaSDK stub libs emit GEN_WEAK_EXPORTS
+#   weak imports, which do not block process start when unresolved.
+#   v02.23: (a) kuPowerGetSysClockFrequency() DIRECT CALL at boot/HANG -
+#   one call answers "is the code in kernel" with a sane 111..444 clock,
+#   no enum, no stat; precheck gains a "CALLABLE (enum blind)" state.
+#   (b) the fix hint now points at the skprx BUNDLED in our own VPK
+#   (app0:kubridge.skprx): one config.txt line (*KERNEL
+#   app0:kubridge.skprx) loads it, no file hunting needed.
+set(VITA_VERSION  "02.23")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
