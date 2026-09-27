@@ -6092,3 +6092,62 @@ log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其�
 ### 遗留
 - cpu1 全零窗口成因待定（tone/wd 均 lastcpu=1 且活，非本问题阻塞项）。
 - VITA_DISP_REC 16x id=3 疑点；OS_linux.cpp.bak 清理（低优）。
+
+## 2026-09-27 log46（v02.22）— 判决：kubridge 真没装；冻结签名第 5 轮收敛 I/O 路径
+
+### 判决 1：kubridge 确实没有运行（三轮探测线终结）
+- **模块表实锤**：v02.22 `vita_kf_list_modules` 输出 flag 0x81 域 15 个模块，
+  含 taiHEN 注入的 oclockvita/vsh/Framecounter（证明 taiHEN 本身工作正常），
+  **唯独没有 kubridge**。
+- **文件探测**：`tai ux0:0 ur0:0` —— sceIoGetstat 在两个 tai 目录都找不到
+  kubridge.skprx。用户以为部署到了 ur0，实际文件不在。
+- **v02.21 推理正式作废**：「强符号导入 + 进程能启动 ⇒ kubridge 必在内核」
+  被推翻——VitaSDK stub 库生成 **GEN_WEAK_EXPORTS 弱导出**（vita-elf-create
+  对未解析导入不阻链接、不阻启动），进程照常启动与模块在否无关。
+- **修复路径比预想简单**：v02.18 起我们自己的 VPK 根就打包了 kubridge.skprx
+  （`vita-port/kernel/kubridge.skprx`，14820B，SCE 加密态，CMakeLists:1839），
+  随安装落在 `ux0:app/J2ME00001/kubridge.skprx`。taiHEN 只认 config.txt，
+  不扫 app0。用户侧只需在 `ur0:tai/config.txt`（或 ux0:tai/）加一行：
+  `*KERNEL app0:kubridge.skprx`（或把文件拷到 ux0:tai/ 再写
+  `*KERNEL ux0:tai/kubridge.skprx`），重启即生效——无需找文件。
+
+### 判决 2：第 5 轮冻结签名，仍收敛 stdio→sceIo
+- site ring frozen（seq=173989）：[0]=JVMObjectHeap::allocate、
+  [1]=Java_java_lang_Thread_start0；VM C 栈/寄存器段落 =
+  **png_image_read_and_map**（0x810cc5e4..0x810cd560 区间，libpng 经 stdio
+  FILE* 读图，audit png_read_image calls=5）。
+- 五轮签名链：log42 _fseeko_r → log43 _fseeko_r → log44 _vfprintf_r/
+  __ssvfscanf_r → log45 inflate/png → log46 png_image_read_and_map。
+  **主假设不变且增强：VM 线程的 sceIo* 内核路径不可中断阻塞。**
+- cpu1 计数三零在 log45/log46 两轮相同（与 VM 落点无关）→ cpu1 计数器
+  疑似天生不走字，log45 判决 B（线程级停摆，非整核死）维持，但该核计数
+  数据从此只作参考不作判据。
+- 旁观线程：Permissions.getGroupMessages/sha1_block（MIDP 安全初始化），
+  与主停摆无因果。
+
+### v02.23 改动（39bef65）
+1. `ku_clock_probe()`：直接调用 `kuPowerGetSysClockFrequency()`——模块真在
+   内核则返回 111/166/222/333/444 sane 值；不在则 0/错误码。绕过枚举与
+   stat 的一切盲区，终判探针。boot 与 HANG 两条路径都打
+   `kuPowerGetSysClockFrequency: <n>`。
+2. precheck 新态 `CALLABLE (enum blind)`：clk>=41 即返回，枚举盲区不再
+   影响判决。
+3. ABSENT 分支输出修复指引：探测到 `app0:kubridge.skprx`（VPK 自带）时
+   直接打印 config.txt 该加的那一行；`tai ux0:.. ur0:.. bundled(app0):..`
+   三态探测。
+4. CMakeLists 版本块 02.23 注释记录 log46 判决与 v02.21 推理作废。
+
+### 判读表（v02.23，用户修好部署后）
+- `kubridge precheck: present` → 模块表可见，HANG 后 kernel_forensics.log
+  直接出 threadmgr 内核读数（v02.18 链路自动激活）。
+- `CALLABLE (enum blind)` → 枚举盲但直调成功 → kf_read 正常走。
+- `ABSENT` + `kuPowerGetSysClockFrequency: 0` → 真没装，按日志里的
+  config.txt 指引修。
+- **注意：用户修好 kubridge 部署后无需等新版本——现有 v02.22/23 的
+  vita_kf_dump 在 HANG 时会自动做内核读数。**
+
+### 遗留
+- THREAD_REG_INFO 1888B 布局未破解（现用代码域扫描法绕过）。
+- cpu1 计数器歧义标注（见判决 2）。
+- 下一步候选：若 kubridge 修好后 threadmgr 读数到手，对照 VM 冻结时刻
+  的 cur_tid/runqueue 状态定性「不可中断等待」的具体内核对象。
