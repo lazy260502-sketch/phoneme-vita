@@ -372,6 +372,13 @@ int main(int argc, char *argv[]) {
         /* v02.22: full module table (flag domain x names) into
          * kernel_forensics.log at boot - one log answers visibility. */
         vita_kf_list_modules("ux0:/data/J2ME00001/kernel_forensics.log");
+        /* v02.25: resolve SceKernelThreadmgr's kernel data address
+         * NOW, on the main thread while the whole system is healthy.
+         * log48 proved the taiHEN cross-domain query blocks forever
+         * if issued from the HANG path (watchdog caught mid-syscall
+         * in the core dump); done here it is a plain fast call. The
+         * HANG path then only reads kernel memory via kubridge. */
+        vita_kf_boot_resolve();
     }
 
     vita_net_early_init();

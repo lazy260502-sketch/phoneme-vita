@@ -1002,6 +1002,19 @@ set(VITA_VERSION  "02.23")
 #   (module_get_by_name_nid + module_get_offset with KERNEL_PID 0x10005),
 #   which reads the kernel's OWN module table; enum kept as fallback.
 set(VITA_VERSION  "02.24")
+# 02.25 (2026-09-28): log48 verdict - the taiHEN cross-domain query
+#   (module_get_by_name_nid, KERNEL_PID) BLOCKS FOREVER when issued
+#   from the HANG path: the core dump caught the watchdog thread with
+#   r0-r3 = the exact call args, pc on the SVC veneer, and the result
+#   buffer still zeroed - the syscall never returned. v02.24's other
+#   half worked: "kubridge: present" + clock 190 finally printed, so
+#   the gate fix landed. Fix: resolve SceKernelThreadmgr's data
+#   address at BOOT (vita_kf_boot_resolve on the main thread, healthy
+#   system), cache it; the HANG path consumes the cache and issues
+#   ONLY kuKernelCpuUnrestrictedMemcpy reads from then on. Also: VM
+#   user-stack recovered from the core (0x81381000, 256K) - last
+#   frames are _svfprintf_r + jar-iterator + app0: path strings.
+set(VITA_VERSION  "02.25")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
