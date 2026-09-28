@@ -6270,3 +6270,57 @@ log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其�
 - 工作区 PROJECT_MEMORY.md 曾被回退成 9-18 旧版（v01.95 前，4168 行）
   ——`git checkout --` 从 a982426 恢复 6207 行版。怀疑是某编辑器/工具
   用旧缓冲覆盖。今后改文档前先 `git diff` 确认基线。
+
+## 2026-09-28 log49（v02.25）— 判决：v02.25 回归，开机即死（我的 bug）
+
+### 判决 1：闪退根因 = v02.25 的 boot 期 taiHEN 查询杀死了主线程
+- 现象：启动游戏秒退。crumb.log 两条 launcher start（用户点了两次），
+  两份 core dump 间隔 11 秒。进程里只有 main + SceCommonDialogWorker
+  两个线程——VM/watchdog 都还没创建，死在 boot 早期。
+- THREAD_REG_INFO 唯一真实条目：tid=0x40010003（主线程）、
+  pc=0x02a28948、cpsr=0x00010030（USR+Thumb）——**与 log48 watchdog
+  完全相同的 SVC veneer**；r0=0x10005(KERNEL_PID)、r2=0xFFFFFFFF
+  (IGNORE_NID)、r3=info 缓冲（内核未写回）——正是
+  module_get_by_name_nid 的实参。
+- **log48 归因被推翻**：不是"HANG 上下文才阻塞"，是这台机器上该
+  taiHEN syscall **任何上下文都不返回**。佐证：module 表脚注
+  `tai ux0:0 ur0:0 bundled(app0):1`——用户态 taiHEN 完全不存在，
+  veneer 指向的 syscall 门在这台 fw 上是黑洞。
+- 教训固化：**无法确认返回的 syscall 不进任何路径**；跨域查询在这台
+  机器上已死两次（log48 WD + log49 main），永不复用。
+
+### 判决 2：core 解析工艺更新（log49 顺带收获）
+- .psp2dmp 是 **gzip 压缩**的（log48 那份恰好存了未压版？）——先
+  `gunzip -c` 再解析；本次 /tmp 解压后 2870140B。
+- NOTE desc 偏移可能不按 4 对齐（log49 @0x15f3）——字段要从 0x15f4
+  起；THREAD_REG_INFO 头部还有 0x28 前导 + 条目 stride 0x178 不变，
+  但 log49 的条目 0 直接从 desc+4 开始且只有部分字段有效（其余
+  0xdeadbeef 填充 = 线程退出后的坟墓标记）。解析器要兼容两种布局。
+- THREAD_INFO（type 0x1003）可作线程清单交叉验证：log49 里只有
+  main（J2ME00001...）+ SceCommonDialogWorker 两条。
+
+### v02.26 修复（7981ca7，b369）：taiHEN Route 1 彻底退役
+- 删除 `kf_taihen_resolve()` 函数、`module_get_by_name_nid`/
+  `module_get_offset` extern 声明、KF_KERNEL_PID/KF_IGNORE_NID 宏、
+  CMakeLists 的 `taihenModuleUtils_stub` 链接——**零 taiHEN syscall**。
+- `vita_kf_boot_resolve()` 重写：纯用户态
+  `sceKernelGetModuleList/info` 枚举 + `kf_read`（ku memcpy）回读
+  自检（首字能读回才收），来源标记 `boot(enum+readback)`。
+- 预期：枚举在这台 fw 上仍盲（log46/47 已证），dump 会诚实打
+  `resolved at: none` + "threadmgr module not found"。threadmgr 数据
+  段地址改由**离线扫 core dump**（MODULE_INFO/SYSTEM_INFO2 段）获得，
+  下一版可把扫出的常量硬编进 cfg 作为 manual override。
+- 产物 `out/vpk/midp_vita_v02.26.vpk`，版本串
+  `J2ME Player v02.26 b369 (7981ca7)` 已验证。
+
+### 下一轮预期（v02.26 真机）
+1. **首要：游戏能再次启动**（v02.25 的闪退消失；boot_log 与 log49
+   同级别内容 + `kubridge precheck: CALLABLE (enum blind)`）。
+2. HANG 后 kernel_forensics.log：
+   `SceKernelThreadmgr data @ 0x00000000 (resolved at: none)` +
+   `threadmgr module not found - no kernel read`——这是诚实输出，
+   不是失败。
+3. 若要 threadmgr 四核读数：离线解 core 的 MODULE_INFO 段找
+   SceKernelThreadmgr 的内核基址（内核侧段表用户态枚举不可见，
+   但 core dump 的 MODULE_INFO 可能含内核模块）→ 下一版加
+   hardcode override 探针。
