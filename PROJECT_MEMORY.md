@@ -1,5 +1,5 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-26
+> Last Updated: 2026-09-28
 
 ## 2026-09-26 log40：**v02.15 判决 = NEITHER（预注册命中）——cpu1 内核调度器死亡，方向 A 穷尽；core dump 把死点钉死在"第一次切入 MIDlet Java 代码"的第 7 条指令**
 
@@ -6205,3 +6205,68 @@ log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其�
   "threadmgr module not found"（说明 fw 偏移/权限另有问题）。
 - 拿到 per-core 双采样后，可对 VM 所在核判定：runqueue 空转？cur_tid
   恒为 VM？idle 不走字？——定性"不可中断等待"的具体内核对象。
+
+## 2026-09-28 log48（v02.24）— 半程成功 + WD 死因抓个正着
+
+### 判决 1：v02.24 门控修复生效，但 taiHEN 查询在 HANG 路径永久阻塞
+- kernel_forensics.log 首次出现 `kubridge: present` +
+  `kuPowerGetSysClockFrequency: 190`——十二轮以来内核探针第一次真正跑
+  起来（此前十一轮全部 ABSENT 误报）。
+- 但日志到此中断：`SceKernelThreadmgr data @ ...` 一行没打。core dump
+  给出死因：**watchdog 永久阻塞在 module_get_by_name_nid 的 syscall 里**。
+  THREAD_REG_INFO WD 条目（布局见判决 2）：
+  - r0=0x10005(KERNEL_PID)、r2=0xFFFFFFFF(KF_IGNORE_NID)、
+    r3=0x81638b70（info 缓冲区）——正是该调用实参（r1 为
+    "SceKernelThreadmgr" 串指针，rodata 页不在 core）；
+  - pc=0x02a28948（SVC veneer）、lr=0x8105b55d（veneer 后返回地址）；
+  - **info 缓冲区 = 0x40 后全零**：我写的 size=64 在，内核从未写回。
+- 机理：taiHEN 桥在内核态拿内部锁后 copy 给用户；目标核卡死时锁不释
+  放，调用者不可中断睡眠。教训固化为规则：**跨域查询只能发生在系统
+  健康时（boot），HANG 路径只做纯 ku memcpy 读**（log48 证明后者在
+  HANG 上下文可正常返回——present/时钟两行就是那时写出的）。
+
+### 判决 2：THREAD_REG_INFO 布局完全破译（本轮最大工具性成果）
+- NOTE 段 `THREAD_REG_INFO`(type 0x1004)：头 0x28 + 6 条目，stride=0x178。
+  以 tid 字为 +0：r0..r12=+0x04..+0x30，sp=+0x34，lr=+0x38，pc=+0x3c，
+  cpsr=+0x40。
+- 验证：WD cpsr=0x00010030（USR+Thumb）、tone cpsr=0x40000010（USR+Z）。
+- **VM 用户栈就在 core 里**：LOAD 段 0x81381000+0x40000，与 watchdog
+  报的 stack=262144 精确吻合；VM 条目的 pc/lr 是堆区垃圾（抢占后寄存
+  器块未更新），但栈内容是真的。
+- VM 栈顶调用链（sp=0x813bfd88 起）：`_svfprintf_r+0x884` →
+  `_svfprintf_r+0x9fc`，帧内穿插 `midpIterateJarEntries+0xaf`、
+  `getFirstJarEntryInfo+0x7`、`png_read_transform_info+0x3c`、
+  `png_set_text_compression_window_bits+0x18` 与 app0: 路径串指针。
+- 结合第 7 轮 site ring（png_do_rgb_to_gray+0x668 /
+  png_image_read_colormap+0x13c）：**VM 冻结时在用户态做 PNG/JAR 的
+  stdio 格式化，不在任何 syscall 里**——被抢占后所在核停止调度再未
+  回来。VM 无辜（没陷进内核），核调度停摆是唯一凶手，边界再收一格。
+
+### 冻结形态（第 7 轮，签名收敛）
+- watchdog：VM cpu=2 runClocks d=0、KICK 五连无效（susp 0x80020008）、
+  ticker 活（d=49）——与前六轮完全一致。
+- sysinfo：cpu2（VM 所在核）三计数 d=0，其余三核全走——"停的核跟
+  VM 走"第 7 次复现。
+
+### v02.25 修复（24a9bd3）：查询挪 boot，HANG 路径只留纯读
+- 新增 `vita_kf_boot_resolve()`（vita_main.c boot 序列 precheck 后调
+  用）：健康上下文跑 taiHEN 查询 + enum 兜底，地址与来源
+  （"boot(taiHEN)"/"boot(enum)"/"none"）缓存进 `g_kf_tmgr_cache`/
+  `g_kf_resolved_at`（文件级，boot 写、HANG 读）。
+- `vita_kf_dump()`：只消费缓存；之后只发 ku memcpy 读。
+- 产物 `out/vpk/midp_vita_v02.25.vpk`，版本串
+  `J2ME Player v02.25 b367 (24a9bd3)` 已验证。
+
+### 下一轮预期（v02.25 真机）
+- HANG 后 kernel_forensics.log 应完整打出：
+  `SceKernelThreadmgr data @ 0x88xxxxxx (resolved at: boot(taiHEN))` +
+  sample1/sample2 双采样。resolved at: none → boot 查询也败（权限/
+  NID/segidx），改 ku 直扫 threadmgr。
+- 判读表：VM 核 cur_tid 恒=VM 且 idle 不走 → 核被 VM 独占不切出；
+  cur_tid=idle 但 switchN 不走 → 调度器死；其他核正常 → 只剩 VM 核
+  runqueue/上下文损坏。
+
+### 事故记录（流程）
+- 工作区 PROJECT_MEMORY.md 曾被回退成 9-18 旧版（v01.95 前，4168 行）
+  ——`git checkout --` 从 a982426 恢复 6207 行版。怀疑是某编辑器/工具
+  用旧缓冲覆盖。今后改文档前先 `git diff` 确认基线。
