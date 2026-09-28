@@ -102,17 +102,14 @@ static int ku_clock_probe(void)
 
 static int ku_probe(void); /* defined below the flag-matrix comment */
 
-/* v02.25: the taiHEN cross-domain query (module_get_by_name_nid with
- * KERNEL_PID) MUST NOT run in the HANG path. log48's core dump proved
- * it: the watchdog thread blocked FOREVER inside that syscall (saved
- * r0-r3 = the exact call arguments, pc = the SVC veneer, info buffer
- * still zeroed except our size word). taiHEN takes an internal lock
- * while copying results to user memory; with the target core wedged
- * that lock never gets released - the caller sleeps uninterruptibly.
- * The fix: resolve the threadmgr data address ONCE at BOOT (main
- * thread, normal context, everything alive) and cache it; the HANG
- * path then only issues kuKernelCpuUnrestrictedMemcpy reads. */
-static unsigned int kf_taihen_resolve(unsigned int *modid_out);
+/* v02.26: taiHEN cross-domain queries (module_get_by_name_nid with
+ * KERNEL_PID, module_get_offset) are RETIRED ENTIRELY. log48 caught
+ * the watchdog blocked forever inside that syscall; log49 caught the
+ * MAIN THREAD dying in the SAME SVC veneer at BOOT - twice, one dump
+ * per launch, game crashed at startup. On this console those
+ * syscalls simply never return, healthy system or not. The
+ * threadmgr address now comes from the userspace enum at boot,
+ * cross-validated with a ku memcpy read-back. */
 
 /* v02.25: shared threadmgr-address cache + provenance, written ONLY
  * at boot (kf_boot_cache), read by the HANG path. */
@@ -155,19 +152,10 @@ static int ku_bundled_probe(void)
     return sceIoGetstat("app0:kubridge.skprx", &st) >= 0;
 }
 
-/* v02.24: cross-domain module query via taiHEN itself. log47 proved
- * sceKernelGetModuleList is structurally blind to taiHEN-loaded kernel
- * plugins AND to system kernel modules from userspace - but taiHEN
- * exports taihenModuleUtils to USER mode with a pid argument, and
- * KERNEL_PID (0x10005) addresses the kernel's own module table. These
- * are weak stub imports: without taiHEN they return an error code and
- * we fall back to the (blind) enum. */
-#define KF_KERNEL_PID 0x10005
-#define KF_IGNORE_NID 0xFFFFFFFFu
-extern int module_get_by_name_nid(int pid, const char *name,
-                                  unsigned int nid, void *info);
-extern int module_get_offset(int pid, int modid, int segidx,
-                             unsigned int offset, uintptr_t *addr);
+/* v02.24-era taiHEN cross-domain imports (module_get_by_name_nid /
+ * module_get_offset, KERNEL_PID) were REMOVED in v02.26: log49
+ * core dumps caught the main thread dying inside that syscall at
+ * BOOT - it never returns on this console. Do not re-add. */
 
 /* --------------------------------------------------------------- */
 /* kubridge presence: enumerate kernel modules, look for kubridge.  */
@@ -282,49 +270,41 @@ static void kf_puts(SceUID fd, const char *s)
     if (l > 0) sceIoWrite(fd, s, l);
 }
 
-/* v02.25: kf_find_threadmgr routes. Route 1 (taiHEN cross-domain,
- * module_get_by_name_nid with KERNEL_PID + module_get_offset) is now
- * BOOT-ONLY: log48's core dump caught the watchdog blocked forever in
- * that very syscall (r0-r3 = call args, pc = SVC veneer, result buffer
- * untouched). vita_kf_boot_resolve() runs it once while the system is
- * healthy and caches the address here; the HANG path only reads this
- * cache and then uses plain kuKernelCpuUnrestrictedMemcpy reads.
- * Route 2 (userspace enum) is kept as the boot-time fallback for a
- * taiHEN-less console - it is blind to kernel modules on recent CFW
- * (log46/47) but harmless to TRY at boot. */
-/* v02.25: single shared cache for the threadmgr data address. Seeded
- * at BOOT by vita_kf_boot_resolve() (healthy system: taiHEN query is
- * safe there); the HANG path only reads it. g_kf_tried guards the
- * enum fallback so it also runs at most once (boot). Definitions
- * live at the top of the file (shared with kf_boot_cache). */
+/* v02.26: kf_find_threadmgr. The taiHEN cross-domain Route 1
+ * (module_get_by_name_nid with KERNEL_PID) is RETIRED - log48 caught
+ * the watchdog dying in that syscall, log49 caught the MAIN THREAD
+ * dying in it at boot (startup crash). The ONLY route left is the
+ * userspace enum: blind to kernel modules on log46/47-class firmware,
+ * so it will usually find nothing - the dump then says
+ * "resolved at: none". That is the honest answer on this console;
+ * the address hunt moves to an offline scan of the core dumps. */
+/* Single shared cache for the threadmgr data address. Seeded at BOOT
+ * by vita_kf_boot_resolve() (enum + ku read-back self-check); the
+ * HANG path only reads it. g_kf_tried guards the enum so it runs at
+ * most once. Definitions live at the top of the file (shared with
+ * kf_boot_cache). */
 static unsigned int kf_find_threadmgr(void)
 {
     SceUID uids[128];
     SceSize num = 128;
     int rc, i;
 
-    /* v02.25: single file-scope cache (g_kf_tmgr_cache), seeded at
-     * boot by kf_boot_cache(). The HANG path only READS it - no
-     * taiHEN syscall here (log48: it blocks forever), the enum below
-     * runs at most once as the boot-time fallback. */
+    /* v02.26: single file-scope cache (g_kf_tmgr_cache), seeded at
+     * boot by kf_boot_cache(). The HANG path only READS it - zero
+     * taiHEN syscalls anywhere (log48/49: they never return here),
+     * the enum below runs at most once as the boot-time route. */
     if (g_kf_tmgr_cache)
         return g_kf_tmgr_cache;
     if (g_kf_tried)
         return 0;
     g_kf_tried = 1;
 
-    /* Route 1 (v02.24, boot-only since v02.25): taiHEN cross-domain.
-     * info layout mirrors tai_module_info_t (taihen.h): size, modid,
-     * module_nid, name[27], exports/imports pointers. We only need
-     * modid, then ask for segment 1's base via module_get_offset.
-     * In the HANG path this route is reached only when the boot
-     * resolve produced nothing - the syscall below may then block
-     * (log48), so we do NOT issue it here anymore. */
-    {
-        unsigned int modid;
-        unsigned int addr = kf_taihen_resolve(&modid);
-        (void)modid; (void)addr; /* retired from the HANG path */
-    }
+    /* Route 1 (taiHEN cross-domain, v02.24) was RETIRED in v02.26:
+     * log49's core dumps caught the MAIN THREAD dying in that
+     * syscall at BOOT (same SVC veneer, same args as log48's
+     * watchdog). On this console it never returns in ANY context.
+     * The boot resolve is the userspace enum below + a ku read-back
+     * self-check. */
 
     /* Route 2: pre-v02.24 userspace enum (blind to kernel modules on
      * log46/47 firmware, kept as the taiHEN-less fallback). */
@@ -473,65 +453,31 @@ void vita_kf_dump(const char *path)
     kf_puts(fd, "===== end kernel forensics =====\n");
     sceIoClose(fd);
 }
-/* v02.25: BOOT-time resolution of the threadmgr data address. Runs on
- * the MAIN thread before the VM starts - every lock holder is alive,
- * so the taiHEN cross-domain query that blocked forever in log48's
- * HANG path completes here. Result cached into kf_find_threadmgr's
- * static; the HANG path then performs ku reads only. Called from the
- * launcher boot path right after vita_kf_precheck(). */
+/* v02.26: BOOT-time resolution of the threadmgr data address - now a
+ * PURE USERSPACE route. Runs on the MAIN thread before the VM starts:
+ * enum via sceKernelGetModuleList/info, then cross-validate the
+ * segments[1] candidate with a ku memcpy read-back (first word must
+ * come back non-garbage) before caching it. No taiHEN syscall is
+ * issued anywhere - log49 proved those never return on this console
+ * (boot crash, both dumps). Called right after vita_kf_precheck(). */
 void vita_kf_boot_resolve(void)
 {
-    unsigned int modid = 0;
     unsigned int addr;
 
-    /* consume the enum fallback too, so its "tried" flag is spent in
-     * the boot context rather than the HANG path */
-    addr = kf_find_threadmgr();   /* boot enum route (Route 2) */
-    (void)addr;
+    addr = kf_find_threadmgr();   /* userspace enum route */
 
-    addr = kf_taihen_resolve(&modid);
-
-    if (addr && kf_kaddr_plausible(addr)) {
-        kf_boot_cache(addr, "boot(taiHEN)");
-        return;
+    if (addr && ku_available()) {
+        /* read-back self-check: can kubridge actually fetch from this
+         * address? If not, the enum gave us a bad guess - drop it so
+         * the HANG dump says "resolved at: none" instead of feeding
+         * garbage offsets to the kernel copier. */
+        unsigned int probe = 0;
+        if (kf_read(&probe, addr, sizeof(probe)) != 0)
+            addr = 0;
     }
-    /* taiHEN missing or query failed: kf_find_threadmgr's enum route
-     * above already ran; cache whatever it found (usually nothing on
-     * log46/47-class firmware - the dump then says "resolved at:
-     * none" instead of hanging the watchdog). */
-    kf_boot_cache(g_kf_tmgr_cache ? g_kf_tmgr_cache : 0,
-                  g_kf_tmgr_cache ? "boot(enum)" : "none");
+
+    kf_boot_cache(addr, addr ? "boot(enum+readback)" : "none");
 }
-
-/* v02.25: the actual taiHEN query, factored out so BOTH call sites
- * (boot resolve, and the retired HANG-path route) share one body.
- * Returns the threadmgr DATA segment base, 0 on failure; modid_out
- * (optional) receives the module id for the log. */
-static unsigned int kf_taihen_resolve(unsigned int *modid_out)
-{
-    unsigned char info[64];
-    uintptr_t addr = 0;
-    int modid;
-
-    memset(info, 0, sizeof(info));
-    *(size_t *)info = sizeof(info);
-    if (module_get_by_name_nid(KF_KERNEL_PID, "SceKernelThreadmgr",
-                               KF_IGNORE_NID, info) < 0)
-        return 0;
-    modid = *(int *)(info + sizeof(size_t));
-    if (modid_out)
-        *modid_out = (unsigned int)modid;
-    if (modid <= 0)
-        return 0;
-    if (module_get_offset(KF_KERNEL_PID, modid, 1, 0, &addr) < 0)
-        return 0;
-    return (unsigned int)addr;
-}
-
-/* v02.25: boot cache handoff. kf_find_threadmgr's statics live in the
- * HANG path; this writer runs at boot. "where" is logged so the dump
- * tells WHICH route produced the address (taiHEN boot / enum boot /
- * HANG-time fallback). */
 /* v02.20: boot-time probe. Runs sceKernelGetModuleList(0x00) on the
  * MAIN thread at launcher start, so a round's kubridge visibility is
  * recorded in boot_log.txt even if the HANG path never fires. Same

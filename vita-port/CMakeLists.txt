@@ -1015,6 +1015,18 @@ set(VITA_VERSION  "02.24")
 #   user-stack recovered from the core (0x81381000, 256K) - last
 #   frames are _svfprintf_r + jar-iterator + app0: path strings.
 set(VITA_VERSION  "02.25")
+# 02.26 (2026-09-28): log49 verdict - REGRESSION, game crashed AT
+#   STARTUP. Both core dumps catch the MAIN thread (tid 0x40010003,
+#   only main + SceCommonDialogWorker exist) dying on the SAME SVC
+#   veneer as log48's watchdog, with module_get_by_name_nid's exact
+#   args - i.e. v02.25's vita_kf_boot_resolve() killed the app at
+#   boot. My log48 theory ("the query only blocks in the HANG
+#   context") was WRONG: on this console that taiHEN syscall never
+#   returns in ANY context (tai ux0:0 ur0:0 - no user taiHEN at all).
+#   Fix: retire the taiHEN route ENTIRELY (imports removed from the
+#   link); threadmgr address = boot-time userspace enum + ku memcpy
+#   read-back self-check, HANG path reads the cache as before.
+set(VITA_VERSION  "02.26")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
@@ -1795,12 +1807,10 @@ target_link_libraries(${PROJECT_NAME}
     # kubridge plugin is actually loaded - on a console without it the
     # probe degrades to a log line instead of a fatal syscall trap.
     kubridge_stub
-    # v02.24: cross-domain module query (module_get_by_name_nid /
-    # module_get_offset with KERNEL_PID) - the userspace module enum is
-    # structurally blind to kernel modules (log46/47), so the threadmgr
-    # lookup goes through taiHEN's own kernel module table. Weak stub:
-    # without taiHEN the calls return an error and the probe degrades.
-    taihenModuleUtils_stub
+    # v02.26: taihenModuleUtils_stub (module_get_by_name_nid /
+    # module_get_offset) REMOVED - log49 proved those syscalls never
+    # return on this console: the main thread died on the SVC veneer
+    # at boot, game crashed at startup. Do not re-link this stub.
     m
 )
 
