@@ -6324,3 +6324,109 @@ log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其�
    SceKernelThreadmgr 的内核基址（内核侧段表用户态枚举不可见，
    但 core dump 的 MODULE_INFO 可能含内核模块）→ 下一版加
    hardcode override 探针。
+
+## 2026-09-28 log50（v02.26）— 判决：离线内核取证全面判死 + THREAD_REG_INFO pc 伪影实锤（log48/50 死点判决撤回）
+
+### 判决 0：v02.26 双修复确认生效
+- 启动恢复（log49 闪退消失）：boot_log 完整、vm cpu unpinned (mask=0)、
+  kubridge CALLABLE、running com.app.filemanager.FileManagerMIDlet
+  (games/app (1)/game.jar)、RMS appdb_6B15、jit cfg=0 policy=0（纯解释器）。
+- 探针存活：HANG ce=387；watchdog 顺利走到 data abort 触发 core dump。
+- HANG 后 kernel_forensics.log：kubridge present、clock 190（log47/48/50
+  三轮恒定）、`threadmgr resolved at none`——与 v02.26 预期 2 完全一致
+  （诚实输出，枚举在这台 fw 上盲）。
+
+### 判决 1：core dump 里没有内核——离线内核取证三路全灭（本方向终结）
+- **SYSTEM_INFO2（4.1MB）判死**：99% 零填充，仅头 32KB + 尾 4KB 非零；
+  头部以 `46000000 43454341`（"SECA" 魔数）开头，之后高熵——内核侧
+  dump 数据被加密，无字符串可读。搜 SceKernelThreadmgr 零命中。
+- **12 个 0xe0xxxxxx LOAD 段判死**：全是用户态系统模块的进程内映射
+  （SceCommonDialogWorker 的 entry/栈 0xd0001000 均在其中），含
+  SceThreadmgr 等字符串只是系统模块的导入表字符串。非内核内存。
+- **MODULE_INFO（17 模块）判死**：全部是用户态模块（midp_vita 基址
+  0x81029000 大小 0x2c9108、SceLibKernel、SceCommonDialog、oclockvita
+  超频插件、Framecounter 等）——v02.26 预期 3（离线 MODULE_INFO 找
+  threadmgr 内核基址→硬编 override）判死，**不要做**。
+- 结论：psp2core dump 的用户态视图完整（线程/寄存器/用户栈/模块），
+  但内核侧是加密黑盒。threadmgr 内核直读这条线**离线在线均死**，
+  后续任何版本不要再投入。
+
+### 判决 2（重大修正）：THREAD_REG_INFO 的 pc 是伪影——log48/log50
+"VM 死在 png_write_sPLT 的 mla"判决撤回
+- 撤回证据链（五重独立证据）：
+  1. **png 写路径是死代码**：我们源码（vita-port/midp-vita 全覆盖
+     grep）零调用 png write；objdump 全量 bl 调用者搜索：
+     png_write_info←png_image_write_main/png_write_png，而
+     png_image_write_main/png_write_png/png_image_begin_write/
+     png_write_to_memory/png_write_to_stdio 最外层全部 **0 调用者**
+     ——libpng 写路径整链不可达（链接进去但从未被调）。
+  2. **cpsr 与指令集矛盾**：VM 条目 cpsr=0x60070010——T 位(bit5)=0
+     （ARM 态）、mode=0x10（USR），但 pc=0x810e78f4 处是 Thumb-2
+     指令（`fb08 3306` = mla.w）。ARM 态执行 Thumb 代码不可能成立。
+  3. **健康线程 pc 同样落死点**：tone/ticker（全系统最健康：delay
+     循环、loops 计数在涨、runClocks 在走）的 pc 均为 0x81131418
+     ——该地址不在 .text（.text=0x81000040..0x81107e84），落在
+     .rodata 的 `_rom_text_block` 区（**ROM 化的 Java 类数据**）。
+     健康线程不可能执行 rodata——dumper 的 pc 字段是错的。
+  4. **BL 校验栈回溯 0/77**：VM 用户栈扫描 77 个 midp 范围候选字，
+     无一前一条指令是 bl/blx——栈内无有效返回地址，与 pc 同源
+     伪影（dumper 抓的是陈旧/错误槽位的上下文）。
+  5. **log48(v02.24) 与 log50(v02.26) 两次独立 HANG 的 VM pc/sp
+     完全相同**（0x810e78f4/0x813bfd88）——两次独立停摆停在同一
+     指令的概率趋零；更像 dumper 每次都从同一个错误槽位读出同一
+     套陈旧值。版本匹配已排除符号漂移（符号基准 = v02.26 b369
+     (7981ca7) = log50 运行版本）。
+- 保留的可信证据（不受伪影影响）：
+  - r0=0x81eddfb4 = site_ring nrt cell 的 JavaThread obj、r8=
+    0x811b49e4 = jsp+16——寄存器与 site_ring Java 状态互恰，说明
+    dumper 抓的**寄存器组部分真部分假**（数据真、定位错）。
+  - WD 自身 pc=0x81037b40=copy_imageregion+5 是真的（它就是
+    faulting 线程，dumper 对 faulting 线程抓真上下文；0x400100bf/
+    CDW 的 0xe0013cb4 delay sleep 也合理）。
+  - site_ring 的 Java 栈顶（png_do_write_transformations 等）同理
+    降级为不可信——那是从 VM 栈槽读出的陈旧栈残留，非真实调用链
+    （0x810e5dfc objdump 确实在 png_do_write_transformations+0xa44
+    内，但该函数属死代码链，栈残留的来源不明）。
+- 修正后的定性结论（不变的事实层）：cpu0 idle/idleN/switchN 三计数
+  冻结而其他三核推进 + VM 账本 RUNNING/wait=none/cpu=0/runClocks 冻结
+  + KICK0-5 全无效 + Vita3K 不复现——"cpu0 调度死/VM 被困"定性不变，
+  **只是"死在哪条指令"永远无法从 core 得知**（内核侧加密 + 寄存器
+  pc 伪影）。THREAD_REG_INFO 除 faulting 线程外只可信 tid/名字/栈
+  范围/delay/prio/affinity 等静态字段，pc/sp/寄存器一律存疑。
+- 教训固化：**非 faulting 线程的"冻结上下文"不可作为死点证据**；
+  这台机器的 dumper 对非 faulting 线程抓的 pc/sp 是坏的（可能来自
+  线程结构陈旧槽位或 dump 时刻核上下文不可用）。log48 节
+  "判决 2：THREAD_REG_INFO 布局完全破译"中的偏移表保留（结构对），
+  但其中关于 VM 死点的引申全部作废。
+
+### 判决 3：q5 CYCLE(3) = 正常环标记（调度器损坏假说排除）
+- site_ring `q5: t0x81eddfb4(id=4) t0x81eb700c(id=1) t0x81edc2ec(id=3)
+  CYCLE(3)` 是 v02.11 修复的 dump 环走完标记（Scheduler.cpp:2850：
+  循环单链表走 3 步回到头 = 3 元素正常环）。**不是链表损坏**。
+- q5 里 id=4（VM 主 Java 线程）、id=1、id=3 三个 green 线程正常
+  runnable 排队——green 调度器队列完好，等的是 native VM 线程恢复，
+  与"VM native 线程被困 cpu0"自洽。
+
+### 冻结形态（第 8 轮，签名继续收敛）
+- watchdog：VM verdict "exec=0 tick=1 -> ticker RUNS, VM NOT EXECUTING"；
+  vm status=RUNNING wait=none cpu=0 runClocks d=0；tone d=2029、
+  wd d=1675（仪器健康）；KICK0 signal rc=0 但无效、KICK1/2 aff 迁移
+  无实效、KICK5 0x80020008；cpu0 三计数冻结、cpu1/2/3 正常推进。
+- 与前七轮一致：停的核跟 VM 走（本轮 cpu0 = VM unpinned 后所在核）。
+
+### 遗留与下一步方向（v02.27 讨论）
+- 已终结的方向（不要再投入）：①离线内核取证（SYSTEM_INFO2 加密/
+  无内核 LOAD 段/MODULE_INFO 无内核模块）；②taiHEN 跨域查询
+  （log48/49 双杀）；③钉核实验（log37-40 四连判死）；④Vita3K
+  复现（不复现）；⑤以 core 寄存器 pc 为锚的任何推理（伪影）。
+- 存活的事实基座：cpu0 停摆 + VM 困于该核 + green 队列正常 +
+  WD/tone/ticker 健康 + KICK 全无效（signal/aff/prio/suspend）。
+- 候选方向（下轮与用户讨论，未定）：
+  A. **规避类**：接受"某游戏/某操作触发"的偶发性，WD HANG 自愈
+     尝试（如检测到冻结后主动 sceKernelExitDeleteThread 重建 VM？
+     代价大）或超时自杀重启进程（保用户体验）。
+  B. **扩大采样**：WD 双采样间隔从 200ms 提到更大窗口/多轮采样，
+     或在 sysinfo 冻结确认后追加一轮"冻结时长"计量，确认停摆是
+     永久还是超长暂停。
+  C. **用户侧复现条件聚焦**：13 轮 HANG 的游戏/操作分布统计，
+     从"什么触发"侧收敛（需用户提供更多轮次记录或回放习惯）。
