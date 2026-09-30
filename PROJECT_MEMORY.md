@@ -6716,3 +6716,81 @@ trace_ring.log VM 槽（thread id=VM 线程）：
   `__real_` 引用 ✓
 - 产物：`out/vpk/midp_vita_v02.29.vpk` + `.sym`
 - commit：vita-port bd6d988
+
+---
+
+## log52 判决：D 假说胜出——绿线程切换桩死点（2026-09-30）
+
+### 判别器结果：B 拒绝
+
+- **VM 槽（tid 40010003）仍 EVEN**：`io_pwrite (returned)`，12 个新 wrap 已生效
+  计数（VM 线程 io_lseek32=2341、io_getstat_byfd=29 只可能来自 v02.29 新计数器）
+  但无一 ODD → **B 假说（未 wrap syscall 内核楔死）被拒绝**。
+- 二进制身份：b376=98be58b（第 376 个 commit，PM log51 节），构建于 v02.29
+  代码生效后；版本串 `v02.29 b376 (98be58b)` 自证。
+- **VM 迁到 cpu0**（log51 在 cpu1）——**冻结核心跟着 VM 线程走**（watchdog
+  sysinfo cpu0 idle/idleN/switchN 三计数器冻结，cpu1/2/3 活跃）。VM aff=
+  0x70000（3 核）但被调度到 cpu0 后不再切换。cpu0 switchN 冻结与"VM 是该核
+  唯一可跑线程且不再发生上下文切换"自洽。
+- KICK5 susp/res rc=0x80020008 = SCE_KERNEL_ERROR_ILLEGAL_PERMISSION：真机
+  上 self-suspend 不允许（Vita3K 允许故 log23 能用）。非新事实，仅确认边界。
+
+### 死点指令级定案（site ring + coredump 双源闭合）
+
+- **site ring**（slide=+0x7D000，由 self=0x810d5d00−sym(vita_site_dump)
+  0x81058d00 与 mark 双路一致求出）：[0]=switch_thread, [1..14]=
+  pump_events_vita，seq 冻结。与 log51（slide=+0x35000）[1] 同为
+  pump_events_vita → **两份独立 HANG 同死点**。
+- **coredump**（真机 psp2dmp，解析器 `--slide 0x7d000`）：VM 线程
+  **PC=start_lightweight_thread_asm+0x18（0x810c204c）**，LR=同函数+0x0，
+  **fp=0、r1(pending)=NULL、r0=Thread obj 0x81eddfb4**，
+  SP=0x8167fd88 落在 VM 栈（256KB PT_LOAD 顶）。
+- **指令语义**：PC 处是 `bleq invoke_pending_entries`——switch_thread 派发
+  新线程时把 PC 打到桩入口（lr=桩+0x0），桩从 Thread obj 加载 pending_entry
+  发现为 NULL，**"派发即死"：线程被指派了执行权却从未开始执行**。
+- **栈回溯只剩 `JVM::start+0x18c → JVM_Start+0xa4 → midp_run_midlet_...
+  with_args_cp+0x95c`** = log21 定案的"切到 primordial 栈后没回来"同型。
+- r0 = 0x81eddfb4 与 site_ring `threads(active-list)` 的 `t0x81eddfb4 id=4
+  st=00000000 wait=0x00000000 timed` 同一对象 → PC 捕获的是**id=4 线程**
+  （"timed" = 最后一次状态转换是 timed wait，但内核视角 RUNNING）。
+- 指令序列 `ldr r1,[r0,#104]; tst r1,#0x40000000; strne r2,[r0,#36];
+  bleq invoke_pending_entries`：pending_entry 为 NULL 时把 [r0+36] 清零
+  （清 JUST_BORN 标志）后尾跳 invoke_pending_entries，尾跳后 PC 会指向
+  invoke_pending_entries 而非桩+0x18 —— PC 停在 bleq 本身说明**停在条件
+  执行判断处 = 等待/重执行该分支**。结合 fp=0（fp 已被清）与 threads 表
+  id=4 "timed"，这**不是 log21 的"从未开始执行"，而是"已在桩内推进到
+  JUST_BORN 清除分支"——一个已出生、已派发、卡在出生处理分支的线程**。
+- r0 在所有 4 个 dump 线程槽一致（dump 是 sceKernelGetThreadInfo 的用户态
+  枚举，r0 为 dump 时刻值，不影响判决）。
+
+### 判决
+
+**log52 = D 假说胜出**：死点不在任何 syscall 内（52 个 wrap 无一 ODD），
+死点在绿线程切换桩 `start_lightweight_thread_asm` 的 JUST_BORN 处理分支
+（`+0x18`，即清 JUST_BORN 后尾跳 invoke_pending_entries 之前）。
+
+**v02.30 方向（按优先级）**：
+1. **在线程结构上加死点可见性**：vita_site_mark 插到 switch_thread 的
+   JUST_BORN 分支内 + start_lightweight_thread_asm 桩内无法插（asm），
+   但 Scheduler::switch_thread 的 JUST_BORN 分支（L2264 附近）可插 mark，
+   下次 HANG 若 ring 冻结在该 mark → 直接命名死点函数。
+2. switch mark 后窗口的反汇编审查：switch_thread L2206 mark 之后到
+   switch_thread_master_mode 之间的无覆盖区间。
+3. (远期) 用 thread id=4 的 Thread obj 字段读取（via coredump PT_LOAD
+   0x814018d0 覆盖判断）尝试反推 wait 渠道。
+
+### 危险信号（本次新发现）
+
+- **VM 不再绑定核心**：log51 cpu1 → log52 cpu0。冻结跟着 VM 走 → 问题在
+  VM 线程自身（自旋/死循环），不是某个特定核心的外围问题。**oclockvita
+  模块在 module 表中**（190MHz 时钟）——若它是 CPU 超频插件，超频状态下
+  不稳定性的可能性上升；若用户撤掉 oclockvita 后 HANG 消失，则高度指向
+  硬件级不稳定。建议控制变量测试。
+- **两份真机 log 的 slide 不同**（log51=+0x35000、log52=+0x7D000）——每次
+  启动 ASLR slide 都不同，绝不能跨 dump 复用（已知教训重申）。
+
+### 文件与版本对应
+
+- log52 = v02.29 b376 (98be58b)，对应符号归档 `out/vpk/midp_vita_v02.29.sym`
+- 解析：`parse_psp2dmp.py --elf .../midp_vita_v02.29.sym --slide 0x7d000`
+- 二进制身份验证：版本串 + b376=git rev-list count of 98be58b
