@@ -1050,6 +1050,20 @@ set(VITA_VERSION  "02.27")
 # their per-thread counters expose lock/unlock imbalance = WHO holds
 # the thing the VM thread is stuck on.
 set(VITA_VERSION  "02.28")
+# 02.29 (2026-09-30): log51 verdict follow-up - close the EVEN-slot
+# holes. log51: VM slot ended io_pwrite RETURNED (not inside any
+# traced syscall) yet the thread shows TCB=RUNNING wait=none with
+# runClocks d=0 and its core's idle/idleN/switchN all frozen. Two
+# hypotheses remain: (B) wedge inside a syscall the v02.27/28 set
+# never traced - head suspect newlib fsync -> sceIoSyncByFd, the
+# natural call right after pwrite - or (D) a spin no wrapper sees.
+# v02.29 wraps the remaining blocking-capable surface (12 symbols,
+# census-verified): IO SyncByFd/Lseek32/Rename/Rmdir/Chstat/
+# ChstatByFd/GetstatByFd/Devctl, AudioOutOutput, NetEpollWait,
+# ExitDeleteThread/ExitProcess. Next HANG discriminates directly:
+# slot ODD on one of these = B wins (deadpoint named); still EVEN =
+# D (deadpoint outside every syscall wrapper, i.e. userland native).
+set(VITA_VERSION  "02.29")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
@@ -1834,6 +1848,31 @@ target_link_libraries(${PROJECT_NAME}
     -Wl,--wrap=sceKernelSendMsgPipe
     -Wl,--wrap=sceKernelReceiveMsgPipe
     -Wl,--wrap=sceKernelDelayThreadCB
+    # v02.29: close the EVEN-slot holes (log51 verdict). The VM slot
+    # ended io_pwrite RETURNED, so the deadpoint is either inside a
+    # syscall the v02.27/28 set never traced (head suspect: newlib's
+    # fsync -> sceIoSyncByFd, the natural next call after a write) or
+    # beyond every wrapper. Census of the v02.28 ELF: SyncByFd 1,
+    # Lseek32 1, Rename 5, Rmdir 5, Chstat 2, ChstatByFd 2,
+    # GetstatByFd 3, Devctl 1, AudioOutOutput 9, NetEpollWait 1,
+    # ExitDeleteThread 1, ExitProcess 1 direct blx sites each (all
+    # bind __real_ through the fstubs table, same proven route as
+    # v02.27/28). sceKernelExitThread excluded: zero direct sites -
+    # every call goes via the __sceKernelExitThread_from_thumb local
+    # veneer, which --wrap cannot redirect. Exit-family slots stay
+    # ODD on success by design: a live process cannot have returned.
+    -Wl,--wrap=sceIoSyncByFd
+    -Wl,--wrap=sceIoLseek32
+    -Wl,--wrap=sceIoRename
+    -Wl,--wrap=sceIoRmdir
+    -Wl,--wrap=sceIoChstat
+    -Wl,--wrap=sceIoChstatByFd
+    -Wl,--wrap=sceIoGetstatByFd
+    -Wl,--wrap=sceIoDevctl
+    -Wl,--wrap=sceAudioOutOutput
+    -Wl,--wrap=sceNetEpollWait
+    -Wl,--wrap=sceKernelExitDeleteThread
+    -Wl,--wrap=sceKernelExitProcess
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm

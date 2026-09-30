@@ -59,6 +59,8 @@
 #include <psp2/display.h>
 #include <psp2/ctrl.h>
 #include <psp2/touch.h>
+#include <psp2/audioout.h>   /* v02.29: sceAudioOutOutput          */
+#include <psp2/net/net.h>    /* v02.29: SceNetEpollEvent           */
 
 #include "vita_trace.h"
 
@@ -100,7 +102,11 @@ static const char *const g_opname[TRACE_OP_N] = {
     "evtflag_poll", "evtflag_set", "evtflag_clear",
     "cond_signal", "signal_send", "thread_end_wait",
     "msgpipe_send", "msgpipe_recv", "delay_cb",
-    "thread_sleep"
+    "thread_sleep",
+    /* v02.29 */
+    "io_syncbyfd", "io_lseek32", "io_rename", "io_rmdir",
+    "io_chstat", "io_chstat_byfd", "io_getstat_byfd", "io_devctl",
+    "audio_out", "net_epoll_wait", "thread_exitdel", "process_exit"
 };
 
 /* ---- lazy registration ------------------------------------------- */
@@ -687,4 +693,138 @@ int __wrap_sceKernelDelayThreadCB(SceUInt usec)
     r = __real_sceKernelDelayThreadCB(usec);
     vita_trace_exit();
     return r;
+}
+
+/* ------------------------------------------------------------------
+ * v02.29: close the EVEN-slot holes (log51 verdict follow-up).
+ * VM slot ended io_pwrite RETURNED; the untraced syscall set still
+ * contained blocking candidates reachable right after a write -
+ * sceIoSyncByFd (newlib fsync) above all. If the next HANG shows the
+ * VM slot ODD on one of these, hypothesis B (wedge inside an
+ * untraced syscall) wins; still EVEN => hypothesis D (scheduler-side
+ * spin after the last switch mark) or a userland native loop no
+ * wrapper sees. Exit-family calls never return on success - their
+ * slots stay ODD forever, which is CORRECT evidence (a still-alive
+ * process cannot have exited), and their arg is the exit status.
+ * ------------------------------------------------------------------ */
+
+extern int __real_sceIoSyncByFd(SceUID, int);
+int __wrap_sceIoSyncByFd(SceUID fd, int flag)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_IO_SYNCBYFD, (unsigned int)fd);
+    r = __real_sceIoSyncByFd(fd, flag);
+    vita_trace_exit();
+    return r;
+}
+
+extern long __real_sceIoLseek32(SceUID, long, int);
+long __wrap_sceIoLseek32(SceUID fd, long offset, int whence)
+{
+    long r;
+    vita_trace_enter(TRACE_OP_IO_LSEEK32, (unsigned int)fd);
+    r = __real_sceIoLseek32(fd, offset, whence);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceIoRename(const char *, const char *);
+int __wrap_sceIoRename(const char *oldname, const char *newname)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_IO_RENAME, (unsigned int)oldname);
+    r = __real_sceIoRename(oldname, newname);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceIoRmdir(const char *);
+int __wrap_sceIoRmdir(const char *path)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_IO_RMDIR, (unsigned int)path);
+    r = __real_sceIoRmdir(path);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceIoChstat(const char *, SceIoStat *, int);
+int __wrap_sceIoChstat(const char *file, SceIoStat *stat, int bits)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_IO_CHSTAT, (unsigned int)file);
+    r = __real_sceIoChstat(file, stat, bits);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceIoChstatByFd(SceUID, const SceIoStat *, unsigned int);
+int __wrap_sceIoChstatByFd(SceUID fd, const SceIoStat *buf,
+                           unsigned int cbit)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_IO_CHSTAT_BYFD, (unsigned int)fd);
+    r = __real_sceIoChstatByFd(fd, buf, cbit);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceIoGetstatByFd(SceUID, SceIoStat *);
+int __wrap_sceIoGetstatByFd(SceUID fd, SceIoStat *stat)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_IO_GETSTAT_BYFD, (unsigned int)fd);
+    r = __real_sceIoGetstatByFd(fd, stat);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceIoDevctl(const char *, int, void *, int, void *, int);
+int __wrap_sceIoDevctl(const char *dev, int cmd, void *indata,
+                       int inlen, void *outdata, int outlen)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_IO_DEVCTL, (unsigned int)dev);
+    r = __real_sceIoDevctl(dev, cmd, indata, inlen, outdata, outlen);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceAudioOutOutput(int, const void *);
+int __wrap_sceAudioOutOutput(int port, const void *buf)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_AUDIO_OUT, (unsigned int)port);
+    r = __real_sceAudioOutOutput(port, buf);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceNetEpollWait(int, SceNetEpollEvent *, int, int);
+int __wrap_sceNetEpollWait(int eid, SceNetEpollEvent *events,
+                           int maxevents, int timeout)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_NET_EPOLL_WAIT, (unsigned int)eid);
+    r = __real_sceNetEpollWait(eid, events, maxevents, timeout);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelExitDeleteThread(int);
+int __wrap_sceKernelExitDeleteThread(int status)
+{
+    vita_trace_enter(TRACE_OP_THREAD_EXITDEL, (unsigned int)status);
+    __real_sceKernelExitDeleteThread(status);
+    vita_trace_exit(); /* not reached on success; slot stays ODD */
+    return 0;
+}
+
+extern int __real_sceKernelExitProcess(int);
+int __wrap_sceKernelExitProcess(int res)
+{
+    vita_trace_enter(TRACE_OP_PROCESS_EXIT, (unsigned int)res);
+    __real_sceKernelExitProcess(res);
+    vita_trace_exit(); /* not reached on success; slot stays ODD */
+    return 0;
 }

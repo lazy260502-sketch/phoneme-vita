@@ -58,6 +58,32 @@ enum {
     TRACE_OP_MSGPIPE_RECV,
     TRACE_OP_DELAY_CB,
     TRACE_OP_THREAD_SLEEP,
+    /* v02.29: close the EVEN-slot holes. log51 verdict left two
+     * candidates: (B) VM wedged inside a syscall the v02.27/28 set
+     * never traced, or (D) scheduler spin after the last switch_thread
+     * mark. The VM slot's final traced call was io_pwrite RETURNED,
+     * and the very next natural call for a file manager after writing
+     * is fsync() -> sceIoSyncByFd - untraced until now. Census of the
+     * v02.28 ELF (blx sites): SyncByFd 1, Lseek32 1, Rename 5, Rmdir
+     * 5, Chstat 2, ChstatByFd 2, GetstatByFd 3, Devctl 1,
+     * AudioOutOutput 9, NetEpollWait 1, ExitDeleteThread 1,
+     * ExitProcess 1. sceKernelExitThread has ZERO direct sites (all
+     * calls go through the __sceKernelExitThread_from_thumb local
+     * veneer, which --wrap cannot redirect) - excluded. The _-prefixed
+     * stub-only family (_sceIoChstat etc) binds __real_ to the plain
+     * fstubs table entry, same proven mechanism as v02.27. */
+    TRACE_OP_IO_SYNCBYFD,
+    TRACE_OP_IO_LSEEK32,
+    TRACE_OP_IO_RENAME,
+    TRACE_OP_IO_RMDIR,
+    TRACE_OP_IO_CHSTAT,
+    TRACE_OP_IO_CHSTAT_BYFD,
+    TRACE_OP_IO_GETSTAT_BYFD,
+    TRACE_OP_IO_DEVCTL,
+    TRACE_OP_AUDIO_OUT,
+    TRACE_OP_NET_EPOLL_WAIT,
+    TRACE_OP_THREAD_EXITDEL,
+    TRACE_OP_PROCESS_EXIT,
     TRACE_OP_N
 };
 
