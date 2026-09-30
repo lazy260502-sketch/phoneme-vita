@@ -6650,3 +6650,69 @@ switch_thread 内部把当前线程 park 后无人唤醒。
 2. switch_thread 后窗口加密 mark：VITA_DISP_REC 之后、目标线程 resume 处各加 mark
 3. HANG 时枚举全部线程运行状态（sceKernelGetThreadInfo 每 tid 的 status 字段），
    直接看 VM 线程是 RUNNING/READY/WAIT/SUSPENDED 哪个——把"不再被调度"变成可观测
+
+---
+
+## v02.29 补洞 wrap（2026-09-30，vita-port bd6d988）
+
+### 动机：log51 判决的 B/D 假说判别器
+
+log51 终判决（上文）确认 VM 死点在 switch_thread mark 后窗口、trace_ring VM 槽
+io_pwrite RETURNED（不在任何已 wrap syscall 内）、TCB=RUNNING wait=none、cpu1
+三计数器冻结。剩余两假说无法从 log51 区分：
+
+- **B（syscall 内核楔死）**：VM 卡在 v02.27/28 未 wrap 的 syscall 内核路径里。
+  RUNNING wait=none 与"syscall 执行中"兼容（syscall 期间线程保持 RUNNING）；
+  cpu1 三计数器冻结与"关中断内核循环"兼容。
+- **D（switch mark 后自旋）**：VM 在最后一次 switch_thread mark 之后的用户态
+  原生代码/调度器内部自旋。VM 是 cpu1 唯一可跑线程 → 不切换不 idle；
+  runClocks 只在切换点记账 → d=0 伪影。
+
+### 12 个新 wrap（普查三重核查定稿）
+
+对象 = v02.28 ELF 内有 blx 调用点（>0）且具备可绑定 stub 形态的所有剩余可阻塞
+syscall。每符号核查三项：ELF blx 调用点数、stub/fstubs 表项、SDK 头文件原型。
+
+| 符号 | blx 点 | trace op |
+|---|---|---|
+| sceIoSyncByFd | 1 | io_syncbyfd（**头号嫌疑**=newlib fsync 唯一实现路径，FileManagerMIDlet pwrite 后冲刷） |
+| sceIoLseek32 | 1 | io_lseek32 |
+| sceIoRename | 5 | io_rename |
+| sceIoRmdir | 5 | io_rmdir |
+| sceIoChstat | 2 | io_chstat |
+| sceIoChstatByFd | 2 | io_chstat_byfd |
+| sceIoGetstatByFd | 3 | io_getstat_byfd |
+| sceIoDevctl | 1 | io_devctl |
+| sceAudioOutOutput | 9 | audio_out |
+| sceNetEpollWait | 1 | net_epoll_wait |
+| sceKernelExitDeleteThread | 1 | thread_exitdel |
+| sceKernelExitProcess | 1 | process_exit |
+
+- **sceKernelExitThread 剔除**：ELF 内 0 直接调用点——所有调用走
+  `__sceKernelExitThread_from_thumb` 本地 veneer，`--wrap` 拦不到。
+- **Exit 族槽 ODD 语义**：ExitDeleteThread/ExitProcess 成功即不返回，槽留
+  ODD 是正确证据（活进程不可能已退出），enter 时 arg=退出码。
+- **`_`前缀家族（Lseek32/ChstatByFd/GetstatByFd/Devctl）绑定机制**：ELF 内
+  无前缀 sce 符号 = fstubs 三词表项（`.word 0; .word module_id; .word NID`），
+  `--wrap=无前缀名` 的 `__real_` 绑到它——v02.27 的 73 个调用点已验证此机制。
+
+### 下一次 HANG 的判别读法
+
+trace_ring.log VM 槽（thread id=VM 线程）：
+- **槽 ODD 且 op ∈ 12 新 wrap 之一** → **B 胜**：死点 syscall 被点名（如
+  io_syncbyfd ODD = 卡在 fsync 内核路径），下一步做针对性绕过（如 pwrite 后
+  不 fsync 或改全量 flush 策略）。
+- **槽仍 EVEN（io_pwrite returned 之后无新 enter）** → **D 胜**：死点在所有
+  syscall wrapper 之外的用户态原生代码（调度器内部/解释器原生循环），下一步
+  对 switch mark 后 PC 区间做反汇编审查 + 考虑解释器心跳 mark。
+
+### 文件与构建
+
+- 改动：`vita-port/src/vita_trace.h`（12 枚举+注释）、
+  `vita-port/src/vita_trace.c`（opname 12 项+12 wrap+audioout/net 头）、
+  `vita-port/CMakeLists.txt`（12 旗标+v02.29 注释+版本）
+- 构建：一次通过，`nm | grep -c __wrap_sce` = 52（40+12）✓；objdump 验证
+  1/1/9/1/5/5/2/2/3/1/1/1 调用点全走 `__wrap_*`，真身仅剩 wrapper 自身
+  `__real_` 引用 ✓
+- 产物：`out/vpk/midp_vita_v02.29.vpk` + `.sym`
+- commit：vita-port bd6d988
