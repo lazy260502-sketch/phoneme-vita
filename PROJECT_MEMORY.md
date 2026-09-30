@@ -6505,3 +6505,60 @@ vita_trace_dump("ux0:/data/J2ME00001/trace_ring.log")  # WD HANG 路径，coredu
 3. 与 site_ring.log / input_debug.log / ani_mark 交叉对时间戳
 4. 若 VM 槽 EVEN 且无他槽 ODD → 死点在纯解释器/native 未拦截路径，
    下一版加 wrap（候选：sceKernelWaitEventCB / mutex / semaphore 家族）
+
+## 2026-09-30 v02.28：sync 家族全量 wrap（commit 05ed8a6）
+
+用户指令："一次性都加上" sync 家族 wrap（不等 v02.27 跑完看 EVEN 再加）。
+
+### 先普查再动手（防 sceIoChdir 型地雷）
+
+对 v02.27 链接产物 `objdump -d` 全量统计（含 `_` 前缀变体）：
+
+| 符号 | 调用点 | wrap? |
+|---|---|---|
+| sceKernelLockLwMutex / UnlockLwMutex | 9 + 14 | ✅ |
+| sceKernelLockMutex / UnlockMutex | 6 + 6 | ✅ |
+| sceKernelTryLockMutex / TryLockLwMutex | 0（stub 有定义） | ✅ 防御性 |
+| sceKernelPollEventFlag | 5 | ✅ |
+| sceKernelWaitSema / SignalSema / PollSema | 4 / 2 / 0 | ✅ |
+| sceKernelSendMsgPipe / ReceiveMsgPipe | 2 + 2 | ✅ |
+| sceKernelWaitThreadEndCB / SendSignal | 2 + 2 | ✅ |
+| sceKernelSetEventFlag / ClearEventFlag | 2 / 0 | ✅ |
+| sceKernelSignalCond | 0 | ✅ 防御性 |
+| sceKernelDelayThreadCB | stub 有定义 | ✅ |
+| **sceKernelWaitEventFlag / WaitCond / WaitSignal** | **0 调用点** | ❌ 无无前缀 stub，wrap 必炸 |
+| sceIoChdir | — | ❌ v02.27 已踩过：无 stub |
+
+关键认知：**stub 库里等待类符号多带 `_` 前缀**（`_sceKernelWaitEventFlag` 等），
+头文件声明却无前缀——直接按头文件 wrap 会 undefined `__real_`。判据顺序：
+ELF 实际调用点 > stub T 符号表 > 头文件声明。
+
+### 新增 18 个 wrap（v02.27 的 18 + 18 = 36 个 __wrap_sce* + 2 旧线程 wrap = 38）
+
+Mutex/LwMutex（lock+unlock+trylock 各 3）、Sema（wait+poll+signal）、
+EventFlag（poll+set+clear）、CondSignal、SendSignal、WaitThreadEndCB、
+MsgPipe（send+recv）、DelayThreadCB。
+
+arg = SceUID（或 LwMutex work 指针）→ HANG 时冻结槽直接点名**死在哪把锁/管道上**。
+
+### 为什么要 wrap 释放类（不阻塞的调用）
+
+每线程 opcnt 计数器可算 lock/unlock 差值：
+- VM 槽 ODD(sema_wait) + 某线程 sema_signal 计数停更 → VM 等的信号量没人发
+- VM 槽 ODD(mutex_lock) + 某线程 lock 计数 > unlock 计数 → 它抱着 VM 要的锁
+- 这把"谁抱着锁"从离线取证的无解变成了纯算术
+
+### 验证（build/cmake/midp_vita，2026-09-30 构建）
+
+- 一次链接通过（普查先行没有踩雷）
+- objdump 抽验 8 符号：全部调用点走 `__wrap_*`，direct=1 均为 wrapper 自身
+  `__real_` 调用（LockLwMutex 8/wrap、UnlockLwMutex 13、LockMutex 5、
+  WaitSema 3、PollEventFlag 4、ThreadEndCB 1、MsgPipe 1+1）
+- `__wrap_sce*` 符号总数 38，账目吻合
+
+### 下一轮 HANG 读法（v02.28 判别式升级）
+
+1. VM 槽 ODD + op 是阻塞类（mutex_lock/sema_wait/msgpipe_recv/delay）→ 死点=该锁
+2. VM 槽 ODD + op 是 IO 类 → 死在 IO syscall（v02.27 原判别式）
+3. VM 槽 EVEN + 某线程槽 ODD → VM 在等该线程（交叉 site_ring 线程表定位是谁）
+4. 全槽 EVEN → 死在纯解释器/未拦截路径，只剩解释器内部死循环或 SMC/timer 类
