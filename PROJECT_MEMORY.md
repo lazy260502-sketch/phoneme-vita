@@ -6562,3 +6562,91 @@ arg = SceUID（或 LwMutex work 指针）→ HANG 时冻结槽直接点名**死�
 2. VM 槽 ODD + op 是 IO 类 → 死在 IO syscall（v02.27 原判别式）
 3. VM 槽 EVEN + 某线程槽 ODD → VM 在等该线程（交叉 site_ring 线程表定位是谁）
 4. 全槽 EVEN → 死在纯解释器/未拦截路径，只剩解释器内部死循环或 SMC/timer 类
+
+## 2026-09-30 log51 终判决：trace_ring 首次命中 + slide 发现 + 14 轮同死点确认
+
+### trace_ring 首次命中（v02.27/28 的 38 wrap 首战）
+
+HANG 后 dump 四槽归属：
+- 40010003=VM：槽 EVEN，op=io_pwrite returned → **死时不在任何被追踪 syscall**（判别式第 4 格）
+- 4001015f=tone：ODD delay（正常睡，runClocks d=2424 活）
+- 40010163=watchdog：INSIDE io_write（dump 自身写入，自洽；io_open=28/io_write=182/signal_send=1 与 KICK0-5 历史吻合）
+- 400101cf=ticker：正常睡，tick 在涨
+
+VM 槽锁平衡：lwmutex 17655/17656、sema 786:393（2:1 正常配对）→ **无锁泄漏**。
+
+### ★ slide 发现（方法论修正，影响全部历史轮次）
+
+site_ring.log 打印 `self=0x8108d348 mark=0x8108d320`，而 v02.28 ELF 符号
+`vita_site_dump=0x81058348 vita_site_mark=0x81058320` → **运行时基址 = ELF + 0x35000**。
+log50（v02.26）同法：mark 运行时 0x8107e588 − ELF 0x81055588 = **+0x29000**。
+
+**教训：每份 log 必须用它自己的 site_ring self/mark 字段算 slide，再 addr2line。
+此前 log35~50 所有直接解析的运行时地址结论全部作废需重审。**
+（v02.11 打印 mark 地址的设计在此兑现了价值）
+
+三重验证：tone/wd/ticker 三个 creator 按各自 slide 修正后全部解出语义吻合的函数
+（javacall_media_initialize / vita_watchdog_start / JVMOs::start_ticks）。
+
+### log51 死点证据链（全部 slide 修正后）
+
+1. site ring 尾部：**15×switch_thread mark + 1×pump_events_vita mark**，seq=188039 frozen
+   （时间线：pump mark → switch mark×15 → 全冻）
+2. jsp 栈：jsp+04−0x35000=0x810bfb94=**L318**（L318..L319 区间）、jsp+48−0x35000
+   =0x810bfd04=**invoke5_deoptimization_entry_0** → VM 死时 java 栈在解释器 invoke 桩簇
+3. watchdog 交叉：cpu1 idle/idleN/switchN 三计数器全冻结（747035546→747035546）、
+   VM runClocks **d=0**（tone 睡觉都有 d=2424 → VM 死时不耗 CPU）、KICK0-5 无效、
+   jsmp=351/pump=393/CE=393/switch=186585 全冻结
+4. VM 槽 EVEN + d=0 → **不是忙循环、不在 syscall，是"不再被调度"**
+
+### L318 反汇编解码（解释器 invoke 返回点）
+
+```
+L318:  mov lr, pc        ; 保存返回地址
+       mov pc, r2        ; 调用目标方法（invoke）
+0x810bfb94:              ; ← jsp+04 指向 = 调用返回后
+       ldr r7/r8/lr      ; 恢复解释器寄存器
+       ldrb ip,[lr,#3]!  ; 取下一字节码
+       ldr pc,[r5,ip,lsl#2]  ; dispatch 表跳转
+```
+
+即 L318 = C 解释器 invoke 调用返回点，紧邻 dispatch 核心循环。栈残留证明最后一次
+Java 层活动是 invoke 返回（残留≠死点本身，但结合 ring 时间线收窄窗口）。
+
+### log50 交叉验证：14 轮同一死点
+
+log50 jsp 0x810e5dfc − slide(0x29000) = 0x810bcdfc → **同落 L318..L319**。
+两版本、两次独立运行、栈残留各自 ELF 同一标签 → **log35~50 是同一个死点**。
+log50 的 png_do_write_transformations 判决确认为 slide 未修正错误（MIDP imgdcd
+不用 libpng 的旁证原本就矛盾）。
+
+### JIT 假设排除（但发现未来地雷）
+
+- crumb `vm UseCompiler(pre)=1 (jit policy=0)` 的 (pre) 只是 Globals.hpp 默认值
+  （log28 教训注释在案）；实际模式由 runMidlet.c:152-158 决定：policy=0 →
+  **确实 `JVM_ParseOneArg("-int")` → UseCompiler=false** → log51 跑纯解释器
+- hang 后 runMidlet 未返回所以 (post) 行缺失，与 hang 自洽
+- **地雷记录**：`OsMisc_flush_icache`（0x810c41a0）是空壳（`bx lr`，
+  `__builtin___clear_cache` 在此工具链没生成 cache 维护指令）；真正的
+  `arm_flush_icache`（带 mcr cp15）**零调用者**。一旦 launch.cfg 开 jit=1/2，
+  Cortex-A9 分离缓存下 JIT 必因 stale ICache 执行垃圾 → 必须先修 flush 再开 JIT
+
+### 终判决
+
+VM 死在 **switch_thread mark 之后的窗口**（VITA_DISP_REC 之后 → 下个 mark 之前），
+即：调度器完成最后一次切换 → 解释器执行若干 invoke（L318 残留）→ 之后
+**不再有任何 mark、不耗 CPU、不在 syscall、无锁等待** → 调度器再也没有切换过 VM 线程
+（switch 计数冻结）。与 log23（v01.99，纯 Java 计算死循环，switch 持续上涨）形似
+但更彻底——log51 连调度器切换本身都停了。
+
+死亡形态=「VM 线程从 ready 队列消失」：可能机制——线程状态机损坏（被误置
+SUSPENDED/DORMANT）、green-thread scheduler 的链表损坏导致轮转丢失、或
+switch_thread 内部把当前线程 park 后无人唤醒。
+
+### v02.29 取证方向（未实现）
+
+1. 解释器 dispatch 心跳：在 L318 所在的 dispatch 核心循环加每 N 次递增的内存计数器
+   （类似 site mark 但更密），区分"解释器在跑但调度停"vs"dispatch 本身停摆"
+2. switch_thread 后窗口加密 mark：VITA_DISP_REC 之后、目标线程 resume 处各加 mark
+3. HANG 时枚举全部线程运行状态（sceKernelGetThreadInfo 每 tid 的 status 字段），
+   直接看 VM 线程是 RUNNING/READY/WAIT/SUSPENDED 哪个——把"不再被调度"变成可观测
