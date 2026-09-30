@@ -6430,3 +6430,78 @@ log43 仍应读作"钉核形态第 7 轮"（mask=0x20000 是事实），但其�
      永久还是超长暂停。
   C. **用户侧复现条件聚焦**：13 轮 HANG 的游戏/操作分布统计，
      从"什么触发"侧收敛（需用户提供更多轮次记录或回放习惯）。
+
+## 2026-09-30 v02.27：零 I/O syscall 死点追踪器（commit 1bcfa49）
+
+### 背景：用户否决规避方案 + Vita3K I/O 风暴疑云
+
+log50 汇报后用户否决"自杀重启"规避方案（"要找到原因啊……解决不好怎么用"），坚持根因导向。
+同时用户观察到 Vita3K 上 J2ME 启动后持续 open/write/close 打印——定量分析结论：
+
+- Vita3K 泵 12000 次/秒（真机 92/s，130 倍），诊断心跳（HEARTBEAT 每 64 pump 写一次
+  input_debug.log + ani_mark 每 CE 写一次）被放大成 ~190 ops/s 风暴（126s 内 23830 条折叠消息）
+- **判定：模拟器伪影，非 bug**。真机 92/s 泵频下心跳写盘极稀疏；且卡死问题早于诊断代码存在
+- 但诊断日志的高频 sceIo 直写确有 churn 嫌疑 → v02.27 顺手改为零 I/O 内存追踪
+
+### 真机死亡时间线（log50 input_debug.log + ani_mark 终判）
+
+- input_debug.log 仅 12 行：`[HEARTBEAT] #1 ms=1790682023456` → `#385 ms=1790682027638`
+  = **VM 启动 4.18 秒即死**（不是"操作一会"！），泵 92 次/秒
+- ani_mark 最后一行 `CE #387 ANI OUT t=1790682027660`（死前 22ms）
+- CE=385 时 ani=384/384 **平衡进出** → VM 线程不是死在事件泵/ANI 等待里，
+  **死在两次 CheckEvents 之间的 Java/native 执行窗口**（~11ms 窗口）
+- 死亡时间线：boot → 4.18s 正常运行（92 pump/s）→ 死点在 CE#387 与 CE#388 之间
+
+### vita_trace 设计（每线程专属槽——设计修正记录）
+
+第一版共享历史环设计写到一半识别出致命缺陷：tone+ticker+pump ~800 条/s 会在 40ms 内
+冲掉死点证据。改为**每线程专属槽**：
+
+- `tr_slot {seq,op,arg,ts_lo}` × 12 槽（VITA_T_MAX），每线程一槽
+- seqlock 式：进入调用 seq=(seq&~1)+2+1（ODD=INSIDE），退出清 bit0（EVEN=returned）
+- **每线程专属槽保证 entered-never-returned 记录永生**——高频线程只冲刷自己的槽
+- `g_hist[32]` 全局历史环仅作上下文参考；`g_thr[12]` 注册表 lazy 自注册
+  （首次被追踪调用自动注册，spin gate 一次性进入）
+- 每线程每 op 计数 `opcnt[TRACE_OP_N]`——即使无 ODD 槽也能看调用分布
+
+### 18 个 wrap（--wrap 链接器拦截）
+
+sceIo 13 个（Open/Close/Read/Write/Pwrite/Lseek/Sync/Remove/Mkdir/Dopen/Dread/
+Dclose/Getstat）+ sceKernelDelayThread + sceDisplay 2 个（SetFrameBuf/
+WaitVblankStart）+ sceCtrlPeekBufferPositive + sceTouchPeek。
+**sceIoChdir 无用户态 stub，弃用**（链接 undefined reference，已从三处移除）。
+
+模式统一：`enter(op,arg) → __real_* → exit() → return`，零语义变更。
+
+### 判别式（下一轮 HANG 读法）
+
+```
+vita_trace_dump("ux0:/data/J2ME00001/trace_ring.log")  # WD HANG 路径，coredump 之前
+```
+
+- VM 线程槽 **ODD seq → 死点 FOUND**：该槽的 op 即死在里面的 syscall，arg 给参数
+  （io_open 的 arg=文件名指针，dump 时尝试读字符串）
+- VM 线程槽 **EVEN → VM 死在任何被追踪 syscall 之外**：纯解释器执行或未追踪路径
+  （此时看 g_hist 环 + 各线程槽找异常：如某 native 线程 ODD = 它阻塞了 VM 依赖的资源）
+- WD dump 自身也走 wrap（槽最终 EVEN），无害
+
+### 接入点
+
+- watchdog.c：`vita_wd_snapshot(site_ring.log)` 之后、kernel_forensics/data abort 之前
+- main.c：boot 序列 `crumb_printf("version:")` 前调 `vita_trace_register()`（锚定主线程 tid）
+- CMakeLists：源列表 + wrap 旗标区（png_read_image 之后 18 个）+ VITA_VERSION 02.27
+
+### 验证
+
+- 构建通过：`build/cmake/midp_vita.vpk`（3.6MB，2026-09-30 02:41）
+- **wrap 重定向实锤**：`objdump -d` 全二进制 73 个 `sceIoOpen` 调用点全部
+  `bl __wrap_sceIoOpen`，唯一直连真实符号的是 wrapper 自身 `__real_` 调用
+- 22 个 wrap 符号在 .text 落位
+
+### 下一轮取证清单
+
+1. 装新 VPK 正常玩到 HANG → 取 `ux0:/data/J2ME00001/trace_ring.log`
+2. 读法：先找 VM 线程（通常 tid 非最小者，参考 site_ring 的线程表）槽的 seq 奇偶
+3. 与 site_ring.log / input_debug.log / ani_mark 交叉对时间戳
+4. 若 VM 槽 EVEN 且无他槽 ODD → 死点在纯解释器/native 未拦截路径，
+   下一版加 wrap（候选：sceKernelWaitEventCB / mutex / semaphore 家族）
