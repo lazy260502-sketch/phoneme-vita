@@ -27,6 +27,7 @@
 
 #include "vita_watchdog.h" /* v01.72: hang forensics */
 #include "vita_kernel_forensics.h" /* v02.20: boot-time kubridge precheck */
+#include "vita_trace.h"    /* v02.27: syscall deadpoint tracer */
 
 /* MIDP headers */
 #include <midpAMS.h>
@@ -335,7 +336,12 @@ int main(int argc, char *argv[]) {
      * the VM starts; a crash in this window leaves crumb.log truncated at
      * the last bar, which pins the failing subsystem without stdio. */
     crumb_marker("launcher start");
-    crumb_printf("version: %s", VITA_PORT_VERSION_STRING);
+/* v02.27: trace the boot path itself from the first syscall;
+         * every thread lazily self-registers on its first traced call,
+         * so this mainly anchors the main thread's tid early. */
+        vita_trace_register();
+
+        crumb_printf("version: %s", VITA_PORT_VERSION_STRING);
 
     {
         /* v02.18: pin request now comes from ux0:/data/J2ME00001/vm_cpu

@@ -35,6 +35,7 @@
 #include <sys/time.h>
 
 #include "vita_watchdog.h"
+#include "vita_trace.h"
 /* v02.02: OS-side thread forensics (--wrap= registration table). */
 #include "vita_thread_audit.h"
 /* v02.18: kubridge kernel-side forensics (HANG path). */
@@ -66,7 +67,6 @@ extern void vita_site_dump_java(const char *path);
  * _current_thread/status/pending/jsp, VerifyOnly, scheduler counters
  * from the frozen-but-mapped process (the coredump cannot see them). */
 extern void vita_wd_snapshot(const char *path);
-
 #define WD_LOG_PATH "ux0:/data/J2ME00001/watchdog.log"
 #define WD_STALL_POLLS 12   /* 12 x 250 ms ~= 3 s, CLOCK-FREE threshold */
 #define WD_POLL_MS  250
@@ -587,6 +587,13 @@ static int wd_thread_routine(SceSize args, void *argp) {
          * holes (.data/.bss head, whole Java heap) hid exactly these
          * values - read them from the patient, not the corpse. */
         vita_wd_snapshot("ux0:/data/J2ME00001/site_ring.log");
+        /* v02.27: syscall deadpoint trace. Per-thread slots remember
+         * the last call each thread ENTERED; ODD seq = never returned.
+         * This runs BEFORE the coredump abort so the frozen process
+         * itself tells us which syscall (if any) the VM thread died
+         * in - the question 13 rounds of offline forensics could not
+         * answer (kernel dump encrypted, register pc a dump artifact). */
+        vita_trace_dump("ux0:/data/J2ME00001/trace_ring.log");
 
         /* v02.10: per-core scheduler ledger - SAFELY.
          * log33/34 verdict: sceKernelGetThreadRunStatus on the ghost

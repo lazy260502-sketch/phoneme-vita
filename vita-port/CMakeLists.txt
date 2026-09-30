@@ -1027,6 +1027,19 @@ set(VITA_VERSION  "02.25")
 #   link); threadmgr address = boot-time userspace enum + ku memcpy
 #   read-back self-check, HANG path reads the cache as before.
 set(VITA_VERSION  "02.26")
+# 02.27 (2026-09-30): log50 verdict - offline kernel forensics fully
+#   dead (SYSTEM_INFO2 SECA-encrypted, no kernel LOAD segments,
+#   MODULE_INFO user-only, THREAD_REG_INFO pc/sp artifacts - "mla
+#   deadpoint" retracted). New direction: make the process ITSELF
+#   remember. vita_trace.c: zero-I/O per-thread syscall slots wrapped
+#   around every sceIo*/delay/display/ctrl/touch call; at the next
+#   HANG the watchdog dumps trace_ring.log - a slot with ODD seq is
+#   the call that never returned = the deadpoint. Also answers the
+#   user's Vita3K observation: the open/write/close storm there was
+#   our diagnostic heartbeat x a hyperactive pump (12k/s vs 92/s on
+#   HW) - not the bug, but this tracer replaces disk churn with
+#   memory slots anyway.
+set(VITA_VERSION  "02.27")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
@@ -1662,6 +1675,8 @@ add_executable(${PROJECT_NAME}
     src/vita_thread_audit.c
     # v02.18: kubridge-backed kernel-side stall forensics (HANG path)
     src/vita_kernel_forensics.c
+    # v02.27: zero-I/O syscall deadpoint tracer (see vita_trace.c)
+    src/vita_trace.c
 )
 
 # Size of the bundled jar, baked into the binary for the runtime
@@ -1758,6 +1773,32 @@ target_link_libraries(${PROJECT_NAME}
     # can cross-check "libpng really was executing" vs "stale/garbage
     # register context".
     -Wl,--wrap=png_read_image
+    # v02.27: syscall deadpoint tracer (vita_trace.c). Every wrapper is
+    # enter-mark -> __real_* -> exit-mark, no semantic change. At the
+    # next HANG the watchdog dumps trace_ring.log: a per-thread slot
+    # stuck at ODD seq names the call that never returned. The VM
+    # thread's slot is the deadpoint answer 13 rounds of coredump
+    # analysis could not produce (kernel half encrypted, register pc
+    # a dump artifact). The IO wraps also cover the watchdog's own
+    # dump calls - harmless: its slot ends EVEN on every success.
+    -Wl,--wrap=sceIoOpen
+    -Wl,--wrap=sceIoClose
+    -Wl,--wrap=sceIoRead
+    -Wl,--wrap=sceIoWrite
+    -Wl,--wrap=sceIoPwrite
+    -Wl,--wrap=sceIoLseek
+    -Wl,--wrap=sceIoSync
+    -Wl,--wrap=sceIoRemove
+    -Wl,--wrap=sceIoMkdir
+    -Wl,--wrap=sceIoDopen
+    -Wl,--wrap=sceIoDread
+    -Wl,--wrap=sceIoDclose
+    -Wl,--wrap=sceIoGetstat
+    -Wl,--wrap=sceKernelDelayThread
+    -Wl,--wrap=sceDisplaySetFrameBuf
+    -Wl,--wrap=sceDisplayWaitVblankStart
+    -Wl,--wrap=sceCtrlPeekBufferPositive
+    -Wl,--wrap=sceTouchPeek
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm
