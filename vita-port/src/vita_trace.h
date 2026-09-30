@@ -31,6 +31,32 @@ enum {
     TRACE_OP_DISP_VBLANK,
     TRACE_OP_CTRL_PEEK,
     TRACE_OP_TOUCH_PEEK,
+    /* v02.28: sync family. CENSUS of the v02.27 ELF showed the calls
+     * actually made: LwMutex 23 sites, Mutex 12, PollEventFlag 5,
+     * WaitSema 4, ThreadEndCB/SignalSema 2 each, MsgPipe 4. The pure
+     * waits WaitEventFlag/WaitCond/WaitSignal are NEVER called (and
+     * have no plain-name stub) - wrapping them would only produce
+     * undefined __real_ refs. Release-side ops (unlock/signal/set)
+     * never block but their per-thread COUNTERS give lock/unlock
+     * balance: whose slot shows lock>unlock holds what the VM wants. */
+    TRACE_OP_MUTEX_LOCK,
+    TRACE_OP_MUTEX_UNLOCK,
+    TRACE_OP_MUTEX_TRYLOCK,
+    TRACE_OP_LWMUTEX_LOCK,
+    TRACE_OP_LWMUTEX_UNLOCK,
+    TRACE_OP_LWMUTEX_TRYLOCK,
+    TRACE_OP_SEMA_WAIT,
+    TRACE_OP_SEMA_POLL,
+    TRACE_OP_SEMA_SIGNAL,
+    TRACE_OP_EVTFLAG_POLL,
+    TRACE_OP_EVTFLAG_SET,
+    TRACE_OP_EVTFLAG_CLEAR,
+    TRACE_OP_COND_SIGNAL,
+    TRACE_OP_SIGNAL_SEND,
+    TRACE_OP_THREAD_END_WAIT,
+    TRACE_OP_MSGPIPE_SEND,
+    TRACE_OP_MSGPIPE_RECV,
+    TRACE_OP_DELAY_CB,
     TRACE_OP_THREAD_SLEEP,
     TRACE_OP_N
 };

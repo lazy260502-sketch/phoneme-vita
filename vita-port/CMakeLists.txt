@@ -1040,6 +1040,16 @@ set(VITA_VERSION  "02.26")
 #   HW) - not the bug, but this tracer replaces disk churn with
 #   memory slots anyway.
 set(VITA_VERSION  "02.27")
+# 02.28 (2026-09-30): user directed - add the whole sync family NOW,
+# not incrementally. Census of the v02.27 ELF first: the blocking
+# surface actually present is LwMutex(23 sites) Mutex(12)
+# PollEventFlag(5) WaitSema(4) ThreadEndCB/SignalSema(2) MsgPipe(4);
+# WaitEventFlag/WaitCond/WaitSignal are never called and have no
+# plain-name stub (wrapping them = sceIoChdir-style link death), so
+# they stay out. Release ops (unlock/signal/set) never block but
+# their per-thread counters expose lock/unlock imbalance = WHO holds
+# the thing the VM thread is stuck on.
+set(VITA_VERSION  "02.28")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
@@ -1799,6 +1809,31 @@ target_link_libraries(${PROJECT_NAME}
     -Wl,--wrap=sceDisplayWaitVblankStart
     -Wl,--wrap=sceCtrlPeekBufferPositive
     -Wl,--wrap=sceTouchPeek
+    # v02.28: sync family (census-driven; see vita_trace.h). These are
+    # the ONLY blocking calls left in the binary after the IO/display
+    # wraps above - pthread's own locking goes through LwMutex/Mutex/
+    # Sema/MsgPipe thunks and --wrap intercepts them exactly like it
+    # did libc's sceIoOpen calls. WaitEventFlag/WaitCond/WaitSignal
+    # deliberately NOT wrapped: never called in this ELF and no
+    # plain-name stub exists (sceIoChdir lesson).
+    -Wl,--wrap=sceKernelLockMutex
+    -Wl,--wrap=sceKernelUnlockMutex
+    -Wl,--wrap=sceKernelTryLockMutex
+    -Wl,--wrap=sceKernelLockLwMutex
+    -Wl,--wrap=sceKernelUnlockLwMutex
+    -Wl,--wrap=sceKernelTryLockLwMutex
+    -Wl,--wrap=sceKernelWaitSema
+    -Wl,--wrap=sceKernelPollSema
+    -Wl,--wrap=sceKernelSignalSema
+    -Wl,--wrap=sceKernelPollEventFlag
+    -Wl,--wrap=sceKernelSetEventFlag
+    -Wl,--wrap=sceKernelClearEventFlag
+    -Wl,--wrap=sceKernelSignalCond
+    -Wl,--wrap=sceKernelSendSignal
+    -Wl,--wrap=sceKernelWaitThreadEndCB
+    -Wl,--wrap=sceKernelSendMsgPipe
+    -Wl,--wrap=sceKernelReceiveMsgPipe
+    -Wl,--wrap=sceKernelDelayThreadCB
     -Wl,--start-group
     ${PCSL_LIB_DIR}/libpcsl_multimedia.a
     -lcldc_vm

@@ -93,7 +93,14 @@ static const char *const g_opname[TRACE_OP_N] = {
     "io_lseek", "io_sync", "io_remove", "io_mkdir", "io_dopen",
     "io_dread", "io_dclose", "io_getstat",
     "delay_thread", "disp_setframebuf", "disp_waitvblank",
-    "ctrl_peek", "touch_peek", "thread_sleep"
+    "ctrl_peek", "touch_peek",
+    "mutex_lock", "mutex_unlock", "mutex_trylock",
+    "lwmutex_lock", "lwmutex_unlock", "lwmutex_trylock",
+    "sema_wait", "sema_poll", "sema_signal",
+    "evtflag_poll", "evtflag_set", "evtflag_clear",
+    "cond_signal", "signal_send", "thread_end_wait",
+    "msgpipe_send", "msgpipe_recv", "delay_cb",
+    "thread_sleep"
 };
 
 /* ---- lazy registration ------------------------------------------- */
@@ -476,6 +483,208 @@ int __wrap_sceTouchPeek(SceUInt port, SceTouchData *data, int nbufs)
     int r;
     vita_trace_enter(TRACE_OP_TOUCH_PEEK, port);
     r = __real_sceTouchPeek(port, data, nbufs);
+    vita_trace_exit();
+    return r;
+}
+
+/* ------------------------------------------------------------------
+ * v02.28: sync family (see census note in vita_trace.h). arg = the
+ * SceUID (or LwMutex work-area pointer) so a frozen slot names the
+ * exact lock/pipe the thread died on.
+ * ------------------------------------------------------------------ */
+
+extern int __real_sceKernelLockMutex(SceUID, int, unsigned int *);
+int __wrap_sceKernelLockMutex(SceUID mutexid, int lockCount,
+                              unsigned int *timeout)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_MUTEX_LOCK, (unsigned int)mutexid);
+    r = __real_sceKernelLockMutex(mutexid, lockCount, timeout);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelUnlockMutex(SceUID, int);
+int __wrap_sceKernelUnlockMutex(SceUID mutexid, int unlockCount)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_MUTEX_UNLOCK, (unsigned int)mutexid);
+    r = __real_sceKernelUnlockMutex(mutexid, unlockCount);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelTryLockMutex(SceUID, int);
+int __wrap_sceKernelTryLockMutex(SceUID mutexid, int lockCount)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_MUTEX_TRYLOCK, (unsigned int)mutexid);
+    r = __real_sceKernelTryLockMutex(mutexid, lockCount);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelLockLwMutex(SceKernelLwMutexWork *, int,
+                                       unsigned int *);
+int __wrap_sceKernelLockLwMutex(SceKernelLwMutexWork *pWork,
+                                int lockCount, unsigned int *pTimeout)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_LWMUTEX_LOCK, (unsigned int)pWork);
+    r = __real_sceKernelLockLwMutex(pWork, lockCount, pTimeout);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelUnlockLwMutex(SceKernelLwMutexWork *, int);
+int __wrap_sceKernelUnlockLwMutex(SceKernelLwMutexWork *pWork,
+                                  int unlockCount)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_LWMUTEX_UNLOCK, (unsigned int)pWork);
+    r = __real_sceKernelUnlockLwMutex(pWork, unlockCount);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelTryLockLwMutex(SceKernelLwMutexWork *, int);
+int __wrap_sceKernelTryLockLwMutex(SceKernelLwMutexWork *pWork,
+                                   int lockCount)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_LWMUTEX_TRYLOCK, (unsigned int)pWork);
+    r = __real_sceKernelTryLockLwMutex(pWork, lockCount);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelWaitSema(SceUID, int, SceUInt *);
+int __wrap_sceKernelWaitSema(SceUID semaid, int signal, SceUInt *timeout)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_SEMA_WAIT, (unsigned int)semaid);
+    r = __real_sceKernelWaitSema(semaid, signal, timeout);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelPollSema(SceUID, int);
+int __wrap_sceKernelPollSema(SceUID semaid, int signal)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_SEMA_POLL, (unsigned int)semaid);
+    r = __real_sceKernelPollSema(semaid, signal);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelSignalSema(SceUID, int);
+int __wrap_sceKernelSignalSema(SceUID semaid, int signal)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_SEMA_SIGNAL, (unsigned int)semaid);
+    r = __real_sceKernelSignalSema(semaid, signal);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelPollEventFlag(int, unsigned int,
+                                         unsigned int, unsigned int *);
+int __wrap_sceKernelPollEventFlag(int evid, unsigned int bits,
+                                  unsigned int wait, unsigned int *outBits)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_EVTFLAG_POLL, (unsigned int)evid);
+    r = __real_sceKernelPollEventFlag(evid, bits, wait, outBits);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelSetEventFlag(SceUID, unsigned int);
+int __wrap_sceKernelSetEventFlag(SceUID evid, unsigned int bits)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_EVTFLAG_SET, (unsigned int)evid);
+    r = __real_sceKernelSetEventFlag(evid, bits);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelClearEventFlag(SceUID, unsigned int);
+int __wrap_sceKernelClearEventFlag(SceUID evid, unsigned int bits)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_EVTFLAG_CLEAR, (unsigned int)evid);
+    r = __real_sceKernelClearEventFlag(evid, bits);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelSignalCond(SceUID);
+int __wrap_sceKernelSignalCond(SceUID condId)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_COND_SIGNAL, (unsigned int)condId);
+    r = __real_sceKernelSignalCond(condId);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelSendSignal(SceUID);
+int __wrap_sceKernelSendSignal(SceUID thid)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_SIGNAL_SEND, (unsigned int)thid);
+    r = __real_sceKernelSendSignal(thid);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelWaitThreadEndCB(SceUID, int *, SceUInt *);
+int __wrap_sceKernelWaitThreadEndCB(SceUID thid, int *stat,
+                                    SceUInt *timeout)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_THREAD_END_WAIT, (unsigned int)thid);
+    r = __real_sceKernelWaitThreadEndCB(thid, stat, timeout);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelSendMsgPipe(SceUID, void *, unsigned int,
+                                       int, void *, unsigned int *);
+int __wrap_sceKernelSendMsgPipe(SceUID uid, void *message,
+                                unsigned int size, int unk1, void *unk2,
+                                unsigned int *timeout)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_MSGPIPE_SEND, (unsigned int)uid);
+    r = __real_sceKernelSendMsgPipe(uid, message, size, unk1, unk2,
+                                    timeout);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelReceiveMsgPipe(SceUID, void *, SceSize,
+                                          int, void *, unsigned int *);
+int __wrap_sceKernelReceiveMsgPipe(SceUID uid, void *message,
+                                   SceSize size, int unk1, void *unk2,
+                                   unsigned int *timeout)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_MSGPIPE_RECV, (unsigned int)uid);
+    r = __real_sceKernelReceiveMsgPipe(uid, message, size, unk1, unk2,
+                                       timeout);
+    vita_trace_exit();
+    return r;
+}
+
+extern int __real_sceKernelDelayThreadCB(SceUInt);
+int __wrap_sceKernelDelayThreadCB(SceUInt usec)
+{
+    int r;
+    vita_trace_enter(TRACE_OP_DELAY_CB, usec);
+    r = __real_sceKernelDelayThreadCB(usec);
     vita_trace_exit();
     return r;
 }
