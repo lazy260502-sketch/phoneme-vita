@@ -6794,3 +6794,121 @@ trace_ring.log VM 槽（thread id=VM 线程）：
 - log52 = v02.29 b376 (98be58b)，对应符号归档 `out/vpk/midp_vita_v02.29.sym`
 - 解析：`parse_psp2dmp.py --elf .../midp_vita_v02.29.sym --slide 0x7d000`
 - 二进制身份验证：版本串 + b376=git rev-list count of 98be58b
+
+---
+
+## log52 深挖第二轮：dump note 全开采 + 出生/死亡通道判决（v02.29 b376）
+
+日期：2025-09-09（续 log52 判决节）。oclockvita 移除后 HANG 复现 → 硬件嫌疑
+排除，问题定死在 JVM 适配层。本节为 dump 取证终局 + v02.30 方案定稿依据。
+
+### psp2dmp note 矿藏（解析器只处理了 2/24 种！）
+
+psp2core dump 含 24 种 PT_NOTE。`parse_psp2dmp.py` 只解 THREAD_REG_INFO
+(0x1004) 的**第一条记录**与 PROCESS_INFO (0x1000)。以下为全 note 解码结论：
+
+| note | 偏移 | descsz | 结论 |
+|---|---|---|---|
+| THREAD_INFO (0x1003) | 0x678 | 1008 | **内核侧 5 线程状态表**（recsize=200） |
+| THREAD_REG_INFO (0x1004) | 0x1e74 | 1888 | **5 线程寄存器**（12 字节头 + 5×376） |
+| SEMAPHORE_INFO (0x100a) | 0xa84 | 1892 | 27 个系统信号量，无一属 J2ME 线程 |
+| EVENTFLAG_INFO (0x100b) | 0x71 | 880 | 无 J2ME 线程 |
+| MUTEX_INFO (0x100c) | 0x1590 | 768 | 无 J2ME 纠[线程 |
+| LWMUTEX_INFO (0x100d) | 0x18ac | 816 | 无 J2ME 线程 |
+| MESG_PIPE_INFO (0x1010) | 1bf8 | 608 | VM tid 出现在 SceNetAdhocAuthMbx **+72=creator 字段**，非等待者 |
+| STACK_INFO (0x101b) | 0x283c | 88 | {tid,used,max}×5，无新信息 |
+| EVENT_LOG_INFO (0x102c) | 0xf47e4 | 2-mo2060 | 只含系统 Shell NPXS19999 事件，与 J2ME 无关 |
+| SYSTEM_INFO2 (0x102d) | 0xf500c | 4178740 | 哈希数据不可读 |
+| SUMMARY_INFO (0x102e) | 0x4f23ac | 612 | SceModule 统计 |
+| TTY_INFO2 (0x1031) | 0x4f15d84 | 4108 | **psp2core 内核 hook 日志**（见下） |
+
+### 内核侧判决数据（THREAD_INFO + 全同步对象扫描）
+
+**5 线程内核状态**（THREAD_INFO recsize=200, +44=wait/delay 状态字）：
+
+| 线程 | tid | name | state | PC |
+|---|---|---|---|---|
+| VM main | 40010003 | J2ME00001 | **1 (RUNNING)** | 出生桩+0x18 |
+| SceCommonDialogWorker | 400100c3 | - | 8 (delay) | 内核 e000xxxx |
+| tone | 4001015f | j2me_tone | 8 (delay) | sceKernelDelayThread |
+| watchdog | 40010163 | j2me_watchdog | 1 (RUNNING) | wd_thread_routine |
+| ticker | 4100101cd | cldc_ticker | 8 (delay) | sceKernelDelayThread |
+
+- **内核认为 VM=RUNNING**，但 PC 冻结、cpu0 switchN 冻结 → 用户态冻结（非内核阻塞）
+- VM 不在任何 sema/eventflag/mutex/lwmutex/msgpipe 等待队列 → 排除内核同步阻塞
+- SceNetAdhocAuthMbx creator=VM tid：midp 的 net 初始化曾触碰 adhoc（历史痕迹，非阻塞点）
+
+### THREAD_REG_INFO 全 5 线程寄存器（12 头 + 5×376 记录）
+
+**解读**: tid@+0, sp@+56, lr@+60, pc@+64, cpsr@+68。VM: SP=0x8167fd88(原生栈),
+LR=0x8113f034(桩入口), PC=0x8113f04c(桩+0x18), CPSR=0x40070010(User/Z=1/中断开)
+
+**全线程死点分布**：其余 4 线程全正常（delay/内核服务/watchdog 在 dump），
+**唯独 VM 冻结在出生桩**。三次独立 HANG（log21 Vita3K 桩+0x8、log26 真机
+桩+0x14 strne、log52 真机桩+0x18 bl）全落出生桩头 7 条指令内。
+
+### 冻结瞬间原生调用链（栈内存直接判读）
+
+SP 顶帧 `[SP]=JVM::start+0x18c` = `bl primordial_to_current_thread` 返回地址
+（gadget `push {lr}` 所压）。调用链：
+
+```
+midp_run_midlet_with_args_cp → JVM::start() [JVM::run() 内联]
+  → primordial_to_current_thread()  ← SP 冻结在此帧
+  → gadget: ldr lr,[r6,#4]; mov pc,lr → start_lightweight_thread_asm
+  → PC 冻结在桩+0x18 (bleq invoke_pending_entries)
+```
+
+**关键修正**：JVM.cpp:288 `JVM::run()` 被**内联进 JVM::start()**（反汇编
+810b5684-569c：`vita_run_count++` 全局 0x814b2ef8 自增紧邻 `bl gadget`）。
+此前误以为冻结在 time_slice 循环；实为 **run() 首次派发路径**。但 ring 计数
+switch=190836 说明切换发生过 19 万次后才冻结——VM 曾正常运行很久。
+
+### 出生/死亡通道歧义闭合（三大矛盾 + 唯一自洽解）
+
+- dispatch ring 16 条全是 id=3 出让；id=4 从未作为出让方出现
+- pe=0（id=4 pending_entries 已消费）+ th_finish=0 + lw_exit=0（无死亡）
+- cur_thread=id=4 的 java 栈 jsp+04=L318（id=4 跑过解释器）
+
+**判决**：id=4 的出生桩在绿线程派发时被消费（pe 0←1），thread 曾跑过 Java
+代码（L318 帧），但**从未被 time_slice/switch_thread 记入 dispatch ring**。
+出生消费不经 switch_thread 的 VITA_DISP_REC——它经 **JVM::run() 首次派发 /
+primordial 桩重入**。死亡通道排除（th_finish=0）。
+
+### TTY_INFO2 会话历史（内核 hook 日志）
+
+本次开机内 J2ME00001 **两次 coredump**（前一次 done + 本次 start）+ 4 轮
+SceCommonDialog Init/Term type=4（系统错误弹窗，对应 HANG 后弹窗）。另有
+PCSG90096 coredump 记录（本机还 dump 过别的应用）。
+
+### 根因假说收敛（v02.30 方案依据）
+
+19 万次正常切换后突然冻结 + 内核 RUNNING + 不在任何等待对象 + cpu0 切换
+计数冻结 → **不是逻辑死锁，是物理层冻结**。两个候选：
+
+1. **主候选：VM 线程状态损坏说**——id=4（或 id=3）的绿线程栈链/状态字在
+   dump 前被破坏，调度器重入出生桩后无法回解释器。证据：dispatch ring
+   全 id=3、pe=0、L318 帧。堆不在 dump 内无法直接验证。
+2. **次候选：cpu0 中断/异常静默说**——VM 在 cpu0 用户态执行时遭遇未处理
+   异常/中断被静默丢弃，线程永停指令边界。缺乏直接证据，但能解释
+   "RUNNING 却不跑"。
+
+### v02.30 方案定稿（判决前不动笔）
+
+本轮已实现所有"看"的能力，下一步是"改"。在关键路径加 mark/计数器：
+
+1. **出生桩消费计数**：`invoke_pending_entries`（C++，SharedStubs_arm.cpp:614）
+   入口加 `vita_stub_pe_count++`——直接数出出生桩被进入次数
+2. **primordial 重入计数**：`primordial_to_current_thread` 是 asm gadget 无
+   C 侧入口；在调用方 C++ 侧（JVM::run 内联点）不可插；改为在
+   Scheduler::time_slice() 入口 + switch_thread JUST_BORN 分支加计数
+3. 仪表联动：watchdog snapshot 增加新计数器读出
+4. （远期）扩展 parse_psp2dmp.py 支持 THREAD_INFO/多线程 THREAD_REG_INFO
+
+### 教训
+
+- **"1 线程 note"是解析器显示限制**——THREAD_REG_INFO 实为 5×376 记录
+- **psp2core dump 不含堆**——24 个 PT_LOAD 全是栈/内核区，应用堆 (0x81eXXXXX) 不可读
+- **creator 字段 vs 等待者**——同步对象 note 里 tid 出现≠阻塞，先看字段语义
+- **JVM::run 内联进 JVM::start**——源码行号与反汇编对不上时先查内联
+- **slide 每次启动不同**（log51 +0x35000 / log52 +0x7D000）——绝不跨 dump 复用
