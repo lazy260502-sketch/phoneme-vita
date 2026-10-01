@@ -7195,3 +7195,50 @@ _MergedSrc 活对象（start_lightweight_thread_asm 在 InterpreterStubs_arm.cpp
 - **dump 与 sysinfo 不同时**：VM 线程 cpu=2 报告与 cpu0 忙的观测不矛盾
   （watchdog sysinfo 在 dump 之前采样），"VM 在忙 CPU 上自旋"必须用 dump 锚定
 - **heredoc/终端内联 python 继续坑**：多行 python -c 被吞，一律先写 /tmp/*.py
+
+
+### log54 判决修正（同日，排除法闭环后的最终版）
+
+上面"ipe lr 链污染微环"理论**不成立**，自我否决：bleq 是 BL，执行必写
+lr=stub+0x1c；ipe 空返回 `moveq pc,lr` 只能回桩尾；桩尾 3 条指令内必调
+finish（v231_finish=0 证尾从未运行）。环闭不上。
+
+**三条候选环全部被计数器排除**：
+1. 含桩尾的环 → v231_finish/force 必计数 → 全 0，排除
+2. 含 gadget 的环 → switch lane 必计数（v230 已证切换全经 gadget）→ 冻结，排除
+3. 调度器 C++ 宏环（log53 判决）→ 六计数器全冻结 → 排除
+
+**最终判决：VM 线程不在自旋，而是停在出生窗口不动（调度丢失/停驻态）**：
+- runClocks d=0（200ms 零执行时钟）——自旋会烧时钟，停驻不会
+- VM 报 cpu=2 而 cpu2 idle **在涨**（d=+199410µs、idleN +35）——cpu2 在变闲，
+  VM 没在上面跑；cpu0 的"忙"是 watchdog 自己（wd 报 cpu=0，polls=12 轮询中）
+- 内核态 RUNNING、wait=none、KICK 全无效（susp/res rc=0x80020008 非法状态）
+  ——"RUNNING 却拿不到 CPU"的丢失线程形态
+- 三份 dump PC 落在 bleq/ipe+0x8 两个相邻位置 = 停驻时的快照位置（非环内
+  采样命中）；15 轮同窗口 = HANG 总发生在出生窗口（绿线程首次派发/退出重入），
+  之后切换机构停摆，现场永远冻结在那里
+
+**死因指向**：master 模式的绿线程切换机构（svc 0x9f0001 trap 处理链）在
+HANG 时刻已死亡/卡住，VM 主线程被停在"半切换"状态（LR=出生链值=刚被
+gadget 装载、尚未执行 bleq），此后再无任何调度事件发生。cpu0/1 上再无
+任何 phoneME 线程在跑（六计数器+fast/site/jsmp+dispatch ring 全冻结）。
+
+**v02.32 方向（改判后的新打法）**：目标从"打破环"改为"切换机构何时死的"：
+- 桩/ipe/gadget 全在冻结 Interpreter_arm.o，环内埋点不可行（已证）
+- 活对象探测点：midp-vita wrap 层（C 代码，audit "wrap active"）、
+  OS_vita.cpp JVMSPI 层、Scheduler 活对象（_MergedSrc002）
+- 关键问题：svc 0x9f0001 的处理者是谁（vita 侧无注册代码，OS_ads.cpp 仅有
+  SWI 指令本体）——找到 trap 处理链才能知道它为何停摆
+
+### 补充教训（log54）
+
+- **"RUNNING+忙 CPU"必须用 runClocks+idle 斜率双重验证**：cpu0 忙≠VM 在跑
+  （本轮忙的是 watchdog 自己）；自旋烧 runClocks，停驻 runClocks=0
+- **排除法三连**：桩尾（finish）/gadget（switch）/调度器（六计数器）全排除后，
+  "环"叙事本身就该放弃——剩下的是"停驻"
+- **冻结对象清单扩大**：start_lightweight_thread_asm、invoke_pending_entries、
+  call_on_primordial_stack 全在 Interpreter_arm.o（与 pe_enter 同宿主），
+  出生窗口内不可能埋任何探针
+- **THREAD_REG_INFO 全记录解码**：note 头{magic=0x11,count=5,recsz=376}，
+  每记录 tid@0/sp@+56/lr@+60/pc@+64/cpsr@+68；plausibility 过滤会漏记录
+  （本轮 5 条只显 1 条），全解码要自己遍历（/tmp/log54_allrec.py 模式）
