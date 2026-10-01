@@ -6996,3 +6996,68 @@ C 层）。swjb/pe 预期恒 0，非 0 即本构建配置被改（信息量同�
   17ade63（注释修复，b384 实际编译源）
 - VM 库：libcldc_vm.a 29 成员（OS_vita.o 06:11 新编、33 对象全量代）
 - VPK：v02.30 b384 (17ade63)，06:24 产出
+
+
+---
+
+## log53 判决：绿线程调度机构用户态自旋转锤 + bleq 微环理论否决（v02.30 b384 首战，2026-10-01）
+
+### 本轮实证（slide=0x21000，self 锚点命中 vita_site_dump+0x0）
+
+**死点（THREAD_REG_INFO 5 线程全解码）**：
+- VM(40010003)：PC=0x810e2e2c-0x21000=**invoke_pending_entries+0x8**（`ldr r1,[r0,#36]`
+  正在加载 pe 字段），LR=**start_lightweight_thread_asm+0x0**（出生桩入口=gadget
+  `ldr lr,[r6,#4]` 签名），r0=0x81ee0d5c=id5 绿线程对象，cpsr=0x40070010（Z=SET、
+  User、中断开——与 log52 逐位相同）
+- tone/ticker：PC=sceKernelDelayThread+0x8 正常节拍；SceNet 内核态正常
+- 原生栈帧与 log52 完全同构：[SP]=JVM::start+0x18c / JVM_Start+0xa4 /
+  midp_run_midlet_with_args_cp+0x95c
+
+**watchdog（HANG 时刻）**：VM 内核状态 RUNNING、wait=none、runClocks d=0；
+**cpu1 idle/idleN/switchN 三 d=0**（忙而永不换出=用户态自旋铁证）；KICK 全无效；
+fast=111/site=19609/jsmp=92 三计数器全冻结（零解释器进展）。
+
+**v230 探针判读（本次核心架构知识）**：`ts_enter=0 ts_gadget=0` 而 `switch=18430`、
+`run=1`——绿线程切换**全部**经 trap/gadget 在 VM 内部完成（master 模式），
+`Scheduler::time_slice`/Main_vita slave 循环是**死路径**，探针放错了层。
+swjb/pe 三计数器如预期恒 0（编译死）。
+
+### 微环理论否决（重要修正）
+
+log52 PM 里"bleq+moveq pc,lr 无限环"假说**错误**：`0x0bffff42` 的 L 位=1，
+是 **BL+EQ（带链接）**——ipe 空返回会正确回到 stub+0x1c，桩内无死环。
+
+### 判决：调度器层宏环——僵尸绿线程无限重派（高置信）
+
+环路径：gadget（LR=桩入口）→ 出生桩 → bleq ipe → **pe=0 空返回** → 桩尾
+（call_on_primordial_stack 系列 → svc 0x009f0001 绿线程退出 syscall）→ wrap 层
+→ 调度器 → **再次派出同一线程**（链仍=出生态、pe 仍=NULL）→ 无限循环。
+
+全部观测吻合：
+- 15 轮同死点窗口（log36-53）：两次 dump 采样落在相邻指令（log52=stub+0x18、
+  log53=ipe+0x8），环内其余时间在调度器 C 码/桩尾
+- cpu1 忙而不换出、零解释器进展、内核 RUNNING 不进等待队列
+- id5 反常：th_start=5 已出生、**有活 Java 栈**（jsp=0x81ee1bf0 多帧）、ring 显示
+  近期 3 次正常切换——之后最终一次派发却走**出生链**（LR=桩入口）= 链回归出生态
+- 死亡通道断裂恒证：**th_finish=0、lw_exit=0（15 轮全 0）**——绿线程死亡从未走完，
+  死而不葬的线程留在可运行队列里被无限重派
+- ring 末段 id3(13×)+id5(3×) 交替且全无解释器进展 = 双僵尸轮转，与
+  "19 万次正常切换后才冻结"（活线程陆续死光只剩僵尸）自洽
+
+### 层2悬案（v02.31 目标）
+
+链为何回归出生态 / 僵尸为何不被移出队列：候选=退出 wrap 未接
+Scheduler::thread_finish；出生链重派前未查 pe。**探针必须放 switch_thread
+（C 层活代码）与退出 wrap 处**：记录每次派发目标 (id, chain[4], pe, status) 环，
+HANG 时 WD 快照直接读出"谁在无限重派、目标是否僵尸"。
+
+### 教训
+
+- **bleq 判读**：objdump 助记符 `bleq` = BL+EQ 带链接，勿与 `beq` 混淆——微环
+  假说死于一个 L 位
+- **探针先证路径活着**：v230 三探针全 0 不是坏消息而是架构事实（master 模式
+  trap 驱动切换）——放置前先在 dump/日志里证明该路径有流量
+- **THREAD_INFO note 布局与 THREAD_REG_INFO 不同**（本脚本偏移不通用），
+  内核状态直接用 watchdog 的 sceKernelGetThreadInfo 更可靠
+- log53 dump 与 log52 结构同源（24 note/5 线程），但 slide=0x21000 再次印证
+  **slide 绝不跨 dump 复用**
