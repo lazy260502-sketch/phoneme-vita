@@ -7122,3 +7122,76 @@ exit-ring 记录在 `lw_exit` 入口——若环困在更早的 finish/force 阶
 
 - 主仓 j2me `97ee23b`：Thread.cpp×4 + Scheduler.cpp×2 + OS_vita.cpp（定义+
   记录函数+快照输出）+ CMakeLists.txt（02.31 + 判读注释块）
+
+
+## log54 判决：ipe 空返回 lr 链污染微环（v02.31 b387 首战，2026-10-01）
+
+### 本轮实证（slide=0x1b000，self 锚点命中 vita_site_dump+0x0）
+
+**死点（THREAD_REG_INFO 1 线程，VM 主线程 tid=0x40010003）**：
+- PC=0x810dd2bc-0x1b000=**start_lightweight_thread_asm+0x18**（`bleq invoke_pending_entries`
+  指令本身，与 log52 同点）；LR=**桩入口+0x0**（出生链保存值，gadget 签名）
+- r0=0x81eddfb4（id4 绿线程对象，与 site_ring nrt 一致，jsp=0x81edef60 活栈）
+- r1=0（status 无 TERMINATING 位）、cpsr=0x40070010（Z=1、User、中断开——与 log52/53 逐位同）
+- r6=0x81edf01c（出生链块）、r12=0x81ede52c（=stack_limit，帧完好）
+- 原生栈底：JVM::start+0x18c → JVM_Start+0xa4 → midp_run_midlet_with_args_cp+0x95c
+  （三份 dump 同构）；栈上无任何 Scheduler/switch 层帧——绿线程不在 C 栈上运行
+
+**v231 六计数器判读（核心新证据）**：
+两次 wd_snapshot（间隔 400ms）：`finish=0 force=0 setcur=59→59 term=0 term_listed=0
+exit_seq=0`——**全冻结且 setcur 非零**（=探针路径活，非 v230 死探针）。
+按预设判读表第一分支命中：**环在桩簇 asm 内，无任何 C++ 体参与**。
+log53 "调度器宏环"判决修正：环不在调度器 C 层，比想象的更小。
+
+**watchdog 新形态**：忙 CPU 是 **cpu0**（log53 为 cpu1）；VM 线程报 cpu=2、
+lastcpu=2，但 cpu0 idle/idleN/switchN 三 d=0 且 cpu2 idle 在涨——"VM 线程锚定
+在忙 CPU"的旧锚定法失效（dump 采样与 sysinfo 采样不同时 + 调度漂移），
+判读以 dump 寄存器为准。dispatch ring 末段 **id=3 ×16**（log53 为 id3+id5 混合，
+本轮更纯）。ce=373/pump=373、ttk d=0 但 tick d=50（ticker 线程活着）。
+
+### 环的精确路径（三份 dump 交叉闭合）
+
+```
+某处(WRAP 层) 调 gadget/call_on_primordial_stack 返回序列
+  ldr lr,[r6,#4]          ← lr 装载出生链保存值 = 桩入口地址
+  jmpx(lr)                → 跳进桩入口（LR=桩入口的观测来源）
+桩头: get_thread; ldr r1,[r0+status]; tst TERMINATING(Z=1)
+  bleq ipe                → 跳 ipe（log54 PC=bleq 本身、log53 PC=ipe+0x8）
+ipe: ldr r0,[_current_thread]; ldr r1,[r0,#36](pe); cmp; pe=0
+  moveq pc,lr             → lr=桩入口！回桩头（而非 stub+0x1c）
+→ 微环闭合：桩头↔ipe，永不前进到桩尾
+```
+
+关键物证：**LR=桩入口而非 stub+0x1c**——bl 语义应写 lr=stub+0x1c，观测值
+是链装载值。ipe 空返回 `moveq pc,lr` 用被污染的 lr 跳回桩头。环内无 C++ 体
+（v231 全零）、无解释器进展（fast/site/jsmp 冻结）、cpu 忙而不换出。
+
+### 判决
+
+**ipe 空返回 lr 链污染微环**：出生链的 lr 槽（[r6+4]，setup_stack_asm 布局）
+被 wrap/gadget 层装载后，ipe 的空返回路径 `moveq pc,lr` 把执行流送回桩头而非
+bl 的正确返回点 stub+0x1c，形成桩头↔ipe 死环。环困住的是**最后一次派发**的
+绿线程（本轮 id4，jsp 活栈），死因是**链回归出生态+lr 污染**，非"调度器无限
+重派"（dispatch ring 冻结、无重派流量）。
+
+### 下一步（v02.32 候选探针）
+
+环内每次过 ipe pe 检查都是热点：在 ipe 空返回路径（moveq pc,lr）前埋计数器
+可测环频率；但 ipe 在冻结 Interpreter_arm.o——**不可行**。替代：桩头是
+_MergedSrc 活对象（start_lightweight_thread_asm 在 InterpreterStubs_arm.cpp，
+需确认宿主对象是否冻结）。更优：**在 wrap 层出口埋点**（master 循环每圈必经
+的 C 函数，如 Scheduler::allocate_or_recycle、Scheduler::step 之类活代码），
+记录 wrap 每圈派发的 (id, chain, lr 装载值)——若 wrap 在转，环在 wrap↔桩头；
+若 wrap 也冻结，则环是纯 asm 微环（桩头↔ipe 两地址间），修复方向为 ipe 返回
+路径改 `moveq pc, lr_saved_from_bl` 或桩头自恢复（进桩先 push lr）。
+
+### 教训
+
+- **cpsr 偏移**：THREAD_REG_INFO 记录布局 tid@desc+0xC、16 寄存器@desc+0x10、
+  **cpsr@desc+0x50**（PM 旧记载 +68 是记录相对，绝对偏移 0x50）
+- **LR 观测值的两义性**：LR=桩入口既可能是"刚被 gadget 装载、BL 尚未覆盖"
+  （环在桩头前），也可能是"ipe 空返回用它跳回"（环含 ipe）——需结合 PC 位置
+  与计数器判读，单一 LR 不能定环
+- **dump 与 sysinfo 不同时**：VM 线程 cpu=2 报告与 cpu0 忙的观测不矛盾
+  （watchdog sysinfo 在 dump 之前采样），"VM 在忙 CPU 上自旋"必须用 dump 锚定
+- **heredoc/终端内联 python 继续坑**：多行 python -c 被吞，一律先写 /tmp/*.py
