@@ -6912,3 +6912,87 @@ PCSG90096 coredump 记录（本机还 dump 过别的应用）。
 - **creator 字段 vs 等待者**——同步对象 note 里 tid 出现≠阻塞，先看字段语义
 - **JVM::run 内联进 JVM::start**——源码行号与反汇编对不上时先查内联
 - **slide 每次启动不同**（log51 +0x35000 / log52 +0x7D000）——绝不跨 dump 复用
+
+---
+
+# v02.30（b384 17ade63）：出生链三探针——两代实现与三次静默失效追捕
+
+## 目标
+
+log52 判决冻结点在出生桩（start_lightweight_thread_asm+0x18，LR=桩入口=primordial
+gadget 签名），v02.30 要回答的只有一个问题：**冻结时主循环/gadget 穿越/出生消费
+哪个还活着？**
+
+## 第一代实现（58b70e0，部分失效）
+
+- Scheduler.cpp：`_vita_swjb_seen/_vita_swjb_clear`——switch_thread 出让侧统计仍带
+  JUST_BORN 位的线程
+- SharedStubs_arm.cpp：生成桩 `invoke_pending_entries` pe≠NULL 路径加 4 指令
+  `_vita_pe_enter++`
+- OS_vita.cpp：wd snapshot 增行 `v230 swjb_seen=… swjb_clear=… pe_enter=…`
+
+## 三次静默失效（每个都是结构性陷阱）
+
+1. **pe_enter 永不生效**：桩符号（invoke_pending_entries/primordial gadget/
+   shared_entry/出生桩）全部宿主在 `Interpreter_arm.o`，而 rebuild_vm.sh 的
+   pack_lib **故意从备份库回填旧 Interpreter_arm.o**（再生 .s 丢 jvm_f2i/jvm_d2i
+   浮点桩）。生成器源码改动永远进不了产物。教训：**改生成桩前先 `nm -A libcldc_vm.a`
+   确认符号宿主对象**；若宿主是被回填冻结的成员，asm 层插桩死路。
+2. **swjb 两计数器编译死**：`THREAD_JUST_BORN` 仅在 `Scheduler::start()` 的
+   `_debugger_active`（本构建恒 0）分支置位——位永远不置，计数器永远 0。
+   教训：**加计数器前先 grep 置位点**，确认被测事件在本构建配置下真的会发生。
+3. **注释 `*/` 提前终止**：`/* swjb_*/pe_enter ... */` 把块注释拦腰斩断，
+   `OS_vita.cpp:1137 'pe_enter' was not declared` 编译失败——但 rebuild_vm.sh
+   的 `|| true` 把它吞了，32 对象照常打包（缺 OS_vita.o），库链进 VPK 的是
+   04:31 的旧对象。教训：**注释里绝不写 `xxx_*/yyy` 模式**；rebuild 后应
+   `strings` 验证新格式串真的入库（本次靠它连抓两层失效）。
+
+第四次是构建系统陷阱：**cmake 不跟踪 `-lcldc_vm` 的 mtime**——库换了 velf 不重链。
+改 VM 库后必须 `rm -f midp_vita.velf` 强制重链再 build。
+
+## 第二代实现（30e1e38 + 17ade63，生效）
+
+C 层等价观测（调用图证明覆盖 asm 层）：gadget 仅两处调用——`JVM::run`（首次，
+vita_run_count 已覆盖）与 `time_slice`（每次切换）。
+
+- `_vita_ts_enter`：`Scheduler::time_slice()` 入口——Main_vita slave 主循环每圈
+  +1（含早退圈）
+- `_vita_ts_gadget`：gadget 调用前最后一条 C 指令——数真实穿越进 Java 的次数
+- snapshot 行扩为 `v230 swjb_seen=… swjb_clear=… pe_enter=… ts_enter=…
+  ts_gadget=…`（swjb/pe 三死计数保留只为快照不撒谎式省略）
+
+### 判读指南（HANG 后两次快照对比）
+
+| ts_enter | ts_gadget | 判决 |
+|----------|-----------|------|
+| 停滞 | （任意） | 主循环冻死在 gadget 穿越中（log52 情形） |
+| 仍涨 | 停滞 | 主循环空转：无 runnable 绿线程，早退 return 100 |
+| 仍涨 | 仍涨 | 切换健康，冻结在别处（重看 dump） |
+
+三态覆盖了除"纯 asm 自旋环"外的所有情形；调用图证明纯 asm 环不存在（桩路径必回
+C 层）。swjb/pe 预期恒 0，非 0 即本构建配置被改（信息量同样大）。
+
+## 验证链（每层都做了实证）
+
+- `strings libcldc_vm.a | grep v230` → 新格式串入库
+- `arm-vita-eabi-nm -A libcldc_vm.a | grep ts_` → accessor T 定义在 OS_vita.o
+- `rm velf` 重链后 `strings midp_vita.velf | grep v230` → 新串进 velf
+- 产物 `vita-port/out/vpk/midp_vita_v02.30.vpk`（b384 17ade63）：
+  - `strings .sym | grep "J2ME Player"` → `J2ME Player v02.30 b384 (17ade63)`
+  - `strings .sym | grep "v230 swjb"` → 含 ts_enter/ts_gadget
+  - `nm .sym | grep -c vita_sched_ts` → 2
+
+## 部署与预期
+
+- 真机装 `midp_vita_v02.30.vpk`（b384），复现 HANG 后取 psp2core dump +
+  wd_snapshot（两次快照对比），读 `v230 … ts_enter/ts_gadget` 行
+- 若 ts_enter 停滞（主循环冻死）：冻结点必在 time_slice 体内或 gadget 穿越中，
+  结合 dump 的 PC/SP 判据与 log52 一致——顺藤摸 gadget 内部
+- 若 ts_enter 仍涨：冻结不在 VM 主循环——转向 MIDP 事件层/绿线程世界内部
+
+## git
+
+- phoneme-cldc（j2me 主仓跟踪）：58b70e0（一代）→ 30e1e38（二代 ts 探针）→
+  17ade63（注释修复，b384 实际编译源）
+- VM 库：libcldc_vm.a 29 成员（OS_vita.o 06:11 新编、33 对象全量代）
+- VPK：v02.30 b384 (17ade63)，06:24 产出
