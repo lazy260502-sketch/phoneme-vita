@@ -903,6 +903,18 @@ void Scheduler::dispose() {
 
 void Scheduler::terminate(Thread* thread JVM_TRAPS) {
   JVM_IGNORE_TRAPS;
+#if defined(VITA)
+  /* v02.31: terminate is the queue-removal half of green-thread death
+   * (called from lightweight_thread_exit). Count entries and - see
+   * the post-check at the bottom - whether this thread is STILL on
+   * the global list after removal. A still-listed hit means either
+   * double-terminate or a re-inserted zombie: both feed the redispatch
+   * macro-loop verdict. */
+  {
+    extern unsigned int vita_v231_term;
+    vita_v231_term++;
+  }
+#endif
   if (TraceThreadsExcessive) {
     TTY_TRACE_CR(("terminating 0x%x", thread->obj()));
   }
@@ -995,6 +1007,21 @@ void Scheduler::terminate(Thread* thread JVM_TRAPS) {
     *Universe::async_watcher() = (ReturnOop)NULL;
   }
 
+#if defined(VITA)
+  /* v02.31 post-check: the removal loop above must have unlinked this
+   * thread. Raw pointer walk (no handles - we are inside an
+   * AllocationDisabler), compare by obj() address. */
+  {
+    extern unsigned int vita_v231_term_listed;
+    for (Thread::Raw t_ = Universe::global_threadlist()->obj();
+         t_.not_null(); t_ = t_().global_next()) {
+      if (t_.obj() == thread->obj()) {
+        vita_v231_term_listed++;
+        break;
+      }
+    }
+  }
+#endif
 }
 
 void Scheduler::terminate_all() {

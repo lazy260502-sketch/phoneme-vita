@@ -1076,7 +1076,21 @@ set(VITA_VERSION  "02.28")
 #   SharedStubs_arm.cpp). Next HANG: pe_enter climbing with dispatch
 #   ring flat = birth-stub re-entry loop named; pe_enter stuck =
 #   stub never ran after the last dispatch.
-set(VITA_VERSION  "02.30")
+# 02.31 (log53 verdict): the bleq micro-loop theory is RETRACTED
+#   (0x0bffff42 has L=1, BL+EQ links correctly - no in-stub loop).
+#   log53 froze at invoke_pending_entries+0x8 with the SAME LR=stub
+#   entry, same cpsr 0x40070010, cpu1 busy-but-never-context-switching
+#   and ALL lane counters frozen (switch/yield/gnrt/fast/site) - so
+#   the loop (if any) never touches switch_thread/time_slice. The
+#   only C++ a stub-tail cycle can reach are the call_on_primordial_
+#   stack bodies: finish / force_terminated / thread_task_cleanup /
+#   lightweight_thread_exit(terminate+yield). v02.31 instruments
+#   exactly those (all in live _MergedSrc objects, no loopgen
+#   dependency) plus set_current, a terminate post-check for
+#   still-listed threads, and an 8-slot exit ring. Next HANG, two
+#   snapshots: any v231 counter climbing names the spinning body;
+#   all frozen with cpu1 busy = the loop is confined to stub asm.
+set(VITA_VERSION  "02.31")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows

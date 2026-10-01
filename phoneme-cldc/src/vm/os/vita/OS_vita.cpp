@@ -485,6 +485,43 @@ volatile unsigned int vita_sched_start_count = 0;
 volatile unsigned int vita_thread_start_count = 0;
 volatile unsigned int vita_thread_finish_count = 0;
 volatile unsigned int vita_lw_exit_count = 0;
+/* v02.31: macro-loop (zombie redispatch) probes. The log53 verdict put
+ * the freeze in the birth-stub <-> ipe window with ALL v02.17 lane
+ * counters frozen (switch/yield/gnrt) - so if a loop runs at all it
+ * must cycle through the C++ bodies the stub tail invokes via
+ * call_on_primordial_stack: finish / force_terminated /
+ * thread_task_cleanup / lightweight_thread_exit(+terminate+yield).
+ * Those bodies live in _MergedSrc002/004 (live objects, rebuilt every
+ * time - NOT the loopgen-frozen Interpreter_arm.o). At the hang, two
+ * watchdog snapshots decide:
+ *   - any of finish/force/term/setcur still climbing  -> macro-loop
+ *     confirmed AND named (which body it spins through)
+ *   - all frozen, cpu1 still busy                     -> the loop is
+ *     confined to the stub cluster asm itself (no C++ body involved)
+ * term_listed>0 -> terminate ran on a thread that stayed on the global
+ * list (double-terminate or re-inserted zombie).
+ * exit-ring: last 8 lightweight_thread_exit records (id, status, pe,
+ * chain-word at +0x64 the primordial gadget walks). If the VM keeps
+ * dispatching an id whose LAST exit-ring record shows the death view,
+ * redispatch-after-death is proven without waiting for a dump. */
+volatile unsigned int vita_v231_finish     = 0;
+volatile unsigned int vita_v231_force_term = 0;
+volatile unsigned int vita_v231_setcur     = 0;
+volatile unsigned int vita_v231_term       = 0;
+volatile unsigned int vita_v231_term_listed = 0;
+#define VITA_V231_EXIT_RING 8
+volatile unsigned int vita_v231_exit_ring[VITA_V231_EXIT_RING][4];
+volatile unsigned int vita_v231_exit_seq = 0;
+extern "C" void vita_v231_exit_ring_rec(unsigned int id, unsigned int st,
+                                        unsigned int pe, unsigned int chain)
+{
+    unsigned int s = vita_v231_exit_seq;
+    vita_v231_exit_ring[s & (VITA_V231_EXIT_RING - 1)][0] = id;
+    vita_v231_exit_ring[s & (VITA_V231_EXIT_RING - 1)][1] = st;
+    vita_v231_exit_ring[s & (VITA_V231_EXIT_RING - 1)][2] = pe;
+    vita_v231_exit_ring[s & (VITA_V231_EXIT_RING - 1)][3] = chain;
+    vita_v231_exit_seq = s + 1;
+}
 volatile unsigned int vita_start0_count = 0;
 volatile unsigned int vita_justborn_dispatch = 0;
 volatile unsigned int vita_ticker_loops = 0;
@@ -1152,6 +1189,35 @@ static void vita_wd_snapshot_one(SceUID fd) {
                      vita_sched_pe_enter(),
                      vita_sched_ts_enter(), vita_sched_ts_gadget());
         sceIoWrite(fd, buf, n);
+    }
+
+    /* v02.31: macro-loop probes (definitions next to the other vita
+     * counters near the top of this file). Read these FIRST at a hang:
+     * any still climbing between the two snapshots names the spinning
+     * body; all frozen with cpu1 busy means the loop never leaves the
+     * stub-cluster asm. */
+    n = snprintf(buf, sizeof(buf),
+                 "  v231 finish=%u force=%u setcur=%u term=%u"
+                 " term_listed=%u exit_seq=%u\n",
+                 vita_v231_finish, vita_v231_force_term,
+                 vita_v231_setcur, vita_v231_term,
+                 vita_v231_term_listed, vita_v231_exit_seq);
+    sceIoWrite(fd, buf, n);
+    {
+        unsigned int c = vita_v231_exit_seq;
+        unsigned int start = (c >= VITA_V231_EXIT_RING)
+                               ? (c - VITA_V231_EXIT_RING) : 0;
+        unsigned int i;
+        for (i = start; i < c; i++) {
+            unsigned int idx = i & (VITA_V231_EXIT_RING - 1);
+            n = snprintf(buf, sizeof(buf),
+                         "  exit[%u] id=%u st=%08x pe=%u chain=%08x\n",
+                         i, vita_v231_exit_ring[idx][0],
+                         vita_v231_exit_ring[idx][1],
+                         vita_v231_exit_ring[idx][2],
+                         vita_v231_exit_ring[idx][3]);
+            sceIoWrite(fd, buf, n);
+        }
     }
 
     /* (3) The last 8 Java threads created (class.method). A create/die

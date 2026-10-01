@@ -39,6 +39,14 @@ jlong Thread::_global_tick_count = 1;
 
 static int _thread_creation_count;
 
+#if defined(VITA)
+/* v02.31: defined in OS_vita.cpp - records the after-death scheduler
+ * view at each lightweight_thread_exit (see the call site below).
+ * Declared at namespace scope: block-scope extern "C" is illegal C++. */
+extern "C" void vita_v231_exit_ring_rec(unsigned int, unsigned int,
+                                        unsigned int, unsigned int);
+#endif
+
 HANDLE_CHECK(Thread, is_jvm_thread())
 
 void Thread::append_pending_entry(EntryActivation* entry) {
@@ -93,6 +101,13 @@ void Thread::setup_lightweight_stack(JVM_SINGLE_ARG_TRAPS) {
 void force_terminated(Thread* thread) {
 #if defined(VITA)
   vita_site_mark(); /* v01.84: log10 - death-path branch marker */
+  /* v02.31: force_terminated is the last-resort death mark on the
+   * birth-stub tail (between finish and task_cleanup). If the macro
+   * loop runs the stub tail over and over this climbs while
+   * vita_thread_finish_count stays flat (or vice versa) - separating
+   * "finish body reached" from "force path taken". */
+  extern unsigned int vita_v231_force_term;
+  vita_v231_force_term++;
 #endif
   ThreadObj::Raw thread_obj = thread->thread_obj();
   thread_obj().set_terminated();
@@ -219,6 +234,22 @@ void Thread::lightweight_thread_exit() {
    * climbs while the dispatch ring keeps showing the same thread, the
    * VM is cycling create -> run -> exit through Java. */
   vita_lw_exit_count++;
+  /* v02.31: capture the AFTER-DEATH scheduler view right here - the
+   * exit path just removed this thread from every queue (terminate +
+   * yield above), so if the VM afterwards keeps dispatching THIS id
+   * the queues still contain a dead entry. Ring entry: id, status,
+   * pending_entries, chain[+0x64] (the stack-chain word the primordial
+   * gadget walks). Single writer = VM thread; the watchdog reader
+   * tolerates torn values (writer frozen at hang). */
+  {
+    Thread *me_ = Thread::current();
+    unsigned int chain_ = *(volatile unsigned int *)
+                            ((char *)me_ + 0x64);
+    vita_v231_exit_ring_rec((unsigned int)me_->id(),
+                            (unsigned int)me_->status(),
+                            (me_->pending_entries() != NULL) ? 1u : 0u,
+                            chain_);
+  }
 #endif
   SETUP_ERROR_CHECKER_ARG;
   Thread *thread = Thread::current();
@@ -318,6 +349,17 @@ ReturnOop Thread::allocate(JVM_SINGLE_ARG_TRAPS) {
 }
 
 void Thread::set_current(Thread* value) {
+#if defined(VITA)
+  /* v02.31: set_current is where the VM actually commits a green-
+   * thread switch (switch_thread and lightweight_thread_exit both
+   * funnel through it). The dispatch ring only records the OUTGOING
+   * thread of switch_thread - this counter plus the ring captured
+   * inside lightweight_thread_exit (below) closes the incoming side:
+   * at the hang, a climbing set_current with a frozen switch_thread
+   * count means redispatch is driven from the exit path. */
+  extern unsigned int vita_v231_setcur;
+  vita_v231_setcur++;
+#endif
   GUARANTEE(_last_handle == NULL, "No handles when switching threads");
   GUARANTEE(last_kni_handle_info == NULL,
                                  "No KNI handles when switching threads");
@@ -427,6 +469,13 @@ void Thread::finish() {
    * thread died before its first quantum - i.e. inside the new-thread
    * entry path that log41 froze on. */
   vita_thread_finish_count++;
+  /* v02.31: finish() is one of the C++ bodies the birth-stub tail
+   * invokes via call_on_primordial_stack. At the hang NONE of the
+   * v02.17 lane counters (switch/yield/gnrt) move anymore, so the
+   * macro loop (if any) must be spinning through the stub-tail
+   * bodies - which are exactly the functions instrumented here. */
+  extern unsigned int vita_v231_finish;
+  vita_v231_finish++;
 #endif
   SETUP_ERROR_CHECKER_ARG;
   Thread *thread = Thread::current();
