@@ -7061,3 +7061,64 @@ HANG 时 WD 快照直接读出"谁在无限重派、目标是否僵尸"。
   内核状态直接用 watchdog 的 sceKernelGetThreadInfo 更可靠
 - log53 dump 与 log52 结构同源（24 note/5 线程），但 slide=0x21000 再次印证
   **slide 绝不跨 dump 复用**
+
+
+## v02.31：桩尾 C++ 体六探针 + exit-ring（97ee23b / b387，2026-10-01）
+
+### 设计依据（承接 log53 判决）
+
+log53 判决环在**调度器层宏环**（僵尸重派），且 HANG 期间 switch/yield/gnrt
+计数器全冻结——若按原计划把探针埋进 `switch_thread` 将**一无所获**（冻结路径
+无流量）。改为埋**出生桩尾 C++ 体**（`call_on_primordial_stack` 的派发目标，
+即宏环每圈必经的 C++ 环节）：
+
+| 探针 | 位置 | 语义（宏环每圈若有 C++ 体参与必 +1） |
+|---|---|---|
+| `vita_v231_finish` | `Thread::finish()` 入口 | 桩尾正常收尾体 |
+| `vita_v231_force_term` | `Thread::force_terminated()` 入口 | 强杀体 |
+| `vita_v231_setcur` | `Thread::set_current()` 入口 | 任何真实切换必经 |
+| `vita_v231_term` | `Scheduler::terminate()` 入口 | 调度器终结路径 |
+| `vita_v231_term_listed` | `terminate()` 尾部 raw 扫 global_threadlist 命中受害者仍在链 | 双 terminate / 僵尸重插 |
+| exit-ring(8×4) | `lightweight_thread_exit()` 入口：id/status/pe!=NULL/chain(+0x64) | 死后链回归出生态实锤 |
+
+### 宿主对象验证（防 Interpreter_arm.o 冻结类失效）
+
+`force_terminated`/`thread_task_cleanup`/`_ZN9JVMThread6finishEv`/
+`_ZN9JVMThread23lightweight_thread_exitEv`/`_ZN9JVMThread11set_currentEPS_`/
+`append_pending_entry` 全在 `_MergedSrc004.o`；`Scheduler::yield`/
+`Scheduler::terminate` 在 `_MergedSrc002.o`——**全是每轮 rebuild 重编的活对象**。
+`invoke_pending_entries` 在冻结 `Interpreter_arm.o`（勿再在那埋点）。
+
+### 编译修复：块作用域 extern "C" 非法
+
+Thread.cpp 首次在函数体内写 `extern "C" void f(...)` 报
+`expected unqualified-id`（C++ 标准禁止块作用域 linkage-specification）。
+修复：声明移到**文件作用域**（`#if defined(VITA)` 包裹）。另一坑：C++ 文件内
+`extern unsigned f(void)` 声明会 mangle、与 extern "C" 定义不匹配——统一
+extern "C"。rebuild_vm.sh 的 `|| true` 会吞编译错误，务必 grep error: 自查。
+
+### 验证链（全过）
+
+- `strings libcldc_vm.a | grep -c "v231 finish"` → 1（格式串入库）
+- `nm libcldc_vm.a | grep vita_v231` → 6 计数器 B + exit_ring/seq B +
+  `vita_v231_exit_ring_rec` T + 2 个 U（Scheduler 侧引用闭合）
+- 产物 `midp_vita_v02.31.sym`：版本串 `J2ME Player v02.31 b387 (97ee23b)`、
+  8 个 vita_v231 符号链接入
+
+### 判读指南（HANG 后两次 wd_snapshot 对比）
+
+- 任一 v231 计数器仍涨 → 宏环确认**且点名自旋体**（涨者即环内活跃体）
+- 全冻结而 cpu1 忙 → 环困在桩簇 asm 内（无 C++ 体参与，层2悬案指向 asm）
+- `term_listed>0` → terminate 过的线程仍在全局链表（双 terminate 或重插僵尸）
+- exit-ring 最后记录与 dispatch ring 死后仍派发同一 id → 死后重派实锤
+
+### 遗留风险
+
+exit-ring 记录在 `lw_exit` 入口——若环困在更早的 finish/force 阶段则 exit-ring
+不动但对应计数器会动，判读时注意层次。`+0x64` chain 读取依赖 primordial gadget
+栈链字偏移（log53 实测），若上游重构需同步。
+
+### git
+
+- 主仓 j2me `97ee23b`：Thread.cpp×4 + Scheduler.cpp×2 + OS_vita.cpp（定义+
+  记录函数+快照输出）+ CMakeLists.txt（02.31 + 判读注释块）
