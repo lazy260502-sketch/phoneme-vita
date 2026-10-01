@@ -7242,3 +7242,41 @@ gadget 装载、尚未执行 bleq），此后再无任何调度事件发生。cp
 - **THREAD_REG_INFO 全记录解码**：note 头{magic=0x11,count=5,recsz=376}，
   每记录 tid@0/sp@+56/lr@+60/pc@+64/cpsr@+68；plausibility 过滤会漏记录
   （本轮 5 条只显 1 条），全解码要自己遍历（/tmp/log54_allrec.py 模式）
+
+
+### log54 判决终版（同日第二次修正，runClocks 归属表闭环）
+
+上一节"cpu0 的忙是 watchdog 自己"**错误**，修正：wd 报 cpu=1，sysinfo 窗口内
+wd 在 sleep 200ms（vita_watchdog.c:629 两采样间 sceKernelDelayThread(200*1000)），
+cpu1 idle 恰涨 +199.6ms=wd 的睡眠；而 cpu0 全窗口 idle d=0/idleN d=0/switchN
+d=0 = 某线程连续执行 200ms 从未切换、从未进 idle。
+
+**runClocks 归属表（排除法）**：
+- VM d=0（若自旋必积累 ~200ms）；wd d=1683µs（睡眠）；tone d=2331µs（delay
+  节拍）；ticker delay 正常 → **cpu0 旋者不在任何被采样线程中**=未观测线程
+- VM 报 cpu=2 但 cpu2 idle 涨满窗口 → VM 不在 cpu2 上跑过；cpu1/2/3 都有大
+  量空闲而 VM（内核态 READY：RUNNING/wait=none）从未被派发 → **不是 CPU
+  饥饿，是就绪队列链/TCB 损坏（丢失线程，lost-ready）**
+- KICK5 susp/res rc=0x80020008（非法状态）与 log33/34 ghost-TCB 先例吻合：
+  同类腐败。log53 重读：当时 cpu1 忙+VM 报 cpu=1 但 runClocks 同样 d=0——
+  **log53 把旋者错归给 VM 线程**，"某线程在忙核上用户态自旋"成立、"VM 在
+  自旋"不成立；log52 以来三 dump 的 PC 同窗口只是"VM 停驻点"恰好都在出生
+  窗口（HANG 高发于绿线程出生/切换边界）
+
+**最终判决（v3）**：VM 主线程在绿线程 id4 出生窗口中段（gadget 装载链后、
+bleq 执行前后）**停驻**——内核可见 READY 但永不获派发（TCB/队列损坏），
+runClocks 归零、全部 phoneME 计数器冻结皆因载体线程死了。同时另一未观测
+线程在某核上无限自旋（idle/switch 双冻结）。两者可能是同一次内存/TCB 损坏
+的两个症状（如已释放线程仍挂队列：旋者=僵尸，VM=被挤掉链的受害者）。
+
+### v02.32 探针方案（最终版）：watchdog 线程普查
+
+目标：**点名 cpu0 旋者 + 找 ghost tid**。全部在 vita-port C 活代码（无冻结
+对象风险）：
+- HANG 时 `sceKernelGetThreadIdList` 枚举进程全部线程 → 逐 tid
+  `sceKernelGetThreadInfo`（name/status/cpu/runClocks），200ms 双采样
+- 旋者=runClocks d≈200ms 的 tid，名字直接读出；census 与 AUDIT 三注册表
+  差集=未观测线程清单（ANI 池/音频/输入/ghost）
+- 安全纪律（log34 教训）：**每个 tid 先 log 再查**——若 wd 在某 tid 上死于
+  内核数据 abort，最后 log 的 tid 就是腐败 TCB（天然二分标记）；
+  sceKernelGetThreadRunStatus 永久禁用（log33/34 已证杀死调用者）
