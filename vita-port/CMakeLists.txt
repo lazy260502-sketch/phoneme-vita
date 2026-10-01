@@ -1054,7 +1054,7 @@ set(VITA_VERSION  "02.28")
 # holes. log51: VM slot ended io_pwrite RETURNED (not inside any
 # traced syscall) yet the thread shows TCB=RUNNING wait=none with
 # runClocks d=0 and its core's idle/idleN/switchN all frozen. Two
-# hypotheses remain: (B) wedge inside a syscall the v02.27/28 set
+# hypotheses remained: (B) wedge inside a syscall the v02.27/28 set
 # never traced - head suspect newlib fsync -> sceIoSyncByFd, the
 # natural call right after pwrite - or (D) a spin no wrapper sees.
 # v02.29 wraps the remaining blocking-capable surface (12 symbols,
@@ -1063,7 +1063,20 @@ set(VITA_VERSION  "02.28")
 # ExitDeleteThread/ExitProcess. Next HANG discriminates directly:
 # slot ODD on one of these = B wins (deadpoint named); still EVEN =
 # D (deadpoint outside every syscall wrapper, i.e. userland native).
-set(VITA_VERSION  "02.29")
+# 02.30 (log52 second round): full dump-note forensics. Kernel-side
+#   THREAD_INFO says VM=RUNNING, VM tid in NO wait queue (all sync
+#   object notes scanned), all 5 thread register records decoded -
+#   only the VM thread is frozen (PC=birth stub +0x18, LR=stub entry
+#   = the primordial_to_current_thread gadget signature, SP on the
+#   native stack under JVM::run()'s inlined bl). 190k normal green
+#   switches happened first. v02.30 adds birth-stub visibility:
+#   swjb_seen/swjb_clear (switch_thread JUST_BORN counting moved out
+#   of the never-active _debugger_active short-circuit) and pe_enter
+#   (generated invoke_pending_entries stub entry-with-body counter,
+#   SharedStubs_arm.cpp). Next HANG: pe_enter climbing with dispatch
+#   ring flat = birth-stub re-entry loop named; pe_enter stuck =
+#   stub never ran after the last dispatch.
+set(VITA_VERSION  "02.30")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows

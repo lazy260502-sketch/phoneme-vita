@@ -623,6 +623,22 @@ void SharedStubs::generate_invoke_pending_entries() {
   cmp(r1, zero);
   jmpx(lr, eq);
 
+#if defined(VITA)
+  /* v02.30: count entries that actually have a pending entry to run
+   * (i.e. birth-stub consumption with a live body). log52 froze the VM
+   * thread at start_lightweight_thread_asm+0x18 (the bleq to this stub)
+   * with LR = stub entry - the primordial_to_current_thread gadget
+   * signature. If a later freeze shows _vita_pe_enter climbing while
+   * dispatch ring / interpreter counters stay flat, the birth stub is
+   * being re-entered in a loop without ever reaching the interpreter.
+   * scratch r3 is dead here (r0 thread / r1 pe are the live values). */
+  comment("v02.30: bump _vita_pe_enter (VITA birth-stub visibility)");
+  ldr_label(r3, "_vita_pe_enter", false);
+  ldr(r2, imm_index(r3));
+  add(r2, r2, imm(1));
+  str(r2, imm_index(r3));
+#endif
+
   // Note that we need to push fp-jsp rather than fp itself.  The GC knows
   // how to relocate the stack pointer, but not the saved frame pointer
   comment("Save permanent registers");

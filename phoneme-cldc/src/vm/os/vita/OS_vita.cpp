@@ -1126,6 +1126,24 @@ static void vita_wd_snapshot_one(SceUID fd) {
                  vita_lw_exit_count, vita_start0_count,
                  vita_sched_justborn());
     sceIoWrite(fd, buf, n);
+    /* v02.30: birth-stub visibility (log52 froze the VM at the birth
+     * stub with LR=stub entry - the primordial gadget signature; see
+     * Scheduler.cpp file-head note). swjb_seen counts switch-outs of
+     * threads still carrying JUST_BORN; pe_enter counts entries into
+     * the generated invoke_pending_entries stub that had a live body.
+     * At a freeze: pe_enter >> swjb_seen means consumption without
+     * dispatch records (the birth-stub re-entry loop); pe_enter stuck
+     * while justborn-class bits remain means the stub never ran. */
+    {
+        extern unsigned int vita_sched_swjb_seen(void);
+        extern unsigned int vita_sched_swjb_clear(void);
+        extern unsigned int vita_sched_pe_enter(void);
+        n = snprintf(buf, sizeof(buf),
+                     "  v230 swjb_seen=%u swjb_clear=%u pe_enter=%u\n",
+                     vita_sched_swjb_seen(), vita_sched_swjb_clear(),
+                     vita_sched_pe_enter());
+        sceIoWrite(fd, buf, n);
+    }
 
     /* (3) The last 8 Java threads created (class.method). A create/die
      * spin prints the same pair over and over - which names the Java

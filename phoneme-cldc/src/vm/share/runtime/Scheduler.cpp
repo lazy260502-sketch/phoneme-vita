@@ -63,6 +63,22 @@ unsigned int Scheduler::_vita_switch_count      = 0;
  * get_next_runnable_thread() (mid-file) increments them. */
 static unsigned int _vita_gnrt_hits   = 0;
 static unsigned int _vita_gnrt_nulls  = 0;
+/* v02.30: log52 nailed the freeze at start_lightweight_thread_asm+0x18
+ * with the kernel still reporting the VM thread RUNNING and zero threads
+ * in any wait queue - so the freeze is user-space only. The open question
+ * is whether the birth stub of the dispatched green thread is re-entered
+ * through primordial_to_current_thread() (LR=stub entry is that gadget's
+ * signature: 'ldr lr,[chain+4]; mov pc,lr'). These counters split the
+ * switch-out side JUST_BORN visibility out of the _debugger_active short-
+ * circuit (never active in this build) so the next dump can tell 'born,
+ * dispatched, ran' apart from 'born, dispatched, never executed'.
+ * _vita_swjb_seen counts switch-outs of threads that still had the
+ * JUST_BORN bit set; _vita_swjb_clear counts the debugger-gated clears
+ * (expected to stay 0 here); _vita_pe_enter counts entries into the
+ * generated invoke_pending_entries stub (see SharedStubs_arm.cpp). */
+static unsigned int _vita_swjb_seen  = 0;
+static unsigned int _vita_swjb_clear = 0;
+unsigned int _vita_pe_enter = 0;
 /* v02.05: Thread::timer_tick entry count (defined in Thread.cpp next
  * to the Java-site sampling probe) - read through the accessor bridge
  * at the bottom of this file. */
@@ -2252,6 +2268,15 @@ extern "C" void switch_thread(Thread* thread) {
   // We are switching away from a thread.  If the JUST_BORN bit is
   // set, clear it and send an event.  The stack pointers are now
   // set in the thread structure.
+#if defined(VITA)
+  /* v02.30: count JUST_BORN switch-outs OUTSIDE the _debugger_active
+   * short-circuit (log52: the frozen VM never reaches the branch inside,
+   * so v02.17's counter could never move in this build). This counts
+   * every switch-away from a thread that still carries the bit. */
+  if (thread->status() & THREAD_JUST_BORN) {
+    _vita_swjb_seen++;
+  }
+#endif
   if (_debugger_active && thread->status() & THREAD_JUST_BORN) {
 #if defined(VITA)
     /* v02.17: count JUST_BORN dispatches separately from Thread::start()
@@ -2260,6 +2285,7 @@ extern "C" void switch_thread(Thread* thread) {
      * interpeter after spawn - which is exactly the log41 freeze site
      * (primordial_to_current_thread -> invoke_pending_entries). */
     vita_justborn_dispatch++;
+    _vita_swjb_clear++;
 #endif
     thread->set_status(thread->status() & ~THREAD_JUST_BORN);
     VMEvent::thread_event(thread, true);
@@ -2601,6 +2627,17 @@ extern "C" unsigned int vita_sched_nrt_obj(void) {
 }
 extern "C" unsigned int vita_sched_justborn(void) {
   return vita_justborn_dispatch;
+}
+/* v02.30: birth-stub visibility counters for vita_wd_snapshot (see the
+ * declaration note at the file head). */
+extern "C" unsigned int vita_sched_swjb_seen(void) {
+  return _vita_swjb_seen;
+}
+extern "C" unsigned int vita_sched_swjb_clear(void) {
+  return _vita_swjb_clear;
+}
+extern "C" unsigned int vita_sched_pe_enter(void) {
+  return _vita_pe_enter;
 }
 
 extern "C" int vita_sched_nrt_info(char *out, int out_size) {
