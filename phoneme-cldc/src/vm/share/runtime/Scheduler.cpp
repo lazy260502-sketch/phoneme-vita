@@ -79,6 +79,21 @@ static unsigned int _vita_gnrt_nulls  = 0;
 static unsigned int _vita_swjb_seen  = 0;
 static unsigned int _vita_swjb_clear = 0;
 unsigned int _vita_pe_enter = 0;
+/* v02.30 addendum: THREAD_JUST_BORN is only SET under _debugger_active
+ * (Scheduler::start, this file) which is compiled to 0 in this build,
+ * so swjb_seen/swjb_clear are expected to stay 0 - kept only so the
+ * snapshot line does not lie by omission. The LIVE probes are the
+ * time_slice counters below: Main_vita's slave-mode loop calls
+ * JVM_TimeSlice() once per iteration, so _vita_ts_enter counts master
+ * loop iterations (each early-return included) and _vita_ts_gadget
+ * counts the ones that actually crossed primordial_to_current_thread()
+ * into Java. At a freeze: ts_enter stalled = the master loop itself
+ * never came back (log52's case: frozen inside the gadget crossing);
+ * ts_enter still climbing with ts_gadget stalled = spinning on the
+ * no-runnable-thread early return (dead green threads, birth channel
+ * starved); both climbing = healthy switching, freeze is elsewhere. */
+static unsigned int _vita_ts_enter  = 0;
+static unsigned int _vita_ts_gadget = 0;
 /* v02.05: Thread::timer_tick entry count (defined in Thread.cpp next
  * to the Java-site sampling probe) - read through the accessor bridge
  * at the bottom of this file. */
@@ -1782,6 +1797,10 @@ void *Scheduler::get_blocked_thread_data(int *data_size) {
 
 jlong Scheduler::time_slice(JVM_SINGLE_ARG_TRAPS) {
   GUARANTEE(is_slave_mode(), "sanity");
+#if defined(VITA)
+  /* v02.30: master-loop liveness probe (see file-head note). */
+  _vita_ts_enter++;
+#endif
 
   // It is important that there be no pending handles when this is called.
   // When primoridal_to_current_thread() returns, we may be in a different
@@ -1854,6 +1873,13 @@ jlong Scheduler::time_slice(JVM_SINGLE_ARG_TRAPS) {
   }
 #endif
 
+#if defined(VITA)
+  /* v02.30: last C-level instruction before crossing into Java via the
+   * primordial gadget. If a future dump freezes inside the gadget (as
+   * log52 did) this counter's frozen value is the number of COMPLETED
+   * crossings minus this one. */
+  _vita_ts_gadget++;
+#endif
   primordial_to_current_thread();
 
   if (_estimated_event_readiness > 0) {
@@ -2638,6 +2664,14 @@ extern "C" unsigned int vita_sched_swjb_clear(void) {
 }
 extern "C" unsigned int vita_sched_pe_enter(void) {
   return _vita_pe_enter;
+}
+/* v02.30: master-loop liveness counters for vita_wd_snapshot (see the
+ * file-head note for the three-way readout). */
+extern "C" unsigned int vita_sched_ts_enter(void) {
+  return _vita_ts_enter;
+}
+extern "C" unsigned int vita_sched_ts_gadget(void) {
+  return _vita_ts_gadget;
 }
 
 extern "C" int vita_sched_nrt_info(char *out, int out_size) {

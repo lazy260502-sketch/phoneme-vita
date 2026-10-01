@@ -1133,15 +1133,24 @@ static void vita_wd_snapshot_one(SceUID fd) {
      * the generated invoke_pending_entries stub that had a live body.
      * At a freeze: pe_enter >> swjb_seen means consumption without
      * dispatch records (the birth-stub re-entry loop); pe_enter stuck
-     * while justborn-class bits remain means the stub never ran. */
+     * while justborn-class bits remain means the stub never ran.
+     * v02.30 addendum: swjb_*/pe_enter are compiled dead in this build
+     * (JUST_BORN is only set under _debugger_active=0; the pe_enter
+     * asm patch lives in the loopgen-frozen Interpreter_arm.o, see
+     * rebuild_vm.sh pack_lib). The LIVE probes are ts_enter/ts_gadget
+     * below - read those first. */
     {
         extern unsigned int vita_sched_swjb_seen(void);
         extern unsigned int vita_sched_swjb_clear(void);
         extern unsigned int vita_sched_pe_enter(void);
+        extern unsigned int vita_sched_ts_enter(void);
+        extern unsigned int vita_sched_ts_gadget(void);
         n = snprintf(buf, sizeof(buf),
-                     "  v230 swjb_seen=%u swjb_clear=%u pe_enter=%u\n",
+                     "  v230 swjb_seen=%u swjb_clear=%u pe_enter=%u"
+                     " ts_enter=%u ts_gadget=%u\n",
                      vita_sched_swjb_seen(), vita_sched_swjb_clear(),
-                     vita_sched_pe_enter());
+                     vita_sched_pe_enter(),
+                     vita_sched_ts_enter(), vita_sched_ts_gadget());
         sceIoWrite(fd, buf, n);
     }
 
