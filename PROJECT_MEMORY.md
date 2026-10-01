@@ -6813,14 +6813,14 @@ psp2core dump 含 24 种 PT_NOTE。`parse_psp2dmp.py` 只解 THREAD_REG_INFO
 | THREAD_REG_INFO (0x1004) | 0x1e74 | 1888 | **5 线程寄存器**（12 字节头 + 5×376） |
 | SEMAPHORE_INFO (0x100a) | 0xa84 | 1892 | 27 个系统信号量，无一属 J2ME 线程 |
 | EVENTFLAG_INFO (0x100b) | 0x71 | 880 | 无 J2ME 线程 |
-| MUTEX_INFO (0x100c) | 0x1590 | 768 | 无 J2ME 纠[线程 |
+| MUTEX_INFO (0x100c) | 0x1590 | 768 | 无 J2ME 线程 |
 | LWMUTEX_INFO (0x100d) | 0x18ac | 816 | 无 J2ME 线程 |
-| MESG_PIPE_INFO (0x1010) | 1bf8 | 608 | VM tid 出现在 SceNetAdhocAuthMbx **+72=creator 字段**，非等待者 |
+| MESG_PIPE_INFO (0x1010) | 0x1bf8 | 608 | VM tid 出现在 SceNetAdhocAuthMbx **+72=creator 字段**，非等待者 |
 | STACK_INFO (0x101b) | 0x283c | 88 | {tid,used,max}×5，无新信息 |
-| EVENT_LOG_INFO (0x102c) | 0xf47e4 | 2-mo2060 | 只含系统 Shell NPXS19999 事件，与 J2ME 无关 |
+| EVENT_LOG_INFO (0x102c) | 0xf47e4 | 2060 | 只含系统 Shell NPXS19999 事件，与 J2ME 无关 |
 | SYSTEM_INFO2 (0x102d) | 0xf500c | 4178740 | 哈希数据不可读 |
 | SUMMARY_INFO (0x102e) | 0x4f23ac | 612 | SceModule 统计 |
-| TTY_INFO2 (0x1031) | 0x4f15d84 | 4108 | **psp2core 内核 hook 日志**（见下） |
+| TTY_INFO2 (0x1031) | 0x4f1384 | 4108 | **psp2core 内核 hook 日志**（见下） |
 
 ### 内核侧判决数据（THREAD_INFO + 全同步对象扫描）
 
@@ -6832,7 +6832,7 @@ psp2core dump 含 24 种 PT_NOTE。`parse_psp2dmp.py` 只解 THREAD_REG_INFO
 | SceCommonDialogWorker | 400100c3 | - | 8 (delay) | 内核 e000xxxx |
 | tone | 4001015f | j2me_tone | 8 (delay) | sceKernelDelayThread |
 | watchdog | 40010163 | j2me_watchdog | 1 (RUNNING) | wd_thread_routine |
-| ticker | 4100101cd | cldc_ticker | 8 (delay) | sceKernelDelayThread |
+| ticker | 400101cd | cldc_ticker | 8 (delay) | sceKernelDelayThread |
 
 - **内核认为 VM=RUNNING**，但 PC 冻结、cpu0 switchN 冻结 → 用户态冻结（非内核阻塞）
 - VM 不在任何 sema/eventflag/mutex/lwmutex/msgpipe 等待队列 → 排除内核同步阻塞
