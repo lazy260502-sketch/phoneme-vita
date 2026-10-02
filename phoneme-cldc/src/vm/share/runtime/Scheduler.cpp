@@ -82,6 +82,10 @@ static unsigned int _vita_swjb_clear = 0;
  * (and reset to -1) by the birth-delay gate in switch_thread() on that
  * thread's FIRST dispatch. -1 = no pending birth. */
 static int vita_last_started_id = -1;
+/* v02.36: declared here (not #include'd) because Scheduler.cpp is a
+ * merged-src unit with no direct system includes; signature per
+ * psp2/kernel/threadmgr.h. */
+extern "C" int sceKernelDelayThread(unsigned int usec);
 unsigned int _vita_pe_enter = 0;
 /* v02.30 addendum: THREAD_JUST_BORN is only SET under _debugger_active
  * (Scheduler::start, this file) which is compiled to 0 in this build,
