@@ -424,6 +424,90 @@ static int wd_thread_routine(SceSize args, void *argp) {
         vita_thread_audit_dump("ux0:/data/J2ME00001/site_ring.log");
         vita_thread_audit_dump_vm_marker("ux0:/data/J2ME00001/site_ring.log");
 
+        /* v02.32: THREAD CENSUS - enumerate EVERY thread in the
+         * process, not just the registered ones. log54 verdict:
+         * cpu0 showed a 200 ms zero-switch busy owner that is NOT any
+         * sampled thread (VM d=0, wd asleep, tone in delay); the
+         * dump's THREAD_INFO note names exactly 5 threads, one of
+         * them 'SceCommonDialogWorker' (a Vita3K HLE worker we never
+         * sample) - and in log53 AND log54 that thread's registers
+         * froze bit-identical at pc=0xe0009304 inside the HLE stub
+         * range. The census must name the spinner directly.
+         * sceKernelGetThreadIdList is NOT exported to user mode
+         * (checked the stub archive), so enumerate by UID-space scan:
+         * tids are dense (0x40010001..0x400101ff covers every thread
+         * the audit table plus any HLE workers), holes simply return
+         * an error which we skip silently.
+         * SAFETY (log33/34 lesson): log the tid BEFORE querying it -
+         * if GetThreadInfo ever aborts in the kernel on a corrupt
+         * TCB, the last logged tid is the corrupt one (built-in
+         * bisect marker). GetThreadInfo on a healthy-looking tid has
+         * survived 15 hang rounds (wd_dump_thread), and 0x80020008
+         * on KICK5 says the VM tid's bookkeeping is odd but its
+         * INFO read is fine. Per thread: name/status/cpu/aff +
+         * runClocks sampled twice 200 ms apart - the spinner is the
+         * tid whose d(runClocks) ~= the full window while idle/switch
+         * ledgers say a core never yielded. */
+        {
+            char cbuf[192];
+            SceKernelThreadInfo ci;
+            SceUID tids[64];
+            SceUInt64 rc0[64];
+            int ntid = 0;
+            int ci_;
+            int m = snprintf(cbuf, sizeof(cbuf),
+                             "[WD] census: uid-scan 0x40010001..0x400101ff\n");
+            wd_log(cbuf, m);
+            for (SceUID t = 0x40010001; t <= 0x400101ff && ntid < 64; t++) {
+                int nl = snprintf(cbuf, sizeof(cbuf),
+                                  "[WD] census probe tid=0x%x\n", t);
+                wd_log(cbuf, nl);   /* log BEFORE query (log33/34) */
+                memset(&ci, 0, sizeof(ci));
+                ci.size = sizeof(ci);
+                if (sceKernelGetThreadInfo(t, &ci) < 0)
+                    continue;       /* hole: tid never existed / freed */
+                rc0[ntid] = ci.runClocks;
+                tids[ntid] = t;
+                ntid++;
+                m = snprintf(cbuf, sizeof(cbuf),
+                             "[WD] census '%s' status=%s cpu=%d "
+                             "lastcpu=%d aff=0x%x prio=0x%x "
+                             "runClocks=%llu\n",
+                             ci.name, wd_status_name(ci.status),
+                             ci.currentCpuId, ci.lastExecutedCpuId,
+                             ci.currentCpuAffinityMask,
+                             ci.currentPriority,
+                             (unsigned long long)ci.runClocks);
+                wd_log(cbuf, m);
+            }
+            m = snprintf(cbuf, sizeof(cbuf),
+                         "[WD] census found %d threads, sampling "
+                         "+200ms\n", ntid);
+            wd_log(cbuf, m);
+            sceKernelDelayThread(200 * 1000);
+            for (ci_ = 0; ci_ < ntid; ci_) {
+                memset(&ci, 0, sizeof(ci));
+                ci.size = sizeof(ci);
+                if (sceKernelGetThreadInfo(tids[ci_], &ci) < 0) {
+                    m = snprintf(cbuf, sizeof(cbuf),
+                                 "[WD] census tid=0x%x <gone>\n",
+                                 tids[ci_]);
+                    wd_log(cbuf, m);
+                    ci_++;
+                    continue;
+                }
+                m = snprintf(cbuf, sizeof(cbuf),
+                             "[WD] census '%s' runClocks d=%lld "
+                             "release d=%lld\n",
+                             ci.name,
+                             (long long)(ci.runClocks - rc0[ci_]),
+                             (long long)(ci.threadReleaseCount -
+                                         (SceUInt64)0));
+                wd_log(cbuf, m);
+                ci_++;
+            }
+        }
+
         /* v02.10: THERAPEUTIC KICK - MOVED UP, before the supplementary
          * ring/snapshot captures. log33/34 already banked two complete
          * forensic sets (identical picture: d=0 ghost, site ring

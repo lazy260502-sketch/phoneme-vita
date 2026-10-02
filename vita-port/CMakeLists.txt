@@ -1090,7 +1090,22 @@ set(VITA_VERSION  "02.28")
 #   still-listed threads, and an 8-slot exit ring. Next HANG, two
 #   snapshots: any v231 counter climbing names the spinning body;
 #   all frozen with cpu1 busy = the loop is confined to stub asm.
-set(VITA_VERSION  "02.31")
+# 02.32 (log54 verdict, runClocks attribution table): the loop
+#   narrative is RETIRED - all three candidates excluded by frozen
+#   counters (stub-tail: v231 all 0 with live setcur=59 probe;
+#   gadget: switch lane frozen; scheduler C++: six counters frozen).
+#   VM thread is PARKED in the birth window: runClocks d=0 (spin
+#   burns clocks), kernel RUNNING/wait=none yet never dispatched
+#   across 3 idle cores, KICK5 0x80020008 (ghost-TCB family, log33/
+#   34). The cpu0 200ms zero-switch busy owner is an UNOBSERVED
+#   thread; THREAD_INFO note names 5 threads and SceCommonDialog-
+#   Worker (Vita3K HLE, never sampled) froze bit-identical at
+#   pc=0xe0009304 across log53+log54 hangs. v02.32 census: uid-scan
+#   0x40010001..0x400101ff with GetThreadInfo per tid (log-before-
+#   query safety), runClocks double-sampled 200ms. Spinner = tid
+#   with d ~= window; VM d=0 re-confirms park. Vita3K-HLE vs phoneME
+#   split decided by ONE line: who owns the busy core.
+set(VITA_VERSION  "02.32")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
