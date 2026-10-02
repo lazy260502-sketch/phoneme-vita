@@ -7628,3 +7628,35 @@ w33 字段：VM log54 真在 **cpu2**（census sysinfo 读 cpu0 忙是失真/过
 
 判读锚点：`site_ring.log` 的 `birth_delay=` 行自证当轮配置；冻结判据同 log36-55（`vm runClocks d=0` + `KICK no effect` + `swjb_seen` 若仍 0 则冻结仍在首 dispatch）。
 
+---
+
+## 2026-10-02 log56/57/58 判决 + v02.36 修复死门控（v02.36 b407 cac5a7a）
+
+### 1. 三轮结果
+
+| 轮 | 配置（site_ring 自证） | 结果 |
+|---|---|---|
+| log56 | `birth_delay=0` 对照 | 冻结（dump 只剩 .tmp，site_ring 完整）→ v02.35 新代码零扰动 ✓ |
+| log57 | `birth_delay=1` | 冻结，`swjb_seen=0`，pc=**stub+0x18** |
+| log58 | `birth_delay=1`+`ticker_cpu=2` 生效 | 冻结，ticker 活跃钉 cpu2（loops 4461→4518 跳动），VM 冻 cpu1，pc=**stub+0** |
+
+### 2. 坏消息（判读时主动刹车发现）：v02.35 门控是死的，log57"delay 无效"判决作废
+
+`THREAD_JUST_BORN` **只在 `_debugger_active` 时置位**（`Scheduler.cpp` start() 尾 `if (_debugger_active) { set_status(THREAD_JUST_BORN); }`），本构建无 debugger。v02.30 注记（OS_vita.cpp "swjb_seen…compiled dead"）早已写明——**改 v02.35 时读过此注却没把死条件应用到自己的门控**。三轮 `swjb_seen=0` 是铁证：delay 一次都没执行。教训入纪律：**复用任何状态位做门控前，先 grep 它的置位点确认本构建路径可达**。
+
+### 3. 两个有效判决（不依赖死门控）
+
+1. **ticker 同核 tick 注入假说判死**：log58 ticker 真实分离 cpu2 且活跃，VM 仍冻 cpu1 出生窗口——与 log37/39/40 钉核判决独立闭合。
+2. **时序竞态指纹增强**（同一 v02.35 二进制内）：
+   - 死点游走：log57 pc=stub+0x18、log58 pc=stub+0（lr=stub+0 锚定法；对比 log53/54/55 三轮恒 ipe+4）
+   - `setcur` 终值波动：126/100/104（log53/54/55 恒 97）
+   - 确定性死锁死点应钉死——**同二进制内漂移 = 竞态指纹**
+
+### 4. v02.36 改动（phoneme-cldc 67ba518 / vita-port cac5a7a）
+
+- `Scheduler.cpp` 文件级 `static int vita_last_started_id = -1`（同 `_vita_swjb_seen` 先例位置）：`Scheduler::start()` 尾记录 `thread->id()`（int，GC 免疫）
+- `switch_thread()` **门控移到 `next_thread` reload 之后、实际切换之前**（旧位置在 reload 前会错过空缓存的首 dispatch）：`next_thread->not_null() && next_thread->id() == vita_last_started_id` → `sceKernelDelayThread(dms*1000)`，然后锚清 -1（只在首 dispatch 触发一次）
+- 类型走查记录：`_next_runnable_thread` 是 `OopDesc*`（不可直接 `->id()`），`next_thread` 是 `Thread*`（372 行 `thread->id()` 先例）——门控用后者
+- 版本 02.36；产物 `out/vpk/midp_vita_v02.36.vpk`（3681189 B，sym `v02.36 b407 (cac5a7a)`，birth_delay 符号 ×2）
+- 跑法不变：对照（无文件）+ `birth_delay` 写 `1`。**判读新增自证项：v02.36 起 delay 若执行，site_ring 的 setcur 前后应有 1ms 级间隔且 swjb_seen 首次可能 >0（首 dispatch 完成后被切出才计）——若 `birth_delay=1` 仍冻结且 swjb_seen 仍 0，先怀疑门控再怀疑假说**
+
