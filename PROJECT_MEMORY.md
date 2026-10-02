@@ -7354,3 +7354,56 @@ HLE stub 区。
 - 产物 `vita-port/out/vpk/midp_vita_v02.32.vpk/.sym`（b391）
 - **勘误 commit（本轮）**：vita_watchdog.c / CMakeLists / PM 三处 Vita3K
   HLE 错误归因已改为真机表述；产物待重建（字符串注释级改动，不影响二进制行为）
+
+
+## log55 判决：census 首战——进程内全员洗脱，旋者=VM 自己的内核上下文（6ace1d5/b394，2026-10-02）
+
+### census 五行判决表（200ms 双采样）
+
+| 线程 | d(runClocks) | 判决 |
+|---|---|---|
+| J2ME00001 (VM) | **d=0** | 停驻再确认（三重窗口一致） |
+| SceCommonDialogWorker | **d=0** | **洗脱**——上轮怀疑被证伪；且本轮 dump pc=0xe000cd64 ≠ 前两轮 0xe0009304（在内核里正常走动） |
+| j2me_tone | d=26484 (~60µs) | delay 唤醒小活，正常 |
+| j2me_watchdog | d=844708 (~1.9ms) | census 自身开销（扫 511 uid + 日志 I/O），正常 |
+| cldc_ticker | d=4018 (~9µs) | 周期小活，正常 |
+
+**判读表落在第 3 行：旋者不属于任何用户线程。**
+
+### 关键交叉证据（slide=0x2f000，锚点 self=0x81087fd0）
+
+1. **VM 冻结点**：pc=`invoke_pending_entries+0x4`，lr=`start_lightweight_thread_asm+0`
+   （primordial_to_current_thread gadget 新生签名，同 log52/53 的出生窗口）；
+   tone/ticker=`sceKernelDelayThread+0x8`（正常）；wd=自身例程
+2. **syscall trace**：VM 最后 syscall io_pwrite **已返回**——不是卡在 syscall 入口
+3. **三轮忙核 vs VM 声称核**：log53 cpu1=忙=VM cpu1 ✓、log55 cpu1=忙=VM cpu1 ✓、
+   log54 cpu0=忙 vs VM cpu2（唯一失配，字段可能陈旧）
+4. 本轮 sysinfo 采样窗（含 wd 200ms sleep）：cpu1 idle d=0 全窗黑暗，
+   cpu0/2/3 分别 +198/+202/+177ms——**唯独 VM 的核忙**
+
+### 终版因果链（不再是猜测，是排除法闭合）
+
+VM 线程在出生窗口（ipe 头部）**经中断离开用户态后再未返回**：
+
+- status=RUNNING/wait=none（离开时状态留存）
+- runClocks 冻结（内核态不记 tick 账）
+- 用户态 PC 停在正常指令上（中断打在哪就存哪：+0x4/+0x8/+0x18 三轮不同=时钟中断时机差异）
+- 该核 idle d=0 + switchN d=0（内核态关抢占自旋，不再调度任何线程）
+- KICK5 susp/res **0x80020008**（ILLEGAL_PERMISSION=线程处于不可挂起的内核过渡态）
+- v231 全计数器 0（用户代码从未恢复）
+
+**旋者不是"未观测线程"，就是 VM 线程自己的内核上下文**——用户态探针的观测下限
+到此为止。TCB 损坏或内核调度器在该线程上楔死（log33/34 ghost 同族）。
+
+### 下一步（v02.33 方向）：内核侧取证
+
+kubridge 已在场（kernel_forensics: "kubridge: present"）但 v02.18 的
+SceKernelThreadmgr 解析失败（"threadmgr module not found - no kernel read"）。
+修它：kubridge 模块枚举定位 threadmgr 基址 → HANG 时直接读 VM tid 的内核 TCB，
+看它卡在哪个内核等待点/哪把锁上。这是用户态→内核态唯一的观测通道。
+
+### 教训
+
+- census 判读表四出口全部先写后验，本轮落在第 3 行且与预期一致——**先写判读表再跑实验**的纪律有效
+- runClocks 记账模型：内核态关抢占不记账——"RUNNING+d=0+核忙"三元组=内核态楔死的签名
+- 0x80020008 族错误码要当作"线程处于内核过渡态"的信号读，不只是"权限不足"
