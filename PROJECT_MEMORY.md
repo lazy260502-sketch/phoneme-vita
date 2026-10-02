@@ -7495,3 +7495,64 @@ v02.33 首次真机运行即**开机重启**。触发点：`vita_kf_boot_resolve
   2. **NID 直查**：离线从固件 dump（若用户有）解析 SceKernelThreadmgr 基址
   3. 若都不行：接受"内核侧不可观测"，回到行为学取证（变异法：改条件看
      HANG 率变化）
+
+
+---
+
+## log55/53/54 coredump 离线全字段挖掘——出生窗口铁案（v02.34 后，零风险路线）
+
+### THREAD_REG_INFO 记录结构完全破译
+
+376B 记录布局（此前只解了 72B）：
+`+000=tid`、**`+004..+034 = r0..r12 完整寄存器堆`**、`+038=sp`、`+03c=lr`、`+040=pc`、`+044=cpsr`、`+048`=fpscr、`+060`起 ASCII 时间戳、`+090..+0cf`=VFP d 寄存器、`+150`=μs 时间戳对。剩余 0x7f80dead/0x7ff8dead 是内核未初始化标记。
+
+### 三轮 dump VM 线程冻结点对比（铁案）
+
+| | log53 | log54 | log55 |
+|---|---|---|---|
+| 构建 | v02.31 | v02.31 | v02.32 |
+| slide | 0x35000 | 0x1b000 | 0x2f000 |
+| fp(r11) | **0** | **0** | **0** |
+| r3 | 0x81ee0d5c=nrt obj **id=5** | 0x81eddfb4=nrt obj **id=4** | 0x81eddfb4=nrt obj **id=4** |
+| r0 | =r3（已解引用） | =r3 | GOT 槽 &\_current_thread |
+| pc | ipe 头部窗口 | invoke_pending_entries+0x20 | **ipe+0x4（ldr r0,[r0] 第一句）** |
+| lr | 蹦床内 | ipe 附近 | **start_lightweight_thread_asm+0** |
+| cpu(w33) | 1 | **2** | 1 |
+| nrt pe | 0 | 0 | 0 |
+
+三个独立启动轮次，冻结点全部落在**绿色线程出生路径**：`switch_thread → 弹引导帧[fp=0, lr=蹦床] → 蹦床前几条 → ipe 头部 ≤10 条指令窗口`。
+
+### 逐项闭合证据
+
+1. **fp=0**：`setup_stack_asm`（InterpreterRuntime_arm.cpp:112）压引导帧最后一项 `*xsp=0`——新生儿标记，三轮全中
+2. **lr=蹦床+0**：蹦床调 ipe 用 `bleq`（branch 不写 lr）——lr 仍是引导帧弹出的原始值，**从出生起没有任何 bl 执行过**
+3. **r0=r5+0x40c 精确命中**：caller `810c25b4: ldr r0,[r5,#1036]` 刚加载的 GOT 槽（r5=gp=0x8140191c，静态 0x813d291c+slide 自洽）
+4. **r3=nrt obj**：与 site_ring 的 `nrt obj` 同一对象同轮快照（log55 双验 0x81eddfb4）
+5. **pc=ipe+0x4**：IRQ 保存惯例 actual+4，第一句还没执行完
+6. **新生儿 pe=0**：ipe 对空 pe 是 4 条指令空操作——窗口极窄却三轮全中，非随机
+7. **出生计数**：th_start=4 th_finish=0 justborn=0；dispatch ring 全 id=3（主线程连续让步，新线程从未上环=从未跑起来）；ttk_stage=7 hits 全 350（tick 链健康）
+8. **栈三源互锁**：STACK_INFO(current=0x1278) = 栈顶 0x81381000 - sp 0x8137fd88；THREAD_INFO w15/16 给出栈基 0x81341000+0x40000
+
+### cpsr 细读（修正此前"I=1"误读）
+
+VM `0x40070010` = USER + **I=0（IRQ 开）** + Z=1 + GE=7（SIMD 残留）。五线程全 USER 态保存（wd 的 0x200f0030=USER+Thumb）。VM 是在纯用户态执行 ipe 时**被中断捕获**，现场停格——与 census"内核态楔死"判决拼合：IRQ 在出生窗口打断 VM → 内核处理中关抢占自旋 → 永不返回。
+
+### 其它 note 判读（无进一步价值）
+
+- EVENT_LOG(0x102c)=shell 应用启动历史（NPXS19999/J2ME00001/TOOLBOX20 + μs 时间戳 0~344s），非调度器日志
+- TTY/TTY_INFO2 = 全 0/dead 标记；SYSTEM_INFO2 = 4MB hashed 数据（无法字段化）
+- THREAD_INFO 布局：w0=tid、w1..w7=name、w15/16=栈基+大小、w33=最后所在 cpu、w38=pc；MODULE_INFO 可给 0xe0 模块命名
+
+### log54 cpu 悬案闭合
+
+w33 字段：VM log54 真在 **cpu2**（census sysinfo 读 cpu0 忙是失真/过渡态）。三轮 1/2/1 = **VM 线程跨核迁移**，忙核跟随 VM。其余四线程恒 cpu0。
+
+### 判决
+
+冻结不是 VM 代码 bug：出生路径全部是已映射用户态代码、无 syscall、ipe 是空操作。是**出生时序制造了内核竞态条件**（首次 dispatch 新线程的瞬间 IRQ 落在切换关键窗口），内核调度/中断返回路径楔死。187663 次常规切换无事、4 次出生 3 次捕获冻结——事件强绑定"首次 dispatch"。
+
+### v02.35 方案候选（按推荐序）
+
+1. **钉核**：VM pthread 创建后 `sceKernelChangeThreadCpuAffinityMask(0, 1)`（API 见 threadmgr.h:365，已确认存在）。假说：竞态与跨核迁移有关；一行改动、可归因（HANG 消失=迁移致因；仍 HANG=排除）
+2. 出生 dispatch 前让步/延迟：避开 tick 边界，改动中等
+3. tick 降频：间接减少打断密度，归因力弱
