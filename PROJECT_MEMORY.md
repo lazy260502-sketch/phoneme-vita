@@ -7586,4 +7586,45 @@ w33 字段：VM log54 真在 **cpu2**（census sysinfo 读 cpu0 忙是失真/过
 
 ### cpu 与 HANG 的关系定位（诚实版）
 
-目前**只有相关没有因果**：VM 唯一迁移 + 冻结绑定出生窗口。钉核实验（v02.35 候选：`sceKernelChangeThreadCpuAffinityMask`，threadmgr.h:365）就是二选一判决器——HANG 消失=迁移参与竞态；仍 HANG=排除核因素。
+目前**只有相关没有因果**：VM 唯一迁移 + 冻结绑定出生窗口。~~钉核实验（v02.35 候选）~~ **已判死勿重跑**：log37(v02.12 钉 cpu0)/log39/40(v02.14/15 VM+ticker 同钉 cpu1)三轮都仍卡死——跨核迁移假说早已被推翻，v02.35 方案因此刹车改道（见下节）。
+
+---
+
+## 2026-10-02 v02.35 前最后判读 + birth-delay A/B（phoneme-cldc b454236 / vita-port bc8aeaa / b403）
+
+### 1. 四矿关闭（本节判读，勿重挖）
+
+1. **PIPE `SceNetAdhocAuthMbx` = 背景噪音**：subtype=**0x10c**（SceShellSvc 管道是 0x83，结构不同不可横比）。它是 `vita_net.c:151` `sceNetInit` 内部创建的 AdhocAuth mailbox，创建者=调用线程=主线程=40010003(VM)。`+72` 是 **creator 字段**不是等待者列表。三轮同现="每次启动主线程都初始化网络"的正常背景。
+2. **`setcur=97` 判读 + 记忆修正**：`Thread::set_current`（`Thread.cpp:356`，v02.31 插桩）是绿线程切换唯一提交点（switch_thread 与 lightweight_thread_exit 都汇入）。97=冻结前切换总数，冻结后静止。**⚠ 修正：此前"18 万次切换"是把 site ring `seq=219277` 误当切换数。真实切换仅 97 次——冻结恰落在"第一次 dispatch 给新生儿"那一次。**
+3. **第 10 证 `swjb_seen=0`**：v02.30 旁路计数（统计"带 JUST_BORN 位的线程被切出"）三轮全 0 ⟹ **从未有一个新生儿完成过首切片后被切出**，与 dispatch ring 全 id=3 互锁：冻结=第一个新生儿的第一次 dispatch。
+4. **THREAD_INFO w11 疑似 state（VM=1, tone=0x80000008）但无权威依据**：本 SDK 无 `SceKernelThreadInfo` 结构定义（include 里只有 vita-import/export 头，无 psp2/ 目录），按"不猜字段"纪律关矿。
+
+### 2. 实验空间终验（哪些真没做过）
+
+| 实验 | 状态 |
+|---|---|
+| 钉核（vm_cpu/ticker 同核） | log37/39/40 **已判死**（钉核仍卡） |
+| 内核窗口读取 | v02.33 **致真机重启**，判死（单字探针未做前禁止再碰） |
+| coredump 离线挖矿 | 已榨干（10 证闭合） |
+| **tickgate/ticker_cpu 行为学开关** | **从未跑过**——log46~55 十轮全部 `cpu_cfg=-1 tickgate=0` 默认态（终验：逐轮 grep site_ring.log） |
+| **出生 dispatch 前延迟** | 从未做过 → v02.35 |
+
+### 3. v02.35 改动（最小 diff，3 文件）
+
+- `phoneme-cldc/src/vm/share/runtime/Scheduler.cpp`：`switch_thread` 的 JUST_BORN 分支（`_vita_swjb_seen` 旁路同位置）加运行期门控 `sceKernelDelayThread(dms*1000)`。开关文件 `ux0:/data/J2ME00001/birth_delay`，首字节数字=毫秒（'1'=1ms），缺席/0=与 v02.34 完全一致。
+- `phoneme-cldc/src/vm/os/vita/OS_vita.cpp`：wd `boot` 读段加 `birth_delay=%d`，每份 dump 自文档化当轮 A/B 配置。
+- `vita-port/CMakeLists.txt`：版本 02.35 + rationale。
+- 构建：`rebuild_vm.sh` 全代重编（33 对象/29 成员/守卫全过）→ `vita-port/build.sh` → 产物 `out/vpk/midp_vita_v02.35.vpk`（3681178 B，`J2ME Player v02.35 b403 (bc8aeaa)`，sym 内含 birth_delay 符号×2）。
+
+### 4. 真机跑法（零代码轮次，与 v02.35 一包两用）
+
+**轮 1（对照组，先跑）**：不放置任何开关文件 → 应复现冻结（`NEITHER` 签名）+ dump 里 `birth_delay=0`。确认 v02.35 新代码没有改变复现。
+
+**轮 2（实验组）**：`ux0:/data/J2ME00001/birth_delay` 写 `1` → 同路径复跑。
+- **HANG 消失**（菜单能进、游戏能玩 >5min）⇒ **时序竞态实证**：出生 dispatch 撞上 tick/IRQ 窗口是因果链最后一环，下一步做永久修复（出生路径 yield 而非 sleep / 关键区屏蔽）。
+- **仍 HANG** ⇒ 排除"IRQ 撞切换窗口"，转向轮 3。
+
+**轮 3（备选，零代码）**：删 `birth_delay`，放 `ticker_cpu.2`（ticker 挪 cpu2）→ 判 ticker 同核 tick 注入。仍卡再试 `tickgate.2`。
+
+判读锚点：`site_ring.log` 的 `birth_delay=` 行自证当轮配置；冻结判据同 log36-55（`vm runClocks d=0` + `KICK no effect` + `swjb_seen` 若仍 0 则冻结仍在首 dispatch）。
+
