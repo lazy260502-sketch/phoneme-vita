@@ -1149,7 +1149,20 @@ set(VITA_VERSION  "02.28")
 #   in the wd 'boot' readout so every dump self-documents its A/B
 #   config. Companion zero-code switch: ticker_cpu.2 / tickgate.*
 #   (shipped v02.17, never actually run - log46..55 all defaults).
-set(VITA_VERSION  "02.36")
+set(VITA_VERSION  "02.37")
+# 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
+#   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
+#   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the
+#   shell file's timestamp, so both v02.35 and v02.36 Scheduler.cpp edits
+#   compiled to NOTHING (confirmed: no vita_last_started_id symbol in
+#   v02.36's .sym, _MergedSrc002.o dated Oct 1 11:33 predating both edits).
+#   log59/60 verdicts are therefore VOID: log60's "birth_delay=1 still
+#   froze" tested a binary with no gate at all. Fix: rm the stale .o (the
+#   documented rm-before-rebuild trap, now in its MergedSrc variant),
+#   rebuild, and VERIFY AT SYMBOL LEVEL (nm must show vita_last_started_id
+#   in the .a and the .sym). Code fix riding along: sceKernelDelayThread
+#   needs a file-scope extern "C" declaration (merged-src units have no
+#   direct system includes; function-local extern "C" is illegal C++).
 # 02.36 (2026-10-02): birth-delay round 2 - the v02.35 gate was DEAD.
 #   THREAD_JUST_BORN is only set under _debugger_active, so gating on it
 #   never fired: log56 (control) froze with birth_delay=0, log57/58
