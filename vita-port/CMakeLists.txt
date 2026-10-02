@@ -1108,7 +1108,25 @@ set(VITA_VERSION  "02.28")
 #   query safety), runClocks double-sampled 200ms. Spinner = tid
 #   with d ~= window; VM d=0 re-confirms park. phoneME-vs-system
 #   split decided by ONE line: who owns the busy core.
-set(VITA_VERSION  "02.32")
+#   with d ~= window; VM d=0 re-confirms park. phoneME-vs-system
+#   split decided by ONE line: who owns the busy core.
+# 02.33 (log55 verdict): census DECIDED - all in-process threads
+#   exonerated (VM d=0, SceCommonDialogWorker d=0 AND its dump pc
+#   MOVED 0xe0009304->0xe000cd64, exonerated with prejudice); the
+#   spinner is the VM thread's own KERNEL context (left user mode
+#   at ipe+0x4 via interrupt, never returned; core idle/switch
+#   frozen = kernel-mode spin with preemption off; KICK 0x80020008
+#   = kernel transition state). Userspace observation is EXHAUSTED.
+#   v02.33 goes kernel-side: boot-time K0 signature scan (Kubridge
+#   memcpy over the whole 0x81000000..0x84000000 direct map, no
+#   holes) for the "J2ME00001" thread name, tid-self-verified within
+#   +-0x100 - locks the VM TCB address without any module enum (the
+#   enum is structurally blind here) and without taiHEN queries
+#   (log48/49: never return on this console). HANG path dumps the
+#   raw TCB twice 400ms apart; offline join with THREAD_REG_INFO
+#   names the kernel wait point. vmalloc window deliberately NOT
+#   scanned: unmapped holes there abort uncatchably.
+set(VITA_VERSION  "02.33")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows

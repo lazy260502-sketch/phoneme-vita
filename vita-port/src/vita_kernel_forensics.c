@@ -53,6 +53,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 #include "vita_kernel_forensics.h"
 
@@ -116,6 +117,14 @@ static int ku_probe(void); /* defined below the flag-matrix comment */
 static unsigned int g_kf_tmgr_cache = 0;
 static int g_kf_tried = 0;
 static const char *g_kf_resolved_at = "none";
+
+/* v02.33: VM TCB address found by the boot-time K0 signature scan.
+ * This is the NAME-field address, not the struct base - the exact
+ * name offset inside SceKernelThreadControlBlock is firmware data
+ * we dump raw and resolve offline. Written ONLY at boot; the HANG
+ * path just kf_reads it. */
+static unsigned int g_kf_vm_tcb = 0;
+static int g_kf_vm_tcb_tid_off = 0;   /* tid word offset rel. name */
 static int kf_kaddr_plausible(unsigned int a);
 static void kf_boot_cache(unsigned int addr, const char *where)
 {
@@ -332,6 +341,110 @@ static unsigned int kf_find_threadmgr(void)
     return 0;
 }
 
+/* --------------------------------------------------------------- */
+/* v02.33: K0 TCB SIGNATURE SCAN.                                   */
+/*                                                                   */
+/* Both threadmgr address routes are dead on this console: the      */
+/* userspace enum is structurally blind to kernel modules (v02.21)  */
+/* and the taiHEN cross-domain query never returns (log48/49). But  */
+/* log55 proved kubridge memcpy works (clock=190) and log48 proved  */
+/* ku reads return even from the HANG path. So skip the module      */
+/* base entirely and find the VM thread's TCB by CONTENT:           */
+/*                                                                   */
+/*   scan the K0 direct map (0x81000000..0x84000000 - ALL physical   */
+/*   RAM, no holes, so every read is abort-free) for the string     */
+/*   "J2ME00001" (the main/VM thread name, set by SceAppMgr at      */
+/*   process birth, present before this boot code runs), then       */
+/*   verify the hit is a TCB by finding this thread's own tid       */
+/*   (sceKernelGetThreadId) within +-0x100 words of the name.       */
+/*                                                                   */
+/* The vmalloc window (0x88800000+) is NOT scanned: it has          */
+/* unmapped holes and a read there aborts in kernel context -       */
+/* uncatchable, console-fatal.                                       */
+/*                                                                   */
+/* Runs at BOOT on the main thread (healthy system; the 48 MB scan  */
+/* costs a few seconds); the HANG path only kf_reads the cached     */
+/* address. Off-line, the raw TCB dump joins the coredump's         */
+/* THREAD_REG_INFO (saved kernel pc/lr/sp) to name the kernel-side  */
+/* wait point of the wedged VM thread.                               */
+/* --------------------------------------------------------------- */
+#define KF_K0_SCAN_START 0x81000000u
+#define KF_K0_SCAN_END   0x84000000u
+static unsigned char kf_scan_buf[0x8000];   /* 32 KB chunks */
+
+static void kf_scan_log(const char *fmt, ...)
+{
+    SceUID fd = sceIoOpen("ux0:/data/J2ME00001/kernel_forensics.log",
+                          SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    char line[160];
+    va_list ap;
+    int n;
+    if (fd < 0)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    sceIoWrite(fd, line, n);
+    sceIoClose(fd);
+}
+
+static int kf_scan_k0(unsigned int self_tid)
+{
+    /* chunk overlap 0x120 so a name at a chunk edge still gets its
+     * full +-0x100 tid-verification window on the next pass */
+    const unsigned int step = sizeof(kf_scan_buf) - 0x120;
+    unsigned int base;
+    int nhit = 0;
+
+    if (!ku_available())
+        return 0;
+
+    for (base = KF_K0_SCAN_START; base < KF_K0_SCAN_END; base += step) {
+        unsigned int len = sizeof(kf_scan_buf);
+        unsigned int i;
+        if (base + len > KF_K0_SCAN_END)
+            len = KF_K0_SCAN_END - base;
+        if (len < 0x140)
+            break;
+        if (kf_read(kf_scan_buf, base, len) != 0)
+            continue;       /* should not happen inside K0 */
+        for (i = 0; i + 10 <= len; i += 4) {
+            unsigned int hit;
+            int tid_off = -1;
+            unsigned int j, j0, j1;
+            if (kf_scan_buf[i] != 'J' ||
+                memcmp(kf_scan_buf + i, "J2ME00001", 10) != 0)
+                continue;
+            hit = base + i;
+            nhit++;
+            /* tid self-check: this thread's own tid value must live
+             * within +-0x100 of the name inside a real TCB */
+            j0 = (i > 0x100) ? i - 0x100 : 0;
+            j1 = i + 0x100;
+            if (j1 + 4 > len)
+                j1 = len - 4;
+            for (j = j0; j <= j1; j += 4) {
+                unsigned int v;
+                memcpy(&v, kf_scan_buf + j, 4);
+                if (v == self_tid) {
+                    tid_off = (int)(j - i);
+                    break;
+                }
+            }
+            kf_scan_log("v02.33 K0 scan hit %d: name @ 0x%08x "
+                        "tid %+d\n", nhit, hit, tid_off);
+            if (tid_off >= -0x100 && tid_off <= 0x100) {
+                g_kf_vm_tcb = hit;
+                g_kf_vm_tcb_tid_off = tid_off;
+                return 1;
+            }
+        }
+    }
+    kf_scan_log("v02.33 K0 scan: %d hits, none tid-verified "
+                "(TCB not in K0?)\n", nhit);
+    return 0;
+}
+
 void vita_kf_dump(const char *path)
 {
     SceUID fd;
@@ -450,6 +563,43 @@ void vita_kf_dump(const char *path)
         }
     }
 
+    /* v02.33: the VM thread's kernel TCB, located by the boot-time
+     * K0 signature scan. Dumped raw twice (400 ms apart, same
+     * discipline as everything else): the SceKernelThreadControlBlock
+     * layout is firmware data, so the dump goes to the log as hex
+     * words and the offline join with THREAD_REG_INFO / runClocks
+     * values resolves which word is what. The two samples also show
+     * kernel-side mutation: a frozen TCB across the window is itself
+     * evidence the scheduler stopped touching this thread. */
+    if (g_kf_vm_tcb) {
+        unsigned char tb[0x100];
+        unsigned int tb_base = g_kf_vm_tcb - 0x80;
+        int smp;
+        n = snprintf(line, sizeof(line),
+                     "\n--- v02.33 VM TCB @ 0x%08x (name @ +0x80, "
+                     "tid %+d) ---\n", g_kf_vm_tcb,
+                     g_kf_vm_tcb_tid_off);
+        sceIoWrite(fd, line, n);
+        for (smp = 0; smp < 2; smp++) {
+            if (kf_read(tb, tb_base, sizeof(tb)) == 0) {
+                int o;
+                for (o = 0; o < (int)sizeof(tb); o += 16) {
+                    unsigned int *w = (unsigned int *)(tb + o);
+                    n = snprintf(line, sizeof(line),
+                                 "s%d +0x%02x: %08x %08x %08x %08x\n",
+                                 smp + 1, o, w[0], w[1], w[2], w[3]);
+                    sceIoWrite(fd, line, n);
+                }
+            } else {
+                kf_puts(fd, "TCB read FAILED\n");
+            }
+            if (smp == 0)
+                sceKernelDelayThread(400 * 1000);
+        }
+    } else {
+        kf_puts(fd, "\n--- v02.33 VM TCB: boot scan found none ---\n");
+    }
+
     kf_puts(fd, "===== end kernel forensics =====\n");
     sceIoClose(fd);
 }
@@ -463,6 +613,12 @@ void vita_kf_dump(const char *path)
 void vita_kf_boot_resolve(void)
 {
     unsigned int addr;
+
+    /* v02.33: content-address the VM TCB first - the module-base
+     * routes are dead on this console, the name scan is not. The
+     * main thread IS the VM thread-to-be (same tid for its whole
+     * life), so its own tid self-verifies the hit. */
+    kf_scan_k0((unsigned int)sceKernelGetThreadId());
 
     addr = kf_find_threadmgr();   /* userspace enum route */
 
