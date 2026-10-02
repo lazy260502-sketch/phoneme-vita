@@ -7280,3 +7280,52 @@ runClocks 归零、全部 phoneME 计数器冻结皆因载体线程死了。同�
 - 安全纪律（log34 教训）：**每个 tid 先 log 再查**——若 wd 在某 tid 上死于
   内核数据 abort，最后 log 的 tid 就是腐败 TCB（天然二分标记）；
   sceKernelGetThreadRunStatus 永久禁用（log33/34 已证杀死调用者）
+
+
+## v02.32：线程普查探针（159e458 / b391，2026-10-02）
+
+### 实施前的补充取证（本轮新物证，改变问题性质）
+
+**THREAD_INFO note（type 0x1003）破译**：布局为 12B 头{magic=0x12,count=5,
+recsz=0xC8} + 每记录 200B（tid@+0、name@+0xF 起 32B、attr/cpu 等在后）。
+全进程仅 **5 个线程**：J2ME00001 / **SceCommonDialogWorker** / j2me_tone /
+j2me_watchdog / cldc_ticker。
+
+**SceCommonDialogWorker 双 dump 逐位冻结**：log53 与 log54 两次独立 HANG，
+其 PC/LR/SP 完全相同（0xe0009304 / 0xe000d957 / 0xd0010fe8），PC 落在
+Vita3K HLE stub 区间（0xe0000000+）——它在某个 HLE syscall 里从未返回。
+它是 Vita3K 自己的 HLE 工作线程（SceCommonDialog 模块），**从不在我们的
+观测名单**（AUDIT 表只注册 tone/wd/ticker）。
+
+### log54 归属表最终形态
+
+- cpu0 的 200ms 零切换占用者 ∈ {SceCommonDialogWorker, 未知}
+- VM 主线程 d=0 停驻（非旋者）；wd/tone/ticker 各有不在场证明
+- **SceCommonDialogWorker 是唯一无不在场证明的线程**
+
+### 探针实现（vita_watchdog.c，KICK 块后）
+
+- `sceKernelGetThreadIdList` **不在用户态 stub**（已查 libSceKernelThreadMgr_
+  stub.a，174 符号无枚举类）→ 改 **uid 区间扫描** 0x40010001..0x400101ff
+  （覆盖全部已知 tid；洞返回错误直接跳过，无害）
+- 每个 tid **先 log 再查**（log33/34 教训：若 GetThreadInfo 死在内核，
+  最后 log 的 tid 就是腐败 TCB——天然二分标记）
+- 逐线程输出 name/status/cpu/lastcpu/aff/prio/runClocks，200ms 后二采样
+  输出 d(runClocks)
+- 判读一行定案：**d(runClocks)≈窗口时长的 tid = cpu0 旋者**；VM d=0 再证
+  停驻；census 名单 vs AUDIT 差集 = HLE/ghost 线程清单
+
+### 判读分流（这次没有"猜测"出口）
+
+| census 结果 | 结论 | 下一步 |
+|---|---|---|
+| SceCommonDialogWorker d≈200ms | **Vita3K HLE 缺陷实锤**，phoneME 无辜 | 换 Vita3K 版本/真机验证，不再打 VM 探针 |
+| 其它 tid d≈200ms | 点名具体线程 | 针对性查它 |
+| 全部 d=0 但 cpu0 仍忙 | 旋者非 guest 线程 = 纯仿真层问题 | 同上，转真机 |
+| VM tid 查询即死 wd | 最后 log 的 tid = 腐败 TCB | 修 TCB 源头 |
+
+### git
+
+- 主仓 j2me `159e458`：vita_watchdog.c census 块（+96 行）+ CMakeLists 02.32
+  （含完整判读注释）
+- 产物 `vita-port/out/vpk/midp_vita_v02.32.vpk/.sym`（b391）
