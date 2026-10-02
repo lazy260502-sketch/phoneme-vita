@@ -7556,3 +7556,34 @@ w33 字段：VM log54 真在 **cpu2**（census sysinfo 读 cpu0 忙是失真/过
 1. **钉核**：VM pthread 创建后 `sceKernelChangeThreadCpuAffinityMask(0, 1)`（API 见 threadmgr.h:365，已确认存在）。假说：竞态与跨核迁移有关；一行改动、可归因（HANG 消失=迁移致因；仍 HANG=排除）
 2. 出生 dispatch 前让步/延迟：避开 tick 边界，改动中等
 3. tick 降频：间接减少打断密度，归因力弱
+
+
+---
+
+## 【判例表】cpu 观测数据源与三轮终值（2026-10-02，永不重推导）
+
+**病根记录**：此前 cpu 结论反复，一是把 census 的"忙核"（sysinfo 采样，回答"哪个核忙"）误当"VM 所在核"用；二是 THREAD_INFO 记录实际 196B/条、按 200B 对齐导致 cpu 列取错（w32/w34 都取到过 attr 值 0x80028028）。已用 pc 锚定法（用已知 pc 值反推列号）定死 **w33 = 最后运行核**。以下为终值，引用即可，禁止重推导。
+
+### 数据源语义表（先分清问的是什么，再谈数值）
+
+| 数据源 | 回答的问题 | 可靠性 |
+|---|---|---|
+| census sysinfo "忙核" | wd 睡眠窗内哪个核忙（采样） | **会失真**（log54 读 cpu0，实际 VM 在 cpu2） |
+| THREAD_INFO w33 | 内核记录的线程最后运行核（dump 时刻） | **权威** |
+| THREAD_REG_INFO pc/cpsr | 用户态停格现场 | 权威 |
+
+### 三轮终值（log53/54/55，全部 5 线程）
+
+| 线程 | log53 | log54 | log55 | 结论 |
+|---|---|---|---|---|
+| J2ME00001 (VM) | cpu1 | **cpu2** | cpu1 | **唯一迁移者** |
+| SceCommonDialogW | cpu0 | cpu0 | cpu0 | 恒 0 |
+| j2me_tone | cpu0 | cpu0 | cpu0 | 恒 0 |
+| j2me_watchdog | cpu0 | cpu0 | cpu0 | 恒 0 |
+| cldc_ticker | cpu0 | cpu0 | cpu0 | 恒 0 |
+
+规律：睡眠型线程唤醒全落 cpu0（定时器落点）；VM 唯一满载被负载均衡推到 1/2。**"忙核"一直跟着 VM 走，从未乱跳**；census log54 的 cpu0 读数是采样失真。
+
+### cpu 与 HANG 的关系定位（诚实版）
+
+目前**只有相关没有因果**：VM 唯一迁移 + 冻结绑定出生窗口。钉核实验（v02.35 候选：`sceKernelChangeThreadCpuAffinityMask`，threadmgr.h:365）就是二选一判决器——HANG 消失=迁移参与竞态；仍 HANG=排除核因素。
