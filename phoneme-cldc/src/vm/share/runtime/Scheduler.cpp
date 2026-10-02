@@ -78,6 +78,10 @@ static unsigned int _vita_gnrt_nulls  = 0;
  * generated invoke_pending_entries stub (see SharedStubs_arm.cpp). */
 static unsigned int _vita_swjb_seen  = 0;
 static unsigned int _vita_swjb_clear = 0;
+/* v02.36: id of the most recently Scheduler::start()ed thread; consumed
+ * (and reset to -1) by the birth-delay gate in switch_thread() on that
+ * thread's FIRST dispatch. -1 = no pending birth. */
+static int vita_last_started_id = -1;
 unsigned int _vita_pe_enter = 0;
 /* v02.30 addendum: THREAD_JUST_BORN is only SET under _debugger_active
  * (Scheduler::start, this file) which is compiled to 0 in this build,
@@ -1432,6 +1436,10 @@ void Scheduler::start(Thread* thread JVM_TRAPS) {
   /* v02.17: visible-through-the-watchdog denominator for the same
    * question (the ring above only keeps 16 slots and is overwritten). */
   vita_sched_start_count++;
+  /* v02.36: birth-delay anchor - see the matching block in
+   * switch_thread(). Records the most recently started thread so its
+   * FIRST dispatch can be delayed. */
+  vita_last_started_id = thread->id();
 #endif
   if (!Universe::is_bootstrapping()) {
     allocate_blocked_threads_buffer(_active_count+1 JVM_CHECK);
@@ -2329,23 +2337,21 @@ extern "C" void switch_thread(Thread* thread) {
   if (thread->status() & THREAD_JUST_BORN) {
     _vita_swjb_seen++;
   }
-  /* v02.35: runtime-gated birth-delay A/B. The ten-proof case says the
-   * freeze lands on the FIRST dispatch of the first newborn green thread
-   * (fp=0 trampoline frame, pc in the first <=10 ipe instructions, an
-   * interrupt is the prime suspect for taking the context away). The
-   * switch below happens BEFORE the actual context switch, so a 1 ms
-   * sleep here moves the dispatch off any tick/IRQ window it was about
-   * to collide with. Gate: file ux0:/data/J2ME00001/birth_delay with
-   * first byte '1'-'9' = delay in ms ('1' = 1 ms). Absent/0 = off
-   * (v02.34 behaviour). Attribution is clean: hang gone with the file,
-   * back with it removed = timing race proven. */
-  if (thread->status() & THREAD_JUST_BORN) {
-    extern int vita_cfg_digit(const char *name, int dflt);
-    int dms = vita_cfg_digit("birth_delay", 0);
-    if (dms > 0) {
-      sceKernelDelayThread(dms * 1000);
-    }
-  }
+  /* v02.36: birth-delay A/B, round 2 - the v02.35 gate was dead.
+   * THREAD_JUST_BORN is only set under _debugger_active (see Scheduler::
+   * start below), so the v02.35 'status & THREAD_JUST_BORN' condition
+   * never fired: log56/57/58 froze with swjb_seen=0 and birth_delay=1
+   * having never delayed once. New anchor: Scheduler::start() records
+   * the last started thread's id; the block right before the actual
+   * context switch delays when the thread being switched TO is that
+   * last-started one (i.e. its first dispatch). An int id is used, not
+   * an Oop, so the anchor survives GC compaction. Gate file unchanged:
+   * ux0:/data/J2ME00001/birth_delay, digit = ms. Absent/0 = v02.34
+   * behaviour. Attribution (log57/58 fingerprints, same binary): dead
+   * pc walked stub+0x18 vs stub+0 and set_current totals differed per
+   * run (126/100/104 vs 97 in log53/54/55) - a deterministic deadlock
+   * would not walk; this is a timing race, and this experiment moves
+   * the switch off whatever window it collides with. */
 #endif
   if (_debugger_active && thread->status() & THREAD_JUST_BORN) {
 #if defined(VITA)
@@ -2377,6 +2383,24 @@ extern "C" void switch_thread(Thread* thread) {
 #if ENABLE_WTK_PROFILER
   if (!next_thread->is_null() && !next_thread->equals(thread)) {
     jprof_record_thread_switch();
+  }
+#endif
+
+#if defined(VITA)
+  /* v02.36 birth-delay gate (anchor set in Scheduler::start()): delay
+   * right before the FIRST dispatch of the most recently started
+   * thread, after ALL scheduler bookkeeping - only the switch itself
+   * moves in time. */
+  {
+    extern int vita_cfg_digit(const char *name, int dflt);
+    if (next_thread->not_null() &&
+        next_thread->id() == vita_last_started_id) {
+      int dms = vita_cfg_digit("birth_delay", 0);
+      if (dms > 0) {
+        sceKernelDelayThread(dms * 1000);
+      }
+      vita_last_started_id = -1; /* fire only on the FIRST dispatch */
+    }
   }
 #endif
 
