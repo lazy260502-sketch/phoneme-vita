@@ -1135,7 +1135,21 @@ set(VITA_VERSION  "02.28")
 #   abort -> reboot. Scan DISABLED (call commented out); the
 #   kernel-window premise must be re-proven with single-word probe
 #   reads before any bulk read ever runs again.
-set(VITA_VERSION  "02.34")
+# 02.35 (2026-10-02): birth-delay A/B - the first experiment after
+#   the ten-proof "first newborn dispatch freeze" verdict. The freeze
+#   lands on the FIRST dispatch of the first java.lang.Thread spawned
+#   by the MIDlet (fp=0 trampoline frame, pc in the first <=10 ipe
+#   instructions, set_current total = 97 switches, swjb_seen = 0:
+#   no newborn ever completed a first slice). Prime suspect: an
+#   interrupt taking the context during the switch critical window.
+#   Runtime-gated (ux0:/data/J2ME00001/birth_delay, digit 1..9 =
+#   ms): before the JUST_BORN context switch in Scheduler.cpp we
+#   sleep 1 ms, moving the dispatch off any tick/IRQ boundary it was
+#   about to collide with. Absent/0 = v02.34 behaviour. Also printed
+#   in the wd 'boot' readout so every dump self-documents its A/B
+#   config. Companion zero-code switch: ticker_cpu.2 / tickgate.*
+#   (shipped v02.17, never actually run - log46..55 all defaults).
+set(VITA_VERSION  "02.35")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
