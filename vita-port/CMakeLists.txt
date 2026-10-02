@@ -1149,7 +1149,20 @@ set(VITA_VERSION  "02.28")
 #   in the wd 'boot' readout so every dump self-documents its A/B
 #   config. Companion zero-code switch: ticker_cpu.2 / tickgate.*
 #   (shipped v02.17, never actually run - log46..55 all defaults).
-set(VITA_VERSION  "02.35")
+set(VITA_VERSION  "02.36")
+# 02.36 (2026-10-02): birth-delay round 2 - the v02.35 gate was DEAD.
+#   THREAD_JUST_BORN is only set under _debugger_active, so gating on it
+#   never fired: log56 (control) froze with birth_delay=0, log57/58
+#   (birth_delay=1) froze IDENTICALLY with swjb_seen=0 - the delay never
+#   ran once. Round 2 anchors on Scheduler::start(): it records the last
+#   started thread's id (plain int, GC-immune); the gate sits right
+#   before the actual context switch in switch_thread() and delays when
+#   the thread being switched TO is that id (its FIRST dispatch).
+#   log57/58 did buy two real verdicts though: (a) ticker_cpu=2 LIVE on
+#   cpu2, VM still froze on cpu1 -> same-core tick-injection hypothesis
+#   DEAD; (b) same-binary dead pc walked stub+0x18 vs stub+0 and
+#   set_current totals 126/100/104 vs 97 - a deterministic deadlock
+#   would not walk, timing-race fingerprint reinforced.
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows
