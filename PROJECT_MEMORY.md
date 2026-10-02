@@ -7292,16 +7292,20 @@ recsz=0xC8} + 每记录 200B（tid@+0、name@+0xF 起 32B、attr/cpu 等在后�
 j2me_watchdog / cldc_ticker。
 
 **SceCommonDialogWorker 双 dump 逐位冻结**：log53 与 log54 两次独立 HANG，
-其 PC/LR/SP 完全相同（0xe0009304 / 0xe000d957 / 0xd0010fe8），PC 落在
-Vita3K HLE stub 区间（0xe0000000+）——它在某个 HLE syscall 里从未返回。
-它是 Vita3K 自己的 HLE 工作线程（SceCommonDialog 模块），**从不在我们的
-观测名单**（AUDIT 表只注册 tone/wd/ticker）。
+其 PC/LR/SP 完全相同（0xe0009304 / 0xe000d957 / 0xd0010fe8）。~~PC 落在
+Vita3K HLE stub 区间（0xe0000000+）——它在某个 HLE syscall 里从未返回。~~
+（**勘误 2026-10-02**：真机 dump。pc=0xe0009304 不落在任何 PT_LOAD——
+最低系统段 0xe0010000 起 → 它在**内核保留区 = 阻塞在内核调用里**，两轮
+同 pc 只说明等在同一种系统服务上，**正常等待形态，不是卡死**。端口未
+链接/未调用 SceCommonDialog，该线程为系统注入。）它是系统线程，
+**从不在我们的观测名单**（AUDIT 表只注册 tone/wd/ticker）。
 
 ### log54 归属表最终形态
 
 - cpu0 的 200ms 零切换占用者 ∈ {SceCommonDialogWorker, 未知}
 - VM 主线程 d=0 停驻（非旋者）；wd/tone/ticker 各有不在场证明
-- **SceCommonDialogWorker 是唯一无不在场证明的线程**
+- SceCommonDialogWorker 无 runClocks 采样（census 前无法排除），但其
+  dump 形态是内核阻塞等待，不构成指控
 
 ### 探针实现（vita_watchdog.c，KICK 块后）
 
@@ -7313,15 +7317,34 @@ Vita3K HLE stub 区间（0xe0000000+）——它在某个 HLE syscall 里从未�
 - 逐线程输出 name/status/cpu/lastcpu/aff/prio/runClocks，200ms 后二采样
   输出 d(runClocks)
 - 判读一行定案：**d(runClocks)≈窗口时长的 tid = cpu0 旋者**；VM d=0 再证
-  停驻；census 名单 vs AUDIT 差集 = HLE/ghost 线程清单
+  停驻；census 名单 vs AUDIT 差集 = 系统注入/ghost 线程清单
+
+### 环境勘误（2026-10-02，用户指正）
+
+**测试环境自 log50 起一直是真机**（PM 6443/6744/6987 行均有记录：psp2dmp
+均为真机 core dump）。本节初版把 SceCommonDialogWorker 误判为 "Vita3K
+HLE 工作线程"、把 pc=0xe0009304 误读为 "HLE stub 区间"——模拟器思维套
+真机，双重错误，已全部修正：
+
+- 端口未链接/未调用 SceCommonDialog；该线程是真机系统注入的
+- pc=0xe0009304 **不落在任何 PT_LOAD**（最低系统段 0xe0010000 起）→
+  内核保留区 = **阻塞在内核调用里**，两轮同 pc 只说明它等在同一种
+  系统服务上——**正常等待形态，不是卡死**，不构成 HANG 原因
+- "SceCommonDialogWorker 是唯一无不在场证明的线程"这一表述保留，但
+  其内核阻塞形态不构成对其的指控
+- "换 Vita3K 版本/转真机" 等下一步全部作废
+
+**教训入纪律**：涉及 dump 判读，先核对测试环境（真机 vs Vita3K），
+再解读地址区间；0xe0000000 段在真机上是内核/系统保留区，不是模拟器
+HLE stub 区。
 
 ### 判读分流（这次没有"猜测"出口）
 
 | census 结果 | 结论 | 下一步 |
 |---|---|---|
-| SceCommonDialogWorker d≈200ms | **Vita3K HLE 缺陷实锤**，phoneME 无辜 | 换 Vita3K 版本/真机验证，不再打 VM 探针 |
+| SceCommonDialogWorker d≈200ms | 系统线程在真机上烧 cpu0 | 查它等的内核服务为何不返回（ sceAppUtil/sceCommonDialog 类） |
 | 其它 tid d≈200ms | 点名具体线程 | 针对性查它 |
-| 全部 d=0 但 cpu0 仍忙 | 旋者非 guest 线程 = 纯仿真层问题 | 同上，转真机 |
+| 全部 d=0 但 cpu0 仍忙 | 旋者非本进程线程（系统/中断上下文） | 查中断/内核侧（DmacpIntr 等） |
 | VM tid 查询即死 wd | 最后 log 的 tid = 腐败 TCB | 修 TCB 源头 |
 
 ### git
@@ -7329,3 +7352,5 @@ Vita3K HLE stub 区间（0xe0000000+）——它在某个 HLE syscall 里从未�
 - 主仓 j2me `159e458`：vita_watchdog.c census 块（+96 行）+ CMakeLists 02.32
   （含完整判读注释）
 - 产物 `vita-port/out/vpk/midp_vita_v02.32.vpk/.sym`（b391）
+- **勘误 commit（本轮）**：vita_watchdog.c / CMakeLists / PM 三处 Vita3K
+  HLE 错误归因已改为真机表述；产物待重建（字符串注释级改动，不影响二进制行为）

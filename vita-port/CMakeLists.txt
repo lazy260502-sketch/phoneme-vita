@@ -1099,11 +1099,14 @@ set(VITA_VERSION  "02.28")
 #   across 3 idle cores, KICK5 0x80020008 (ghost-TCB family, log33/
 #   34). The cpu0 200ms zero-switch busy owner is an UNOBSERVED
 #   thread; THREAD_INFO note names 5 threads and SceCommonDialog-
-#   Worker (Vita3K HLE, never sampled) froze bit-identical at
-#   pc=0xe0009304 across log53+log54 hangs. v02.32 census: uid-scan
+#   Worker (system-injected on real HW, never sampled) froze
+#   bit-identical at pc=0xe0009304 across log53+log54 hangs - but
+#   that pc sits in the kernel-reserved range (below the lowest
+#   PT_LOAD 0xe0010000) = blocked in a kernel call, a NORMAL wait
+#   shape on real HW, not a hang verdict. v02.32 census: uid-scan
 #   0x40010001..0x400101ff with GetThreadInfo per tid (log-before-
 #   query safety), runClocks double-sampled 200ms. Spinner = tid
-#   with d ~= window; VM d=0 re-confirms park. Vita3K-HLE vs phoneME
+#   with d ~= window; VM d=0 re-confirms park. phoneME-vs-system
 #   split decided by ONE line: who owns the busy core.
 set(VITA_VERSION  "02.32")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the

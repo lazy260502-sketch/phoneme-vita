@@ -429,15 +429,19 @@ static int wd_thread_routine(SceSize args, void *argp) {
          * cpu0 showed a 200 ms zero-switch busy owner that is NOT any
          * sampled thread (VM d=0, wd asleep, tone in delay); the
          * dump's THREAD_INFO note names exactly 5 threads, one of
-         * them 'SceCommonDialogWorker' (a Vita3K HLE worker we never
-         * sample) - and in log53 AND log54 that thread's registers
-         * froze bit-identical at pc=0xe0009304 inside the HLE stub
-         * range. The census must name the spinner directly.
+         * them 'SceCommonDialogWorker' (a SYSTEM-injected thread we
+         * never sample - real HW, not an emulator artifact; its dump
+         * pc=0xe0009304 sits in the kernel-reserved range below the
+         * lowest PT_LOAD, i.e. blocked in a kernel call - that is a
+         * normal wait shape, NOT proof of a hang). The census must
+         * name the spinner directly, or prove it is none of these.
          * sceKernelGetThreadIdList is NOT exported to user mode
          * (checked the stub archive), so enumerate by UID-space scan:
          * tids are dense (0x40010001..0x400101ff covers every thread
-         * the audit table plus any HLE workers), holes simply return
-         * an error which we skip silently.
+         * the audit table plus any system-injected workers); holes
+         * simply return an error which we skip silently. If a thread
+         * from the dump note does NOT show up in the census, it
+         * belongs to another process/system and is irrelevant here.
          * SAFETY (log33/34 lesson): log the tid BEFORE querying it -
          * if GetThreadInfo ever aborts in the kernel on a corrupt
          * TCB, the last logged tid is the corrupt one (built-in
