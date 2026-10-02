@@ -7456,3 +7456,42 @@ SceKernelThreadmgr 解析失败（"threadmgr module not found - no kernel read"�
 - 主仓 j2me `c6bfaf2`：vita_kernel_forensics.c（+175 行：扫描器+TCB dump+
   varargs 日志）、CMakeLists 02.33
 - 产物 `vita-port/out/vpk/midp_vita_v02.33.vpk/.sym`（b395）
+
+
+## v02.33 事故：K0 扫描致真机重启（v02.34 止血，99bdd3a / b397，2026-10-02）
+
+### 事故
+
+v02.33 首次真机运行即**开机重启**。触发点：`vita_kf_boot_resolve` 里的
+`kf_scan_k0`——boot 时对 0x81000000..0x84000000 的 48MB 批量
+`kuKernelCpuUnrestrictedMemcpy`。
+
+### 根因（自我勘误，两层错误）
+
+1. **窗口前提错误**：我沿用 v02.18 注释"K0 直映区=全部物理 RAM 无洞"，
+   但 log55 的数据早就否定了它——我们进程自己就映射在该窗口
+   （site_dump 运行时 0x81087fd0、heap_top 0x8389d580、PT_LOAD 0x813xxxxx）。
+   用户态窗口 ≠ 内核窗口：内核在自己的地址空间里执行 ku memcpy，撞到
+   内核 ASID 下未映射的页 → 内核态 abort 不可捕获 → 重启
+2. **经验来源错误**： VitaTorchlight 用的是内核插件直接跑在内核态，
+   从未从用户态批量读该窗口。"社区证明可行"是我套用不当
+
+### 止血与纪律
+
+- v02.34：扫描调用注释禁用，其余探针不动；v02.33 产物作废
+- **新纪律（入最高优先级教训）**：任何内核窗口读取，必须先用**单词探测读**
+  （单次 4 字节 ku read，结果落盘，真机观察）证明窗口安全，再谈批量读。
+  未经证明的窗口批量读 = 故意重启真机
+- 事后审计：v02.18~v02.32 的 kf_read 内核读**从未真正执行过**（threadmgr
+  解析一直失败早退）——所以这个地雷埋了 15 个版本才被 v02.33 踩响
+
+### v02.33 的观察目标怎么办（kernel TCB 取证路线重评）
+
+- K0 扫描路线：**废弃**。没有安全的窗口证明手段（探测读也会踩雷，见上）
+- 替代优先级：
+  1. **coredump 离线路线**（零风险）：psp2dmp 的 SYSTEM_INFO2 是 4MB
+     hashed 数据，但 THREAD_REG_INFO 里已有内核保存的 pc/lr/sp——本轮
+     已用锚点法全部解开。TCB 内核字段可尝试从 dump 的其它 note 挖
+  2. **NID 直查**：离线从固件 dump（若用户有）解析 SceKernelThreadmgr 基址
+  3. 若都不行：接受"内核侧不可观测"，回到行为学取证（变异法：改条件看
+     HANG 率变化）
