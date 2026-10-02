@@ -7660,3 +7660,46 @@ w33 字段：VM log54 真在 **cpu2**（census sysinfo 读 cpu0 忙是失真/过
 - 版本 02.36；产物 `out/vpk/midp_vita_v02.36.vpk`（3681189 B，sym `v02.36 b407 (cac5a7a)`，birth_delay 符号 ×2）
 - 跑法不变：对照（无文件）+ `birth_delay` 写 `1`。**判读新增自证项：v02.36 起 delay 若执行，site_ring 的 setcur 前后应有 1ms 级间隔且 swjb_seen 首次可能 >0（首 dispatch 完成后被切出才计）——若 `birth_delay=1` 仍冻结且 swjb_seen 仍 0，先怀疑门控再怀疑假说**
 
+## 2026-10-02 log59/60 判决 + v02.37 修复 MergedSrc 构建缺陷（v02.37 sym 812e1878，cldc cdee4e0 / vita-port 56a4b1e）
+
+### 1. 两轮结果与判决作废
+
+| 轮 | 配置（site_ring 自证） | 死点符号化（slide 锚定法） | 判决 |
+|---|---|---|---|
+| log59 | 对照 `birth_delay=0`，setcur=102 | pc=**ipe+0x4**（810c22e0） | 对照干净：回归 log53/54/55 经典位，v02.36 声称的改动零扰动 ✓（但见下） |
+| log60 | `birth_delay=1`，setcur=87 | pc=**stub+0x18**（810c25cc） | 表面"仍冻结"——**实验无效，作废** |
+
+### 2. 第三次工具性作废：v02.36 门控代码从未编译进包（MergedSrc 依赖断裂）
+
+判读纪律"仍冻结先查门控再怀疑假说"再次起效。三条证据链：
+
+1. **`.sym` 无门控符号**：v02.36 sym 全查无 `vita_last_started_id`（只有 `_ZL15_vita_swjb_seen`）
+2. **库内无符号**：`nm libcldc_vm.a | grep vita_last_started_id` 空（仅 `vita_sched_justborn`）
+3. **`.o` 时间戳铁证**：`_MergedSrc002.o` = **Oct 1 11:33**，早于 v02.35（Oct 2 11:30 改）与 v02.36（Oct 2 13:50 改）两次 Scheduler.cpp 修改
+
+**依赖断裂机制**（PM 已知坑"make 单对象重编要先 rm 旧 .o"的 MergedSrc 变体）：
+```
+_MergedSrc002.cpp (76B 壳文件, Aug 29)  ← make 只盯它的时间戳
+  └─ #include "__MergedSrc002.cpp.incl" (220 个 include)
+       └─ #213: #include ".../Scheduler.cpp"  ← 绝对路径，无依赖追踪
+```
+改 Scheduler.cpp 永远不触发 `_MergedSrc002.o` 重编。`rebuild_vm.sh` 报 "33 objects OK" 只清点 .o 数量，**不验证内容**。v02.35 的 log57/58 是死门控（代码在包但条件永假），v02.36 的 log59/60 是无门控（代码根本不在包）——**三次 delay 实验（57/58/60）全部工具性作废**，假说本身仍未被真正检验。
+
+### 3. v02.37 修复（cldc cdee4e0 / vita-port 56a4b1e）
+
+1. `rm target/release/_MergedSrc002.o` → `rebuild_vm.sh` 全量重编（32→33 objects，29 成员 repack）
+2. **编译错误顺带修复**：merged-src 单元无系统头可 include，函数内 `extern "C"` 非法（C++ linkage-spec 只能文件级）→ 文件级 `extern "C" int sceKernelDelayThread(unsigned int usec);` 加在 `vita_last_started_id` 声明旁
+3. **符号级验证闭环**（新纪律）：`nm libcldc_vm.a` 命中 `_ZL20vita_last_started_id`（.a 内 00000008 d）+ `nm v02.37.sym` 命中 `_ZL20vita_last_started_id @ 812e1878` + `_MergedSrc002.o` 时间戳 Oct 2 15:50（本次构建）
+4. 版本 02.37（避免真机测错版本，log25 教训）；产物 `out/vpk/midp_vita_v02.37.vpk`（3681618 B，15:53）
+
+### 4. 新纪律（入判读防呆项）
+
+- **门控实验构建后必须符号级验证**：`nm --defined-only` 查门控变量/函数符号必须在 `.a` 与 `.sym` 双命中，"objects OK"清点不算数
+- **MergedSrc 单元改源后必须 rm 对应 `_MergedSrcNNN.o`**：依赖链 `.cpp壳→.incl→绝对路径源文件` 断裂，touch 源文件无效；改哪个 vm/share 源就 rm 哪组（Scheduler.cpp=_MergedSrc002）
+- 顺带发现的既成事实：v02.35→v02.36 间 `_MergedSrc004.o`（11:55）编过一次——那是 OS_vita.cpp 走 **独立 .o**（非 MergedSrc）路径，log59/60 site_ring 能打印 birth_delay 证明该路径正常
+
+### 5. 待跑（v02.37 真门控首轮真机）
+
+- 对照轮（无 birth_delay 文件）：预期复现冻结、pc 在出生簇——验证 v02.37 门控在包内但未激活时零扰动
+- delay 轮（birth_delay=1）：**首次真实检验** delay 假说。判读自证链：sym 已含门控符号（前提成立）→ site_ring birth_delay=1（开关读到）→ 死点仍在出生簇+swjb/setcur 变化（门控执行）→ HANG 是否消失分流：消失=竞态坐实转永久修复设计；仍在=delay 1ms 不够或位置不对，升 5/10ms 重试
+
