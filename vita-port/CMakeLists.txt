@@ -1126,7 +1126,16 @@ set(VITA_VERSION  "02.28")
 #   raw TCB twice 400ms apart; offline join with THREAD_REG_INFO
 #   names the kernel wait point. vmalloc window deliberately NOT
 #   scanned: unmapped holes there abort uncatchably.
-set(VITA_VERSION  "02.33")
+# 02.33a HOTFIX: the K0 scan REBOOTED the real console at launch.
+#   Root cause: 0x81000000..0x84000000 is NOT a kernel-only window
+#   on this firmware - our own process maps live there (log55:
+#   site_dump runtime 0x81087fd0, heap_top 0x8389d580), so a bulk
+#   ku memcpy across the range walks pages that are unmapped (or
+#   remapped) under the kernel address space -> kernel-context
+#   abort -> reboot. Scan DISABLED (call commented out); the
+#   kernel-window premise must be re-proven with single-word probe
+#   reads before any bulk read ever runs again.
+set(VITA_VERSION  "02.34")
 # 02.15 (2026-10-28): log39 verdict (ticker pin INEFFECTIVE) + the
 #   VM-side liveness experiment.
 #   log39 ran v02.14's pin. The pin SUCCEEDED - thread audit shows

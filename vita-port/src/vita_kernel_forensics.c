@@ -614,11 +614,18 @@ void vita_kf_boot_resolve(void)
 {
     unsigned int addr;
 
-    /* v02.33: content-address the VM TCB first - the module-base
-     * routes are dead on this console, the name scan is not. The
-     * main thread IS the VM thread-to-be (same tid for its whole
-     * life), so its own tid self-verifies the hit. */
-    kf_scan_k0((unsigned int)sceKernelGetThreadId());
+    /* v02.33a HOTFIX - SCAN DISABLED. The K0 scan REBOOTED the real
+     * console on launch (first v02.33 run). The premise "0x81000000..
+     * 0x84000000 = kernel direct map, all physical RAM, no holes" is
+     * WRONG for this firmware: our own process maps live there
+     * (log55: vita_site_dump runtime 0x81087fd0, heap_top 0x8389d580,
+     * our PT_LOADs 0x813xxxxx), and under the kernel's address space
+     * those pages are NOT what our window says they are - a bulk ku
+     * memcpy across them aborts in kernel context = uncatchable =
+     * console reboot. Any future kernel-window scan must first
+     * PROVE its window on this firmware (single-word probe read,
+     * result logged, console watched) before any bulk read. */
+    /* kf_scan_k0((unsigned int)sceKernelGetThreadId()); */
 
     addr = kf_find_threadmgr();   /* userspace enum route */
 
