@@ -7703,3 +7703,51 @@ _MergedSrc002.cpp (76B 壳文件, Aug 29)  ← make 只盯它的时间戳
 - 对照轮（无 birth_delay 文件）：预期复现冻结、pc 在出生簇——验证 v02.37 门控在包内但未激活时零扰动
 - delay 轮（birth_delay=1）：**首次真实检验** delay 假说。判读自证链：sym 已含门控符号（前提成立）→ site_ring birth_delay=1（开关读到）→ 死点仍在出生簇+swjb/setcur 变化（门控执行）→ HANG 是否消失分流：消失=竞态坐实转永久修复设计；仍在=delay 1ms 不够或位置不对，升 5/10ms 重试
 
+## 2026-10-02 log61/62/63/64 判决：三剂量终验——birth_delay 1/5/10ms 全冻结，术前延迟假说判死（v02.37 b410）
+
+### 1. v02.37 构建修复验证成功（方法论闭环）
+
+- log61（对照 birth_delay=0）与 log62（birth_delay=1）midp_stderr 均自证 `v02.37 b410 (56a4b1e)`——测错版本风险已防住
+- **门控执行铁证（新证据源：trace_ring 的 VM 线程 syscall 桶）**：log61 VM 线程（tid 0x40010003）`delay_thread=0`，log62 =**4**——与 `th_start=4` 完美自洽（4 个新生儿各被 delay 一次后正常开跑）。**syscall 桶计数从此列入判读自证项**：门控/延迟类实验必须查 VM tid 桶的 delay_thread 计数
+- 死点（v02.37 新锚：stub=810c2644 / ipe=810c236c，重编后地址变了——**每次重编后必须重取锚地址**）：log61 pc=**ipe+0x10**（`moveq pc,lr`）、log62 pc=**stub+0x4**（`ldr r0,[r5,#0x40c]` GP 表基址加载）——都在出生簇内继续游走，竞态指纹持续 ✓
+
+### 2. 三剂量终验：log63（delay=5）/ log64（delay=10）仍冻结 → 假说判死
+
+用户真机回报：5ms、10ms 与 1ms 表现一致，全部冻结。结合 log62 门控铁证（机制 100% 工作），判决：
+
+**术前延迟（pre-dispatch delay）假说死亡。** 冻结不依赖"新生儿到达蹦床前"的时序窗口——把首 dispatch 推迟 1/5/10ms（三个数量级跨度内）都不改变结局。病灶在**切换本身或其后**：要么切换指令序列与某全局状态的互锁，要么新生儿执行的前几条指令（GP 表加载→ipe 检查→entry 跳转）与另一执行流的互锁。
+
+### 3. 死点精确语义（v02.37 velf 反汇编，build/cmake/midp_vita.velf Oct 2 15:53）
+
+```
+stub (start_lightweight_thread_asm=810c2644):
+  +0x00 ldr  r5,[pc,#120]     ; 文字池 → GP 表基址
+  +0x04 ldr  r0,[r5,#0x40c]   ; ← log62 死点：读全局（Universe？）
+  +0x08 ldr  r1,[r0,#0x68]
+  +0x0c mov  r2,#0
+  +0x10 tst  r1,#0x40000000
+  +0x14 strne r2,[r0,#0x24]
+  +0x18 bleq ipe(810c236c)    ; ← log57/58/60 死点家族（bleq 不写 lr——slide 锚定法依据）
+ipe (invoke_pending_entries=810c236c):
+  +0x00 ldr r0,[pc,#40]
+  +0x04 ldr r0,[r0]
+  ...  +0x10 moveq pc,lr        ; ← log61 死点：ipe 入口检查直返
+```
+
+**死点全部落在"蹦床头部读全局 + ipe 入口检查"序列**，从未深入——十证铁案"冻结=新生儿首次 dispatch"的指令级形态。
+
+### 4. 遗产：v02.37 门控机制本身是有价值工具
+
+`vita_last_started_id` 锚定 + 首 dispatch 触发的框架已验证可用（计数自洽、零扰动）。后续实验可复用：换 delay 为**内窥/干预动作**（如在门控点 dump 新生儿上下文+q5 环+GP 表目标值），无需再动构建体系。
+
+### 5. 下一步方向（冻结窗口内窥，替代已死的延迟路线）
+
+1. **GP 表/GLOBAL_JAVA状态窥探**：门控点（已验证可达）读出 `[r5+0x40c]` 指向的全局（疑似 `Global::` 侧 Universe/step_enable 类对象），dump 其 0x68 偏移字段——检验"另一执行流持有关键状态"假设
+2. **q5 环完整快照**：冻结时 5 线程环（id=4 领头）各自 wait 字段/SP 走向——现有 site_ring 已有雏形（nrt obj 行），补 SP 采样
+3. 备选：tickgate.2（从未跑过）+ 门控点干预组合实验
+
+### 6. 版本记录
+
+- v02.37 b410 sym 锚：stub=810c2644 / ipe=810c236c / `vita_last_started_id@812e1878`
+- log61~64 全部为 v02.37 b410；log63/64 日志目录暂缺（用户口述），若后续导出可补符号化死点
+
