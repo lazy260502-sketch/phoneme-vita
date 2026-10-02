@@ -2329,6 +2329,23 @@ extern "C" void switch_thread(Thread* thread) {
   if (thread->status() & THREAD_JUST_BORN) {
     _vita_swjb_seen++;
   }
+  /* v02.35: runtime-gated birth-delay A/B. The ten-proof case says the
+   * freeze lands on the FIRST dispatch of the first newborn green thread
+   * (fp=0 trampoline frame, pc in the first <=10 ipe instructions, an
+   * interrupt is the prime suspect for taking the context away). The
+   * switch below happens BEFORE the actual context switch, so a 1 ms
+   * sleep here moves the dispatch off any tick/IRQ window it was about
+   * to collide with. Gate: file ux0:/data/J2ME00001/birth_delay with
+   * first byte '1'-'9' = delay in ms ('1' = 1 ms). Absent/0 = off
+   * (v02.34 behaviour). Attribution is clean: hang gone with the file,
+   * back with it removed = timing race proven. */
+  if (thread->status() & THREAD_JUST_BORN) {
+    extern int vita_cfg_digit(const char *name, int dflt);
+    int dms = vita_cfg_digit("birth_delay", 0);
+    if (dms > 0) {
+      sceKernelDelayThread(dms * 1000);
+    }
+  }
 #endif
   if (_debugger_active && thread->status() & THREAD_JUST_BORN) {
 #if defined(VITA)

@@ -1157,11 +1157,12 @@ static void vita_wd_snapshot_one(SceUID fd) {
      * are produced and die in a spin". */
     n = snprintf(buf, sizeof(buf),
                  "  boot run=%u sched_start=%u th_start=%u th_finish=%u"
-                 " lw_exit=%u start0=%u justborn=%u\n",
+                 " lw_exit=%u start0=%u justborn=%u birth_delay=%d\n",
                  vita_run_count, vita_sched_start_count,
                  vita_thread_start_count, vita_thread_finish_count,
                  vita_lw_exit_count, vita_start0_count,
-                 vita_sched_justborn());
+                 vita_sched_justborn(),
+                 vita_cfg_digit("birth_delay", 0));
     sceIoWrite(fd, buf, n);
     /* v02.30: birth-stub visibility (log52 froze the VM at the birth
      * stub with LR=stub entry - the primordial gadget signature; see
