@@ -7407,3 +7407,52 @@ SceKernelThreadmgr 解析失败（"threadmgr module not found - no kernel read"�
 - census 判读表四出口全部先写后验，本轮落在第 3 行且与预期一致——**先写判读表再跑实验**的纪律有效
 - runClocks 记账模型：内核态关抢占不记账——"RUNNING+d=0+核忙"三元组=内核态楔死的签名
 - 0x80020008 族错误码要当作"线程处于内核过渡态"的信号读，不只是"权限不足"
+
+
+## v02.33：内核 TCB 取证——K0 签名扫描（c6bfaf2 / b395，2026-10-02）
+
+### 问题：threadmgr 基址两条路都是死路
+
+- 用户态 `sceKernelGetModuleList` **结构性看不见内核模块**（v02.21 判决：enum rc=0
+  nmod=0；flag 0x81 列的全是用户态模块）
+- taiHEN 跨域查询（module_get_by_name_nid KERNEL_PID）在本机**永不返回**——
+  log48 杀 wd、log49 杀主线程（boot 即崩），v02.26 已彻底退役
+- 但 kubridge memcpy 本身**可用**：clock=190（log46/47 判决），且 log48 证明
+  HANG 态下 ku 读**能返回**
+
+### 方案：内容寻址，跳过模块基址
+
+- **boot 时**（主线程，健康系统）：kubridge 读整个 K0 直映区
+  0x81000000..0x84000000（全部物理 RAM，无洞，读不会 abort），32KB 分块扫
+  字符串 `"J2ME00001"`（主线程名，SceAppMgr 进程出生即设，早于扫描执行）
+- **tid 自校验**：命中点 ±0x100 内必须能找到本线程自己的 tid
+  （`sceKernelGetThreadId()`）——TCB 里 tid 与 name 相邻，假阳性（日志缓冲、
+  dump 文件缓存里的同名串）不会有 tid 呼应
+- **HANG 时**：`vita_kf_dump` 直接 kf_read 缓存的 TCB 地址，dump 名字±0x80
+  的 0x100 窗口，**双采样 400ms**——冻结的 TCB 本身就是"调度器不再碰这个
+  线程"的证据；差分还能看到内核侧字段是否在动
+- 离线合并：TCB hex 与 coredump THREAD_REG_INFO（内核保存的 pc/lr/sp）、
+  runClocks 已知值对齐 → 命名 VM 线程楔死的内核等待点
+
+### 安全边界（不可遗忘）
+
+- **只扫 K0 直映区**；vmalloc 窗口（0x88800000+）有未映射洞，读洞=内核态
+  abort 不可捕获=真机变砖风险，永远不扫
+- kf_read 的 plausibility 门（两窗口校验）对所有读取仍然生效
+- 扫描只在 boot 跑（健康态），HANG 路径零枚举零 taiHEN——log48/49 纪律
+
+### 判读指南（下轮 HANG 的 kernel_forensics.log）
+
+| 输出 | 含义 |
+|---|---|
+| `VM TCB LOCKED @ 0x...` + TCB hex | 扫描成功，HANG 时同地址双采样 |
+| TCB 两次采样逐位相同 | 调度器完全不再触碰 VM 线程（lost-ready 实锤） |
+| TCB 有字段在动 | 调度器还在摸它（等特定字段差分定位） |
+| `boot scan found none` | TCB 不在 K0（vmalloc 分配）——考虑 NID 直查或放弃 kubridge 路线 |
+| scan hit 无 tid 命中 | 命中的是日志/文件缓存里的假串，正常噪音 |
+
+### git
+
+- 主仓 j2me `c6bfaf2`：vita_kernel_forensics.c（+175 行：扫描器+TCB dump+
+  varargs 日志）、CMakeLists 02.33
+- 产物 `vita-port/out/vpk/midp_vita_v02.33.vpk/.sym`（b395）
