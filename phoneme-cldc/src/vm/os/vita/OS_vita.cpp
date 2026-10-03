@@ -301,6 +301,31 @@ void Os::initialize() {
 
     // Vita does not need signal handlers - we use polling for timer
     // and VM exceptions are handled differently
+
+#if defined(VITA)
+    /* v02.38 vm_cpu pin: the log61/62 coredump verdict - VM thread
+     * RUNNING + wait=none + runClocks d=0 + KICK prio OK but suspend
+     * 0x80020008 - the kernel run-queue loses a MIGRATING thread (aff
+     * 0x70000, chgcpu ~2800). Pinning the VM thread to one core makes
+     * migration impossible. Runtime A/B via ux0:/data/J2ME00001/vm_cpu
+     * (digit 0/1/2; absent = keep inherited affinity, printed below so
+     * every dump self-documents). */
+    {
+        extern int vita_cfg_digit(const char *name, int dflt);
+        extern void vita_boot_log(const char *fmt, ...);
+        int pin = vita_cfg_digit("vm_cpu", -1);
+        SceUID self = sceKernelGetThreadId();
+        int aff = sceKernelGetThreadCpuAffinityMask(self);
+        if (pin >= 0 && pin <= 2) {
+            int mask = (SCE_KERNEL_CPU_MASK_USER_0 << pin);
+            int rc = sceKernelChangeThreadCpuAffinityMask(self, mask);
+            vita_boot_log("[vita] vm_cpu=%d aff 0x%x->0x%x rc=0x%x",
+                          pin, aff, mask, rc);
+        } else {
+            vita_boot_log("[vita] vm_cpu=off aff=0x%x", aff);
+        }
+    }
+#endif
 }
 
 void Os::dispose() {
