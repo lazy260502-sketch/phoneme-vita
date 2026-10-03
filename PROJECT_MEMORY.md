@@ -7751,3 +7751,67 @@ ipe (invoke_pending_entries=810c236c):
 - v02.37 b410 sym 锚：stub=810c2644 / ipe=810c236c / `vita_last_started_id@812e1878`
 - log61~64 全部为 v02.37 b410；log63/64 日志目录暂缺（用户口述），若后续导出可补符号化死点
 
+
+---
+
+## 2026-10-03：v02.38 vm_cpu 钉核实验（调度器丢线程假说的决定性检验）
+
+### 1. 假说升级：内核运行队列丢失迁移中线程
+
+log61/62 内核态证据链 + 三剂量判决后，假说从"术前时序"升级为：
+
+**Vita3K 内核运行队列丢失迁移中的线程**。证据拼图：
+- VM 线程 `status=RUNNING wait=none`，runClocks d=0（死前无时钟推进）
+- 最后一个 syscall 已返回（不在内核等待）
+- KICK suspend 跨核拒绝 `0x80020008`（线程不在目标核运行队列）
+- `aff=0x70000`（3 核全开）+ `chgcpu ~2800`（高频迁移）
+- 冻结所在核游走（log58 cpu1 / log61/62 cpu2）——与核无关
+- 剂量无关（birth_delay 1/5/10ms 全冻）
+- 一个故事解释全部：线程在核间迁移瞬间被 KICK/suspend，运行队列丢失
+
+### 2. v02.38 实验：钉死迁移可能性
+
+`Os::initialize()` 尾部（OS_vita.cpp ~292 行）新增运行期门控块：
+- 读 `ux0:/data/J2ME00001/vm_cpu`（0/1/2），调 `sceKernelChangeThreadCpuAffinityMask(self, SCE_KERNEL_CPU_MASK_USER_0<<pin)`
+- 缺省（无文件）= off，只打印当前 aff（对照组自证）
+- 结果行打 `vm_boot.log`：`[vita] vm_cpu=N aff 0x70000->0x20000 rc=0`
+- 注意 API 真名是 **Change**ThreadCpuAffinityMask（SDK 无 Set 版）；
+  与 watchdog 的 chgcpu 计数对应同一内核调用
+
+**A/B 判读表**：
+| 结果 | 判决 |
+|---|---|
+| 钉核后 HANG 消失 | 调度器丢线程坐实 → 永久修复=默认钉核或 launcher 侧 |
+| 仍冻 | 假说死亡 → 回 stub↔ipe 乒乓线（修 loopgen 浮点 stubs） |
+| watchdog 里 vm aff=0x20000 | 门控生效自证 |
+| vm_boot.log 无 vm_cpu 行 | 测错包（版本自证失败） |
+
+### 3. 今日构建陷阱新记录（PM 固化）
+
+1. **CMakeLists 版本号：CMake 取文件里最后一个 set(VITA_VERSION)**——本文件历
+   史惯例是"新版本块插在旧块前面"，残留的旧 set 会遮蔽新版本（v02.38 首次出包名
+   仍 02.37 即此坑）。bump 后必须 `python3 -c` 验证 last wins。
+2. **vita-port 有两个 build 目录**：`build/`（陈旧，10-02 15:52 前的产物）与
+   `build/cmake/`（真目录）。构建命令必须是 `cmake --build build/cmake`。
+3. **loopgen 宿主链接失败（fast_memclear 未定义）不阻断 ARM 库 repack**——33
+   objects OK + packed 29 members 即出库成功；loopgen 只影响 ROMImage 再生成，
+   本次未改 Java 侧，无需再生成。（既有问题，非本次引入。）
+
+### 4. 今日免费 coredump 三发现（log61/62 内窥）
+
+1. **新生儿执行过指令**：log62 r5=81401924（GP 基址已加载=stub+0 已执行）→ 冻
+   结非"从未 dispatch"，是"执行 1~10 条后被饿死"
+2. **Z=1 乒乓可能**：log61 cpsr Z=1 + ipe+0x10 `moveq pc,lr` → pending_entries
+   ==0 → ipe 返 stub+0 → stub↔ipe 无限互调可能；但 runClocks d=0 矛盾→统一解
+   释：乒乓中被抢占后调度器永不再选它
+3. **stub 探针从未生效**：`_vita_pe_enter` 符号在（814b464c B）但 stub 无引用
+   代码——rebuild 脚本从旧库回抽 Interpreter_arm.o（缺 jvm_f2i/jvm_d2i），v02.30
+   起所有 stub 侧改动从未进包；pe_enter=0 四轮恒零是无效证据
+
+### 5. 版本记录
+
+- v02.38 提交：phoneme-cldc 7a54eca（OS_vita.cpp vm_cpu 块）；vita-port 8699ea0
+  + fixup（CMakeLists 02.38 块+尾随 set 清理）
+- 产物：`vita-port/out/vpk/midp_vita_v02.38.vpk`（3681263B，Oct 3 02:33）
+- 符号级验证：`sceKernelChangeThreadCpuAffinityMask` T@8110c170 + 两条 vm_cpu
+  打印串 + 门控路径串，三中
