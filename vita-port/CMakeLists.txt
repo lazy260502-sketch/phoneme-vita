@@ -1168,7 +1168,6 @@ set(VITA_VERSION  "02.38")
 #   confirmed -> permanent default pin (or launcher-side). If not:
 #   hypothesis dead, back to the stub<->ipe ping-pong line (fix loopgen
 #   float stubs so the probes finally build).
-set(VITA_VERSION  "02.37")
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
 #   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the
