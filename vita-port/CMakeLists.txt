@@ -1149,6 +1149,25 @@ set(VITA_VERSION  "02.28")
 #   in the wd 'boot' readout so every dump self-documents its A/B
 #   config. Companion zero-code switch: ticker_cpu.2 / tickgate.*
 #   (shipped v02.17, never actually run - log46..55 all defaults).
+set(VITA_VERSION  "02.38")
+# 02.38 (2026-10-03): vm_cpu runtime pin - the scheduler-loses-thread
+#   experiment. log61/62 kernel-state verdict chain: VM thread RUNNING,
+#   wait=none, runClocks d=0, last syscall returned, KICK suspend
+#   rejected 0x80020008 cross-core, aff=0x70000 (all 3 cores),
+#   chgcpu ~2800 (constant migration), freeze walked cpu1->cpu2 across
+#   builds, dose-independent (birth_delay 1/5/10ms all froze). One
+#   story fits it all: Vita3K's kernel run-queue drops a thread that is
+#   migrating between cores at suspend/kick time. v02.38 kills migration
+#   for the VM thread entirely: Os::initialize() reads digit 0/1/2 from
+#   ux0:/data/J2ME00001/vm_cpu and calls
+#   sceKernelChangeThreadCpuAffinityMask(self, SCE_KERNEL_CPU_MASK_USER_0
+#   <<pin). Absent = off (control run, prints current aff). Result line
+#   in vm_boot.log ("vm_cpu=N aff 0x..->0x.. rc=0x.."), cross-checkable
+#   against watchdog's affinity readout. A/B: run control (no file)
+#   first, then vm_cpu=1. If pinning fixes the hang: scheduler loss
+#   confirmed -> permanent default pin (or launcher-side). If not:
+#   hypothesis dead, back to the stub<->ipe ping-pong line (fix loopgen
+#   float stubs so the probes finally build).
 set(VITA_VERSION  "02.37")
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
