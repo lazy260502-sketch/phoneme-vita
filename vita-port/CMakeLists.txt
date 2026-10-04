@@ -1168,6 +1168,34 @@ set(VITA_VERSION  "02.38")
 #   confirmed -> permanent default pin (or launcher-side). If not:
 #   hypothesis dead, back to the stub<->ipe ping-pong line (fix loopgen
 #   float stubs so the probes finally build).
+set(VITA_VERSION  "02.40")
+# 02.40 (2026-10-05): C landing pad - moving the freeze boundary into
+#   instrumentable code. Six rounds (log61..66) froze the VM at the
+#   birth/death trampoline head (pc=+0/+8, half-executed, r1=0 in log66)
+#   but the trampoline is inside the loopgen-FROZEN Interpreter_arm.o -
+#   it can never carry a probe (v02.30 lesson). Plan A (approved after
+#   the log66 verdict killed the snapshot hypothesis): the bootstrap
+#   sentinel word seeded by setup_stack_asm (InterpreterRuntime_arm.cpp,
+#   fresh _MergedSrc004.o) now points at a NEW naked-asm landing pad,
+#   vita_landing_pad, instead of the trampoline. Both consumers of the
+#   sentinel - the birth tail of primordial_to_current_thread and the
+#   interpreter unwind at run() return - must cross the pad first.
+#   Pad ABI (verified against the v02.39 binary): entry lr=pad addr,
+#   fp=0, jsp=r6=exit word (trampoline reads [r6,#16] later => pad must
+#   not clobber r4-r11), gp/r5 undefined. Pad = movw/movt absolute
+#   probes, touches ONLY r0/r1, then bx to the trampoline. Probes
+#   (watchdog v240 line): land = sentinel handoffs executed in fresh
+#   code; fp/lr = last entry template (expect fp=0, lr=pad).
+#   Next-freeze matrix:
+#     land=0           -> freeze BEFORE any sentinel handoff (switcher
+#                         never dispatched; combined with born_dsp>0
+#                         this pins the asm gap itself)
+#     land>0, pc in pad-> freeze INSIDE fresh code (first ever)
+#     land>0, pc still trampoline head -> boundary is the pad->trampoline
+#                         handoff; pad execution proves dispatch happened
+#   Sentinel-template diagnostics updated (OS_vita rd2 stacktop,
+#   vita_sched_dump_stack): the never-executed template now shows the
+#   pad address as its 6th word, not the trampoline's.
 set(VITA_VERSION  "02.39")
 # 02.39 (2026-10-04): born_dsp first-dispatch decision counter. log64/65
 #   coredump forensics nailed the freeze signature: pc at birth trampoline
