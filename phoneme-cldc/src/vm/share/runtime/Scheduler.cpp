@@ -102,6 +102,32 @@ unsigned int _vita_pe_enter = 0;
  * starved); both climbing = healthy switching, freeze is elsewhere. */
 static unsigned int _vita_ts_enter  = 0;
 static unsigned int _vita_ts_gadget = 0;
+/* v02.39: first-dispatch decision counter. log61/62/64/65 all froze
+ * the VM thread with pc inside the first 3 instructions of the birth
+ * trampoline (start_lightweight_thread_asm+0/+4/+8), lr=trampoline
+ * entry, sp=park level of the boot gadget frame (JVM::start+0x18c on
+ * the C stack). run=1/ts_enter=0 pin the C side: the boot crossing
+ * happened exactly once and mid-run dispatches never re-cross the
+ * gadget. The open question is whether the frozen pc is REAL (the
+ * trampoline executed 0-2 instructions, then the cpu was taken away)
+ * or a SNAPSHOT (the green-thread switcher wrote the birth imprint
+ * into the TCB but the cpu was lost before/while dispatching - the
+ * kernel then keeps reporting RUNNING while nothing runs).
+ * _vita_born_dsp counts the dispatch DECISIONS for the most recently
+ * started thread (same anchor the v02.36 birth-delay gate consumes).
+ * It is incremented in C++ right before the master-mode switch, i.e.
+ * BEFORE any trampoline instruction could run. At a freeze:
+ *   born_dsp = 0  -> the scheduler never even decided to dispatch the
+ *                    newborn; the frozen pc cannot be a TCB snapshot
+ *                    written by this path (snapshot hypothesis DEAD,
+ *                    the trampoline really executed 0-2 instructions)
+ *   born_dsp > 0  -> at least one birth dispatch was handed to the
+ *                    switcher. Frozen pc at stub+0/+8 with born_dsp
+ *                    counting only the DECISION still cannot prove
+ *                    execution - but combined with pe consumption it
+ *                    separates 'decided, lost cpu before entering the
+ *                    stub' from 'decided, entered, lost cpu inside'. */
+static unsigned int _vita_born_dsp = 0;
 /* v02.05: Thread::timer_tick entry count (defined in Thread.cpp next
  * to the Java-site sampling probe) - read through the accessor bridge
  * at the bottom of this file. */
@@ -2404,6 +2430,11 @@ extern "C" void switch_thread(Thread* thread) {
         sceKernelDelayThread(dms * 1000);
       }
       vita_last_started_id = -1; /* fire only on the FIRST dispatch */
+      /* v02.39: count the first-dispatch DECISION itself (see the
+       * _vita_born_dsp note at the file head). This is the last C++
+       * instruction before the master-mode switch hands the cpu to
+       * the birth trampoline. */
+      _vita_born_dsp++;
     }
   }
 #endif
@@ -2744,6 +2775,11 @@ extern "C" unsigned int vita_sched_ts_enter(void) {
 }
 extern "C" unsigned int vita_sched_ts_gadget(void) {
   return _vita_ts_gadget;
+}
+/* v02.39: first-dispatch decision count for vita_wd_snapshot (see the
+ * _vita_born_dsp note at the file head for the three-way readout). */
+extern "C" unsigned int vita_sched_born_dsp(void) {
+  return _vita_born_dsp;
 }
 
 extern "C" int vita_sched_nrt_info(char *out, int out_size) {

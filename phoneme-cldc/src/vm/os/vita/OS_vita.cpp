@@ -1208,12 +1208,14 @@ static void vita_wd_snapshot_one(SceUID fd) {
         extern unsigned int vita_sched_pe_enter(void);
         extern unsigned int vita_sched_ts_enter(void);
         extern unsigned int vita_sched_ts_gadget(void);
+        extern unsigned int vita_sched_born_dsp(void);
         n = snprintf(buf, sizeof(buf),
                      "  v230 swjb_seen=%u swjb_clear=%u pe_enter=%u"
-                     " ts_enter=%u ts_gadget=%u\n",
+                     " ts_enter=%u ts_gadget=%u born_dsp=%u\n",
                      vita_sched_swjb_seen(), vita_sched_swjb_clear(),
                      vita_sched_pe_enter(),
-                     vita_sched_ts_enter(), vita_sched_ts_gadget());
+                     vita_sched_ts_enter(), vita_sched_ts_gadget(),
+                     vita_sched_born_dsp());
         sceIoWrite(fd, buf, n);
     }
 
