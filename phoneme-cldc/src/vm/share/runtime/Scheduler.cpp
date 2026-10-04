@@ -2866,10 +2866,14 @@ extern "C" int vita_sched_dump_dispatch(char *out, int out_size) {
 /* v02.17: top of the CURRENT thread's Java stack, word by word. The
  * coredump only ever contains NATIVE (pthread) stacks, so the Java
  * bootstrap frame described in InterpreterRuntime_arm.cpp:setup_stack_asm
- * (frame pointer 0, then start_lightweight_thread_asm, ..., TestCompiler)
+ * (frame pointer 0, then the sentinel word, ..., TestCompiler)
  * has never been observable. If the top words still match that template
  * the thread never entered Java at all; any other shape says how far it
- * got. 16 words is enough to cover the whole template. */
+ * got. 16 words is enough to cover the whole template.
+ * v02.40: the sentinel word is now vita_landing_pad (fresh-compiled
+ * landing pad in InterpreterRuntime_arm.cpp), not
+ * start_lightweight_thread_asm - the pad forwards to the trampoline
+ * after bumping the v240 counters. */
 extern "C" int vita_sched_dump_stack(char *out, int out_size) {
   int pos = 0;
   int n;

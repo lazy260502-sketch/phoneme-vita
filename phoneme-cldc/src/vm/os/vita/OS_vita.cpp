@@ -534,6 +534,18 @@ volatile unsigned int vita_v231_force_term = 0;
 volatile unsigned int vita_v231_setcur     = 0;
 volatile unsigned int vita_v231_term       = 0;
 volatile unsigned int vita_v231_term_listed = 0;
+/* v02.40: landing-pad probes. Definitions live in
+ * InterpreterRuntime_arm.cpp (_MergedSrc004.o, fresh-compiled): the
+ * bootstrap sentinel word now points at vita_landing_pad instead of
+ * the frozen trampoline, so land>0 proves the sentinel handoff ran
+ * at least once in fresh code; fp/lr record the entry template
+ * (expected fp=0, lr=pad address). */
+extern "C" {
+extern volatile unsigned int vita_v240_land;
+extern volatile unsigned int vita_v240_fp;
+extern volatile unsigned int vita_v240_lr;
+extern void vita_landing_pad(void);
+}
 #define VITA_V231_EXIT_RING 8
 volatile unsigned int vita_v231_exit_ring[VITA_V231_EXIT_RING][4];
 volatile unsigned int vita_v231_exit_seq = 0;
@@ -1124,10 +1136,12 @@ static void vita_wd_snapshot_one(SceUID fd) {
 
     /* (6) Top of the Java stacks. The coredump never contains the Java
      * heap, so the bootstrap frame built by setup_stack_asm (frame
-     * pointer 0 + start_lightweight_thread_asm + TestCompiler) has never
+     * pointer 0 + landing pad + TestCompiler) has never
      * been visible. The watchdog CAN read it - it runs in the same
      * process. A top-of-stack matching setup_stack_asm proves the thread
-     * has never executed; anything else shows how far it got. */
+     * has never executed; anything else shows how far it got.
+     * v02.40: the sentinel word is now vita_landing_pad (fresh code),
+     * NOT start_lightweight_thread_asm - see the v240 probe line. */
     {
         static char stack_dump[1024];
         int len = vita_sched_dump_stack(stack_dump, (int)sizeof(stack_dump));
@@ -1230,6 +1244,18 @@ static void vita_wd_snapshot_one(SceUID fd) {
                  vita_v231_finish, vita_v231_force_term,
                  vita_v231_setcur, vita_v231_term,
                  vita_v231_term_listed, vita_v231_exit_seq);
+    sceIoWrite(fd, buf, n);
+
+    /* v02.40: landing-pad probes (see definitions near the v231
+     * counters). land counts sentinel handoffs executed in fresh
+     * (non-frozen) code; fp/lr are the last recorded entry template.
+     * At a freeze: land=0 -> the handoff never ran; land>0 with a
+     * frozen pc still in the trampoline head -> the boundary is
+     * between the pad and the trampoline's first loop iteration. */
+    n = snprintf(buf, sizeof(buf),
+                 "  v240 land=%u fp=%08x lr=%08x pad=%08x\n",
+                 vita_v240_land, vita_v240_fp, vita_v240_lr,
+                 (unsigned int)&vita_landing_pad);
     sceIoWrite(fd, buf, n);
     {
         unsigned int c = vita_v231_exit_seq;

@@ -109,6 +109,66 @@ OopDesc* _anewarray(Thread *thread, OopDesc* raw_base_klass, int length
   }
 #endif /*#if ENABLE_THUMB_COMPILER*/
 
+#if defined(VITA)
+/* v02.40: C landing pad for the green->green sentinel handoff.
+ *
+ * Six freeze rounds (log61..66, version-corrected deathpoint table in
+ * PROJECT_MEMORY.md) froze the VM thread at pc=trampoline+0/+8 with
+ * lr=trampoline entry, half-executed (log66: r5/r0 loaded by instr 1/2
+ * but r1=0 => instr 3 never ran). The trampoline lives in the
+ * loopgen-frozen Interpreter_arm.o and can never be instrumented, so
+ * this pad moves the observable boundary into fresh-compiled code:
+ * setup_stack_asm below now seeds THIS function's address as the
+ * bootstrap sentinel word instead of start_lightweight_thread_asm.
+ * Every path that used to enter the trampoline "from nothing" - the
+ * birth tail of primordial_to_current_thread (ldr lr,[jsp,-4];
+ * ldr fp,[jsp,-8]; mov pc,lr) and the interpreter unwind at run()
+ * return - now lands here first.
+ *
+ * ABI at entry (birth tail verified in the v02.39 binary at 0x810c26e0):
+ *   lr = pad entry address (the sentinel word itself)
+ *   fp = 0 (bootstrap frame), jsp/r6 = lightweight_thread_exit word,
+ *   gp/r5 = UNDEFINED (the trampoline self-initializes it), and the
+ *   ARM sp/r13 is still the primordial stack (green-thread model).
+ * The trampoline reads [r6,#16] at its 7th instruction, so the pad
+ * MUST NOT clobber r4-r11: a compiled C body would legally use r6 as
+ * callee-saved scratch and only restore it in an epilogue that never
+ * runs (the trampoline does not return). Hence naked + hand asm,
+ * touching only r0/r1 (dead at this point), movw/movt absolute
+ * addressing (non-PIE build; avoids literal-pool range issues in a
+ * merged translation unit).
+ *
+ * Probes (watchdog v240 line in OS_vita.cpp):
+ *   land  >=1 -> sentinel handoff completed at least once
+ *   land  ==0 at freeze -> freeze sits BEFORE any sentinel handoff
+ *   fp/lr snapshot -> template confirmation (fp==0, lr==pad expected)
+ */
+extern "C" {
+volatile unsigned int vita_v240_land = 0;
+volatile unsigned int vita_v240_fp   = 0;
+volatile unsigned int vita_v240_lr   = 0;
+}
+extern "C" void vita_landing_pad(void) __attribute__((naked));
+extern "C" void vita_landing_pad(void) {
+  asm volatile(
+    "movw  r0, #:lower16:vita_v240_land\n"
+    "movt  r0, #:upper16:vita_v240_land\n"
+    "ldr   r1, [r0]\n"
+    "add   r1, r1, #1\n"
+    "str   r1, [r0]\n"
+    "movw  r0, #:lower16:vita_v240_fp\n"
+    "movt  r0, #:upper16:vita_v240_fp\n"
+    "str   r11, [r0]\n"
+    "movw  r0, #:lower16:vita_v240_lr\n"
+    "movt  r0, #:upper16:vita_v240_lr\n"
+    "str   lr, [r0]\n"
+    "movw  r0, #:lower16:start_lightweight_thread_asm\n"
+    "movt  r0, #:upper16:start_lightweight_thread_asm\n"
+    "bx    r0\n"
+  );
+}
+#endif /* VITA */
+
   address setup_stack_asm(address sp) {
     jint* xsp = (jint*)sp;
     *xsp = TestCompiler;
@@ -121,7 +181,14 @@ OopDesc* _anewarray(Thread *thread, OopDesc* raw_base_klass, int length
       xsp += JavaStackDirection;
     *xsp = (jint)(address_word)Thread::lightweight_thread_exit;
       xsp += JavaStackDirection;
+#if defined(VITA)
+    /* v02.40: sentinel word now lands in vita_landing_pad (see above)
+     * instead of the trampoline directly; the pad forwards to the
+     * trampoline after recording the crossing. */
+    *xsp = (jint)(address_word)vita_landing_pad;
+#else
     *xsp = (jint)(address_word)start_lightweight_thread_asm;
+#endif
       xsp += JavaStackDirection;
     *xsp = 0;                   // value of frame pointer
     return (address)xsp;
