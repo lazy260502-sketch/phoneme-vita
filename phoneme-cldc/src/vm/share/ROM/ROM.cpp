@@ -224,6 +224,21 @@ int ROM::text_segment_of(const OopDesc* obj) {
 const int* rom_linkcheck_hle  = &_ROM_LINKCHECK_HLE;
 const int* rom_linkcheck_mffl = &_ROM_LINKCHECK_MFFL;
 const int* rom_linkcheck_mffd = &_ROM_LINKCHECK_MFFD;
+#if defined(VITA)
+/* v02.40: link self-containment fix. The MIDP-side ROMImage.cpp is
+ * compiled by MIDP.gmk with -DMSW_FIRST_FOR_DOUBLE=1, so it defines
+ * only the *_true variant; this file (VM side, ARM VFP view, macro
+ * undefined => false) references _rom_linkcheck_mffd_false. Every
+ * historic link only resolved because a stray romgen-layout
+ * ROMImage.o (which defines the _false variants) happened to ride
+ * along; the v02.40 full-generation repack dropped it and the link
+ * broke with "undefined reference to `_rom_linkcheck_mffd_false'".
+ * Define the missing variant here. This does not change any runtime
+ * behavior: the linkcheck pointers above still point at whatever
+ * definition the linker picks, and the v02.39 binary (which ran,
+ * with its ROM loading fine) resolved the exact same way. */
+const int _rom_linkcheck_mffd_false = 0;
+#endif
 #endif
 
 #if USE_BINARY_IMAGE_GENERATOR
