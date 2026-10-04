@@ -8037,3 +8037,107 @@ idle）。cpsr I=F=0 证明用户态未关中断。这是**真机内核侧冻结
 恒定落在"切换完成边界"——3 个版本 5 轮一致。用户态能做的下一步是把
 "切换完成边界"从直跳蹦床改为经 C 着陆垫，或让 VM 线程真正单核化。
 
+# v02.40 A 方案（C 着陆垫）完整落地记录
+
+## 版本快照
+
+- **产物**：`vita-port/out/vpk/midp_vita_v02.40.vpk` / `.sym`（2026-10-04 18:07 归档）
+- **git**：phoneme-cldc `dddd48b`（垫三部曲）→ `2372686`（ROM.cpp mffd 修复）；vita-port `7b71512`（版本块）
+- **v02.40 新锚点（下次 core dump 判读基准，必记）**：
+  - 蹦床 `start_lightweight_thread_asm` = **0x810b1524**（相对 v02.39 的 810c26ec 平移 -0x111c8）
+  - C 着陆垫 `vita_landing_pad` = **0x810892a0**（.text，13 条指令）
+  - 探针 `vita_v240_land` = **0x81432a30**（B）、`vita_v240_fp` = 0x81432a2c、`vita_v240_lr` = 0x81432a28
+  - `setup_stack_asm` = 0x8108a698（播种指令 `movw/movt r2 → str [r3,#-20]`，哨兵字=垫地址）
+
+## 1. A 方案设计（冻结边界从 asm 空隙移进可插桩代码）
+
+绿-绿切换尾：`mov pc,lr` 直跳蹦床（哨兵字=蹦床地址），边界落在不可插桩
+asm 空隙。A 方案把哨兵字改为 **C 着陆垫地址**：出生线程恢复完寄存器后
+先落进垫（计数+拍 fp/lr 快照）再 `bx` 蹦床。冻结若仍发生，pc/探针组合
+即可钉死边界落在垫前、垫内、还是垫→蹦床交接。
+
+### 垫 ABI 约束（为什么必须 naked + 手写 asm）
+
+- 垫入口 ABI：lr=垫地址+4（哨兵字本身被 `ldr lr,[jsp,#4]` 装载）、fp=0、
+  jsp=r6=lw_exit 字、gp=r5 未定义（蹦床首条自设）
+- `Assembler_arm.hpp:150-180` 寄存器约定：gp=r5、jsp=r6、locals=r7、
+  cpool=r8、fp=r11 全是 callee-saved；蹦床第 7 条 `ldr r0,[r6,#16]` 依赖
+  它们 → **垫绝不可破坏 r4-r11**
+- 编译 C 函数会合法使用 r6 且 epilogue 永不执行（尾跳）→ 必须
+  `__attribute__((naked))` + 只碰 r0/r1 + movw/movt 绝对寻址（非 PIE）
+- **语法教训**：`__attribute__((naked)) extern "C" void f()` 非法——
+  必须 `extern "C" void f(void) __attribute__((naked));` 声明后置属性
+
+## 2. 改动文件（3+1）
+
+| 文件 | 改动 |
+|---|---|
+| `src/vm/cpu/arm/InterpreterRuntime_arm.cpp` | 垫定义（13 条 naked asm）+ v240 探针变量 + `setup_stack_asm` 哨兵字 `#if defined(VITA)` 播垫地址 |
+| `src/vm/os/vita/OS_vita.cpp` | watchdog v231 行后新增 `v240 land/fp/lr/pad` 读出行 |
+| `src/vm/share/runtime/Scheduler.cpp` | `vita_sched_dump_stack` 哨兵模板注释同步（第 6 字=垫） |
+| `src/vm/share/ROM/ROM.cpp` | `#if defined(VITA)` 定义 `_rom_linkcheck_mffd_false`（见 §4） |
+
+## 3. 垫反汇编（发布版逐指令验证通过）
+
+```
+vita_landing_pad @ 0x810892a0:
+  movw r0,#0x2a30; movt r0,#0x8143   ; &vita_v240_land
+  ldr r1,[r0]; add r1,#1; str r1,[r0]   ; land++
+  movw r0,#0x2a2c; movt r0,#0x8143   ; &vita_v240_fp
+  str fp,[r0]                           ; fp 快照（垫 ABI 下应为 0）
+  movw r0,#0x2a28; movt r0,#0x8143   ; &vita_v240_lr
+  str lr,[r0]                           ; lr 快照（应为垫地址+4）
+  movw r0,#0x1524; movt r0,#0x810b   ; start_lightweight_thread_asm
+  bx r0                                  ; 尾跳蹦床
+```
+
+只碰 r0/r1 ✓、重定位全 R_ARM_MOVW_ABS_NC/MOVT_ABS ✓、蹦床首 5 条与
+v02.39 逐指令相同（冻结成员原样）✓。
+
+## 4. mffd_false 链接事件（v02.40 专属坑，防复发）
+
+**现象**：VPK 链接 `undefined reference to _rom_linkcheck_mffd_false`
+（_MergedSrc005.o .data+0x10）。v02.39 能链、v02.40 不能。
+
+**根因链**：
+1. 宏不对称**历史既存**：`ROMImage.hpp:250-275` 的 linkcheck 宏把
+   `MSW_FIRST_FOR_DOUBLE` 映射成 `_rom_linkcheck_mffd_true/false` 指针；
+   MIDP.gmk（~246 行）编 ROMImage.cpp 用 `-DMSW_FIRST_FOR_DOUBLE=1` →
+   定义 **mffd_true**；VM 侧 ROM.cpp 不带该宏（ARM VFP 视角→引用
+   **mffd_false**）。两侧永远对不上。
+2. v02.39 靠**混入物侥幸**：v02.39.sym 里 mffd_false@8110deac 邻接 11 个
+   `_rom_check_*` 符号（romgen 布局 ROMImage.o 特征）——提供者是
+   `phoneme-cldc/build/vita_arm/romgen/app/ROMImage.o`（2026-09-05 产物）
+   混进链接线，靠 `--allow-multiple-definition` 与 MIDP 的 mffd_true 并存。
+3. **全量重打包显形**：rebuild_vm.sh 的 pack_lib 重打包 libcldc_vm_g.a
+   后混入物消失 → 未定义引用。
+
+**修复**：ROM.cpp 补 `#if defined(VITA) const int _rom_linkcheck_mffd_false
+= 0; #endif`——VM 侧可重编成员（_MergedSrc005），不动上游 MIDP.gmk，精确
+复现 v02.39 解析语义。运行时 linkcheck 指针指向链接器选择的定义（v02.39
+即如此运行，实机 ROM 加载正常佐证）；ROM.cpp:378 GUARANTEE 仅在
+`_rom_compilation_enabled` 时检查，ROM AOT 未启用不触发。
+
+**防复发**：今后凡 pack_lib 全量重打包后出现 linkcheck 类 undefined，
+先查宏不对称（ROMImage.hpp 宏映射 × 各编译单元实际 -D 旗标），再看是否
+历史混入物消失。
+
+## 5. 判读矩阵（v02.40 冻结时 watchdog 快照读 v240 行）
+
+| 读数 | 判定 |
+|---|---|
+| land=0 | 冻结在哨兵交接**前**（结合 born_dsp>0 即钉死 asm 空隙——A 方案核心目标） |
+| land>0 + pc 在垫内（0x810892a0..0x810892d8） | 冻结首次进入新代码（垫本身） |
+| land>0 + pc 仍在蹦床头（0x810b1524..） | 边界=垫→蹦床交接 |
+| land>0 + 蹦床完整执行 | 出生尾通过，冻结后移——看下一版本锚点 |
+
+探针语义：land=落地次数（每次哨兵交接 +1）；fp 在垫 ABI 下恒 0（若非 0
+说明入口 ABI 假设错）；lr=垫地址+4（哨兵字装载值）。
+
+## 6. 遗留风险
+
+- mffd_false 定义属链接自足性补丁，运行时语义不变；但需留意 v02.40 实机
+  ROM 加载是否依旧正常——若出现 ROM 相关异常回查 §4。
+- `--allow-multiple-definition` 仍在链接线（MIDP 侧 mffd_true 与 VM 侧
+  mffd_false 现在是两个不同符号，不再冲突，但该旗标历史上掩盖过混入物，
+  长期应移除）。
