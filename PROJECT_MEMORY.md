@@ -7815,3 +7815,73 @@ log61/62 内核态证据链 + 三剂量判决后，假说从"术前时序"升级
 - 产物：`vita-port/out/vpk/midp_vita_v02.38.vpk`（3681263B，Oct 3 02:33）
 - 符号级验证：`sceKernelChangeThreadCpuAffinityMask` T@8110c170 + 两条 vm_cpu
   打印串 + 门控路径串，三中
+
+---
+
+## 2026-10-04：ASLR 幻影事故 + 真机死点修正（log64/65 判读基础重建）
+
+### 0. 环境事实重申（最高优先级纪律）
+
+**所有 HANG 均为真机冻结，与 Vita3K 无关**。log61~65 coredump 全部由真机
+psp2core dump 产生。后续判读禁止引入 Vita3K host 侧分析——用户已多次纠正，
+本次会话又犯（读 Vita3K thread.cpp 想解释 runClocks），**再犯即事故**。
+
+### 1. ASLR 幻影事故（log64/65 判读推倒重来）
+
+10-03 会话曾判读"死点落在 ROM 源数组区（_rom_heap_block/_rom_data_block_src），
++0x120000 后落 text_block0 三投三中"——**全部是幻影**。真相：
+
+**真机内核有 ASLR，每次启动 slide 不同**。证据：
+- site_ring.log 线程表 creator= 字段是运行时代码地址（Thread 创建调用点）
+- v02.38 静态锚（.sym 反汇编）：tone BL@8100d084→ret 8100d089、wd BL@8100ee90
+  →ret 8100ee95、ticker BL@810597f8→ret 810597fd
+- log61 creator=8100d089 → **slide=0**（无 ASLR 或 slide=0 的启动）
+- log62: 81077089-8100d089 = **0x6A000**（wd/ticker 锚互验 ✓）
+- log64: 8107a089-8100d089 = **0x6D000**（三锚互验 ✓）
+- log65: 8106f089-8100d089 = **0x62000**（三锚互验 ✓）
+- log62↔64 creator 恒差、log64↔65 恒差 0xB000 = 每次启动 slide 独立
+- r5(GP)=0x81401924 两轮相同 ≠ 代码 slide——GP 指向 RW 段，RW 分配地址与
+  slide 无关（误把 r5 差当 slide 是 10-03 幻影的起点）
+
+**判读纪律（固化）**：凡解读 coredump 任何代码指针，先扣 slide。四锚法：
+site_ring.log 里 tone/wd/ticker 三行 creator= 减静态 .sym 锚即得，30 秒。
+
+### 2. 修正后的真机死点（四次冻结全一致）
+
+| 轮 | 版本 | slide | pc(静态真身) | 指令 |
+|---|---|---|---|---|
+| log58 | v02.35 | 未解 | stub+0x8（当时判读） | ldr r1,[r0,#0x68] |
+| log61 | v02.37 | 0 | stub+0x18 区 | bleq ipe 附近 |
+| log62 | v02.38 | 0x6A000 | **stub+0x04** | ldr r0,[r5,#0x40c] |
+| log64 | v02.38 | 0x6D000 | **stub+0x00** | lstub 第一条 |
+| log64 lr | | | **stub+0x00** | 出生帧原始返回址 |
+| log65 | v02.38 | 0x62000 | **stub+0x08** | ldr r1,[r0,#0x68] |
+
+共同签名：**pc∈蹦床最前 3 条指令、lr=stub+0、sp=出生栈、r0=r3=新生儿对象、
+fp=0、cpsr=0x60070010（ARM 态 User 模式，Z=1）**。
+
+**物理检查**：dump 里 stub 代码页 = HOLE（只读页未被写）→ 蹦床代码完好，
+"代码被覆写"论死。
+
+### 3. 修正后的最小事实集（全部真机证据）
+
+1. VM 线程冻在出生蹦床入口 1~3 条指令内，从未执行到 bleq ipe（lr 未变）
+2. runClocks d=0（watchdog 两次采样，tone/wd 字段同期正常走）→ 线程没有被
+   执行，不是在循环里跑
+3. 内核态 RUNNING/wait=none/最后 syscall 已返回 → 不在内核等待
+4. KICK prio/susp/res 全无效（susp 0x80020008）→ 内核认为它"在运行"
+5. 钉核（log65）不救：cpu1 钉死、chgcpu=7，冻结签名不变
+6. ticker 同核（log65）也饿死 32 秒 → cpu1 上"什么都没跑"但内核仍报 RUNNING
+
+### 4. 待验证方向（全部真机侧，无 Vita3K 假设）
+
+自旋论已死（runClocks d=0 + 代码页 HOLE + stub 前 3 条无循环结构）。当前
+唯一与全部事实相容的图景：**上下文切换器写入 newborn 上下文后，真机内核
+从未真正 dispatch 它**——pc/lr/sp 只是切换器写进 TCB 的初始值快照。需要
+解释：为什么内核报 RUNNING 却不分配时钟。
+
+候选实验（下一轮）：
+- A. 检查切换器（switch_to_asm/Scheduler）对 newborn 首切的完整语义
+- B. born 栈顶"TestCompiler 指针"槽：出生帧必经，读 dump 验证出生栈完整性
+- C. 出生栈 C 栈（sp=8167fd88/log64）与 TCB 内核栈是两个东西——查 scheduler
+  设 sp 的方式与真机内核栈边界检查的关系
