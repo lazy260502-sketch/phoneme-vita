@@ -7885,3 +7885,85 @@ fp=0、cpsr=0x60070010（ARM 态 User 模式，Z=1）**。
 - B. born 栈顶"TestCompiler 指针"槽：出生帧必经，读 dump 验证出生栈完整性
 - C. 出生栈 C 栈（sp=8167fd88/log64）与 TCB 内核栈是两个东西——查 scheduler
   设 sp 的方式与真机内核栈边界检查的关系
+
+## 2026-10-04（下午）：C 栈取证闭环 + 调用链全景 + v02.39 born_dsp 探针（phoneme-cldc 40840fb / vita-port d402aa0）
+
+### 1. C 栈顶帧全解（决定性证据链最后一环）
+
+log64/65 的 C 栈（sp 处 40B，readsp.py）slide 修正后**完全一致**：
+
+| 槽 | 静态值 | 含义 |
+|---|---|---|
+| [sp+0] | 810b5d2c | **JVM::start+0x18c = bl gadget 的返回地址**（gadget push{lr} 压入） |
+| [sp+4] | 814b2f84 | **vita_run_count 地址**——主循环 bl 前自增的那个计数器（r3 残影） |
+| [sp+8] | 81567b10 | JVM::start 帧的 r4（[sp-8]=_fini+0x83988 为加载器残影） |
+| [sp+12] | 81567aa8 | JVM::start 帧的 r5 |
+| [sp-4] | 810c1f78 | L415+0x10（gadget push{r3-r11} 的残影区边界） |
+
+两轮 sp 均为"栈顶-0x278"（log64=0x8167fd88/栈基 0x81680000，log65=
+0x813bfd88/栈基 0x813c0000——**栈基址每次启动不同（线程栈分配 ASLR），但
+相对深度相同**）。**lr=stub+0 的真相**：gadget 的 `ldr lr,[jsp+4]; mov pc,lr`
+把蹦床入口装进 lr 作为跳转载体——lr 不是返回地址，此前"call_on_primordial_
+stack 尾声路径"的疑虑解除。
+
+### 2. 调用链全景（5 个 gadget 调用点归属 + run=1 焊死）
+
+- v02.38 全二进制仅 5 处引用 gadget（810c26a0），无 GP 表间接引用：
+  - 810b5d28 bl ← **JVM::start**（vita_run_count++ 后，boot crossing）
+  - 810b4f3c b  ← **JVM::run**（被 JVM::start 内联，同一 crossing）
+  - 810893a4 bl ← **JVMScheduler::time_slice**（slave 模式专用，真机不走）
+  - 810b1d14/810b1d68 ← **Universe::invoke_pending_entries**×2（romizer/
+    TestCompiler 路径，#if USE_JAR_ENTRY_ENUMERATOR 死代码）
+- **JVM::start 无主模式循环**：源码确认 run() 仅调用一次；snapshot
+  `run=1`（log64/65）= boot crossing 恰好一次。此后绿线程切换全在执行栈上
+  的纯 asm 切换器完成，C 栈**永远停泊**在 boot gadget 帧——这解释了游戏跑
+  215 秒后冻结、C 栈顶仍是 JVM::start+0x18c。
+- **中途 newborn dispatch 路径**：C++ `switch_thread`（vita_site_mark/
+  VITA_DISP_REC/pump 在此）→ birth-delay gate → `switch_thread_master_mode`
+  （仅 set_current，无 asm 切换！切换由绿栈上的生成代码完成）→ 蹦床。
+  绿-绿切换器**不写 TCB pc**（内核线程一直在跑，从未让出）——"pc 是切换器
+  写入 TCB 快照"假说的机制不存在，但"决策后跳转前/跳转中被夺核"仍开放。
+- 上游对照：master 模式 VM 线程在 `check_blocked_threads`→JVMSPI_CheckEvents
+  睡眠等事件；绿线程全部阻塞时这是唯一的 C++ 可见点。
+
+### 3. dump 覆盖澄清（防误判）
+
+psp2core 只捕获：C 栈（0x81381000..+0x40000）+ 三个环形缓冲 + 内核 note。
+**代码段/堆/RW 段均不落盘**——"newborn 对象页 HOLE"、"蹦床代码页 HOLE"
+均不能推出运行时 unmapped/被覆写；ROM 数据区幻影事故的教训在此复用。
+SYSTEM_INFO(0x1001) 无 crash reason；0xb8dae≈75.7s 为运行时长。APP_INFO
+自证版本串。THREAD_REG_INFO 每线程 376B：15 GPR + FPU d0-d15（全 NaN）
++ fpscr，无"停止原因"字段。
+
+### 4. v02.39 born_dsp 探针（判别"pc=快照" vs "蹦床真执行"）
+
+- **位置**（关键避开 loopgen 冻结陷阱）：Scheduler.cpp birth-delay gate
+  消费 `vita_last_started_id` 处（= dispatch 决策点，C++ 侧，先于 asm
+  跳转）；accessor `vita_sched_born_dsp()`；OS_vita.cpp snapshot v230 行
+  加 `born_dsp=%u` 读出。
+- **生成器侧探针永远死**：蹦床生成器在 InterpreterStubs_arm.cpp → 编进
+  pack_lib 从旧库提取的冻结 Interpreter_arm.o——v02.30 pe_enter=0 的死因，
+  C++ 侧是唯一活位置。
+- **判读矩阵**（冻结时 snapshot v230 行）：
+  - `born_dsp=0`：调度器从未决策 dispatch newborn → 冻结 pc 不可能是该
+    路径快照 → **蹦床真执行了 0-2 条**（快照假说死）
+  - `born_dsp>0`：决策已做 → 冻结在决策与蹦床完成之间；配合 pe 消费可
+    分离"进 stub 前丢核"vs"进 stub 内丢核"
+- 构建：rebuild_vm.sh（33 对象/29 成员）→ nm 验证 `_ZL14_vita_born_dsp`
+  + `vita_sched_born_dsp` T 符号 → vpk 3681825B。蹦床指令编码逐条比对
+  v02.38 无扰动（仅整体平移 +0x28）。
+- **产物**：`vita-port/out/vpk/midp_vita_v02.39.vpk/.sym`。
+
+### 5. 事故与基准保护
+
+- **v02.38 产物污染**：版本块误插在 02.38 set 之前（last-set-wins），第一
+  次构建把 `out/vpk/midp_vita_v02.38.vpk/.sym` 覆盖成含 born_dsp 的新
+  代码（蹦床移到 810c26ec）。out/ 被 gitignore 无法恢复。**真 v02.38 符号
+  基准唯一存档：`debug/tools/v02.38_full_disasm.txt.bak`（14MB，333287 行
+  全量反汇编，源 /tmp/v38_dis.txt）**——log64/65 的 slide 四锚法仍以它
+  为准。
+- **v02.39 静态锚（新基准，log66+ 判读用）**：蹦床
+  `810c26ec`（start_lightweight_thread_asm）、gadget 810c26a0 不变（其
+  前无插入）、born_dsp 定义 814b4658、accessor 81087ef8。
+- 版本块追加纪律：**新版本 set 必须在文件中最后一个 set(VITA_VERSION
+  之后**（1152 行 02.38 → 1171 行 02.39 模式）。
