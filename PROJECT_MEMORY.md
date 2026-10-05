@@ -8041,13 +8041,14 @@ idle）。cpsr I=F=0 证明用户态未关中断。这是**真机内核侧冻结
 
 ## 版本快照
 
-- **产物**：`vita-port/out/vpk/midp_vita_v02.40.vpk` / `.sym`（2026-10-04 18:07 归档）
+- **产物**：`vita-port/out/vpk/midp_vita_v02.40.vpk` / `.sym`（**正确构建树 2026-10-05 17:03 归档**；10-04 18:07 首版为错误构建树产物，已被替换）
 - **git**：phoneme-cldc `dddd48b`（垫三部曲）→ `2372686`（ROM.cpp mffd 修复）；vita-port `7b71512`（版本块）
 - **v02.40 新锚点（下次 core dump 判读基准，必记）**：
-  - 蹦床 `start_lightweight_thread_asm` = **0x810b1524**（相对 v02.39 的 810c26ec 平移 -0x111c8）
-  - C 着陆垫 `vita_landing_pad` = **0x810892a0**（.text，13 条指令）
-  - 探针 `vita_v240_land` = **0x81432a30**（B）、`vita_v240_fp` = 0x81432a2c、`vita_v240_lr` = 0x81432a28
-  - `setup_stack_asm` = 0x8108a698（播种指令 `movw/movt r2 → str [r3,#-20]`，哨兵字=垫地址）
+  - 蹦床 `start_lightweight_thread_asm` = **0x810c277c**（v02.39 的 810c26ec +0x90）
+  - C 着陆垫 `vita_landing_pad` = **0x8109a4f8**（.text，13 条指令）
+  - 探针 `vita_v240_land` = **0x814b4b18**（B）、`vita_v240_fp` = 0x814b4b14、`vita_v240_lr` = 0x814b4b10
+  - `setup_stack_asm` = 0x8109b8f0（播种指令 `movw/movt r2 → str [r3,#-20]`，哨兵字=垫地址）
+  - ⚠️ **10-05 勘误**：首次发布的 v02.40（10-04 18:07 归档）是**错误构建树产物**——用了旧极简入口 `midp-vita/build_midp_vita.sh`（仅 main.c 对象），缺整个 vita-port 启动器（~300KB：vita_menu/wraps/libpng），真机打开即 C1-2543-4 无 coredump。正确构建树是 `vita-port/build.sh`（或手动 cmake+make）。上表锚点已全部换算为正确构建树 10-05 17:03 产物。
 
 ## 1. A 方案设计（冻结边界从 asm 空隙移进可插桩代码）
 
@@ -8080,14 +8081,14 @@ asm 空隙。A 方案把哨兵字改为 **C 着陆垫地址**：出生线程恢�
 ## 3. 垫反汇编（发布版逐指令验证通过）
 
 ```
-vita_landing_pad @ 0x810892a0:
-  movw r0,#0x2a30; movt r0,#0x8143   ; &vita_v240_land
+vita_landing_pad @ 0x8109a4f8:
+  movw r0,#0x4b18; movt r0,#0x814b   ; &vita_v240_land
   ldr r1,[r0]; add r1,#1; str r1,[r0]   ; land++
-  movw r0,#0x2a2c; movt r0,#0x8143   ; &vita_v240_fp
+  movw r0,#0x4b14; movt r0,#0x814b   ; &vita_v240_fp
   str fp,[r0]                           ; fp 快照（垫 ABI 下应为 0）
-  movw r0,#0x2a28; movt r0,#0x8143   ; &vita_v240_lr
+  movw r0,#0x4b10; movt r0,#0x814b   ; &vita_v240_lr
   str lr,[r0]                           ; lr 快照（应为垫地址+4）
-  movw r0,#0x1524; movt r0,#0x810b   ; start_lightweight_thread_asm
+  movw r0,#0x277c; movt r0,#0x810c   ; start_lightweight_thread_asm
   bx r0                                  ; 尾跳蹦床
 ```
 
@@ -8127,8 +8128,8 @@ v02.39 逐指令相同（冻结成员原样）✓。
 | 读数 | 判定 |
 |---|---|
 | land=0 | 冻结在哨兵交接**前**（结合 born_dsp>0 即钉死 asm 空隙——A 方案核心目标） |
-| land>0 + pc 在垫内（0x810892a0..0x810892d8） | 冻结首次进入新代码（垫本身） |
-| land>0 + pc 仍在蹦床头（0x810b1524..） | 边界=垫→蹦床交接 |
+| land>0 + pc 在垫内（0x8109a4f8..0x8109a530） | 冻结首次进入新代码（垫本身） |
+| land>0 + pc 仍在蹦床头（0x810c277c..） | 边界=垫→蹦床交接 |
 | land>0 + 蹦床完整执行 | 出生尾通过，冻结后移——看下一版本锚点 |
 
 探针语义：land=落地次数（每次哨兵交接 +1）；fp 在垫 ABI 下恒 0（若非 0

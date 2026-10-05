@@ -1168,6 +1168,31 @@ set(VITA_VERSION  "02.38")
 #   confirmed -> permanent default pin (or launcher-side). If not:
 #   hypothesis dead, back to the stub<->ipe ping-pong line (fix loopgen
 #   float stubs so the probes finally build).
+set(VITA_VERSION  "02.39")
+# 02.39 (2026-10-04): born_dsp first-dispatch decision counter. log64/65
+#   coredump forensics nailed the freeze signature: pc at birth trampoline
+#   +0/+8, lr=trampoline entry, sp=boot gadget park level with
+#   [sp]=JVM::start+0x18c, fp=0, jsp=newborn birth stack, cpsr User/I=0.
+#   run=1 + ts_enter=0 pin the C side (boot crossing happened exactly
+#   once); all 5 direct gadget call sites accounted (JVM::run, time_slice,
+#   Universe::ipe x2 [romizer-dead], JVM::start); no GP-table reference.
+#   Mid-run first dispatch is pure asm: C++ switch_thread -> birth-delay
+#   gate -> asm switcher -> trampoline. Open question: did the trampoline
+#   EXECUTE 0-2 instructions before the cpu was lost, or is the frozen pc
+#   a SNAPSHOT the switcher never actually dispatched? _vita_born_dsp
+#   (Scheduler.cpp, right after the birth-delay gate consumes
+#   vita_last_started_id) counts the dispatch DECISION in C++ - before
+#   any trampoline instruction could run. Readout added to the wd
+#   snapshot v230 line (born_dsp=N). At the next freeze:
+#     born_dsp=0  -> scheduler never decided; frozen pc is not from this
+#                     path's decision -> trampoline really ran (snapshot
+#                     hypothesis DEAD)
+#     born_dsp>0  -> decision made; freeze sits between decision and
+#                     trampoline completion (combined with pe=0 pe-
+#                     consumption: lost cpu before/at stub entry)
+#   Note: generator-side probes (InterpreterStubs_arm.cpp) are compiled
+#   into the loopgen-frozen Interpreter_arm.o and never reach the binary
+#   (v02.30 pe_enter lesson) - C++ side is the only live placement.
 set(VITA_VERSION  "02.40")
 # 02.40 (2026-10-05): C landing pad - moving the freeze boundary into
 #   instrumentable code. Six rounds (log61..66) froze the VM at the
@@ -1196,31 +1221,6 @@ set(VITA_VERSION  "02.40")
 #   Sentinel-template diagnostics updated (OS_vita rd2 stacktop,
 #   vita_sched_dump_stack): the never-executed template now shows the
 #   pad address as its 6th word, not the trampoline's.
-set(VITA_VERSION  "02.39")
-# 02.39 (2026-10-04): born_dsp first-dispatch decision counter. log64/65
-#   coredump forensics nailed the freeze signature: pc at birth trampoline
-#   +0/+8, lr=trampoline entry, sp=boot gadget park level with
-#   [sp]=JVM::start+0x18c, fp=0, jsp=newborn birth stack, cpsr User/I=0.
-#   run=1 + ts_enter=0 pin the C side (boot crossing happened exactly
-#   once); all 5 direct gadget call sites accounted (JVM::run, time_slice,
-#   Universe::ipe x2 [romizer-dead], JVM::start); no GP-table reference.
-#   Mid-run first dispatch is pure asm: C++ switch_thread -> birth-delay
-#   gate -> asm switcher -> trampoline. Open question: did the trampoline
-#   EXECUTE 0-2 instructions before the cpu was lost, or is the frozen pc
-#   a SNAPSHOT the switcher never actually dispatched? _vita_born_dsp
-#   (Scheduler.cpp, right after the birth-delay gate consumes
-#   vita_last_started_id) counts the dispatch DECISION in C++ - before
-#   any trampoline instruction could run. Readout added to the wd
-#   snapshot v230 line (born_dsp=N). At the next freeze:
-#     born_dsp=0  -> scheduler never decided; frozen pc is not from this
-#                     path's decision -> trampoline really ran (snapshot
-#                     hypothesis DEAD)
-#     born_dsp>0  -> decision made; freeze sits between decision and
-#                     trampoline completion (combined with pe=0 pe-
-#                     consumption: lost cpu before/at stub entry)
-#   Note: generator-side probes (InterpreterStubs_arm.cpp) are compiled
-#   into the loopgen-frozen Interpreter_arm.o and never reach the binary
-#   (v02.30 pe_enter lesson) - C++ side is the only live placement.
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
 #   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the
