@@ -8153,3 +8153,10 @@ v02.39 逐指令相同（冻结成员原样）✓。
 2. **v02.41（d48161a）**：`VITA_NO_PNG` 屏蔽 libpng（唯一运行时漏斗 `vita_icon_decode_png` 早退 -1，桩=`mov.w r0,#-1; bx lr`；MIDP 皮肤不走 libpng；cache.bin 无需清）。锚点：垫@0x8109a270、蹦床@0x810c24f4、探针 0x814b4b10-18（.bss 不平移）、128 符号、md5 e6844e2f3f2dfdca602397289047e4d1。
 3. **判读矩阵**：图标消失+`[AUDIT] calls=0`=屏蔽自检；冻结消失=libpng 堆破坏实锤（回补查 rowbytes 族 bug）；仍冻结=活锁与 libpng 无关，下一主战场=**优先队列成环成因**（Scheduler 挂回路径/resume 延迟入队/重入 reschedule）。
 4. **环境**：`vitasdk.sh` 不存在，用 `export VITASDK=/home/zyb/.local/vitasdk; export PATH=$VITASDK/bin:$PATH`；正确树纪律不变（vita-port cmake+make，midp-vita/build_midp_vita.sh 永久废弃）。
+
+## 2026-10-07（二）：v02.42 队列 forensics 包发货（log68 预备）
+
+1. **背景**：log67 判决活锁为纯 asm 闭环（unwind→哨兵→垫→蹦床→桩 `moveq pc,lr`→再 unwind），switch/lw_exit/ts_gadget 全静止，环内无 C++ 检查点 → 成因观测面只剩"最后一批 C++ 队列操作"。同轮实锤 v02.30 `_vita_pe_enter` 是死探针（冻结 Interpreter_arm.o 吞掉生成器侧计数）→ 活探针只能放 fresh 单元。
+2. **v02.42（CLDC 3be09f5 / vita-port 7f71d3d）**：三件套——(a) `_vita_q_ring` 64 条 (id,op,pri,pe) 六 op 插桩（ADD/REM/SEL/NRT×3/PRI/JBC，站点表见 notes）；(b) 垫 `vita_v242_pe[2]` pe 存活计数（读 `_current_thread`+0x24，双槽 pe==NULL/!=NULL，basic asm 只碰 r0/r1）；(c) watchdog `[rd0 qring]` 分节（dump 于 dispatch ring 前，成因先于后果）+ `v242 pe0/pe1` 行。判读矩阵与锚点见 `debug/notes/log68_prep_v0242_qring_forensics.md`。
+3. **锚点**：垫@0x8109a5a0（+0x330 平移）、`_current_thread`@0x812e1d30（GP 首槽未平移）、`_vita_q_ring`@0x814b4d34、`vita_v242_pe`@0x814b5718、129 符号、md5 dbb85acf66b72e1aee0706a5b346c993。
+4. **新教训**：垫引用 `_current_thread` 使 loopgen 宿主 exe 多一条 undefined（历史既有报错之外）——判据是库内有无 `D _current_thread` 定义与 vita-port 最终链接，非 loopgen 退出码。v02.42 仍携带 VITA_NO_PNG（02.41 块 flag 持续生效）：若直接跑不冻结无法归因 PNG，仍冻结则 qring/pe 数据正交可判读。
