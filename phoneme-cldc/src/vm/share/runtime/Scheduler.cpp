@@ -147,6 +147,35 @@ extern volatile unsigned int _vita_ttk_hits[8];
 #define VITA_DISP_RING 32
 volatile unsigned int _vita_disp_ring[VITA_DISP_RING][4]; /* id,pri,st,pe */
 volatile unsigned int _vita_disp_seq = 0;
+/* v02.42: scheduler QUEUE-OP ring - the cause-side counterpart of the
+ * dispatch ring. log67's livelock verdict (land 14.5M/s, dispatch ring
+ * id=3 pe=0 x16, q5 CYCLE(2), switch/lw_exit/ts_gadget all FROZEN)
+ * means the spin loop is a pure-asm closed loop that no longer passes
+ * through ANY C++ checkpoint - so the last C++ queue operations
+ * before the spin started are frozen in history: exactly what this
+ * ring preserves. Six ops recorded:
+ *   1=add_to_active    2=remove_from_active   3=selected-by-get_next
+ *   4=nrt-cache-write  5=set_priority-move    6=justborn-nrt-clear
+ * Entry = id, op, priority, pending_entries!=NULL. The pe column is
+ * the case-critical one: log67 dispatched id=3 with pe=0 sixteen
+ * times, and WHO re-queued / re-selected a pe=0 thread is the open
+ * question. Single writer (VM thread), watchdog reads after freeze. */
+#define VITA_Q_RING 64
+volatile unsigned int _vita_q_ring[VITA_Q_RING][4]; /* id,op,pri,pe */
+volatile unsigned int _vita_q_seq = 0;
+#define VITA_Q_REC(tp, op_, pri_, pe_)                                     \
+  do {                                                                     \
+    unsigned int qs_ = _vita_q_seq;                                        \
+    {                                                                      \
+      Thread *qp_ = (tp);                                                  \
+      _vita_q_ring[qs_ & (VITA_Q_RING - 1)][0] =                           \
+        (unsigned int)qp_->id();                                           \
+      _vita_q_ring[qs_ & (VITA_Q_RING - 1)][1] = (unsigned int)(op_);       \
+      _vita_q_ring[qs_ & (VITA_Q_RING - 1)][2] = (unsigned int)(pri_);      \
+      _vita_q_ring[qs_ & (VITA_Q_RING - 1)][3] = (unsigned int)(pe_);       \
+    }                                                                      \
+    _vita_q_seq = qs_ + 1;                                                 \
+  } while (0)
 #define VITA_DISP_REC(t)                                                   \
   do {                                                                     \
     unsigned int s_ = _vita_disp_seq;                                      \
@@ -411,6 +440,10 @@ void Scheduler::adjust_priority_list(Thread *thread, bool is_add) {
       // otherwise we may have starvation.
       priority_lists().obj_at_put(priority, thread);
     }
+#if defined(VITA)
+    VITA_Q_REC(thread, 1, priority,
+               (thread->pending_entries() != NULL) ? 1u : 0u);
+#endif
   } else {
     if (TraceThreadsExcessive) {
       TTY_TRACE_CR(("remove: thread 0x%x (id=%d, prio=%d) from list 0x%x",
@@ -436,6 +469,10 @@ void Scheduler::adjust_priority_list(Thread *thread, bool is_add) {
              (_next_runnable_thread ? thread_list().id() : -1)));
       }
     }
+#if defined(VITA)
+    VITA_Q_REC(thread, 2, priority,
+               (thread->pending_entries() != NULL) ? 1u : 0u);
+#endif
   }
 }
 
@@ -1528,6 +1565,10 @@ void Scheduler::set_priority(Thread* thread, int old_priority) {
       priority_lists().obj_at_put(new_priority, thread);
     }
     set_priority_valid(thread, new_priority);
+#if defined(VITA)
+    VITA_Q_REC(thread, 5, new_priority,
+               (thread->pending_entries() != NULL) ? 1u : 0u);
+#endif
   }
   // if thread wasn't in an active list then it may be asleep or waiting
   // it will get added to correct list when it calls add_to_active()
@@ -1906,6 +1947,11 @@ jlong Scheduler::time_slice(JVM_SINGLE_ARG_TRAPS) {
   Thread *next_thread = get_next_runnable_thread();
   if (!next_thread->equals(Thread::current())) {
     Thread::set_current(next_thread);
+#if defined(VITA)
+    /* v02.42 op 4: JVM_TimeSlice nrt-cache consume point. */
+    VITA_Q_REC(next_thread, 4, next_thread->priority(),
+               (next_thread->pending_entries() != NULL) ? 1u : 0u);
+#endif
   }
 #if ENABLE_ISOLATES
   {
@@ -2234,6 +2280,11 @@ inline void Scheduler::switch_thread_slave_mode(Thread *next_thread,
   } else if (!next_thread->equals(thread)) {
     // why will this happen?
     Thread::set_current(next_thread);
+#if defined(VITA)
+    /* v02.42 op 4: slave-mode nrt-cache consume point. */
+    VITA_Q_REC(next_thread, 4, next_thread->priority(),
+               (next_thread->pending_entries() != NULL) ? 1u : 0u);
+#endif
   }
 }
 
@@ -2264,6 +2315,11 @@ inline void Scheduler::switch_thread_master_mode(Thread *next_thread,
       }
       //      next_thread->set_start_time(Thread::global_tick_count());
       Thread::set_current(next_thread);
+#if defined(VITA)
+      /* v02.42 op 4: master-mode nrt-cache consume point. */
+      VITA_Q_REC(next_thread, 4, next_thread->priority(),
+                 (next_thread->pending_entries() != NULL) ? 1u : 0u);
+#endif
     }
   }
 }
@@ -2398,6 +2454,13 @@ extern "C" void switch_thread(Thread* thread) {
     // more than likely we suspended all threads so null this out so we
     // do the right thing below
     _next_runnable_thread = NULL;
+#if defined(VITA)
+    /* v02.42: op 6 - the just-born dispatch clears the nrt cache right
+     * here; log64-67 all froze somewhere after this. Knowing the last
+     * ops before the spin = what the cache held when it went dark. */
+    VITA_Q_REC(thread, 6, thread->priority(),
+               (thread->pending_entries() != NULL) ? 1u : 0u);
+#endif
   }
 
   Thread *next_thread;
@@ -2633,6 +2696,10 @@ Thread *Scheduler::get_next_runnable_thread(Thread *starting_thread) {
           // put this thread at the head of the appropriate queue
           priority_list().obj_at_put(priority, &thread);
           _next_runnable_thread = thread.obj();
+#if defined(VITA)
+          VITA_Q_REC((Thread *)thread.obj(), 3, priority,
+                     (thread().pending_entries() != NULL) ? 1u : 0u);
+#endif
           _thread_execute_counts[tid][priority]++;
           return (Thread *)&_next_runnable_thread;
         } while (!last.equals(thread));
@@ -2858,6 +2925,43 @@ extern "C" int vita_sched_dump_dispatch(char *out, int out_size) {
                  (_vita_disp_ring[idx][2] & THREAD_DEAD)        ? " DEAD":"",
                  (_vita_disp_ring[idx][2] & THREAD_NOT_ACTIVE_MASK) ? " INA":"",
                  _vita_disp_ring[idx][3]);
+    if (n > 0 && pos + n < out_size) pos += n; else break;
+  }
+  return pos;
+}
+
+/* v02.42: scheduler queue-op ring dump. The CAUSE-side counterpart of
+ * the dispatch ring above: the last C++ queue operations before the
+ * pure-asm livelock loop went dark (log67: switch/lw_exit/ts_gadget
+ * all frozen => the loop passes no C++ checkpoint, so these entries
+ * are frozen at the moment the spin started - the "who did it" record
+ * log67 could not produce). Op legend: 1=add_to_active 2=remove_from_
+ * active 3=selected(get_next_runnable_thread head-rotate) 4=nrt-cache
+ * -write(switch_thread) 5=set_priority-move 6=justborn-nrt-clear.
+ * The pe column answers the case-critical question directly: any op
+ * that re-queues or re-selects a thread with pe=0 names the culprit
+ * site; the seq delta between the last entry and the hang says how
+ * long the system spun before the watchdog fired. */
+extern "C" int vita_sched_dump_qring(char *out, int out_size) {
+  static const char *opname[7] = {
+    "?", "ADD", "REM", "SEL", "NRT", "PRI", "JBC"
+  };
+  int pos = 0;
+  int n;
+  unsigned int seq = _vita_q_seq;
+  unsigned int i;
+  n = snprintf(out + pos, out_size - pos,
+               "queue-op ring (last %d, newest first, seq=%u):\n",
+               VITA_Q_RING / 2, seq);
+  if (n > 0) pos += n;
+  for (i = 0; i < VITA_Q_RING && i < (VITA_Q_RING / 2); i++) {
+    unsigned int idx = (seq - 1u - i) & (VITA_Q_RING - 1u);
+    unsigned int op = _vita_q_ring[idx][1];
+    n = snprintf(out + pos, out_size - pos,
+                 "  [%2u] id=%u %-3s pri=%u pe=%u\n", i,
+                 _vita_q_ring[idx][0],
+                 (op <= 6) ? opname[op] : "?",
+                 _vita_q_ring[idx][2], _vita_q_ring[idx][3]);
     if (n > 0 && pos + n < out_size) pos += n; else break;
   }
   return pos;

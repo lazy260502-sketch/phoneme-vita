@@ -544,6 +544,10 @@ extern "C" {
 extern volatile unsigned int vita_v240_land;
 extern volatile unsigned int vita_v240_fp;
 extern volatile unsigned int vita_v240_lr;
+/* v02.42: pe liveness counters from the landing pad (see
+ * InterpreterRuntime_arm.cpp): slot 0 = crossings with pe==NULL,
+ * slot 1 = crossings with pe!=NULL. */
+extern volatile unsigned int vita_v242_pe[2];
 extern void vita_landing_pad(void);
 }
 #define VITA_V231_EXIT_RING 8
@@ -1006,6 +1010,7 @@ extern "C" {
     int  vita_sched_nrt_info(char *out, int out_size);
     unsigned int vita_sched_justborn(void);
     int  vita_sched_dump_dispatch(char *out, int out_size);
+    int  vita_sched_dump_qring(char *out, int out_size);
     int  vita_sched_dump_stack(char *out, int out_size);
 }
 
@@ -1127,6 +1132,17 @@ static void vita_wd_snapshot_one(SceUID fd) {
      * from, newest first. Tells which threads the dispatcher cycles
      * through right before the freeze (same id repeating == a hot loop
      * through one thread; a fixed rotation == a real round-robin). */
+    {
+        /* v02.42 (5a) queue-op ring FIRST: it is the CAUSE-side record
+         * (who re-queued / re-selected whom, frozen at the moment the
+         * pure-asm spin loop went dark). The dispatch ring below only
+         * shows the EFFECT (who the last dispatches cycled through).
+         * See vita_sched_dump_qring in Scheduler.cpp for the op legend. */
+        static char qring_dump[2048];
+        int len = vita_sched_dump_qring(qring_dump, (int)sizeof(qring_dump));
+        if (len > 0) sceIoWrite(fd, qring_dump, len);
+        vita_wd_puts(fd, "[rd0 qring ok]\n");
+    }
     {
         static char disp_dump[2048];
         int len = vita_sched_dump_dispatch(disp_dump, (int)sizeof(disp_dump));
@@ -1256,6 +1272,15 @@ static void vita_wd_snapshot_one(SceUID fd) {
                  "  v240 land=%u fp=%08x lr=%08x pad=%08x\n",
                  vita_v240_land, vita_v240_fp, vita_v240_lr,
                  (unsigned int)&vita_landing_pad);
+    sceIoWrite(fd, buf, n);
+    /* v02.42: landing-pad pe liveness - the counter pair that splits
+     * log67's spin into "empty trampoline bounce" (pe0 climbing, pe1
+     * flat) vs "body present but never consumed" (pe1 climbing too).
+     * Slot semantics defined next to vita_v242_pe in
+     * InterpreterRuntime_arm.cpp. */
+    n = snprintf(buf, sizeof(buf),
+                 "  v242 pe0=%u pe1=%u\n",
+                 vita_v242_pe[0], vita_v242_pe[1]);
     sceIoWrite(fd, buf, n);
     {
         unsigned int c = vita_v231_exit_seq;

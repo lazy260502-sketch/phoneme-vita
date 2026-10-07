@@ -147,6 +147,16 @@ extern "C" {
 volatile unsigned int vita_v240_land = 0;
 volatile unsigned int vita_v240_fp   = 0;
 volatile unsigned int vita_v240_lr   = 0;
+/* v02.42: pe liveness at the sentinel crossing. log67's livelock
+ * dispatched id=3 with pe=0 sixteen times while land spun at 14.5M/s:
+ * if the pad sees pe==0 on every crossing the spinning thread has NO
+ * Java body at all (empty trampoline bounce); if pe!=0 the body is
+ * there and the invoke_pending_entries stub must be consuming it -
+ * the distinction the frozen binary's pe probes could not make.
+ * Slot 0 counts pe==NULL crossings, slot 1 counts pe!=NULL.
+ * Offset 0x24 is Thread::pending_entries_offset(), verified against
+ * the shipped v02.41 invoke_pending_entries stub (ldr r1,[r0,#36]). */
+volatile unsigned int vita_v242_pe[2] = {0, 0};
 }
 extern "C" void vita_landing_pad(void) __attribute__((naked));
 extern "C" void vita_landing_pad(void) {
@@ -162,6 +172,17 @@ extern "C" void vita_landing_pad(void) {
     "movw  r0, #:lower16:vita_v240_lr\n"
     "movt  r0, #:upper16:vita_v240_lr\n"
     "str   lr, [r0]\n"
+    "movw  r0, #:lower16:_current_thread\n"
+    "movt  r0, #:upper16:_current_thread\n"
+    "ldr   r0, [r0]\n"
+    "ldr   r1, [r0, #36]\n"
+    "movw  r0, #:lower16:vita_v242_pe\n"
+    "movt  r0, #:upper16:vita_v242_pe\n"
+    "cmp   r1, #0\n"
+    "addne r0, r0, #4\n"
+    "ldr   r1, [r0]\n"
+    "add   r1, r1, #1\n"
+    "str   r1, [r0]\n"
     "movw  r0, #:lower16:start_lightweight_thread_asm\n"
     "movt  r0, #:upper16:start_lightweight_thread_asm\n"
     "bx    r0\n"
