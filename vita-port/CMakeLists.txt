@@ -1243,6 +1243,37 @@ set(VITA_VERSION  "02.41")
 #   suspect is the queue CYCLE itself. NOTE: cache.bin still stores raw
 #   icon PNG bytes; only the decode is skipped.
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DVITA_NO_PNG")
+set(VITA_VERSION  "02.42")
+# 02.42 (2026-10-07): log67 follow-up - scheduler QUEUE-OP forensics for
+#   the livelock cause hunt. log67 froze with pc=vita_landing_pad+0x18,
+#   land spinning at 14.5M/s, dispatch ring id=3 pe=0 x16 and
+#   q5: id=4 -> id=3 CYCLE(2) - while switch/lw_exit/ts_gadget were ALL
+#   frozen: the spin is a PURE-ASM closed loop (interpreter unwind ->
+#   sentinel -> pad -> trampoline -> invoke_pending_entries stub ->
+#   back) that no longer passes any C++ checkpoint. Consequence: the
+#   last C++ queue operations before the spin are frozen in history -
+#   capture them. Three probes, all cause-side:
+#   (a) queue-op ring (Scheduler.cpp, _vita_q_ring): every
+#       add_to_active / remove_from_active / get_next_runnable selection
+#       / nrt-cache write (JVM_TimeSlice + both switch modes) /
+#       set_priority move / just-born nrt clear, as (id,op,pri,pe).
+#       Watchdog dumps it as "[rd0 qring]" BEFORE the dispatch ring.
+#   (b) pad pe liveness (InterpreterRuntime_arm.cpp, vita_v242_pe[2]):
+#       the landing pad reads _current_thread->pending_entries (offset
+#       0x24, verified against the shipped v02.41 stub) at every
+#       crossing; pe0 counts pe==NULL crossings, pe1 counts pe!=NULL.
+#       pe0-only spin = empty trampoline bounce; pe1 climbing = a Java
+#       body is present but never consumed. v240 line gains "v242".
+#   (c) NOTE: _vita_pe_enter (v02.30) is a DEAD PROBE - objdump of the
+#       shipped v02.41 invoke_pending_entries stub shows the counter
+#       bump never made it into the frozen Interpreter_arm.o (v02.30
+#       lesson repeating): the stub's pe==NULL fast path is plain
+#       "moveq pc,lr". The pad probe (b) replaces it from outside the
+#       frozen object. Thread.cpp C++ consumers of pe are unaffected.
+#   Files: Scheduler.cpp (_MergedSrc002), InterpreterRuntime_arm.cpp
+#   (_MergedSrc004 - same object as the v02.40 pad), OS_vita.cpp.
+#   Rebuild: rebuild_vm.sh (rm the shell .o files first - v02.37), then
+#   this tree. libpng stays OFF (v02.41 experiment continues).
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
 #   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the
