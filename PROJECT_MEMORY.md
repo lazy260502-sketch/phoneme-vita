@@ -8142,3 +8142,14 @@ v02.39 逐指令相同（冻结成员原样）✓。
 - `--allow-multiple-definition` 仍在链接线（MIDP 侧 mffd_true 与 VM 侧
   mffd_false 现在是两个不同符号，不再冲突，但该旗标历史上掩盖过混入物，
   长期应移除）。
+
+---
+
+# log67 判读与 v02.41 libpng 屏蔽实验（活锁判决，2026-10-05~07）
+
+详录：`debug/notes/log67_livelock_and_v0241_png_off.md`。要点：
+
+1. **log67 判决（推翻 log66"首次派发即冻结"）**：pc=垫+0x18（首次进新代码）但 land 双快照 303,949,169→309,758,141（~14.5M/s 热旋转）+ dispatch ring id=3 pe=0 x16 + 优先队列 `q5: id=4→id=3 CYCLE(2)` = **绿线程调度器活锁**；log64-66"蹦床半执行"是旋转中途丢 CPU 快照。旋转不经过 C++ 调度器（switch=185,015 静止）。v230/v231/v240 探针行在 **site_ring.log**；dump LOAD 段不含探针 .bss。
+2. **v02.41（d48161a）**：`VITA_NO_PNG` 屏蔽 libpng（唯一运行时漏斗 `vita_icon_decode_png` 早退 -1，桩=`mov.w r0,#-1; bx lr`；MIDP 皮肤不走 libpng；cache.bin 无需清）。锚点：垫@0x8109a270、蹦床@0x810c24f4、探针 0x814b4b10-18（.bss 不平移）、128 符号、md5 e6844e2f3f2dfdca602397289047e4d1。
+3. **判读矩阵**：图标消失+`[AUDIT] calls=0`=屏蔽自检；冻结消失=libpng 堆破坏实锤（回补查 rowbytes 族 bug）；仍冻结=活锁与 libpng 无关，下一主战场=**优先队列成环成因**（Scheduler 挂回路径/resume 延迟入队/重入 reschedule）。
+4. **环境**：`vitasdk.sh` 不存在，用 `export VITASDK=/home/zyb/.local/vitasdk; export PATH=$VITASDK/bin:$PATH`；正确树纪律不变（vita-port cmake+make，midp-vita/build_midp_vita.sh 永久废弃）。
