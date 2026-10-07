@@ -157,6 +157,24 @@ volatile unsigned int vita_v240_lr   = 0;
  * Offset 0x24 is Thread::pending_entries_offset(), verified against
  * the shipped v02.41 invoke_pending_entries stub (ldr r1,[r0,#36]). */
 volatile unsigned int vita_v242_pe[2] = {0, 0};
+/* v02.44: bouncer anatomy. log69 froze the VM thread at
+ * start_lightweight_thread_asm+0x8 (3rd instruction, the status load)
+ * with lr=pad, fp=0, r6=0x81ed0804 - which is 0xBC ABOVE id4's saved
+ * stack_pointer (0x81ed0748): the exit-table base the stub reads
+ * ([r6]=lightweight_thread_exit .. [r6+16]=TestCompiler) is NOT where
+ * setup_stack_asm left the birth frame. Every forward path past the
+ * stub's +0x1c goes through C++ whose counters are ALL frozen at 0,
+ * so if the spin is real it must close via a CORRUPTED slot jumping
+ * back (L444 -> call_on_primordial_stack([r6]) -> pad if [r6] holds
+ * the pad address; note call_on_primordial_stack also PUSHES lr/fp
+ * at [r6-8]/[r6-4] every iteration - a fingerprint rd7 can read).
+ * The coredump never contains the Java heap, so the pad records the
+ * two words the next freeze needs: ct = the _current_thread object
+ * the bouncer sees (is it really the dispatch ring's id?), r6 = the
+ * exit-table base (watchdog rd7 dereferences 7 words around it).
+ * r2 is dead at pad entry (stub writes it at +0xc before any use). */
+volatile unsigned int vita_v244_ct = 0;
+volatile unsigned int vita_v244_r6 = 0;
 }
 extern "C" void vita_landing_pad(void) __attribute__((naked));
 extern "C" void vita_landing_pad(void) {
@@ -183,6 +201,18 @@ extern "C" void vita_landing_pad(void) {
     "ldr   r1, [r0]\n"
     "add   r1, r1, #1\n"
     "str   r1, [r0]\n"
+    "movw  r2, #:lower16:vita_v244_ct\n"   /* v02.44: r1 dead after the
+     * counter store, r2 dead across pad->stub edge (stub does
+     * mov r2,#0 at +0xc before any use). Reload ct: r0 now holds
+     * &vita_v242_pe, not the thread. */
+    "movt  r2, #:upper16:vita_v244_ct\n"
+    "movw  r1, #:lower16:_current_thread\n"
+    "movt  r1, #:upper16:_current_thread\n"
+    "ldr   r1, [r1]\n"
+    "str   r1, [r2]\n"
+    "movw  r2, #:lower16:vita_v244_r6\n"
+    "movt  r2, #:upper16:vita_v244_r6\n"
+    "str   r6, [r2]\n"
     "movw  r0, #:lower16:start_lightweight_thread_asm\n"
     "movt  r0, #:upper16:start_lightweight_thread_asm\n"
     "bx    r0\n"

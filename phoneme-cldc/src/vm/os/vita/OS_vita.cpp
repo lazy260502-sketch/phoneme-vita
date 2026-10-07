@@ -548,6 +548,12 @@ extern volatile unsigned int vita_v240_lr;
  * InterpreterRuntime_arm.cpp): slot 0 = crossings with pe==NULL,
  * slot 1 = crossings with pe!=NULL. */
 extern volatile unsigned int vita_v242_pe[2];
+/* v02.44: bouncer anatomy from the landing pad (see
+ * InterpreterRuntime_arm.cpp): ct = _current_thread object at the
+ * last pad crossing, r6 = the exit-table base the birth stub will
+ * index. rd7 dereferences r6 to dissect the birth frame. */
+extern volatile unsigned int vita_v244_ct;
+extern volatile unsigned int vita_v244_r6;
 extern void vita_landing_pad(void);
 }
 #define VITA_V231_EXIT_RING 8
@@ -1331,6 +1337,74 @@ static void vita_wd_snapshot_one(SceUID fd) {
         if (len > 0)
             sceIoWrite(fd, thread_dump, len);
         vita_wd_puts(fd, "[rd6 dumpthreads ok]\n");
+    }
+
+    /* v02.44 rd7: birth frame anatomy. log69's coredump caught the VM
+     * thread at start_lightweight_thread_asm+0x8 with lr=pad, fp=0,
+     * r6=0x81ed0804 - 0xBC above id4's saved stack_pointer (0x81ed0748).
+     * The birth stub's whole exit table is indexed off r6 ([r6]=
+     * lightweight_thread_exit .. [r6+16]=TestCompiler), and every
+     * forward path beyond the stub goes through C++ counters that are
+     * ALL frozen at 0. So the live hypothesis is a corrupted slot
+     * bouncing back (L444 -> call_on_primordial_stack([r6]) -> pad),
+     * and the frame's runtime words are the missing evidence - the
+     * coredump never maps the Java heap, so the pad saved them for us:
+     * ct (last _current_thread seen) and r6 (exit-table base). Here we
+     * dump [r6-8 .. r6+16] and compare against the setup_stack_asm
+     * template + the saved stack_pointer. call_on_primordial_stack's
+     * per-iteration push would leave lr/pad at [r6-8]/[r6-4] - the
+     * fingerprint of the closing edge. */
+    {
+        unsigned int ct = vita_v244_ct;
+        unsigned int r6 = vita_v244_r6;
+        n = snprintf(buf, sizeof(buf),
+                     "[rd7 birthframe] v244_ct=%08x v244_r6=%08x\n",
+                     ct, r6);
+        sceIoWrite(fd, buf, n);
+        if (r6 != 0 && (r6 & 3) == 0) {
+            unsigned int *fr = (unsigned int *)(uintptr_t)r6;
+            n = snprintf(buf, sizeof(buf),
+                         "  frame[-2..+4]: %08x %08x | %08x %08x %08x "
+                         "%08x %08x\n",
+                         fr[-2], fr[-1], fr[0], fr[1], fr[2], fr[3],
+                         fr[4]);
+            sceIoWrite(fd, buf, n);
+            /* Careful: the [+16] word is NOT a code address. setup_stack_asm
+             * stores the TestCompiler FLAG there, and in this PRODUCT
+             * build TestCompiler is a compile-time const false (develop
+             * flag via ENABLE_PERFORMANCE_COUNTERS=0 -> DECLARE_
+             * DEVELOPER_FLAG under PRODUCT -> const bool = false), so
+             * the template value is 0 and the stub's "cmp r0,#0; bne
+             * L444" takes the FULL exit chain when the frame is intact.
+             * A nonzero [+16] therefore means residual stack garbage
+             * steering the stub straight to L444 - and [r6] then names
+             * the bounce target. Also compare v244_r6 across the two
+             * samples: call_on_primordial_stack does stmdb r6!,{lr,fp}
+             * per traversal (r6 -= 8, never restored on the non-return
+             * path), so a monotonically sliding r6 between samples is
+             * that gadget's fingerprint. */
+            n = snprintf(buf, sizeof(buf),
+                         "  template: exit=%08x uncaught=%08x finish=%08x "
+                         "force_term=%08x flagword(+16)=0 (TestCompiler "
+                         "const false) pad=%08x\n",
+                         (unsigned int)(uintptr_t)&Thread::lightweight_thread_exit,
+                         (unsigned int)(uintptr_t)&Thread::lightweight_thread_uncaught_exception,
+                         (unsigned int)(uintptr_t)&Thread::finish,
+                         (unsigned int)(uintptr_t)&force_terminated,
+                         (unsigned int)(uintptr_t)&vita_landing_pad);
+            sceIoWrite(fd, buf, n);
+        }
+        if (ct != 0) {
+            /* Thread::stack_pointer_offset: r6 restore in
+             * primordial_to_current_thread loads [obj,#0x64] - verified
+             * against the shipped binary. */
+            unsigned int *obj = (unsigned int *)(uintptr_t)ct;
+            n = snprintf(buf, sizeof(buf),
+                         "  ct.stack_pointer=%08x (r6 - ct.stack_pointer = %08x)\n",
+                         obj[0x64 / 4], r6 - obj[0x64 / 4]);
+            sceIoWrite(fd, buf, n);
+        }
+        vita_wd_puts(fd, "[rd7 birthframe ok]\n");
     }
 }
 

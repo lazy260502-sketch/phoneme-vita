@@ -1303,6 +1303,51 @@ set(VITA_VERSION  "02.43")
 #     unreadable; ADD/REM/NRT/JBC sites pass Thread* directly and are
 #     correct. v02.43 fixes the SEL cast to read the id through the
 #     handle's operator-> path like every other site.
+set(VITA_VERSION  "02.44")
+# 02.44 (2026-10-08): log69 verdict + PNG icon REALLY restored.
+# PNG root cause (my v02.43 mistake): CMAKE_C_FLAGS is APPEND-ONLY in
+#   this file - every set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DXXX")
+#   accumulates. v02.41 (line ~1245) added -DVITA_NO_PNG and v02.43
+#   merely stopped RE-ADDING it, which did NOT remove it: log69 still
+#   prints "[icon] cached png decode FAILED" x5 + [AUDIT]
+#   png_read_image calls=0. Fix: explicit string(REPLACE) strips the
+#   define so the v02.41 line becomes inert history.
+# log69 verdict (v02.43 run, frozen again - same livelock shape):
+#   - SEL fix WORKS: qring SEL ids readable for the first time (id=1..4,
+#     tail id4 ADD -> id3 SEL/NRT -> id4 SEL -> id4 NRT, seq=549 frozen,
+#     all records pe=0). The last real scheduler op selected id4; the
+#     spin adds no queue ops.
+#   - coredump got lucky: pc=start_lightweight_thread_asm+0x8 (3rd
+#     instruction, the status load), lr=pad, fp=0, r0=id4 ThreadObj,
+#     r6=0x81ed0804 = id4's saved stack_pointer+0xBC. Same ring as
+#     log68's stub+0 sample, one arc later.
+#   - BOUNCER = id4 ITSELF, carrying a birth-frame template (fp=0),
+#     but r6 is NOT at the birth frame position and NOT the ThreadObj
+#     saved value (0x81ed0748): the stub's exit table ([r6]=
+#     lightweight_thread_exit .. [r6+16]=TestCompiler flag word) is
+#     indexing RESIDUAL stack, not the template setup_stack_asm wrote.
+#   - all C++ counters frozen (pe1=5, lw_exit=0, dispatch flat) ->
+#     the ring closes in pure asm; the only unprobed edges are the
+#     exit-table slots themselves.
+#   BONUS semantic correction (changes log69's [r6+16] reading): the
+#   birth frame's jsp+16 slot holds the TestCompiler FLAG, not a code
+#   address - in this PRODUCT build TestCompiler is a compile-time
+#   const false (develop flag, ENABLE_PERFORMANCE_COUNTERS=0), so the
+#   template word is 0 and a NONZERO value there = residual garbage
+#   steering the stub straight to L444 (skip exit chain).
+# v02.44 probes:
+#   - pad records r2-ct (_current_thread) + r6 (exit-table base) at
+#     every crossing (InterpreterRuntime_arm.cpp, _MergedSrc004).
+#   - watchdog rd7 dereferences r6: dumps [r6-8..r6+16] vs template,
+#     prints ThreadObj stack_pointer, and the two samples' r6 delta
+#     exposes call_on_primordial_stack's stmdb r6!,{lr,fp} slide (r6
+#     -= 8 per traversal, never restored on the non-return path).
+#   Read order for log70: rd7 frame words FIRST, then v244_ct vs the
+#   dispatch ring's id, then the r6 slide between samples.
+# REALLY drop VITA_NO_PNG this time: strip the define accumulated by
+# the v02.41 block above (CMAKE_C_FLAGS is append-only in this file,
+# "not re-adding" != "removed" - the v02.43 lesson).
+string(REPLACE "-DVITA_NO_PNG" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
 #   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the
