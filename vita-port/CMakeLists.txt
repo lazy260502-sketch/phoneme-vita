@@ -1221,6 +1221,28 @@ set(VITA_VERSION  "02.40")
 #   Sentinel-template diagnostics updated (OS_vita rd2 stacktop,
 #   vita_sched_dump_stack): the never-executed template now shows the
 #   pad address as its 6th word, not the trampoline's.
+set(VITA_VERSION  "02.41")
+# 02.41 (2026-10-05): log67 verdict follow-up - TEMPORARY libpng
+#   elimination (A/B experiment, expect icons gone from the menu).
+#   log67 rewrote the freeze picture: pc froze at vita_landing_pad+0x18
+#   (first-ever freeze inside fresh code), but the v240 land counter
+#   spun 303,949,169 -> 309,758,141 in ~400ms (~14.5M/s) while the
+#   dispatch ring showed id=3 pri=5 pe=0 x16 and the priority queue
+#   q5: id=4 -> id=3 CYCLE(2). That is a green-thread scheduler LIVELOCK
+#   (pad<->trampoline asm loop, pending entries never consumed), not a
+#   first-dispatch freeze; log64-66 "half-executed trampoline" were
+#   mid-rotation CPU-loss snapshots. Hypothesis under test: the menu-
+#   phase libpng runs ([AUDIT] png_read_image calls=5, done before the
+#   menu exits) corrupt the malloc arena / scheduler structures, and
+#   the damage only manifests later as the queue cycle. VITA_NO_PNG
+#   stubs vita_icon_decode_png to return -1 (the only runtime libpng
+#   funnel; MIDP skin/imgdcd never call libpng), both vita_menu.c
+#   callers already handle failure as a text-only row. If the freeze
+#   disappears with PNG disabled -> heap corruption by libpng
+#   confirmed; if it persists -> livelock is libpng-independent, next
+#   suspect is the queue CYCLE itself. NOTE: cache.bin still stores raw
+#   icon PNG bytes; only the decode is skipped.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DVITA_NO_PNG")
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
 #   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the

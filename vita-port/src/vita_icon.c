@@ -9,6 +9,19 @@
  */
 #include "vita_icon.h"
 
+#if defined(VITA_NO_PNG)
+/* log67 A/B experiment: the scheduler-livelock suspect list needs the
+ * libpng native path eliminated wholesale. Every runtime libpng entry
+ * in this port funnels into vita_icon_decode_png (menu icon decode,
+ * 5 calls in log67's [AUDIT]); MIDP's own skin/imgdcd decoders never
+ * call libpng. Returning -1 makes both vita_menu.c callers fall back
+ * to the already-handled "no icon" path (text-only row). */
+int vita_icon_decode_png(const unsigned char *data, unsigned long len,
+                         uint32_t **out_pixels, int *out_w, int *out_h) {
+    (void)data; (void)len; (void)out_pixels; (void)out_w; (void)out_h;
+    return -1;
+}
+#else /* full decoder */
 #include <png.h>
 #include <stdlib.h>
 #include <string.h>
@@ -132,3 +145,4 @@ int vita_icon_decode_png(const unsigned char *data, unsigned long len,
     *out_h = (int)h;
     return 0;
 }
+#endif /* VITA_NO_PNG */
