@@ -8186,3 +8186,28 @@ v02.39 逐指令相同（冻结成员原样）✓。
    (b) 确认弹跳者身份（SEL pe 列 + disp ring 对照，预期 pe=0）；(c) v242 pe0/pe1
    + v240_fp 继续观察；(d) pc 仍落 stub 入口时结合 SEL 历史判断"选择后未执行"还是
    "执行完未出队"。
+
+## 2026-10-08：log69 判决 + v02.44 发货（出生帧解剖 + PNG 真恢复）
+
+1. **log69 判决**：SEL 修复生效（id 全可读，尾部 id4 SEL→NRT，seq=549 冻结，
+   pe=0）；coredump pc=**start_lightweight_thread_asm+0x8**（第 3 条指令，读
+   status），lr=pad、fp=0、r0=id4 ThreadObj → **弹跳者=id4 本人**；r6=
+   0x81ed0804 与 id4 stack_pointer(0x81ed0748) 差 0xBC——jsp 不在出生帧位，
+   退出表索引的是残留栈。全部 C++ 计数器冻结 → 纯 asm 环，唯一 suspect 边=
+   退出表槽位损坏。
+2. **语义修正（判读 [r6+16] 必读）**：出生帧 jsp+16 槽=**TestCompiler 旗标**
+   （PRODUCT+ENABLE_PERFORMANCE_COUNTERS=0 → `const bool = false` 编译期常量，
+   预处理器实证），模板值=0，非函数地址。[+16]≠0 = 垃圾导向 L444。
+3. **PNG 真恢复**：v02.43 失败根因=CMAKE_C_FLAGS 自引用**累积追加**（v02.41
+   块 1245 行活代码），"不再设置"≠撤销。v02.44 用 `string(REPLACE)` 显式剔除
+   （`${CMAKE_C_FLAGS}` 必须带引号防 list 重连）。二进制级验证：反汇编
+   `vita_icon_decode_png` 为真实函数体（png_sig_cmp 链），非 -1 桩。
+4. **v02.44 探针**：垫 +0x58..+0x78 九条指令记 `vita_v244_ct`（_current_
+   thread）/`vita_v244_r6`（退出表基址）；watchdog **rd7** dump `[r6-8..+16]`
+   + 模板对照 + ct.stack_pointer + 两样本 r6 差（call_on_primordial_stack
+   `stmdb r6!,{lr,fp}` 每圈 -8 指纹）。
+5. **v02.44（63763ff）**：三文件（InterpreterRuntime_arm.cpp / OS_vita.cpp /
+   CMakeLists.txt）。VPK md5=6cbfe4350e13f5ef79bee8694d052355，版本串
+   "v02.44 b434 (63763ff)"。rm _MergedSrc004.o+OS_vita.o 后重编；符号/反汇编/
+   重定位/格式串四链验证通过。log70 判读顺序：rd7 帧字 → v244_ct 身份 → r6
+   滑动 → PNG 图标显示。
