@@ -2697,7 +2697,16 @@ Thread *Scheduler::get_next_runnable_thread(Thread *starting_thread) {
           priority_list().obj_at_put(priority, &thread);
           _next_runnable_thread = thread.obj();
 #if defined(VITA)
-          VITA_Q_REC((Thread *)thread.obj(), 3, priority,
+          /* v02.43 FIX: pass a Thread* built from the Raw handle, not
+           * (Thread*)thread.obj(). BasicOop::int_field dereferences
+           * _obj one more time, so casting the OopDesc* (ThreadObj*) to
+           * Thread* made log68's SEL records read *(klass + id_offset)
+           * as the id (0xE5902014 = an ARM instruction word from ROM).
+           * (Thread*)&thread is layout-compatible (PRODUCT: BasicOop has
+           * no vtable, _obj is the first word), so qp_->_obj is the
+           * ThreadObj* and id() reads the real field -- same semantics
+           * as the ADD/REM sites that pass their Thread* parameter. */
+          VITA_Q_REC((Thread *)&thread, 3, priority,
                      (thread().pending_entries() != NULL) ? 1u : 0u);
 #endif
           _thread_execute_counts[tid][priority]++;

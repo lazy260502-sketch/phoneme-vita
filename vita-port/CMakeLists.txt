@@ -1274,6 +1274,35 @@ set(VITA_VERSION  "02.42")
 #   (_MergedSrc004 - same object as the v02.40 pad), OS_vita.cpp.
 #   Rebuild: rebuild_vm.sh (rm the shell .o files first - v02.37), then
 #   this tree. libpng stays OFF (v02.41 experiment continues).
+
+set(VITA_VERSION  "02.43")
+# 02.43 (2026-10-07): log68 verdict + libpng RESTORED.
+# log68 (v02.42 run, still frozen, [AUDIT] png calls=0) closes the A/B:
+#   the livelock is libpng-INDEPENDENT. VITA_NO_PNG is dropped from
+#   this build onward (vita_icon.c keeps its #if guard, inert without
+#   the define).
+# log68 evidence, all three new probes hit:
+#   - pad pe split: pe0 ~10M/s climbing, pe1=5 FROZEN -> the spin is
+#     EMPTY trampoline bounces (pe==NULL crossings), no Java body ever
+#     arrives. land==pe0+pe1 within rounding.
+#   - qring tail: ...SEL SEL SEL (garbage ids, see probe note below)
+#     then NRT id=3, NRT id=4 alternating with SEL - the last real C++
+#     scheduler op was a normal selection; the spin itself adds NO
+#     queue ops (seq frozen at 591 across both samples).
+#   - coredump: pc=invoke_pending_entries+0, lr=vita_landing_pad+0,
+#     r1=0, fp=0 - frozen ON the stub entry edge, the bouncer thread
+#     never reaches the trampoline body.
+#   - id=4 (current) java-stack-top = inflate+0x173 native frame +
+#     interpreter dispatch (L318+8) - midlet JAR inflate reads.
+#   PROBE BUG found + fixed this version: the v02.42 SEL record cast
+#     (Thread*)thread.obj() is WRONG - thread is a Thread::Raw HANDLE,
+#     .obj() yields the OopDesc*, but int_field(id) then dereferences
+#     _obj ONE MORE TIME (BasicOop::int_field reads *(this->_obj+off)),
+#     so the recorded "id" was *(klass_ptr + id_offset) - garbage
+#     (0xE5902014 = an ARM instruction word). SEL ids in log68 are
+#     unreadable; ADD/REM/NRT/JBC sites pass Thread* directly and are
+#     correct. v02.43 fixes the SEL cast to read the id through the
+#     handle's operator-> path like every other site.
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
 #   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the
