@@ -8160,3 +8160,29 @@ v02.39 逐指令相同（冻结成员原样）✓。
 2. **v02.42（CLDC 3be09f5 / vita-port 7f71d3d）**：三件套——(a) `_vita_q_ring` 64 条 (id,op,pri,pe) 六 op 插桩（ADD/REM/SEL/NRT×3/PRI/JBC，站点表见 notes）；(b) 垫 `vita_v242_pe[2]` pe 存活计数（读 `_current_thread`+0x24，双槽 pe==NULL/!=NULL，basic asm 只碰 r0/r1）；(c) watchdog `[rd0 qring]` 分节（dump 于 dispatch ring 前，成因先于后果）+ `v242 pe0/pe1` 行。判读矩阵与锚点见 `debug/notes/log68_prep_v0242_qring_forensics.md`。
 3. **锚点**：垫@0x8109a5a0（+0x330 平移）、`_current_thread`@0x812e1d30（GP 首槽未平移）、`_vita_q_ring`@0x814b4d34、`vita_v242_pe`@0x814b5718、129 符号、md5 dbb85acf66b72e1aee0706a5b346c993。
 4. **新教训**：垫引用 `_current_thread` 使 loopgen 宿主 exe 多一条 undefined（历史既有报错之外）——判据是库内有无 `D _current_thread` 定义与 vita-port 最终链接，非 loopgen 退出码。v02.42 仍携带 VITA_NO_PNG（02.41 块 flag 持续生效）：若直接跑不冻结无法归因 PNG，仍冻结则 qring/pe 数据正交可判读。
+
+## 2026-10-07（二）：log68 判决 + v02.43 发货（SEL 探针修复 + libpng 恢复）
+
+详录：`debug/notes/log68_verdict_and_v0243.md`。要点：
+
+1. **log68 判决：空蹦床弹跳**。pe0 以 ~10M/s 疯涨（187,698,350→191,800,352/400ms）、
+   pe1=5 冻结、v240_fp=0（出生帧模板值）；qring seq 冻结 591（自旋不产生任何 C++
+   队列操作）；coredump pc=invoke_pending_entries+0、lr=vita_landing_pad+0、r1=0、
+   fp=0（桩入口边沿，pc 有 dump 伪影风险）；id4 Java 栈顶 inflate+0x173（JAR 解压）。
+   核心谜题：弹跳者 fp=0 出生帧 vs _current_thread=id4 有正常栈——**身份不同步**。
+2. **libpng A/B 正式闭合**：v02.42 VITA_NO_PNG + [AUDIT] calls=0 仍冻结 → 排除，
+   v02.43 恢复（版本块不设宏，vita_icon.c 零改动走全解码器）。
+3. **SEL 探针 bug（v02.42）**：`(Thread*)thread.obj()` 双解引用——int_field 读
+   `*(qp_->_obj+off)`，而 obj() 已是 ThreadObj*，实际读 *(klass+id_offset)=ROM
+   指令字 0xE5902014（`ldr r2,[r0,#20]`）。SEL 站点 thread 是 `Thread::Raw` 局部
+   handle（ADD/REM 是 `Thread*` 参数直传故正确）。修复=`VITA_Q_REC((Thread*)&thread,...)`：
+   PRODUCT 下 BasicOop 无虚表、首 word=_obj，与 Thread* 布局同构；同函数先例
+   `return (Thread*)&_next_runnable_thread;`。队列本身没坏，SEL 序列 log69 起可读。
+4. **v02.43（fa8059a）**：SEL 修复（Scheduler.cpp 2709 行区）+ libpng 恢复
+   （CMakeLists 1278 行区版本块）。锚点与 v02.42 完全一致（垫@0x8109a5a0、
+   桩@0x810c257c、蹦床@0x810c2854、_current_thread@0x812e1d30、qring@0x814b4d34）
+   ——布局未漂移。md5=133206ba046921a41379c4f4f64cab14。
+5. **log69 判读要点**：(a) SEL 序列首次可读，与 ADD/REM/NRT 交错重建冻结前调度史；
+   (b) 确认弹跳者身份（SEL pe 列 + disp ring 对照，预期 pe=0）；(c) v242 pe0/pe1
+   + v240_fp 继续观察；(d) pc 仍落 stub 入口时结合 SEL 历史判断"选择后未执行"还是
+   "执行完未出队"。
