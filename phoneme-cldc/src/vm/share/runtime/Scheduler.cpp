@@ -3161,4 +3161,139 @@ extern "C" int vita_sched_dump_threads(char *out, int out_size) {
   }
   return pos;
 }
+
+/* v02.46: per-thread SYMBOLIC Java stack walk, for the ring trap and
+ * the watchdog. Why hand-rolled: Thread::trace_stack and every
+ * *Frame::print_on live inside #ifndef PRODUCT (Frame.cpp:1013-1623)
+ * and pss() needs ENABLE_PRODUCT_PRINT_STACK (0 in this build), so the
+ * library has no stack printer at all. This walk uses only
+ * PRODUCT-surviving primitives (all verified in the shipped ELF):
+ * Frame::init (T), is_entry_frame/caller_is/is_first_frame (inline in
+ * Frame.hpp), JavaFrame::method (T), Method::name/signature (T, in
+ * _MergedSrc004), holder() (inline -> Universe::class_from_id, weak
+ * symbol in lib), JavaClass::name (inline), Symbol base_address/
+ * length (inline), bci_with_flags (T). Raw UTF8 signatures (the pretty
+ * decoder is not in PRODUCT) - "(I)V" reads fine anyway.
+ * Constraints honored: Raw handles only, FIELD_OFFSET reads, no
+ * allocation, no tty, no locks - safe from the trap's private stack
+ * and from the watchdog thread. fp is range-checked against the
+ * thread's own stack before EVERY dereference: the livelock premise
+ * is a corrupted jsp, so a garbage fp must stop the walk, not crash
+ * the dumper. Single-task assumption: no-arg holder() resolves class
+ * ids through the current task's class list; this MIDP build runs one
+ * task and the trap context IS the spinning thread's task. */
+static int vita_jstack_append_sym(char *out, int pos, int out_size,
+                                  const Symbol::Raw &s, int maxlen) {
+  if (s.is_null()) {
+    if (pos + 6 < out_size) {
+      out[pos++] = '('; out[pos++] = 'n'; out[pos++] = 'u';
+      out[pos++] = 'l'; out[pos++] = 'l'; out[pos++] = ')';
+    }
+    return pos;
+  }
+  int len = s().length();
+  if (len > maxlen) len = maxlen;
+  const char *p = s().base_address();
+  for (int i = 0; i < len && pos + 1 < out_size; i++) {
+    char c = p[i];
+    out[pos++] = (c >= 32 && c < 127) ? c : '?';
+  }
+  return pos;
+}
+
+extern "C" int vita_sched_dump_jstack(char *out, int out_size) {
+  int pos = 0;
+  int n;
+  n = snprintf(out + pos, out_size - pos, "java stacks (symbolic):\n");
+  if (n > 0) pos += n;
+  {
+    int tcount = 0;
+    for (Thread::Raw t = Universe::global_threadlist()->obj();
+         t.not_null() && tcount < 8;
+         t = t().global_next(), tcount++) {
+      /* operator() hands back a Thread& view of the Raw wrapper -
+       * no copy, no handle-list side effects (PRODUCT pops are
+       * no-ops anyway). */
+      Thread &th = t();
+      address lo = th.stack_limit();
+      address hi = th.stack_base();
+      if ((uintptr_t)lo > (uintptr_t)hi) {
+        address tmp = lo; lo = hi; hi = tmp;
+      }
+      n = snprintf(out + pos, out_size - pos,
+                   "thread id=%d obj=%p stack=[%08x,%08x]\n",
+                   th.id(), (void*)th.obj(),
+                   (unsigned int)(uintptr_t)lo,
+                   (unsigned int)(uintptr_t)hi);
+      if (n > 0 && pos + n < out_size) pos += n; else break;
+
+      /* GUARANTEE in Frame::init compiles out in PRODUCT, so a thread
+       * that never entered Java would set fp=NULL here - handled by
+       * the range check below like any other bad fp. */
+      Frame fr(&th);
+      if (fr.fp() == 0) {
+        n = snprintf(out + pos, out_size - pos, "  (fp=0, not started)\n");
+        if (n > 0 && pos + n < out_size) pos += n; else break;
+        continue;
+      }
+      int fidx = 0;
+      while (fidx < 32) {
+        address fp = fr.fp();
+        if ((uintptr_t)fp < (uintptr_t)lo ||
+            (uintptr_t)fp > (uintptr_t)hi) {
+          n = snprintf(out + pos, out_size - pos,
+                       "  stop: fp=%08x out of stack range\n",
+                       (unsigned int)(uintptr_t)fp);
+          if (n > 0 && pos + n < out_size) pos += n;
+          break;
+        }
+        if (fr.is_entry_frame()) {
+          if (fr.as_EntryFrame().is_first_frame()) {
+            n = snprintf(out + pos, out_size - pos, "  [first frame]\n");
+            if (n > 0 && pos + n < out_size) pos += n;
+            break;
+          }
+          if (pos + 24 < out_size) {
+            out[pos++] = ' '; out[pos++] = ' '; out[pos++] = '[';
+            out[pos++] = 'e'; out[pos++] = 'n'; out[pos++] = 't';
+            out[pos++] = 'r'; out[pos++] = 'y'; out[pos++] = ']';
+            out[pos++] = '\n';
+          }
+          fr.as_EntryFrame().caller_is(fr);
+        } else {
+          Method::Raw m = fr.as_JavaFrame().method();
+          n = snprintf(out + pos, out_size - pos, "  [%2d] ", fidx);
+          if (n > 0 && pos + n < out_size) pos += n; else { pos = out_size - 1; break; }
+          if (m.is_null()) {
+            n = snprintf(out + pos, out_size - pos,
+                         "(null method) fp=%08x\n",
+                         (unsigned int)(uintptr_t)fp);
+            if (n > 0 && pos + n < out_size) pos += n;
+            break;
+          }
+          InstanceClass::Raw h = m().holder();
+          Symbol::Raw cn;
+          if (!h.is_null()) cn = h().name();
+          Symbol::Raw mn = m().name();
+          Symbol::Raw sig = m().signature();
+          pos = vita_jstack_append_sym(out, pos, out_size, cn, 64);
+          if (pos + 1 < out_size) out[pos++] = '.';
+          pos = vita_jstack_append_sym(out, pos, out_size, mn, 48);
+          pos = vita_jstack_append_sym(out, pos, out_size, sig, 48);
+          n = snprintf(out + pos, out_size - pos, " bci=%d fp=%08x\n",
+                       (int)fr.as_JavaFrame().bci(),
+                       (unsigned int)(uintptr_t)fp);
+          if (n > 0 && pos + n < out_size) pos += n; else { pos = out_size - 1; break; }
+          fr.as_JavaFrame().caller_is(fr);
+        }
+        fidx++;
+      }
+      if (fidx >= 32 && pos + 24 < out_size) {
+        n = snprintf(out + pos, out_size - pos, "  (max frames)\n");
+        if (n > 0) pos += n;
+      }
+    }
+  }
+  return pos;
+}
 #endif

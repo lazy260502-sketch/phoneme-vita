@@ -1375,6 +1375,22 @@ set(VITA_VERSION  "02.45")
 # Read order for log70: ring_trap.log FIRST if present (lr of the
 #   hist entries = ring-closing edge, then the r6 delta naming the
 #   sliding gadget); else watchdog log rd7 flood line.
+set(VITA_VERSION  "02.46")
+# 02.46 (2026-10-08): symbolic Java stacks in the trap + watchdog.
+#   Thread::trace_stack, *Frame::print_on (Frame.cpp:1013-1623) and
+#   pss() (ENABLE_PRODUCT_PRINT_STACK=0) are all compiled out in this
+#   PRODUCT build, so the VM had NO stack printer at all - ring_trap
+#   could dump raw jsp windows but never "which method is each thread
+#   executing". New vita_sched_dump_jstack (Scheduler.cpp -> _MergedSrc
+#   _002.o) walks every global-list thread frame by frame using only
+#   PRODUCT-surviving primitives (Frame::init / method / name /
+#   signature / holder->class_from_id / bci_with_flags; is_entry_frame
+#   / caller_is inline) and prints "class.method(raw sig) bci=" per
+#   frame - ROM pointers only, zero allocation, fp range-checked
+#   against each thread's own stack before every dereference (a
+#   corrupted jsp must stop the walk, not crash the dumper).
+#   Wired into ring_trap.log (after threads dump) AND watchdog rd7
+#   (fallback when the trap never fires).
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
 #   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the

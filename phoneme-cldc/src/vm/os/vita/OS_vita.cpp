@@ -1025,6 +1025,10 @@ extern "C" {
     int  vita_sched_dump_dispatch(char *out, int out_size);
     int  vita_sched_dump_qring(char *out, int out_size);
     int  vita_sched_dump_stack(char *out, int out_size);
+    /* v02.46: per-thread SYMBOLIC Java stack walk (Scheduler.cpp) -
+     * trace_stack/print_on/pss are all #ifndef PRODUCT, this is the
+     * PRODUCT-surviving equivalent. */
+    int  vita_sched_dump_jstack(char *out, int out_size);
 }
 
 /* v02.17: one text-append helper (avoid the hand-counted sceIoWrite
@@ -1426,6 +1430,13 @@ static void vita_wd_snapshot_one(SceUID fd) {
                      vita_v245_flood[0], vita_v245_flood[1]);
         sceIoWrite(fd, buf, n);
     }
+    /* v02.46: symbolic Java stacks from the watchdog side too - the
+     * fallback view when the trap never fires (ring misses the pad). */
+    {
+        static char jdump[4096];
+        int len = vita_sched_dump_jstack(jdump, (int)sizeof(jdump));
+        if (len > 0) sceIoWrite(fd, jdump, len);
+    }
 }
 
 void vita_wd_snapshot(const char *path) {
@@ -1558,7 +1569,10 @@ void vita_ring_trap(void)
     }
 
     /* Full scheduler forensics - everything the watchdog would have
-     * printed, from the same instant (no 400ms-later sampling). */
+     * printed, from the same instant (no 400ms-later sampling).
+     * v02.46: + symbolic Java stacks of ALL threads - the frame list
+     * names what each thread was executing, the thing no coredump
+     * (native stacks only) and no previous probe could see. */
     vita_wd_puts(fd, "-- scheduler forensics --\n");
     {
         static char dump[4096];
@@ -1570,6 +1584,10 @@ void vita_ring_trap(void)
         len = vita_sched_nrt_info(dump, (int)sizeof(dump));
         if (len > 0) sceIoWrite(fd, dump, len);
         len = vita_sched_dump_threads(dump, (int)sizeof(dump));
+        if (len > 0) sceIoWrite(fd, dump, len);
+        len = vita_sched_dump_jstack(dump, (int)sizeof(dump));
+        if (len > 0) sceIoWrite(fd, dump, len);
+        len = vita_sched_dump_stack(dump, (int)sizeof(dump));
         if (len > 0) sceIoWrite(fd, dump, len);
     }
     sceIoClose(fd);
