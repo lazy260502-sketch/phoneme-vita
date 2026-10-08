@@ -1,5 +1,18 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-09-28
+> Last Updated: 2026-10-08
+
+## 2026-10-08 log70：**v02.45/v02.46 "进去就白屏"定案——不是 debug 太多，是垫 asm 里丢了一条 `movt`**（v02.47 修复，提交 `af2c9bc` + `788be8a`）
+
+- 症状：装 v02.46 后 MIDlet 一启动就白屏，且这次带回 **psp2core coredump**（`psp2core-*.psp2dmp`，gzip 压缩的 ELF32 ARM core 文件）——是**崩溃**不是冻结。boot_log 止于 `runtime Hello.jar size=9203`（jar 部署完、VM 启动早期），无 ring_trap.log。
+- coredump 判读方法（复用价值高）：
+  1. `gunzip -c *.psp2dmp > /tmp/core`，按 ELF PT_NOTE 遍历：THREAD_INFO（线程名）、THREAD_REG_INFO（5 线程 × 376 字节：size/tid + 17 寄存器 + 扩展区）、STACK_INFO（各线程栈使用量）、TTD/TTY_INFO（内核 TTY 流）。
+  2. **模块实际基址 ≠ 0x81000000**：本次装在 `0x8101a000`。锚点法：睡眠线程 pc=0x81127338/r12=0x9da（`sceKernelDelayThread` stub 内 svc），lr=0x8102bb4b 反算后落在 `__wrap_sceKernelDelayThread` 的 R_ARM_THM_CALL（0x81011b46）返回处 → delta=0x1a000。**addr2line 前必须先减 delta**，否则会把 pc 符号化到 `.rodata`（执行数据=基址错位的典型信号）。
+  3. 主线程现场：pc=`vita_landing_pad+0x148`（`str r1,[r2]`），**r2=0x00009790**——只有 movw 的低 16 位。
+- 根因：v02.45 改注释时把 `movt r2,#:upper16:vita_v244_ct` 挤掉了（v02.44 的 c9fac02^ 里还在）。垫 asm `8:` 标签后的 v244 记录块每次轻量线程出生都执行 → `str` 写未映射的 0x9790 → data abort。洪水检测器从未武装（tripped=0），所以没有 ring_trap.log——**崩在探针自己身上**。
+- 判决：用户"debug 加太多导致白屏"方向对了一半——是 v02.45 引入的**回归 bug**，不是探针设计本身；v02.46 的 jstack 无罪（watchdog/ticker 线程整场都在 `sceKernelDelayThread` 里睡觉）。
+- 修复：补回 movt（InterpreterRuntime_arm.cpp，`8:` 块），重编 `_MergedSrc004.o` + `OS_vita.o` 链验证 33 objects/29 members，VPK `out/vpk/midp_vita_v02.47.vpk` md5 `00bc489870d7403aaa369a33dc8e13ed`，版本串 `v02.47 b441 (788be8a)`。objdump 复核：`movw r2,#0x9790` 后紧跟 `movt r2,#0x814b`，`str` 落在 `vita_v244_ct`(0x814b9790)。
+- 待办：v02.47 上真机复测 log70 场景（FileManagerMIDlet），观察是否回到"冻结+watchdog rd7"老轨道——那样 v02.45 洪水陷阱与 v02.46 jstack 才第一次真正受试。
+- 教训入库：(a) **手写 movw/movt 成对出现，注释编辑时必须逐行 diff 核对**；(b) coredump 里 PC 指向"不可自陷指令"（orr/nop/str 之前有更早的载入错位）先怀疑基址，用睡眠线程的 stub PC 反算 delta；(c) psp2core 会把 fault 涉及的额外页 dump 进 PT_LOAD（本次 0x81707000/0x818a5000/0x818b5000 恰是 r10/r0/r6 指向页），可当内存窥镜。
 
 ## 2026-09-26 log40：**v02.15 判决 = NEITHER（预注册命中）——cpu1 内核调度器死亡，方向 A 穷尽；core dump 把死点钉死在"第一次切入 MIDlet Java 代码"的第 7 条指令**
 
