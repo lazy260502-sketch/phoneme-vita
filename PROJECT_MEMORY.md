@@ -1,6 +1,27 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-10-08
 
+## 2026-10-08 log71：**洪水陷阱首次触发——但 `vita_ring_trap` 死在 trap 自己的 `sceIoOpen` 里**（判读工具化：psp2dmp.py + 技能，提交 `8d3e2a0`）
+
+- 症状：v02.47 正常进入 FileManagerMIDlet、可操作，数分钟后冻结退出，带回 coredump。
+- 判决（`psp2dmp.py threads` 一步复现）：基址 0x81024000；主线程 `J2ME00001` pc=0xe0007d54（SceLibKernel 内）、r12=0xb2a（sceIo* 槽位）、**r0 自动解引用 = `"ux0:/data/J2ME00001/ring_trap.log"`**、r1=0x602（WRONLY|CREAT|TRUNC）、r2=0x1ff(0777)、cpsr=0x070（关中断）。其余 4 线程（tone/watchdog/ticker/SceCommonDialogWorker）全部健康睡眠。
+- 结论链：v02.45 洪水检测器真实触发了（256 连续 pe==NULL 弹跳环——livelock 复现并被捕获），trap 序列把现场存进 vita_ring_trap 区域后调用 `vita_ring_trap`，但**第一行 sceIoOpen 就冻死在内核**——"卡死退出"的直接原因。ring_trap.log 未写出（I/O 未完成，附件里没有是必然）。
+- 意义：(a) v02.47 movt 修复实证有效（能进能玩）；(b) 旧风险"从 JVM 轻量线程上下文调 sceIo 的安全性"得到否定答案——轻量线程非 OS 线程，内核不认它，同步 I/O 即死。
+- **v02.48 方向**：trap 去文件 I/O 化——BSS 快照 + 原子 trip 标志（可选 `sceKernelSendSignal` 唤醒 watchdog），由 watchdog 真线程（250ms 节拍）发现标志后代写文件并 `sceKernelExitProcess`。轻量线程侧只做纯内存操作。
+- 教训入库：(a) psp2core 的 note name 是**空格填充**不是 \0 填充（"THREAD_INFO" 带 4 个尾随空格，"THREAD_REG_INFO" 恰好 15 字符装下才侥幸匹配）——自写解析器必须 rstrip；(b) 睡眠线程 pc 在**模块内 stub**（pc−delta==0x8110d338）而非内核空间，内核 PC+r12 槽号才是"阻塞在系统调用内"的特征；(c) THREAD_INFO 结构 = ver/count/entsize 头 + 条目（tid u32 + name[32]），顺序与 THREAD_REG_INFO 一致。
+
+## 判读工具与技能（复用入口）
+
+- **工具**：`samples/j2me/debug/tools/psp2dmp.py`（git 已提交 `8d3e2a0`；stdlib-only，双 dump 回归通过）
+  - `list <dump>`：notes + PT_LOAD 故障页清单
+  - `threads <dump>`：线程名/寄存器/分类/自动基址探测/pc-lr 符号化/内核线程 r0 自动解引用
+  - `base <dump>`：只出基址判决（双锚点：lr→0x81011b4b 与 stub pc→0x8110d338 必须一致）
+  - `mem <dump> <addr> [len]`：读 dump 内 PT_LOAD 页（栈/故障页窥镜）
+  - `elfstr <dump> <addr>`：runtime 地址→ELF vaddr 映射读字符串（.rodata 路径/格式串）
+  - `--elf` 可覆盖默认 `vita-port/build/midp_vita`
+- **技能**：`.github/skills/psp2dmp-analysis/SKILL.md`（workspace 根，非 git）——判读流程、锚点表、陷阱清单、log70/71 案例模板
+- 下一份 dump 到手时：`python3 debug/tools/psp2dmp.py threads <file>` 一条命令出判决主干了。
+
 ## 2026-10-08 log70：**v02.45/v02.46 "进去就白屏"定案——不是 debug 太多，是垫 asm 里丢了一条 `movt`**（v02.47 修复，提交 `af2c9bc` + `788be8a`）
 
 - 症状：装 v02.46 后 MIDlet 一启动就白屏，且这次带回 **psp2core coredump**（`psp2core-*.psp2dmp`，gzip 压缩的 ELF32 ARM core 文件）——是**崩溃**不是冻结。boot_log 止于 `runtime Hello.jar size=9203`（jar 部署完、VM 启动早期），无 ring_trap.log。
