@@ -8211,3 +8211,34 @@ v02.39 逐指令相同（冻结成员原样）✓。
    "v02.44 b434 (63763ff)"。rm _MergedSrc004.o+OS_vita.o 后重编；符号/反汇编/
    重定位/格式串四链验证通过。log70 判读顺序：rd7 帧字 → v244_ct 身份 → r6
    滑动 → PNG 图标显示。
+
+## 2026-10-08：v02.45 环自陷饱和取证包（c9fac02）
+
+1. **动机**：真机轮次昂贵，用户要求一次打满。思路转变——不再等冻结后采样
+   （watchdog/rd7 是 400ms 后的二手现场，coredump 是抽奖且从不映射 Java 栈
+   页），让死环**当场自己招供**：垫是唯一保证在环上的已插桩点（log68/69 实证
+   环以 ~10M/s 穿过垫），在垫内装洪水检测器。
+2. **洪水判据**：连续 256 次 pe==NULL 弹跳。合法运行不可能——正常出生跨垫时
+   pe!=NULL（log69 冻结时 pe1=5 恒定），到达阈值即活锁实锤，毫秒级触发。
+3. **trip 序列**（垫 asm，只用 r0-r3/ip，r4-r11 只读）：保存 r0-r13 到
+   `vita_v245_flood[20]`（[0]consec [1]tripped [2]ct [3..13]r3..lr [14..19]
+   保留）；每 4 次弹跳记 (r6, lr) 对到 `vita_v245_hist[9]` 环（lr 直接命名环
+   闭合边）；切 `vita_ring_trap_stack_mem+8192` 私有栈（符号布局已验证：
+   trap_stack_mem@0x68, flood@0x2068, hist@0x20b8——+0x2000 严丝合缝）；
+   `bx vita_ring_trap`。
+4. **vita_ring_trap**（OS_vita.cpp，写 ux0:/data/J2ME00001/ring_trap.log 后
+   sceKernelExitProcess）：flood 寄存器现场 → hist 弹跳历史（含 per-bounce
+   r6 delta）→ 模板地址行（exit/uncaught/finish/force_term/flagword=0/pad）
+   → r6 退出表窗口 [r6-8..+24] → ct.stack_pointer + 出生帧窗口 → 保存 sp 的
+   C 栈窗口 [sp..sp+60] → qring/dispatch/nrt/threads 全量调度取证。写序按
+   证据重要性排列（trap 自身若崩，前面的已落盘）。
+5. **后备链**：全部 v02.44 探针保留；rd7 新增 `[rd7 flood] consec/tripped`
+   行——若只有 watchdog log 回来，tripped=0 + consec 巨大=环不过垫（陷阱失
+   效的世界），tripped=1=trap 已写 ring_trap.log。
+6. **v02.45（c9fac02）**：三文件 +281/-5。VPK md5=d1d7a332ffc96f278e262ee
+   46d5aee4b，版本串 "v02.45 b436 (c9fac02)"。四链验证：nm（v245 符号 +
+   U vita_ring_trap）、objdump（cmp #256 / add #8192 / 73 指令垫）、OS_vita.o
+   T vita_ring_trap、ELF 含 "== RING TRAP v02.45 ==" 格式串。
+7. **log70 判读顺序**：ring_trap.log 若在 → hist 的 lr（闭合边）→ r6 逐圈
+   滑动量（命名 gadget）→ 退出表窗口 vs 模板 → 帧字身份；只有 watchdog log
+   → rd7 flood 行分世界。
