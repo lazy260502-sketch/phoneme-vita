@@ -304,6 +304,10 @@ extern "C" void vita_landing_pad(void) {
     "8:\n"
     "movw  r2, #:lower16:vita_v244_ct\n"   /* v02.44 record (unchanged):
      * ct + r6 for watchdog rd7 when no trip happens. */
+    "movt  r2, #:upper16:vita_v244_ct\n"  /* v02.47: restore the movt lost
+     * in the v02.45 edit — without it r2 holds only the lower 16 bits
+     * (0x9790) and the store below faults on every thread birth
+     * (log70 psp2core: pc=str r1,[r2], r2=0x9790). */
     "movw  r1, #:lower16:_current_thread\n"
     "movt  r1, #:upper16:_current_thread\n"
     "ldr   r1, [r1]\n"
