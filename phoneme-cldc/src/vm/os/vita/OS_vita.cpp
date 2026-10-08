@@ -554,6 +554,13 @@ extern volatile unsigned int vita_v242_pe[2];
  * index. rd7 dereferences r6 to dissect the birth frame. */
 extern volatile unsigned int vita_v244_ct;
 extern volatile unsigned int vita_v244_r6;
+/* v02.45: saturation forensics from the landing pad (see
+ * InterpreterRuntime_arm.cpp): hist = last-4-bounce (r6, lr) ring,
+ * flood = gate state + full register scene saved at trip (layout in
+ * the pad source comment). When flood[1] != 0 the trap dumper below
+ * already wrote ux0:/data/J2ME00001/ring_trap.log and exited. */
+extern volatile unsigned int vita_v245_hist[9];
+extern volatile unsigned int vita_v245_flood[20];
 extern void vita_landing_pad(void);
 }
 #define VITA_V231_EXIT_RING 8
@@ -1406,6 +1413,19 @@ static void vita_wd_snapshot_one(SceUID fd) {
         }
         vita_wd_puts(fd, "[rd7 birthframe ok]\n");
     }
+    /* v02.45: flood-gate backup readout. If the trap fired, tripped!=0
+     * and ring_trap.log is already on disk (this whole log may not even
+     * exist - the process exited at trip). If the ring somehow misses
+     * the pad, consec keeps the pe==NULL streak visible from the
+     * watchdog side. Either way this line tells us which world we are
+     * in when only a watchdog log comes back. */
+    {
+        n = snprintf(buf, sizeof(buf),
+                     "[rd7 flood] consec=%u tripped=%u (see ring_trap.log "
+                     "if tripped)\n",
+                     vita_v245_flood[0], vita_v245_flood[1]);
+        sceIoWrite(fd, buf, n);
+    }
 }
 
 void vita_wd_snapshot(const char *path) {
@@ -1423,6 +1443,137 @@ void vita_wd_snapshot(const char *path) {
     vita_wd_puts(fd, "===== v02.18 sample 2 (+400ms) =====\n");
     vita_wd_snapshot_one(fd);
     sceIoClose(fd);
+}
+
+/* v02.45: ring self-trap dumper. The pad's flood gate calls this on a
+ * private stack after 256 consecutive pe==NULL bounces - a condition
+ * legitimate execution cannot reach (normal births cross with
+ * pe!=NULL; log69 froze with pe1=5 while pe0 climbed ~10M/s). The
+ * scene is in vita_v245_flood (registers), vita_v245_hist (last 4
+ * bounce edges). This function writes ONE file and exits the process:
+ * the freeze becomes an immediate visible crash with the complete
+ * scene, from INSIDE the spinning thread - which can read the Java
+ * stack pages no coredump ever maps.
+ *
+ * It must not return (the caller switched sp and saved r4-r11 into
+ * the flood array, not the stack). Keep it leaf-ish: no heap, no
+ * locks, snprintf into a stack buffer only. */
+void vita_ring_trap(void)
+{
+    char buf[320];
+    int n;
+    SceUID fd = sceIoOpen("ux0:/data/J2ME00001/ring_trap.log",
+                          SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,
+                          0777);
+    if (fd < 0) {
+        sceKernelExitProcess(0x45);
+    }
+    const unsigned int *F = vita_v245_flood;
+    const unsigned int *H = vita_v245_hist;
+
+    vita_wd_puts(fd, "== RING TRAP v02.45 ==\n");
+    n = snprintf(buf, sizeof(buf),
+                 "consec=%u tripped=%u ct=%08x\n",
+                 F[0], F[1], F[2]);
+    sceIoWrite(fd, buf, n);
+    n = snprintf(buf, sizeof(buf),
+                 "r0=%08x r3=%08x r4=%08x r5=%08x\n"
+                 "r6=%08x r7=%08x r8=%08x r9=%08x\n"
+                 "r10=%08x fp=%08x sp=%08x lr=%08x\n",
+                 F[2], F[3], F[4], F[5], F[6], F[7], F[8], F[9],
+                 F[10], F[11], F[12], F[13]);
+    sceIoWrite(fd, buf, n);
+
+    /* Last 4 bounce edges (oldest first): who jumped into the pad and
+     * where r6 was - the per-bounce delta names the sliding gadget. */
+    vita_wd_puts(fd, "bounce hist (r6, lr) oldest->newest:\n");
+    {
+        unsigned int idx = H[0];
+        for (int k = 4; k > 0; k--) {
+            unsigned int i = (idx - (unsigned int)k) & 3u;
+            unsigned int r6v = H[1 + 2 * i];
+            unsigned int lrv = H[2 + 2 * i];
+            unsigned int prev6 = H[1 + 2 * ((i - 1u) & 3u)];
+            n = snprintf(buf, sizeof(buf),
+                         "  r6=%08x lr=%08x (d_r6=%+d)\n",
+                         r6v, lrv, (int)r6v - (int)prev6);
+            sceIoWrite(fd, buf, n);
+        }
+    }
+
+    /* The exit table the birth stub indexes (r6) and the birth frame
+     * the scheduler actually wrote (ThreadObj stack_pointer at
+     * [0x64/4]). The gap between the two windows IS the log69 riddle
+     * (0xBC) - now with the bytes. */
+    n = snprintf(buf, sizeof(buf),
+                 "template: exit=%08x uncaught=%08x finish=%08x "
+                 "force_term=%08x flagword(+16)=0 pad=%08x\n",
+                 (unsigned int)(uintptr_t)&Thread::lightweight_thread_exit,
+                 (unsigned int)(uintptr_t)&Thread::lightweight_thread_uncaught_exception,
+                 (unsigned int)(uintptr_t)&Thread::finish,
+                 (unsigned int)(uintptr_t)&force_terminated,
+                 (unsigned int)(uintptr_t)&vita_landing_pad);
+    sceIoWrite(fd, buf, n);
+
+    if ((F[6] & 3u) == 0u && F[6] != 0u) {
+        unsigned int *fr = (unsigned int *)(uintptr_t)F[6];
+        n = snprintf(buf, sizeof(buf),
+                     "exit-table window [r6-8..r6+24]:\n  "
+                     "%08x %08x | %08x %08x %08x %08x %08x %08x\n",
+                     fr[-2], fr[-1], fr[0], fr[1], fr[2], fr[3],
+                     fr[4], fr[5]);
+        sceIoWrite(fd, buf, n);
+    }
+    if (F[2] != 0u) {
+        unsigned int *obj = (unsigned int *)(uintptr_t)F[2];
+        unsigned int saved_sp = obj[0x64 / 4];
+        n = snprintf(buf, sizeof(buf),
+                     "ct: pe=%08x stack_pointer=%08x "
+                     "(r6 - sp = %+d)\n",
+                     obj[36 / 4], saved_sp,
+                     (int)F[6] - (int)saved_sp);
+        sceIoWrite(fd, buf, n);
+        if ((saved_sp & 3u) == 0u && saved_sp != 0u) {
+            unsigned int *bf = (unsigned int *)(uintptr_t)saved_sp;
+            n = snprintf(buf, sizeof(buf),
+                         "birth-frame window [sp-8..sp+24]:\n  "
+                         "%08x %08x | %08x %08x %08x %08x %08x %08x\n",
+                         bf[-2], bf[-1], bf[0], bf[1], bf[2], bf[3],
+                         bf[4], bf[5]);
+            sceIoWrite(fd, buf, n);
+        }
+    }
+    /* The C stack at trip (sp saved at pad entry): residual frames
+     * name the code that was running before the ring closed. */
+    if ((F[12] & 3u) == 0u && F[12] != 0u) {
+        unsigned int *sw = (unsigned int *)(uintptr_t)F[12];
+        n = snprintf(buf, sizeof(buf),
+                     "c-stack window [sp..sp+60]:\n  "
+                     "%08x %08x %08x %08x %08x %08x %08x %08x\n"
+                     "  %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6],
+                     sw[7], sw[8], sw[9], sw[10], sw[11], sw[12],
+                     sw[13], sw[14], sw[15]);
+        sceIoWrite(fd, buf, n);
+    }
+
+    /* Full scheduler forensics - everything the watchdog would have
+     * printed, from the same instant (no 400ms-later sampling). */
+    vita_wd_puts(fd, "-- scheduler forensics --\n");
+    {
+        static char dump[4096];
+        int len;
+        len = vita_sched_dump_qring(dump, (int)sizeof(dump));
+        if (len > 0) sceIoWrite(fd, dump, len);
+        len = vita_sched_dump_dispatch(dump, (int)sizeof(dump));
+        if (len > 0) sceIoWrite(fd, dump, len);
+        len = vita_sched_nrt_info(dump, (int)sizeof(dump));
+        if (len > 0) sceIoWrite(fd, dump, len);
+        len = vita_sched_dump_threads(dump, (int)sizeof(dump));
+        if (len > 0) sceIoWrite(fd, dump, len);
+    }
+    sceIoClose(fd);
+    sceKernelExitProcess(0x45);
 }
 
 } /* extern "C" */

@@ -1348,6 +1348,33 @@ set(VITA_VERSION  "02.44")
 # the v02.41 block above (CMAKE_C_FLAGS is append-only in this file,
 # "not re-adding" != "removed" - the v02.43 lesson).
 string(REPLACE "-DVITA_NO_PNG" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+set(VITA_VERSION  "02.45")
+# 02.45 (2026-10-08): saturation forensics - make the ring CONFESS
+#   itself. Real-hardware rounds are expensive; instead of sampling a
+#   frozen machine minutes later (watchdog/rd7) or a coredump lottery,
+#   the pad (the ONLY point guaranteed to be on the ring - log68/69
+#   proved the ring crosses it ~10M times/sec) now carries a flood
+#   detector: 256 consecutive pe==NULL bounces cannot happen in
+#   legitimate operation (normal births cross with pe!=NULL; log69
+#   froze with pe1=5), so reaching the threshold IS the livelock.
+#   On trip: the pad saves r0-r13 into vita_v245_flood[], records the
+#   last 4 bounce edges (r6, lr) in vita_v245_hist[], switches to a
+#   private 8K stack and calls the C dumper vita_ring_trap (OS_vita.cpp)
+#   which writes ux0:/data/J2ME00001/ring_trap.log (registers, bounce
+#   history with per-bounce r6 delta, exit-table window at r6 vs the
+#   setup_stack_asm template, ThreadObj stack_pointer + birth-frame
+#   window, C-stack window at trip, full scheduler forensics) and
+#   exits the process. A freeze becomes an immediate visible crash
+#   with the complete scene, milliseconds after onset, from INSIDE the
+#   spinning thread - which can read the Java stack pages no coredump
+#   ever mapped.
+#   All v02.44 probes stay (qring/dispatch/rd0-rd7 + v244_ct/r6
+#   records); if the ring somehow misses the pad the trap stays
+#   disarmed silently and rd7's new flood line (consec/tripped) tells
+#   us which world we are in. Watchdog also still fires as before.
+# Read order for log70: ring_trap.log FIRST if present (lr of the
+#   hist entries = ring-closing edge, then the r6 delta naming the
+#   sliding gadget); else watchdog log rd7 flood line.
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
 #   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the

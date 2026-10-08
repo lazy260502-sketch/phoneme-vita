@@ -175,8 +175,42 @@ volatile unsigned int vita_v242_pe[2] = {0, 0};
  * r2 is dead at pad entry (stub writes it at +0xc before any use). */
 volatile unsigned int vita_v244_ct = 0;
 volatile unsigned int vita_v244_r6 = 0;
+/* v02.45: SATURATION forensics - make the ring catch itself. log68/69
+ * both show the ring closes THROUGH this pad (land/pe0 climb at ring
+ * speed ~10M/s) while EVERY C++ counter is frozen, so the pad is the
+ * only instrumented point guaranteed to be on the ring. Real-hardware
+ * rounds are expensive; instead of one probe per run, the pad now
+ * carries a flood detector plus a bounce history, and on trip it
+ * saves the whole register scene for the C dumper (vita_ring_trap in
+ * OS_vita.cpp).
+ *
+ * vita_v245_hist: circular record of the last 4 crossings, written
+ * EVERY crossing before the gate: [0] = write index, then word
+ * pairs [1+2i]=r6, [2+2i]=lr (i = idx&3). lr at pad entry names the
+ * closing edge (jump vs call into the pad); r6's per-bounce delta
+ * exposes any stack slide between consecutive bounces.
+ *
+ * vita_v245_flood: gate state + trip scene. Layout (word index):
+ *   [0] consecutive pe==NULL crossings (reset on pe!=NULL or ct==NULL)
+ *   [1] tripped flag (1 after the trap fired; gate disarms itself)
+ *   [2] ct  [3] r3  [4] r4  [5] r5  [6] r6  [7] r7
+ *   [8] r8  [9] r9 [10] r10 [11] fp(r11) [12] sp [13] lr
+ *  [14..19] reserved (0)
+ * 256 consecutive empty bounces cannot happen in legitimate
+ * operation: normal births cross with pe!=NULL (pe1 stays ~thread
+ * count, see log69), so reaching the threshold IS the livelock,
+ * caught in milliseconds with the full scene instead of a coredump
+ * lottery (and the coredump never maps the Java stack pages - this
+ * dump does, from inside the spinning thread). */
+volatile unsigned int vita_v245_hist[9] = {0};
+volatile unsigned int vita_v245_flood[20] = {0};
+/* v02.45: private stack for the trap path. MUST stay 8192 bytes and
+ * 8-byte aligned: the pad's trip sequence hardcodes add #8192 after
+ * this symbol (see asm below). */
+unsigned char vita_ring_trap_stack_mem[8192] __attribute__((aligned(8)));
 }
 extern "C" void vita_landing_pad(void) __attribute__((naked));
+extern "C" void vita_ring_trap(void);
 extern "C" void vita_landing_pad(void) {
   asm volatile(
     "movw  r0, #:lower16:vita_v240_land\n"
@@ -201,11 +235,75 @@ extern "C" void vita_landing_pad(void) {
     "ldr   r1, [r0]\n"
     "add   r1, r1, #1\n"
     "str   r1, [r0]\n"
-    "movw  r2, #:lower16:vita_v244_ct\n"   /* v02.44: r1 dead after the
-     * counter store, r2 dead across pad->stub edge (stub does
-     * mov r2,#0 at +0xc before any use). Reload ct: r0 now holds
-     * &vita_v242_pe, not the thread. */
-    "movt  r2, #:upper16:vita_v244_ct\n"
+    /* v02.45: bounce history - r0/r1 are dead after the pe store,
+     * r2 is reloaded by the gate below. 12 instructions per
+     * crossing, irrelevant next to a ~10M/s spin. */
+    "movw  r1, #:lower16:vita_v245_hist\n"
+    "movt  r1, #:upper16:vita_v245_hist\n"
+    "ldr   r2, [r1]\n"
+    "and   r2, r2, #3\n"
+    "add   r2, r2, r2\n"
+    "add   r2, r2, r2\n"
+    "add   r2, r2, r2\n"
+    "add   r2, r1, r2\n"
+    "str   r6, [r2, #4]\n"
+    "str   lr, [r2, #8]\n"
+    "ldr   r2, [r1]\n"
+    "add   r2, r2, #1\n"
+    "str   r2, [r1]\n"
+    /* v02.45: flood gate - see vita_v245_flood above. Uses only
+     * r0/r1/r2/ip, all dead at the stub edge (stub reloads r0/r1
+     * and writes r2/r3 itself; ip is written before read). */
+    "movw  r2, #:lower16:vita_v245_flood\n"
+    "movt  r2, #:upper16:vita_v245_flood\n"
+    "ldr   r1, [r2, #4]\n"              /* already tripped? */
+    "cmp   r1, #0\n"
+    "bne   8f\n"                         /* armed once, plain bounce */
+    "movw  r0, #:lower16:_current_thread\n"
+    "movt  r0, #:upper16:_current_thread\n"
+    "ldr   r0, [r0]\n"
+    "cmp   r0, #0\n"
+    "beq   7f\n"                         /* no ct: not a spin */
+    "ldr   r1, [r0, #36]\n"              /* pe */
+    "cmp   r1, #0\n"
+    "bne   7f\n"                         /* pe!=0: reset */
+    "ldr   r1, [r2, #0]\n"              /* consec count */
+    "add   r1, r1, #1\n"
+    "str   r1, [r2, #0]\n"
+    "cmp   r1, #256\n"
+    "blo   8f\n"
+    /* Trip: save the scene, switch to the private stack, call the
+     * C dumper. Only r0-r3/ip are clobbered from here on; r4-r11
+     * are only READ. The dumper never returns (process exit). */
+    "mov   ip, r2\n"                     /* ip = &flood */
+    "mov   r1, #1\n"
+    "str   r1, [ip, #4]\n"              /* [1] tripped */
+    "str   r0, [ip, #8]\n"              /* [2] ct */
+    "str   r3, [ip, #12]\n"             /* [3] r3 */
+    "str   r4, [ip, #16]\n"             /* [4] r4 */
+    "str   r5, [ip, #20]\n"             /* [5] r5 */
+    "str   r6, [ip, #24]\n"             /* [6] r6 - exit-table base */
+    "str   r7, [ip, #28]\n"             /* [7] r7 */
+    "str   r8, [ip, #32]\n"             /* [8] r8 */
+    "str   r9, [ip, #36]\n"             /* [9] r9 */
+    "str   r10, [ip, #40]\n"            /* [10] r10 */
+    "str   r11, [ip, #44]\n"            /* [11] fp */
+    "mov   r1, sp\n"
+    "str   r1, [ip, #48]\n"             /* [12] sp */
+    "str   lr, [ip, #52]\n"             /* [13] lr */
+    "movw  r0, #:lower16:vita_ring_trap_stack_mem\n"
+    "movt  r0, #:upper16:vita_ring_trap_stack_mem\n"
+    "add   r0, r0, #8192\n"             /* top of the private stack */
+    "mov   sp, r0\n"
+    "movw  r0, #:lower16:vita_ring_trap\n"
+    "movt  r0, #:upper16:vita_ring_trap\n"
+    "bx    r0\n"
+    "7:\n"
+    "mov   r1, #0\n"
+    "str   r1, [r2, #0]\n"              /* reset consec count */
+    "8:\n"
+    "movw  r2, #:lower16:vita_v244_ct\n"   /* v02.44 record (unchanged):
+     * ct + r6 for watchdog rd7 when no trip happens. */
     "movw  r1, #:lower16:_current_thread\n"
     "movt  r1, #:upper16:_current_thread\n"
     "ldr   r1, [r1]\n"
