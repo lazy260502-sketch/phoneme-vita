@@ -8242,3 +8242,33 @@ v02.39 逐指令相同（冻结成员原样）✓。
 7. **log70 判读顺序**：ring_trap.log 若在 → hist 的 lr（闭合边）→ r6 逐圈
    滑动量（命名 gadget）→ 退出表窗口 vs 模板 → 帧字身份；只有 watchdog log
    → rd7 flood 行分世界。
+
+## 2026-10-08：v02.46 符号化 Java 栈（ring_trap + watchdog）（c5175f3）
+
+1. **起因**：用户问"Java 栈页也可以通过 JVM 去打印吧"。查证结论：这套
+   PRODUCT 库里 **VM 自己没有任何栈打印**——Thread::trace_stack 与全部
+   *Frame::print_on 在 Frame.cpp:1013-1623 的 #ifndef PRODUCT 里；pss() 需
+   ENABLE_PRODUCT_PRINT_STACK（BuildFlags 默认 0，jvmconfig.h 实证）；pretty
+   签名解码器 print_decoded_on 也不在。直接调 trace_stack 会链接失败。
+2. **正路**：照 Debug.cpp:692 product_trace_stack_from（当年 Sun 为 PRODUCT
+   deadlock 诊断手写的模式）自建符号化遍历。全部依赖已在最终 ELF 符号级验
+   证：Frame::init(T)、JavaFrame::method(T)、Method::name/signature(T，
+   _MergedSrc004)、holder()→Universe::class_from_id(W)、JavaClass::name/
+   Symbol::base_address+length(inline)、bci_with_flags(T)、
+   is_entry_frame/caller_is/is_first_frame(inline)。GUARANTEE 在 PRODUCT 空
+   展开（Debug.hpp:76），遍历安全。
+3. **vita_sched_dump_jstack**（Scheduler.cpp 尾，归 _MergedSrc002.o）：遍历
+   global_threadlist（≤8 线程 × ≤32 帧），逐帧打 `class.method(原始签名)
+   bci=`；Raw 句柄、ROM 只读、零分配、无 tty 无锁——trap 私有栈与 watchdog
+   两侧皆安全。**每次解引用前用线程自身 stack_limit/base 范围检查 fp**——
+   活锁前提就是 jsp 被弄坏，坏 fp 必须停走而非崩掉 dumper。单任务假设成立
+   （MIDP 单 task，trap 上下文即弹跳线程的 task）。
+4. **接线**：ring_trap.log 调度取证尾部 + watchdog rd7 尾部（陷阱失效后备）
+   各加一段。签名用原始 UTF8（"(I)V" 本来就可读）。
+5. **v02.46（c5175f3）**：三文件 +170/-1。VPK md5=435750e76aaf692b5d2ac41
+   8394868c9，版本串 "v02.46 b438 (c5175f3)"。验证链：_MergedSrc002.o 出
+   T vita_sched_dump_jstack（U 集恰为 4 个库符号）、最终 ELF T 符号 +
+   反汇编真函数体（push {r4-r11,lr}，10 处 bl）。
+6. **log70 判读新增**：jstack 段直接回答"每个线程冻结瞬间在执行哪个方法"
+   ——弹跳者(id4)若 fp=0/坏 fp → 从未真正进过 Java；若有帧 → 帧名即案发
+   第一现场。与 hist lr（闭合边）互为印证。
