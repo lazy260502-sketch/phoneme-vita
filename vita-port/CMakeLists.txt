@@ -1375,7 +1375,18 @@ set(VITA_VERSION  "02.45")
 # Read order for log70: ring_trap.log FIRST if present (lr of the
 #   hist entries = ring-closing edge, then the r6 delta naming the
 #   sliding gadget); else watchdog log rd7 flood line.
-set(VITA_VERSION  "02.46")
+set(VITA_VERSION  "02.47")
+# 02.47 (2026-10-08): fix the v02.45 white-screen crash. log70's psp2core
+#   coredump pinned the main thread at vita_landing_pad+0x148
+#   (str r1,[r2]) with r2=0x00009790: the v02.45 comment edit around the
+#   v244 record block dropped the "movt r2,#:upper16:vita_v244_ct", so
+#   EVERY lightweight-thread birth stored _current_thread into the
+#   unmapped 0x9790 -> data abort -> white screen at MIDlet start (and
+#   no ring_trap.log - the crash sat in the probe itself, before the
+#   flood detector could ever arm). Also: module base proven to be
+#   0x8101a000 on this install (sleeper lr lands at the R_ARM_THM_CALL
+#   site inside __wrap_sceKernelDelayThread), coredump addr2line must
+#   subtract 0x1a000 first.
 # 02.46 (2026-10-08): symbolic Java stacks in the trap + watchdog.
 #   Thread::trace_stack, *Frame::print_on (Frame.cpp:1013-1623) and
 #   pss() (ENABLE_PRODUCT_PRINT_STACK=0) are all compiled out in this
