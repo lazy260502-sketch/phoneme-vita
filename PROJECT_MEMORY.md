@@ -1,5 +1,15 @@
 # J2ME/MIDP on PS Vita - Project Memory
-> Last Updated: 2026-10-08
+> Last Updated: 2026-10-09
+
+## 2026-10-09 v02.48：**trap 去 I/O 化——自旋者停车（wfe），watchdog 代写**（提交 `bb305ee`）
+
+- 动机：log71 证明洪水陷阱能抓住环（256 连续 pe==NULL 弹跳），但 `vita_ring_trap` 第一行 `sceIoOpen` 从轻量线程上下文调用就冻死在内核——轻量线程不是 OS 线程，内核不给它服务 I/O。现场永远落不了盘。
+- 设计：trip 路径**纯内存**——现场（r0-r11/sp/lr + parked cookie）存进 `vita_v245_flood[2..13,15]`，`tripped=1` **最后写**（handoff 序），然后 `wfe` 原地停车。watchdog（真 OS 线程，另一核）每轮 poll（250ms）最先检查 `flood[1]`，发现即调用**未改动的** `vita_ring_trap`（写 ring_trap.log + `sceKernelExitProcess(0x45)`）——文件 I/O 与退出都发生在 OS 线程上下文，v01.72 起所有 watchdog.log 已证明安全。
+- `flood[15]` = `&vita_ring_parked`（停车点 cookie）：若停车后系统仍整个冻死出 coredump，pc 落 0x8109xxxx 附近且 flood[15] 指向 0x814b7718 即可命名该自旋环。
+- 符号（v02.48 build/midp_vita）：`vita_ring_parked` B 0x814b7718、`vita_v245_flood` B 0x814b771c（紧邻，BSS）；`vita_ring_trap_stack_mem`(8KB) 已退役删除。
+- 验证：反汇编逐对核查 26 条 movw/movt 成对（log70 教训）、tripped 最后写、自旋环回跳正确；VPK `out/vpk/midp_vita_v02.48.vpk` md5 `db4a7df0915ed0dfe14b40d48a32d908`，版本串 `v02.48 b445 (bb305ee)`。
+- 预期下次真机日志形态：ring_trap.log **终于出现**（头部仍是 "RING TRAP v02.45"——dumper 体未改）；watchdog.log 在看到 tripped 的那轮 poll 处戛然而止（直接跳 dumper，不再记日志）。若 ring_trap.log 出现且含 bounce hist + jstack，livelock 环的完整招供（r6 delta 定位滑动 gadget + 各线程 Java 栈）首次落地。
+- 遗留风险：(a) wfe 若退化为空转只是更热，不影响正确性（watchdog 在另一核）；(b) 若停车后**整核**调度死亡连 watchdog 都停（log40 的 NEITHER 场景），仍无 ring_trap.log——但那属于方向 B（kubridge 内核侧），本设计已覆盖"轻量线程自旋、内核调度存活"的主分支。
 
 ## 2026-10-08 log71：**洪水陷阱首次触发——但 `vita_ring_trap` 死在 trap 自己的 `sceIoOpen` 里**（判读工具化：psp2dmp.py + 技能，提交 `8d3e2a0`）
 
