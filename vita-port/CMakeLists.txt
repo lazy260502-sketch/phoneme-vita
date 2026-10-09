@@ -1375,7 +1375,46 @@ set(VITA_VERSION  "02.45")
 # Read order for log70: ring_trap.log FIRST if present (lr of the
 #   hist entries = ring-closing edge, then the r6 delta naming the
 #   sliding gadget); else watchdog log rd7 flood line.
-set(VITA_VERSION  "02.48")
+set(VITA_VERSION  "02.49")
+# 02.49 (2026-10-09): forensic follow-up to log72's full confession -
+#   the ring anatomy is settled (entry-less dispatch, pad<->stub
+#   bounce, NOT a stack slide) but the topology question remains: the
+#   frozen qring (seq=536, zero REM after ring closure) CONTRADICTS a
+#   bounce cycle that runs the birth-stub death tail every lap (each
+#   lap would pass lightweight_thread_exit -> terminate ->
+#   remove_from_active = op-2 REM, seq would be in the millions), yet
+#   ring_trap.log printed NONE of the C++ counters that could settle
+#   it. Four evidence upgrades, no behavior change (the trip/park/
+#   watchdog-dump chain is untouched - log72 proved it, don't jinx
+#   it):
+#   (1) qring 5th column = CALLER (__builtin_return_address(0)) on
+#       every op - closes two log72 attribution gaps: id4's ADD with
+#       pe=0 (a Thread::start birth ADD must see pe=1 - run_entry is
+#       appended BEFORE Scheduler::start; so either the entry vanished
+#       pre-dispatch or the ADD came from notify_wakeup/timeout), and
+#       id3's 16x SEL with zero NRT (selections without a switch_thread
+#       commit = pure QUERY callers like yield/sleep_forever/terminate
+#       polling is_null). Resolve caller addresses offline: nm on the
+#       .sym export.
+#   (2) ring_trap.log + watchdog v249 line: finish/force/setcur/term/
+#       taskclean/land/pe0/pe1/switch in ONE place at trip time.
+#       taskclean (thread_task_cleanup) is NEW - the one death-tail
+#       body without a counter. Any of these in the millions while
+#       qring seq stays small = the ring runs death-tail C++ (topology
+#       B); all frozen = pure asm ring (topology A).
+#   (3) bounce hist 3rd word per crossing = [r6-8], the fp slot under
+#       the sentinel: call_on_primordial_stack pushes (lr,fp) at
+#       [r6-4],[r6-8] and pops back - a value that CHANGES across the
+#       4 recorded bounces proves the prologue executes inside the
+#       ring; frozen at the pristine template = ring closes before
+#       any push. hist layout 9 -> 13 words (pad asm + dumper in
+#       sync).
+#   (4) ring_trap.log header stays "RING TRAP v02.45" (dumper format
+#       continuity - diffing logs across versions stays clean).
+#   Next run signature: same trip signature as log72 (consec=256,
+#   parked, watchdog dumps) but the log now answers: who ADDED id4
+#       pe=0 (caller col), who SELected id3 16x (caller col), and
+#       which topology the ring has (v249 counters + [r6-8]).
 # 02.48 (2026-10-09): trap de-I/O - the spinner parks, the watchdog
 #   dumps. log71 proved v02.47 works (MIDlet runs, minutes of play)
 #   AND that the v02.45 trap design dies at its first step: the flood
