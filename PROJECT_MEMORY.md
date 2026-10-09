@@ -1,6 +1,36 @@
 # J2ME/MIDP on PS Vita - Project Memory
 > Last Updated: 2026-10-09
 
+## 2026-10-09 log72：**v02.48 全链打通 + livelock 环首次完整招供——环不是栈滑动，是 entry-less 派发在 pad↔birth stub 之间打乒乓**
+
+### v02.48 handoff 验证（全按预期）
+
+- `ring_trap.log` 4739B 完整落盘（bounce hist、exit-table、birth-frame、c-stack、调度器 forensics、5 线程符号化 jstack、java-stack-top——一样不缺）；**无 coredump**（watchdog 干净退出，`sceKernelExitProcess(0x45)` 从 OS 线程上下文执行成功）
+- watchdog.log 如预期在 `[WD] alive` 处戛然而止——看到 tripped 的那轮 poll 直接跳 dumper 没再记日志（设计如此，不是 watchdog 死了）
+- 冻结→落盘延迟 ≤250ms（一轮 poll），远快于 HANG 判定（3s），watchdog 甚至没走到 HANG 分支
+- slide=0x12000（三锚点互验：pad 810ad470/exit 810aeefc/uncaught 810ad6d4 全吻合）
+
+### 环的解剖（core 事实）
+
+1. **不是栈滑动**：4 条 hist 全部 `r6=81ddf378 d_r6=+0`——log69 时代的"滑动 gadget"假说就此排除
+2. **弹跳边**：lr=810ad470 = **pad 自己**——执行是"解释器返回 → 弹出栈底 sentinel（=pad 地址）→ 落进 pad"的循环；pad 每次 pe==NULL 穿越后尾跳 `start_lightweight_thread_asm`，stub 对无 entry 线程无事可做立即返回 → 又弹 sentinel → **pad↔stub 互跳就是环本体**（~10M/s，256 次在微秒级凑满，调度器根本没再进入——qring 的 SEL 记录停在 trap 前）
+3. **被困者 id=4 是新生儿**：jstack `(fp=0, not started)`——一个字节码都没执行过就被派发；r6 指向它栈顶区的真 exit 模板（[r6-4]=pad、[r6+0..12]=exit/uncaught/finish/force_term 完好）
+4. **致命共性：q5 三个可运行线程全部 pe=0**——id=2（卡在 `EventQueue.post` bci=0，事件投递者）、id=3（worker，曾在 run bci=8）、id=4（新生儿）。派发 entry-less 线程 = 必然弹跳
+5. **冻结时点**：MIDlet 轮刚起步——preload 扫完 21 类（watchdog STORM 行），事件泵 startup 阶段；id=0 主线程在 `MIDletSuiteLoader.startSuite→Object.wait`、id=1 在 `EventQueue.run→Object.wait` 等 id=2 的 post——post 永远完不成，全队饿死
+6. 调度序列（qring 尾部倒序）：id=3 SEL×16（id=3 弹跳期，每次回到调度器重选队头）→ id=2 ADD + id=4 ADD（某处唤醒/出生）→ id=2 NRT+SEL → id=4 NRT+SEL → **环闭合**（stub↔pad 紧环，不再回调度器）
+
+### 判决
+
+- **环的充要条件 = 派发了 pe==NULL 的线程**。get_next_runnable_thread 沿优先级链表走，**不检查 entry 就绪性**（Scheduler.cpp:2680-2740 只查 quota/debugger）——链表里有 pe=0 成员就必炸
+- 更深的疑点（v02.49 方向）：id=2/id=3 是**有保存上下文的旧线程**（jstack 有帧），被唤醒进 q5 后为何走了"出生路径"而非"恢复路径"？恢复路径不会经过栈底 sentinel。怀疑唤醒者 add_to_active 时没挂 entry、或 NRT 缓存/switch 丢失了 has-saved-context 判定
+- v02.49 修复方向（两层）：(a) pad 的 pe==NULL 穿越不该尾跳 birth stub（那等于亲手闭环）——应让出 CPU 回调度器；(b) 根因在唤醒链——找到 add 入队不挂 entry / 误走出生路径的调用点。先做 (b) 的取证（给 ADD 记录加 caller），(a) 是兜底刹车
+
+### 教训入库
+
+- **取证管线至此闭环**：v02.45 设计 trap（抓现场）→ log71 证明轻量线程不能做 I/O → v02.48 handoff → log72 环招供。三轮迭代换来"任何冻结 ≤250ms 出完整现场"
+- jstack 的 `.unknown` 类名 = ROM class_from_id 未命中（非崩溃），`??` 是签名原文的 `(`/`[` 被 dumper 过滤
+- CYCLE(3) 是**环形双向链表的正常形态**（q5 有 3 个成员），异常的是全员 pe=0——别再把 CYCLE 当链表损坏
+
 ## 2026-10-09 v02.48：**trap 去 I/O 化——自旋者停车（wfe），watchdog 代写**（提交 `bb305ee`）
 
 - 动机：log71 证明洪水陷阱能抓住环（256 连续 pe==NULL 弹跳），但 `vita_ring_trap` 第一行 `sceIoOpen` 从轻量线程上下文调用就冻死在内核——轻量线程不是 OS 线程，内核不给它服务 I/O。现场永远落不了盘。
