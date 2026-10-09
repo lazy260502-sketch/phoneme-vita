@@ -316,7 +316,10 @@ extern "C" void vita_landing_pad(void) {
     "mov   ip, r2\n"                     /* ip = &flood */
     "mov   r1, #1\n"
     "str   r0, [ip, #8]\n"              /* [2] ct */
-    "str   r3, [ip, #12]\n"             /* [3] r3 */
+    "str   r3, [ip, #12]\n"             /* [3] r3 - NOTE v02.49: r3
+     * here holds the [r6-8] hist sample (the hist block above used
+     * it as scratch), not the caller's r3 at pad entry - r3 is
+     * caller-saved and dead at this edge either way */
     "str   r4, [ip, #16]\n"             /* [4] r4 */
     "str   r5, [ip, #20]\n"             /* [5] r5 */
     "str   r6, [ip, #24]\n"             /* [6] r6 - exit-table base */
