@@ -120,9 +120,19 @@ ReturnOop Thread::task_for_thread( void ) const {
 }
 
 extern "C" {
+  /* v02.49: 4th C++ body of the birth-stub death tail (finish /
+   * force_terminated / this / lightweight_thread_exit). The other
+   * three have carried counters since v02.31, but task_cleanup was
+   * uncovered - and log72's frozen qring (seq=536, no REM records)
+   * CONTRADICTS a ring that runs the death tail every bounce
+   * (lightweight_thread_exit -> terminate -> remove_from_active must
+   * log op-2 REMs). Which of the four bodies the ring actually
+   * reaches is now fully observable from ring_trap.log. */
+  volatile unsigned int vita_v249_taskclean = 0;
   void thread_task_cleanup()  {
 #if defined(VITA)
     vita_site_mark(); /* v01.84: log10 - ring must see task cleanup */
+    vita_v249_taskclean++;
 #endif
     SETUP_ERROR_CHECKER_ARG;
     // We come in here on primordial stack

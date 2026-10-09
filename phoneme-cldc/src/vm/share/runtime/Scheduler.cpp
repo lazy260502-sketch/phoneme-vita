@@ -159,9 +159,24 @@ volatile unsigned int _vita_disp_seq = 0;
  * Entry = id, op, priority, pending_entries!=NULL. The pe column is
  * the case-critical one: log67 dispatched id=3 with pe=0 sixteen
  * times, and WHO re-queued / re-selected a pe=0 thread is the open
- * question. Single writer (VM thread), watchdog reads after freeze. */
+ * question. Single writer (VM thread), watchdog reads after freeze.
+ *
+ * v02.49: 5th column = CALLER (__builtin_return_address(0)). log72
+ * nailed the ring anatomy but left two attribution gaps the 4-column
+ * ring cannot close: (a) id4's ADD carried pe=0 - a birth ADD
+ * (Thread::start appends run_entry BEFORE Scheduler::start->add_to_
+ * active) must see pe=1, so either the entry vanished pre-dispatch or
+ * the ADD came from another path (notify_wakeup / timeout wakeup);
+ * (b) id3 logged 16x SEL with ZERO op-4 NRT - selection without a
+ * switch_thread set_current commit means those SELs came from pure
+ * QUERY callers (yield/sleep_forever/terminate all poll
+ * get_next_runnable_thread for is_null), not dispatches. The caller
+ * return address names the function for every op - resolve offline
+ * against the ELF symtab. Level-0 return address is always available
+ * on this target (arm-vita-eabi, -fno-omit-frame-pointer not needed
+ * for level 0). */
 #define VITA_Q_RING 64
-volatile unsigned int _vita_q_ring[VITA_Q_RING][4]; /* id,op,pri,pe */
+volatile unsigned int _vita_q_ring[VITA_Q_RING][5]; /* id,op,pri,pe,caller */
 volatile unsigned int _vita_q_seq = 0;
 #define VITA_Q_REC(tp, op_, pri_, pe_)                                     \
   do {                                                                     \
@@ -173,6 +188,8 @@ volatile unsigned int _vita_q_seq = 0;
       _vita_q_ring[qs_ & (VITA_Q_RING - 1)][1] = (unsigned int)(op_);       \
       _vita_q_ring[qs_ & (VITA_Q_RING - 1)][2] = (unsigned int)(pri_);      \
       _vita_q_ring[qs_ & (VITA_Q_RING - 1)][3] = (unsigned int)(pe_);       \
+      _vita_q_ring[qs_ & (VITA_Q_RING - 1)][4] =                           \
+        (unsigned int)(uintptr_t)__builtin_return_address(0);              \
     }                                                                      \
     _vita_q_seq = qs_ + 1;                                                 \
   } while (0)
@@ -2967,10 +2984,11 @@ extern "C" int vita_sched_dump_qring(char *out, int out_size) {
     unsigned int idx = (seq - 1u - i) & (VITA_Q_RING - 1u);
     unsigned int op = _vita_q_ring[idx][1];
     n = snprintf(out + pos, out_size - pos,
-                 "  [%2u] id=%u %-3s pri=%u pe=%u\n", i,
+                 "  [%2u] id=%u %-3s pri=%u pe=%u from=%08x\n", i,
                  _vita_q_ring[idx][0],
                  (op <= 6) ? opname[op] : "?",
-                 _vita_q_ring[idx][2], _vita_q_ring[idx][3]);
+                 _vita_q_ring[idx][2], _vita_q_ring[idx][3],
+                 _vita_q_ring[idx][4]);
     if (n > 0 && pos + n < out_size) pos += n; else break;
   }
   return pos;

@@ -186,9 +186,19 @@ volatile unsigned int vita_v244_r6 = 0;
  *
  * vita_v245_hist: circular record of the last 4 crossings, written
  * EVERY crossing before the gate: [0] = write index, then word
- * pairs [1+2i]=r6, [2+2i]=lr (i = idx&3). lr at pad entry names the
- * closing edge (jump vs call into the pad); r6's per-bounce delta
- * exposes any stack slide between consecutive bounces.
+ * triples [1+3i]=r6, [2+3i]=lr, [3+3i]=[r6-8] (i = idx&3). lr at pad
+ * entry names the closing edge (jump vs call into the pad); r6's
+ * per-bounce delta exposes any stack slide between consecutive
+ * bounces. v02.49 adds the third word: [r6-8] is the fp slot just
+ * below the sentinel - call_on_primordial_stack's prologue pushes
+ * (lr,fp) at [r6-4],[r6-8] and its epilogue pops them back, so during
+ * a bounce this word alternates between the static template content
+ * (0 / whatever setup_stack_asm left) and the trampoline's transient
+ * push. A [r6-8] that CHANGES across the 4 recorded bounces proves
+ * the death-tail C++ runs inside the ring (prologue executed); a
+ * frozen [r6-8] matching the pristine template proves the ring closes
+ * before any push - pure asm topology. Format grew from 9 to 13
+ * words; the dumper (OS_vita.cpp) reads the same layout.
  *
  * vita_v245_flood: gate state + trip scene. Layout (word index):
  *   [0] consecutive pe==NULL crossings (reset on pe!=NULL or ct==NULL)
@@ -205,7 +215,7 @@ volatile unsigned int vita_v244_r6 = 0;
  * caught in milliseconds with the full scene instead of a coredump
  * lottery (and the coredump never maps the Java stack pages - this
  * dump does, from inside the spinning thread). */
-volatile unsigned int vita_v245_hist[9] = {0};
+volatile unsigned int vita_v245_hist[13] = {0};
 volatile unsigned int vita_v245_flood[20] = {0};
 /* v02.48: the trap path no longer switches stacks (log71: the C
  * dumper's sceIoOpen froze in-kernel when called FROM a lightweight
@@ -242,18 +252,28 @@ extern "C" void vita_landing_pad(void) {
     "add   r1, r1, #1\n"
     "str   r1, [r0]\n"
     /* v02.45: bounce history - r0/r1 are dead after the pe store,
-     * r2 is reloaded by the gate below. 12 instructions per
-     * crossing, irrelevant next to a ~10M/s spin. */
+     * r2 is reloaded by the gate below. v02.49: layout is now 3 words
+     * per crossing (r6, lr, [r6-8] - the fp slot under the sentinel,
+     * see the vita_v245_hist comment above); the byte offset is
+     * 12*idx: idx -> 2*idx -> 3*idx (2*idx + idx) -> 12*idx (two
+     * doublings). r3 is the scratch (dead at the stub edge - the stub
+     * writes r2/r3 itself before use; it is reloaded from [r6,#-8]
+     * below before its sample store). ~18 instructions per crossing,
+     * irrelevant next to a ~10M/s spin. */
     "movw  r1, #:lower16:vita_v245_hist\n"
     "movt  r1, #:upper16:vita_v245_hist\n"
     "ldr   r2, [r1]\n"
     "and   r2, r2, #3\n"
+    "mov   r3, r2\n"
     "add   r2, r2, r2\n"
-    "add   r2, r2, r2\n"
-    "add   r2, r2, r2\n"
-    "add   r2, r1, r2\n"
+    "add   r3, r2, r3\n"
+    "add   r3, r3, r3\n"
+    "add   r3, r3, r3\n"
+    "add   r2, r3, r1\n"
     "str   r6, [r2, #4]\n"
     "str   lr, [r2, #8]\n"
+    "ldr   r3, [r6, #-8]\n"
+    "str   r3, [r2, #12]\n"
     "ldr   r2, [r1]\n"
     "add   r2, r2, #1\n"
     "str   r2, [r1]\n"

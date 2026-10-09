@@ -559,10 +559,15 @@ extern volatile unsigned int vita_v244_r6;
  * flood = gate state + full register scene saved at trip (layout in
  * the pad source comment). When flood[1] != 0 the trap dumper below
  * already wrote ux0:/data/J2ME00001/ring_trap.log and exited. */
-extern volatile unsigned int vita_v245_hist[9];
+extern volatile unsigned int vita_v245_hist[13];
 extern volatile unsigned int vita_v245_flood[20];
 extern void vita_landing_pad(void);
 }
+/* v02.49: ring-counter block for ring_trap.log - see the v249 line in
+ * vita_wd_snapshot_one(). taskclean is defined in Thread.cpp (inside
+ * the v02.49 counter note there); finish/force/setcur/term live in
+ * this file above; land/pe0/pe1 in InterpreterRuntime_arm.cpp. */
+extern volatile unsigned int vita_v249_taskclean;
 #define VITA_V231_EXIT_RING 8
 volatile unsigned int vita_v231_exit_ring[VITA_V231_EXIT_RING][4];
 volatile unsigned int vita_v231_exit_seq = 0;
@@ -1299,6 +1304,32 @@ static void vita_wd_snapshot_one(SceUID fd) {
                  "  v242 pe0=%u pe1=%u\n",
                  vita_v242_pe[0], vita_v242_pe[1]);
     sceIoWrite(fd, buf, n);
+    /* v02.49: THE missing log72 evidence. The frozen qring (seq=536,
+     * zero REM records after the ring closed) CONTRADICTS a bounce
+     * cycle that runs the birth-stub death tail every lap - each lap
+     * would pass lightweight_thread_exit -> terminate ->
+     * remove_from_active (op-2 REM) and blow the seq counter to tens
+     * of millions. But ring_trap.log never printed ANY of these
+     * counters, so the two candidate topologies could not be told
+     * apart: (A) ring closes BEFORE the death tail in pure asm (pad
+     * <-> stub <-> sentinel pop), all C++ frozen; (B) ring runs part
+     * or all of the death tail C++ every lap and the qring freeze has
+     * another explanation. One line settles it: any of these still
+     * huge/climbing while qring seq stayed small names the spinning
+     * body; all frozen confirms topology (A). Definitions:
+     * finish/force/setcur/term = Thread.cpp + Scheduler.cpp (v02.31),
+     * taskclean = Thread.cpp (v02.49, was the one uncovered body),
+     * land/pe0/pe1 = InterpreterRuntime_arm.cpp pad (v02.40/v02.42),
+     * switch = Scheduler.cpp switch_thread (v01.98). */
+    n = snprintf(buf, sizeof(buf),
+                 "  v249 finish=%u force=%u setcur=%u term=%u taskclean=%u"
+                 " land=%u pe0=%u pe1=%u switch=%u\n",
+                 vita_v231_finish, vita_v231_force_term,
+                 vita_v231_setcur, vita_v231_term,
+                 vita_v249_taskclean,
+                 vita_v240_land, vita_v242_pe[0], vita_v242_pe[1],
+                 vita_sched_switch_count());
+    sceIoWrite(fd, buf, n);
     {
         unsigned int c = vita_v231_exit_seq;
         unsigned int start = (c >= VITA_V231_EXIT_RING)
@@ -1503,18 +1534,25 @@ void vita_ring_trap(void)
     sceIoWrite(fd, buf, n);
 
     /* Last 4 bounce edges (oldest first): who jumped into the pad and
-     * where r6 was - the per-bounce delta names the sliding gadget. */
-    vita_wd_puts(fd, "bounce hist (r6, lr) oldest->newest:\n");
+     * where r6 was - the per-bounce delta names the sliding gadget.
+     * v02.49: 3rd word per crossing = [r6-8], the fp slot under the
+     * sentinel. call_on_primordial_stack pushes (lr,fp) at
+     * [r6-4],[r6-8] and pops them back: if this word differs across
+     * the recorded bounces the death-tail C++ prologue executed
+     * inside the ring; frozen at the pristine template value means
+     * the ring closes before any push (pure asm topology). */
+    vita_wd_puts(fd, "bounce hist (r6, lr, [r6-8]) oldest->newest:\n");
     {
         unsigned int idx = H[0];
         for (int k = 4; k > 0; k--) {
             unsigned int i = (idx - (unsigned int)k) & 3u;
-            unsigned int r6v = H[1 + 2 * i];
-            unsigned int lrv = H[2 + 2 * i];
-            unsigned int prev6 = H[1 + 2 * ((i - 1u) & 3u)];
+            unsigned int r6v = H[1 + 3 * i];
+            unsigned int lrv = H[2 + 3 * i];
+            unsigned int f8v = H[3 + 3 * i];
+            unsigned int prev6 = H[1 + 3 * ((i - 1u) & 3u)];
             n = snprintf(buf, sizeof(buf),
-                         "  r6=%08x lr=%08x (d_r6=%+d)\n",
-                         r6v, lrv, (int)r6v - (int)prev6);
+                         "  r6=%08x lr=%08x [r6-8]=%08x (d_r6=%+d)\n",
+                         r6v, lrv, f8v, (int)r6v - (int)prev6);
             sceIoWrite(fd, buf, n);
         }
     }
@@ -1579,11 +1617,23 @@ void vita_ring_trap(void)
      * printed, from the same instant (no 400ms-later sampling).
      * v02.46: + symbolic Java stacks of ALL threads - the frame list
      * names what each thread was executing, the thing no coredump
-     * (native stacks only) and no previous probe could see. */
+     * (native stacks only) and no previous probe could see.
+     * v02.49: + the ring-counter line FIRST - the log72 topology
+     * question (does the bounce loop run the death-tail C++?) must be
+     * answerable even if a later dump truncates. */
     vita_wd_puts(fd, "-- scheduler forensics --\n");
     {
         static char dump[4096];
         int len;
+        n = snprintf(buf, sizeof(buf),
+                     "  v249 finish=%u force=%u setcur=%u term=%u"
+                     " taskclean=%u land=%u pe0=%u pe1=%u switch=%u\n",
+                     vita_v231_finish, vita_v231_force_term,
+                     vita_v231_setcur, vita_v231_term,
+                     vita_v249_taskclean,
+                     vita_v240_land, vita_v242_pe[0], vita_v242_pe[1],
+                     vita_sched_switch_count());
+        sceIoWrite(fd, buf, n);
         len = vita_sched_dump_qring(dump, (int)sizeof(dump));
         if (len > 0) sceIoWrite(fd, dump, len);
         len = vita_sched_dump_dispatch(dump, (int)sizeof(dump));
