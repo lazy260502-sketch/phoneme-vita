@@ -1375,7 +1375,29 @@ set(VITA_VERSION  "02.45")
 # Read order for log70: ring_trap.log FIRST if present (lr of the
 #   hist entries = ring-closing edge, then the r6 delta naming the
 #   sliding gadget); else watchdog log rd7 flood line.
-set(VITA_VERSION  "02.47")
+set(VITA_VERSION  "02.48")
+# 02.48 (2026-10-09): trap de-I/O - the spinner parks, the watchdog
+#   dumps. log71 proved v02.47 works (MIDlet runs, minutes of play)
+#   AND that the v02.45 trap design dies at its first step: the flood
+#   gate DID fire (256 pe==NULL bounces caught, the ring is real) but
+#   vita_ring_trap's first sceIoOpen froze in-kernel forever - the
+#   caller is a lightweight thread, not an OS thread, and the kernel
+#   does not service its I/O (psp2core: main thread parked in
+#   SceLibKernel, r12=0xb2a sceIo* slot, r0 -> the ring_trap.log path
+#   string, ring_trap.log never written). v02.48 changes the handoff:
+#   the pad's trip path is MEMORY-ONLY (scene into vita_v245_flood
+#   [2..13,15], tripped=1 LAST, then wfe park; flood[15] = parked-site
+#   cookie &vita_ring_parked for coredump symbolization), and the
+#   launcher watchdog - a real SceKernel thread - polls flood[1] each
+#   250ms round and calls the UNCHANGED vita_ring_trap on the
+#   spinner's behalf (file write + exit happen on the watchdog's own
+#   OS-thread context, where I/O is proven safe - every watchdog log
+#   since v01.72 went through the same sceIo* calls). Private
+#   vita_ring_trap_stack_mem (8KB) retired - no stack switch happens.
+#   Expected log signature: ring_trap.log == RING TRAP v02.45 header
+#   (dumper body unchanged), watchdog.log ends mid-poll (the poll
+#   that saw tripped never logs anything - it jumps straight to the
+#   dumper).
 # 02.47 (2026-10-08): fix the v02.45 white-screen crash. log70's psp2core
 #   coredump pinned the main thread at vita_landing_pad+0x148
 #   (str r1,[r2]) with r2=0x00009790: the v02.45 comment edit around the

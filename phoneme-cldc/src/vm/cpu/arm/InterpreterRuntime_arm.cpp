@@ -192,10 +192,13 @@ volatile unsigned int vita_v244_r6 = 0;
  *
  * vita_v245_flood: gate state + trip scene. Layout (word index):
  *   [0] consecutive pe==NULL crossings (reset on pe!=NULL or ct==NULL)
- *   [1] tripped flag (1 after the trap fired; gate disarms itself)
+ *   [1] tripped flag (1 after the trap fired; gate disarms itself).
+ *       v02.48: handoff flag - the spinner stores the scene first,
+ *       1 LAST; the launcher watchdog polls it and does the dump
  *   [2] ct  [3] r3  [4] r4  [5] r5  [6] r6  [7] r7
  *   [8] r8  [9] r9 [10] r10 [11] fp(r11) [12] sp [13] lr
- *  [14..19] reserved (0)
+ *  [14] reserved (0) [15] parked-site cookie (&vita_ring_parked)
+ *  [16..19] reserved (0)
  * 256 consecutive empty bounces cannot happen in legitimate
  * operation: normal births cross with pe!=NULL (pe1 stays ~thread
  * count, see log69), so reaching the threshold IS the livelock,
@@ -204,10 +207,13 @@ volatile unsigned int vita_v244_r6 = 0;
  * dump does, from inside the spinning thread). */
 volatile unsigned int vita_v245_hist[9] = {0};
 volatile unsigned int vita_v245_flood[20] = {0};
-/* v02.45: private stack for the trap path. MUST stay 8192 bytes and
- * 8-byte aligned: the pad's trip sequence hardcodes add #8192 after
- * this symbol (see asm below). */
-unsigned char vita_ring_trap_stack_mem[8192] __attribute__((aligned(8)));
+/* v02.48: the trap path no longer switches stacks (log71: the C
+ * dumper's sceIoOpen froze in-kernel when called FROM a lightweight
+ * thread - not a real OS thread). The spinner parks on wfe; the
+ * watchdog thread performs the dump. This symbol's ADDRESS is the
+ * parked-site cookie stored into flood[15] - resolve it against a
+ * coredump to name the spin loop. */
+volatile unsigned int vita_ring_parked = 0;
 }
 extern "C" void vita_landing_pad(void) __attribute__((naked));
 extern "C" void vita_ring_trap(void);
@@ -272,12 +278,23 @@ extern "C" void vita_landing_pad(void) {
     "str   r1, [r2, #0]\n"
     "cmp   r1, #256\n"
     "blo   8f\n"
-    /* Trip: save the scene, switch to the private stack, call the
-     * C dumper. Only r0-r3/ip are clobbered from here on; r4-r11
-     * are only READ. The dumper never returns (process exit). */
+    /* Trip: save the scene, then park. v02.48: the v02.45 design
+     * switched sp to a private stack and called the C dumper
+     * (vita_ring_trap) which starts with sceIoOpen - and log71
+     * proved the kernel freezes that I/O forever when the caller
+     * is a lightweight thread (not a real OS thread; psp2core:
+     * pc in SceLibKernel, r12=0xb2a sceIo* slot, r0 -> ring_trap.log
+     * path, ring_trap.log never appeared). So the trip path now
+     * does MEMORY ONLY: registers into the flood array (word layout
+     * unchanged, [2..13]), tripped=1 LAST as the handoff flag, then
+     * spin right here on a word the watchdog owns. The watchdog
+     * (real OS thread, 250ms poll) sees tripped, dumps the scene to
+     * ring_trap.log via the existing vita_ring_trap, and exits the
+     * process. The spin keeps the cpu exactly where the ring was
+     * caught; a dead core would take the watchdog with it (log40
+     * proved both stay alive when the VM thread spins). */
     "mov   ip, r2\n"                     /* ip = &flood */
     "mov   r1, #1\n"
-    "str   r1, [ip, #4]\n"              /* [1] tripped */
     "str   r0, [ip, #8]\n"              /* [2] ct */
     "str   r3, [ip, #12]\n"             /* [3] r3 */
     "str   r4, [ip, #16]\n"             /* [4] r4 */
@@ -291,13 +308,22 @@ extern "C" void vita_landing_pad(void) {
     "mov   r1, sp\n"
     "str   r1, [ip, #48]\n"             /* [12] sp */
     "str   lr, [ip, #52]\n"             /* [13] lr */
-    "movw  r0, #:lower16:vita_ring_trap_stack_mem\n"
-    "movt  r0, #:upper16:vita_ring_trap_stack_mem\n"
-    "add   r0, r0, #8192\n"             /* top of the private stack */
-    "mov   sp, r0\n"
-    "movw  r0, #:lower16:vita_ring_trap\n"
-    "movt  r0, #:upper16:vita_ring_trap\n"
-    "bx    r0\n"
+    "movw  r0, #:lower16:vita_ring_parked\n"
+    "movt  r0, #:upper16:vita_ring_parked\n"
+    "9:\n"
+    "str   r0, [ip, #60]\n"             /* [15] parked-site cookie:
+     * the ADDRESS of vita_ring_parked - nm-resolvable in any later
+     * coredump to name this spin loop */
+    "mov   r1, #1\n"
+    "str   r1, [ip, #4]\n"              /* [1] tripped=1 - HANDOFF
+     * LAST: the whole scene ([2..13],[15]) is complete before the
+     * watchdog may read it */
+    "wfe\n"                             /* park. WFE is a hint: if it
+     * degrades to a nop this is a plain spin - still correct, only
+     * hotter; the watchdog runs on the other core either way */
+    "wfe\n"                             /* second one: first may return
+     * immediately off a stale event register bit */
+    "b     9b\n"
     "7:\n"
     "mov   r1, #0\n"
     "str   r1, [r2, #0]\n"              /* reset consec count */

@@ -1466,9 +1466,16 @@ void vita_wd_snapshot(const char *path) {
  * scene, from INSIDE the spinning thread - which can read the Java
  * stack pages no coredump ever maps.
  *
- * It must not return (the caller switched sp and saved r4-r11 into
- * the flood array, not the stack). Keep it leaf-ish: no heap, no
- * locks, snprintf into a stack buffer only. */
+ * v02.48: the CALLER changed (log71: sceIoOpen from the lightweight
+ * thread froze in-kernel - psp2core showed the main thread parked in
+ * SceLibKernel on the very first sceIoOpen of this function, and
+ * ring_trap.log never appeared). The pad now stores the scene and
+ * parks (wfe, memory-only); the launcher WATCHDOG thread - a real
+ * OS thread on the other core - polls flood[1] and calls this on the
+ * spinner's behalf. Body unchanged: read flood/hist, write the file,
+ * exit. Still must not return (the watchdog treats it as noreturn);
+ * keep it leaf-ish: no heap, no locks, snprintf into a stack buffer
+ * only. */
 void vita_ring_trap(void)
 {
     char buf[320];

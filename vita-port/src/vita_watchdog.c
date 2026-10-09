@@ -277,6 +277,21 @@ extern volatile unsigned int vita_gc_count;
  * without this counter the watchdog would kill the process mid-boot. */
 extern volatile unsigned int vita_preload_count;
 
+/* v02.48: ring-trap handoff (see InterpreterRuntime_arm.cpp flood gate).
+ * The pad's trip path is MEMORY-ONLY now: it stores the register scene
+ * into vita_v245_flood[2..13,15] and parks (wfe) with tripped=1 set
+ * LAST. log71 proved the v02.45 design (trap does sceIoOpen itself
+ * from the lightweight thread) freezes in-kernel forever - a
+ * lightweight thread is not an OS thread, the kernel does not service
+ * its I/O. THIS thread (a real SceKernel thread on the other core)
+ * polls the flag and performs the dump + exit on the spinner's behalf.
+ * Layout: [0]=consec [1]=tripped [2]=ct [3..11]=r3..fp [12]=sp
+ * [13]=lr [15]=parked-site cookie. */
+extern volatile unsigned int vita_v245_flood[20];
+/* The existing dumper in OS_vita.cpp (v02.45): writes ring_trap.log
+ * from flood/hist and exits the process. Now called ONLY from here. */
+extern void vita_ring_trap(void);
+
 static int wd_thread_routine(SceSize args, void *argp) {
     (void)args; (void)argp;
     unsigned int last_ce = 0;
@@ -291,6 +306,16 @@ static int wd_thread_routine(SceSize args, void *argp) {
 
     for (;;) {
         sceKernelDelayThread(WD_POLL_MS * 1000);
+
+        /* v02.48: ring-trap handoff - check FIRST, before any hang
+         * heuristics: tripped=1 means the flood gate caught the ring
+         * and the spinner already stored the scene + parked. Delay is
+         * bounded by this poll (<=250ms); the existing dumper writes
+         * ring_trap.log and exits (never returns). */
+        if (vita_v245_flood[1]) {
+            vita_ring_trap();
+            /* unreachable: vita_ring_trap exits the process */
+        }
 
         if (!vita_wd_round_active) {
             /* menu runs its own loop - only watch MIDlet rounds */
