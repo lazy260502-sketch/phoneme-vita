@@ -8344,5 +8344,45 @@ v02.39 逐指令相同（冻结成员原样）✓。
    T vita_sched_dump_jstack（U 集恰为 4 个库符号）、最终 ELF T 符号 +
    反汇编真函数体（push {r4-r11,lr}，10 处 bl）。
 6. **log70 判读新增**：jstack 段直接回答"每个线程冻结瞬间在执行哪个方法"
-   ——弹跳者(id4)若 fp=0/坏 fp → 从未真正进过 Java；若有帧 → 帧名即案发
+   ——弹跳者(id4)若 fp=0/坏 fp → 从未真正进过 Java；若有帧名即案发
    第一现场。与 hist lr（闭合边）互为印证。
+
+## 2026-10-09：v02.49 环取证升级包（ff6334c，二进制=ff6334c，注释跟随 d2194c6）
+
+1. **起因（log72 判决续）**：handoff 全链验证成功，环=entry-less 派发的
+   pad↔birth-stub 乒乓确认。但反汇编 v02.48 发现**拓扑矛盾**：pe==NULL
+   线程 trampoline 死亡尾全为 C++（finish@810c3860→force_term@810c3870
+   →task_cleanup@810c3878→lw_exit@8109cefc→GUARANTEE halt），若环每圈
+   跑完此尾则 qring seq 必为千万级，而 log72 冻结在 536 → 环闭合于死亡尾
+   中途，且 ring_trap.log 无任何 C++ 计数器=观测缺口。
+2. **两个 attribution gap**：(a) id4 的 ADD pe=0 反常——出生 ADD（Thread::
+   start()→add_to_active）必见 pe=1，pe=0 暗示 ADD 来自 notify_wakeup/超时
+   唤醒路径或 entry 首派前消失；(b) id3 有 16 条 SEL 零条 NRT——SEL 后必经
+   switch_thread→set_current 产生 op-4 NRT，无 NRT 说明 SEL 来自纯查询者
+   （yield/sleep_forever/terminate 都用 get_next_runnable_thread() 轮询）。
+3. **四处取证升级（无行为改变）**：
+   - qring 第 5 列 caller（`__builtin_return_address(0)`）→ 定 id4-ADD/
+     id3-SEL 归属；`_vita_q_ring[VITA_Q_RING][5]`，格式 `from=%08x`
+   - v249 计数器行（watchdog + ring_trap 双侧）：`finish/force/setcur/
+     term/taskclean/land/pe0/pe1/switch`——taskclean 是死亡尾四体中唯一
+     原无覆盖者（vita_v249_taskclean 在 thread_task_cleanup 入口自增）
+   - hist 三元组第三词 `[r6-8]`（9→13 词）：跨 4 条记录变化=死亡尾
+     prologue（str lr,[r6,#-4]! / str fp,[r6,#-8]!）在环内执行；静止=
+     纯 asm 拓扑。**[r6-8] 探针原理即 call_on_primordial_stack prologue**
+   - 头部保持 "RING TRAP v02.45"（格式连续性，diff 跨版本可比）
+4. **实施教训**：hist 三元组缩放首版写成两次 `add r2,r2,r2`（=4×idx），
+   自查抓出重写为 `mov r3,r2 / add r2,r2,r2 / add r3,r2,r3 / add r3,r3,r3
+   ×2`（=12×idx 字节）；另修复 OS_vita 误删 v242 行 sceIoWrite、注释块杂
+   散 `*/` 两处。
+5. **验证链**：33 ARM objects + 29 members（loopgen 宿主链接错误为预期
+   噪声）；反汇编 pad（8109b5f8）逐条核验缩放链/三元组落位/trip-park 尾
+   段（bx 810c39d4 新址 trampoline）；三新格式串 strings 落地；版本串
+   "J2ME Player v02.49 b449 (81d59c9)"；VPK md5 237cbbc3bc2373cd4fb7c85
+   8b7ff3a5（out/vpk/midp_vita_v02.49.vpk）。符号：vita_v245_hist@814b7870、
+   vita_v249_taskclean@814b77b0。
+6. **下次日志三问**：(1) v249 行定拓扑 A/B（全冻结=纯 asm 环 / 百万级=C++
+   环，后者与 seq=536 矛盾需重审）；(2) qring caller 定 id4-ADD(id3-SEL
+   归属——from= 指向 notify_wakeup 还是 Thread::start）；(3) hist [r6-8]
+   定 prologue 是否在环内。刹车（pad 穿越时走 [r6]=lw_exit 干净退场）推迟
+   v02.50：候选闭合点不止一个、依赖 r5=gp 前提、盲刹可能切断合法出生路径。
+   详细读法见 debug/notes/v02.49_notes.md。
