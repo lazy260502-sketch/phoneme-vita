@@ -1375,7 +1375,32 @@ set(VITA_VERSION  "02.45")
 # Read order for log70: ring_trap.log FIRST if present (lr of the
 #   hist entries = ring-closing edge, then the r6 delta naming the
 #   sliding gadget); else watchdog log rd7 flood line.
-set(VITA_VERSION  "02.49")
+set(VITA_VERSION  "02.50")
+# 02.50 (2026-10-09): first BEHAVIOR version after log73's verdict.
+#   The onion is peeled: topology (A) extreme - the ring is the bare
+#   pad<->stub bounce, birth-template-exact every lap (fp=0, lr=pad,
+#   r6=exit table base), all C++ frozen, and the ONLY branch
+#   predicate on the straight-line bounce that has no counter is
+#   _current_pending_exception (cpe) gating blne c_o_p_s(uncaught)
+#   before the trampoline's +0x1c - yet finish=0 for the whole
+#   session says the ring leaves before the head, so cpe is the last
+#   uncounted suspect. Two changes, one probe + one brake:
+#   (1) PROBE: hist slots grow 3 -> 4 words; the 4th word is the cpe
+#       snapshot per crossing. If the ring rides the cpe!=0 branch,
+#       cpe!=0 in every slot; if cpe=0 everywhere the paradox needs a
+#       different reading (next onion layer).
+#   (2) BRAKE: on flood-gate trip, instead of parking forever the pad
+#       takes brakes<8 and routes the ghost through the DESIGNED
+#       death door: [r6]=lightweight_thread_exit -> terminate (op-2
+#       REM, breaks q5 CYCLE(2)) -> yield -> live thread. tripped=2
+#       tells the watchdog: dump (identical body + brakes count),
+#       DON'T exit, watch the CE pump - CE moves = self-healed (log +
+#       resume normal rounds); flat 30s = exit (a brake that does not
+#       heal is just a slower kill). brakes>=8 falls back to the
+#       v02.48 park - worst case degrades to the proven behavior.
+#   Watch in the next ring_trap.log: "RING TRAP v02.50 BRAKE" header
+#   = brake fired; brakes=N lap count; cpe words in hist; "BRAKE
+#   HEALED" in wd log = self-heal confirmed.
 # 02.49 (2026-10-09): forensic follow-up to log72's full confession -
 #   the ring anatomy is settled (entry-less dispatch, pad<->stub
 #   bounce, NOT a stack slide) but the topology question remains: the

@@ -200,23 +200,54 @@ volatile unsigned int vita_v244_r6 = 0;
  * before any push - pure asm topology. Format grew from 9 to 13
  * words; the dumper (OS_vita.cpp) reads the same layout.
  *
+ * v02.50: 4th word = _current_pending_exception snapshot (cpe). The
+ * log73 paradox: the trampoline head is a straight line into the
+ * unconditional "bl call_on_primordial_stack(finish)" yet finish=0
+ * for the WHOLE session - so the ring must leave the trampoline
+ * before +0x1c, and the only branch in there whose predicate has no
+ * counter is the "blne c_o_p_s(uncaught_exception)" guarded by
+ * _current_pending_exception (globals gp+0x410). This word tells the
+ * dump whether that predicate was live during the ring. Layout grew
+ * 13 -> 17 words (4 per crossing, byte offset 16*i, write index at
+ * [0]); the dumper in OS_vita.cpp reads the same layout.
+ *
  * vita_v245_flood: gate state + trip scene. Layout (word index):
  *   [0] consecutive pe==NULL crossings (reset on pe!=NULL or ct==NULL)
- *   [1] tripped flag (1 after the trap fired; gate disarms itself).
+ *   [1] tripped flag (1 = parked for dump, 2 = BRAKE mode: scene
+ *       stored, thread left the ring through [r6]=lw_exit to
+ *       self-heal; the watchdog dumps but does NOT kill the process).
  *       v02.48: handoff flag - the spinner stores the scene first,
- *       1 LAST; the launcher watchdog polls it and does the dump
+ *       writes the flag LAST; the launcher watchdog polls it
  *   [2] ct  [3] r3  [4] r4  [5] r5  [6] r6  [7] r7
  *   [8] r8  [9] r9 [10] r10 [11] fp(r11) [12] sp [13] lr
- *  [14] reserved (0) [15] parked-site cookie (&vita_ring_parked)
- *  [16..19] reserved (0)
+ *  [14] cpe snapshot (_current_pending_exception at trip)
+ *  [15] parked-site cookie (&vita_ring_parked)
+ *  [16..19] reserved (0) [20] brake lap count (v02.50)
  * 256 consecutive empty bounces cannot happen in legitimate
  * operation: normal births cross with pe!=NULL (pe1 stays ~thread
  * count, see log69), so reaching the threshold IS the livelock,
  * caught in milliseconds with the full scene instead of a coredump
  * lottery (and the coredump never maps the Java stack pages - this
- * dump does, from inside the spinning thread). */
-volatile unsigned int vita_v245_hist[13] = {0};
-volatile unsigned int vita_v245_flood[20] = {0};
+ * dump does, from inside the spinning thread).
+ *
+ * v02.50 BRAKE: on trip the scene is stored as before, but instead
+ * of parking on wfe (which freezes the game forever) the thread now
+ * EXITS THE RING through the designed death door: ldr r0,[r6] (the
+ * birth template's lightweight_thread_exit slot) + bx r0. lw_exit
+ * runs terminate (op-2 REM - breaks the q5 CYCLE), then yield()
+ * switches to a live thread; the ghost never returns. The watchdog,
+ * on seeing tripped==2, dumps the scene to ring_trap.log with a
+ * BRAKE line and then MONITORS instead of exiting: if the VM recovers
+ * (heartbeat CE climbs) the process lives on - the livelock healed
+ * itself; if CE stays flat for the usual window the watchdog exits
+ * as before. tripped==1 (legacy park) is kept as the fallback if the
+ * brake lap budget (flood[20]) is exhausted, so a brake bug can at
+ * worst degrade to the v02.48 behavior, never worse. */
+volatile unsigned int vita_v245_hist[17] = {0};
+volatile unsigned int vita_v245_flood[24] = {0};
+/* v02.50: total brake engagements (pad -> [r6] door). Written before
+ * the bx; the watchdog prints it in the v250 line. */
+volatile unsigned int vita_v250_brakes = 0;
 /* v02.48: the trap path no longer switches stacks (log71: the C
  * dumper's sceIoOpen froze in-kernel when called FROM a lightweight
  * thread - not a real OS thread). The spinner parks on wfe; the
@@ -252,21 +283,21 @@ extern "C" void vita_landing_pad(void) {
     "add   r1, r1, #1\n"
     "str   r1, [r0]\n"
     /* v02.45: bounce history - r0/r1 are dead after the pe store,
-     * r2 is reloaded by the gate below. v02.49: layout is now 3 words
-     * per crossing (r6, lr, [r6-8] - the fp slot under the sentinel,
-     * see the vita_v245_hist comment above); the byte offset is
-     * 12*idx: idx -> 2*idx -> 3*idx (2*idx + idx) -> 12*idx (two
-     * doublings). r3 is the scratch (dead at the stub edge - the stub
-     * writes r2/r3 itself before use; it is reloaded from [r6,#-8]
-     * below before its sample store). ~18 instructions per crossing,
+     * r2 is reloaded by the gate below. v02.50: layout is now 4 words
+     * per crossing (r6, lr, [r6-8], cpe - see the vita_v245_hist
+     * comment above); the byte offset is 16*idx: idx -> 2*idx ->
+     * 4*idx -> 8*idx -> 16*idx (four doublings, all single-cycle).
+     * r3 is the scratch (dead at the stub edge - the stub writes
+     * r2/r3 itself before use; it is reloaded from [r6,#-8] below
+     * before its sample store). ~22 instructions per crossing,
      * irrelevant next to a ~10M/s spin. */
     "movw  r1, #:lower16:vita_v245_hist\n"
     "movt  r1, #:upper16:vita_v245_hist\n"
     "ldr   r2, [r1]\n"
     "and   r2, r2, #3\n"
     "mov   r3, r2\n"
-    "add   r2, r2, r2\n"
-    "add   r3, r2, r3\n"
+    "add   r3, r3, r3\n"
+    "add   r3, r3, r3\n"
     "add   r3, r3, r3\n"
     "add   r3, r3, r3\n"
     "add   r2, r3, r1\n"
@@ -274,6 +305,10 @@ extern "C" void vita_landing_pad(void) {
     "str   lr, [r2, #8]\n"
     "ldr   r3, [r6, #-8]\n"
     "str   r3, [r2, #12]\n"
+    "movw  r3, #:lower16:_current_pending_exception\n"
+    "movt  r3, #:upper16:_current_pending_exception\n"
+    "ldr   r3, [r3]\n"
+    "str   r3, [r2, #16]\n"
     "ldr   r2, [r1]\n"
     "add   r2, r2, #1\n"
     "str   r2, [r1]\n"
@@ -331,16 +366,37 @@ extern "C" void vita_landing_pad(void) {
     "mov   r1, sp\n"
     "str   r1, [ip, #48]\n"             /* [12] sp */
     "str   lr, [ip, #52]\n"             /* [13] lr */
+    "movw  r0, #:lower16:_current_pending_exception\n"
+    "movt  r0, #:upper16:_current_pending_exception\n"
+    "ldr   r0, [r0]\n"
+    "str   r0, [ip, #56]\n"             /* [14] cpe at trip */
     "movw  r0, #:lower16:vita_ring_parked\n"
     "movt  r0, #:upper16:vita_ring_parked\n"
-    "9:\n"
     "str   r0, [ip, #60]\n"             /* [15] parked-site cookie:
      * the ADDRESS of vita_ring_parked - nm-resolvable in any later
      * coredump to name this spin loop */
+    "movw  r0, #:lower16:vita_v250_brakes\n"
+    "movt  r0, #:upper16:vita_v250_brakes\n"
+    "ldr   r1, [r0]\n"
+    "add   r1, r1, #1\n"
+    "str   r1, [r0]\n"
+    "str   r1, [ip, #80]\n"             /* [20] brake lap count */
+    "cmp   r1, #8\n"
+    "bhs   9f\n"                         /* brake budget exhausted:
+     * fall back to the v02.48 park (tripped=1) below */
+    "mov   r1, #2\n"
+    "str   r1, [ip, #4]\n"              /* [1] tripped=2 BRAKE - HANDOFF
+     * LAST: scene complete; watchdog dumps + monitors, no kill */
+    "ldr   r0, [r6]\n"                 /* the designed death door:
+     * birth template [0] = lightweight_thread_exit */
+    "bx    r0\n"                        /* leave the ring; lw_exit does
+     * terminate (op-2 REM, breaks q5 CYCLE) + yield -> live thread.
+     * NOT returning: lw_exit ends in current_thread_to_primordial */
+    "9:\n"
     "mov   r1, #1\n"
     "str   r1, [ip, #4]\n"              /* [1] tripped=1 - HANDOFF
-     * LAST: the whole scene ([2..13],[15]) is complete before the
-     * watchdog may read it */
+     * LAST: the scene + cookie were stored BEFORE the brake-budget
+     * branch, so nothing else is needed here before the handoff */
     "wfe\n"                             /* park. WFE is a hint: if it
      * degrades to a nop this is a plain spin - still correct, only
      * hotter; the watchdog runs on the other core either way */

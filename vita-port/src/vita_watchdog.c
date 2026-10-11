@@ -287,10 +287,22 @@ extern volatile unsigned int vita_preload_count;
  * polls the flag and performs the dump + exit on the spinner's behalf.
  * Layout: [0]=consec [1]=tripped [2]=ct [3..11]=r3..fp [12]=sp
  * [13]=lr [15]=parked-site cookie. */
-extern volatile unsigned int vita_v245_flood[20];
+extern volatile unsigned int vita_v245_flood[24];
 /* The existing dumper in OS_vita.cpp (v02.45): writes ring_trap.log
- * from flood/hist and exits the process. Now called ONLY from here. */
-extern void vita_ring_trap(void);
+ * from flood/hist and exits the process. Now called ONLY from here.
+ * v02.50: takes brake_mode. brake_mode=0 (tripped==1, the legacy
+ * PARK handoff): dump + exit as before. brake_mode=1 (tripped==2,
+ * the new BRAKE handoff): dump + RETURN - the ghost left the ring
+ * through the designed death door ([r6]=lightweight_thread_exit)
+ * and the VM may self-heal; this thread then watches the CE pump:
+ * recovery -> log +normal round; flat for BRAKE_WAIT_POLLS -> exit
+ * (a brake that does not heal is just a slower kill). */
+extern void vita_ring_trap(int brake_mode);
+
+/* v02.50: polls to wait after a BRAKE dump before giving up
+ * (250ms each -> 120 polls = 30s). If CE moves at any point the
+ * livelock healed itself and normal watchdog rounds resume. */
+#define BRAKE_WAIT_POLLS 120
 
 static int wd_thread_routine(SceSize args, void *argp) {
     (void)args; (void)argp;
@@ -303,18 +315,57 @@ static int wd_thread_routine(SceSize args, void *argp) {
     int storm_noted = 0;
     int preload_extensions = 0;   /* v01.92: bounded grace for the sweep */
     int kick_recoveries = 0;      /* v02.06: KICK-RECOVERED count */
+    char buf[192];                /* v02.50: BRAKE monitor messages */
 
     for (;;) {
         sceKernelDelayThread(WD_POLL_MS * 1000);
 
         /* v02.48: ring-trap handoff - check FIRST, before any hang
-         * heuristics: tripped=1 means the flood gate caught the ring
-         * and the spinner already stored the scene + parked. Delay is
-         * bounded by this poll (<=250ms); the existing dumper writes
-         * ring_trap.log and exits (never returns). */
+         * heuristics: tripped!=0 means the flood gate caught the ring.
+         * v02.50: tripped==1 = the legacy PARK handoff (spinner parked
+         * on wfe; dump + exit). tripped==2 = the BRAKE handoff - the
+         * spinner left through the designed death door and the VM may
+         * self-heal; dump + monitor instead of killing. */
         if (vita_v245_flood[1]) {
-            vita_ring_trap();
-            /* unreachable: vita_ring_trap exits the process */
+            int brake = (vita_v245_flood[1] == 2);
+            vita_ring_trap(brake);
+            if (brake) {
+                /* v02.50 BRAKE: the ghost went through the death door.
+                 * Give the VM a bounded window to self-heal: if the CE
+                 * pump restarts, log it and resume normal rounds; if
+                 * not, exit as the PARK path would have. */
+                unsigned int ce0 = vita_ce_count;
+                int k;
+                {
+                    const char *m = "[WD] BRAKE fired - monitoring recovery\n";
+                    wd_log(m, (int)strlen(m));
+                }
+                for (k = 0; k < BRAKE_WAIT_POLLS; k++) {
+                    sceKernelDelayThread(WD_POLL_MS * 1000);
+                    if (vita_ce_count != ce0) {
+                        int n2 = snprintf(buf, sizeof(buf),
+                            "[WD] BRAKE HEALED: CE %u -> %u\n",
+                            ce0, vita_ce_count);
+                        wd_log(buf, n2);
+                        /* disarm the gate: next ghost re-trips it */
+                        vita_v245_flood[1] = 0;
+                        vita_v245_flood[0] = 0;
+                        break;
+                    }
+                }
+                if (k == BRAKE_WAIT_POLLS) {
+                    sceKernelExitProcess(0x45);
+                }
+                /* healed (or brake counter exhausted in the pad - the
+                 * pad parks then, tripped becomes 1, next poll exits
+                 * via the legacy path). Reset stall baselines so the
+                 * heal is not misread as a fresh hang. */
+                last_ce = vita_ce_count;
+                stalled_polls = 0;
+                reported = 0;
+                continue;
+            }
+            /* unreachable: vita_ring_trap(0) exits the process */
         }
 
         if (!vita_wd_round_active) {

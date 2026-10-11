@@ -559,8 +559,9 @@ extern volatile unsigned int vita_v244_r6;
  * flood = gate state + full register scene saved at trip (layout in
  * the pad source comment). When flood[1] != 0 the trap dumper below
  * already wrote ux0:/data/J2ME00001/ring_trap.log and exited. */
-extern volatile unsigned int vita_v245_hist[13];
-extern volatile unsigned int vita_v245_flood[20];
+extern volatile unsigned int vita_v245_hist[17];   /* v02.50: 4 words/slot */
+extern volatile unsigned int vita_v245_flood[24];  /* v02.50: +[14] cpe, [20] brakes */
+extern volatile unsigned int vita_v250_brakes;     /* v02.50: brake lap counter */
 extern void vita_landing_pad(void);
 }
 /* v02.49: ring-counter block for ring_trap.log - see the v249 line in
@@ -1330,6 +1331,12 @@ static void vita_wd_snapshot_one(SceUID fd) {
                  vita_v240_land, vita_v242_pe[0], vita_v242_pe[1],
                  vita_sched_switch_count());
     sceIoWrite(fd, buf, n);
+    /* v02.50: brake bookkeeping + at-trip cpe (hist 4th word holds
+     * the per-crossing view; flood[14] is the value at trip). */
+    n = snprintf(buf, sizeof(buf),
+                 "  v250 brakes=%u cpe_at_trip=%08x\n",
+                 vita_v250_brakes, vita_v245_flood[14]);
+    sceIoWrite(fd, buf, n);
     {
         unsigned int c = vita_v231_exit_seq;
         unsigned int start = (c >= VITA_V231_EXIT_RING)
@@ -1507,7 +1514,14 @@ void vita_wd_snapshot(const char *path) {
  * exit. Still must not return (the watchdog treats it as noreturn);
  * keep it leaf-ish: no heap, no locks, snprintf into a stack buffer
  * only. */
-void vita_ring_trap(void)
+/* v02.50: brake_mode parameter. brake_mode=0: legacy behavior
+ * (dump + exit, the PARK handoff). brake_mode=1: the BRAKE handoff
+ * - identical dump plus a header line with the brake counter, then
+ * RETURN without exiting: the ghost left the ring through the
+ * designed death door and the VM may self-heal; the watchdog that
+ * called this keeps polling CE and only exits if recovery never
+ * comes. */
+void vita_ring_trap(int brake_mode)
 {
     char buf[320];
     int n;
@@ -1515,12 +1529,19 @@ void vita_ring_trap(void)
                           SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,
                           0777);
     if (fd < 0) {
+        if (brake_mode) {
+            return;               /* keep the process alive to heal */
+        }
         sceKernelExitProcess(0x45);
     }
     const unsigned int *F = vita_v245_flood;
     const unsigned int *H = vita_v245_hist;
 
-    vita_wd_puts(fd, "== RING TRAP v02.45 ==\n");
+    n = snprintf(buf, sizeof(buf),
+                 "== RING TRAP v02.50 %s brakes=%u ==\n",
+                 brake_mode ? "BRAKE" : "PARK",
+                 vita_v250_brakes);
+    sceIoWrite(fd, buf, n);
     n = snprintf(buf, sizeof(buf),
                  "consec=%u tripped=%u ct=%08x\n",
                  F[0], F[1], F[2]);
@@ -1541,18 +1562,20 @@ void vita_ring_trap(void)
      * the recorded bounces the death-tail C++ prologue executed
      * inside the ring; frozen at the pristine template value means
      * the ring closes before any push (pure asm topology). */
-    vita_wd_puts(fd, "bounce hist (r6, lr, [r6-8]) oldest->newest:\n");
+    vita_wd_puts(fd, "bounce hist (r6, lr, [r6-8], cpe) oldest->newest:\n");
     {
         unsigned int idx = H[0];
         for (int k = 4; k > 0; k--) {
             unsigned int i = (idx - (unsigned int)k) & 3u;
-            unsigned int r6v = H[1 + 3 * i];
-            unsigned int lrv = H[2 + 3 * i];
-            unsigned int f8v = H[3 + 3 * i];
-            unsigned int prev6 = H[1 + 3 * ((i - 1u) & 3u)];
+            unsigned int r6v = H[1 + 4 * i];
+            unsigned int lrv = H[2 + 4 * i];
+            unsigned int f8v = H[3 + 4 * i];
+            unsigned int cpev = H[4 + 4 * i];
+            unsigned int prev6 = H[1 + 4 * ((i - 1u) & 3u)];
             n = snprintf(buf, sizeof(buf),
-                         "  r6=%08x lr=%08x [r6-8]=%08x (d_r6=%+d)\n",
-                         r6v, lrv, f8v, (int)r6v - (int)prev6);
+                         "  r6=%08x lr=%08x [r6-8]=%08x cpe=%08x"
+                         " (d_r6=%+d)\n",
+                         r6v, lrv, f8v, cpev, (int)r6v - (int)prev6);
             sceIoWrite(fd, buf, n);
         }
     }
@@ -1634,6 +1657,13 @@ void vita_ring_trap(void)
                      vita_v240_land, vita_v242_pe[0], vita_v242_pe[1],
                      vita_sched_switch_count());
         sceIoWrite(fd, buf, n);
+        /* v02.50: brake bookkeeping + the cpe word both dump sites
+         * need (hist 4th word holds the per-crossing view; this is
+         * the at-trip value from flood[14]). */
+        n = snprintf(buf, sizeof(buf),
+                     "  v250 brakes=%u cpe_at_trip=%08x\n",
+                     vita_v250_brakes, F[14]);
+        sceIoWrite(fd, buf, n);
         len = vita_sched_dump_qring(dump, (int)sizeof(dump));
         if (len > 0) sceIoWrite(fd, dump, len);
         len = vita_sched_dump_dispatch(dump, (int)sizeof(dump));
@@ -1648,6 +1678,10 @@ void vita_ring_trap(void)
         if (len > 0) sceIoWrite(fd, dump, len);
     }
     sceIoClose(fd);
+    if (brake_mode) {
+        return;                     /* v02.50 BRAKE: scene preserved,
+         * process stays alive - the watchdog monitors CE recovery */
+    }
     sceKernelExitProcess(0x45);
 }
 
