@@ -222,7 +222,11 @@ volatile unsigned int vita_v244_r6 = 0;
  *   [8] r8  [9] r9 [10] r10 [11] fp(r11) [12] sp [13] lr
  *  [14] cpe snapshot (_current_pending_exception at trip)
  *  [15] parked-site cookie (&vita_ring_parked)
- *  [16..19] reserved (0) [20] brake lap count (v02.50)
+ *  [16] door word: [r6] value at the v02.51 door check
+ *  [17] door verdict: 1 = [r6]==lightweight_thread_exit (safe
+ *       to bx), 0 = bad door -> park, never jump (log74: the
+ *       v02.50 brake jumped through a heap object and crashed)
+ *  [18..19] reserved (0) [20] brake lap count (v02.50)
  * 256 consecutive empty bounces cannot happen in legitimate
  * operation: normal births cross with pe!=NULL (pe1 stays ~thread
  * count, see log69), so reaching the threshold IS the livelock,
@@ -242,7 +246,17 @@ volatile unsigned int vita_v244_r6 = 0;
  * itself; if CE stays flat for the usual window the watchdog exits
  * as before. tripped==1 (legacy park) is kept as the fallback if the
  * brake lap budget (flood[20]) is exhausted, so a brake bug can at
- * worst degrade to the v02.48 behavior, never worse. */
+ * worst degrade to the v02.48 behavior, never worse.
+ * v02.51: log74 falsified the door premise - the entry-less ghost
+ * has NO birth template, [r6] held a Java-heap object, and the
+ * unvalidated bx crashed the process (psp2core) faster than the
+ * 250ms watchdog poll, destroying the BSS forensics. Two fixes:
+ * (A) door VALIDATION before the bx - [r6] must equal the real
+ *     lightweight_thread_exit symbol (movw/movt), else park;
+ * (B) crash-proof mini-scene: 6 words {magic, [r6], [r6+4],
+ *     [r6+8], [r6+16], cpe} stored at [sp-0x40] - the C stack page
+ *     is always in the coredump, so even a crash right after the
+ *     store leaves the door words + cpe readable. */
 volatile unsigned int vita_v245_hist[17] = {0};
 volatile unsigned int vita_v245_flood[24] = {0};
 /* v02.50: total brake engagements (pad -> [r6] door). Written before
@@ -375,6 +389,54 @@ extern "C" void vita_landing_pad(void) {
     "str   r0, [ip, #60]\n"             /* [15] parked-site cookie:
      * the ADDRESS of vita_ring_parked - nm-resolvable in any later
      * coredump to name this spin loop */
+    /* v02.51 B: crash-proof mini-scene. log74: the brake jumped
+     * through a BAD door and the process crashed - and the
+     * psp2dmp never maps BSS, so flood/hist (and the cpe answer)
+     * died with it. The C stack page IS always in the dump, so
+     * before any door decision the trip writes 6 words at
+     * [sp-0x40]: magic 0x56353144, then the four door words
+     * [r6],[r6+4],[r6+8],[r6+16], then cpe-at-trip (already in
+     * [ip,#56]=flood[14], reloaded). A later coredump reads the
+     * scene straight off the frozen sp. r0 value bus, r3 the
+     * address scratch - both free here (r3's scene slot was the
+     * hist sample, long since stored). */
+    "mov   r3, sp\n"
+    "sub   r3, r3, #0x40\n"
+    "movw  r0, #0x3144\n"
+    "movt  r0, #0x5635\n"
+    "str   r0, [r3]\n"
+    "ldr   r0, [r6]\n"
+    "str   r0, [r3, #4]\n"
+    "ldr   r0, [r6, #4]\n"
+    "str   r0, [r3, #8]\n"
+    "ldr   r0, [r6, #8]\n"
+    "str   r0, [r3, #12]\n"
+    "ldr   r0, [r6, #16]\n"
+    "str   r0, [r3, #16]\n"
+    "ldr   r0, [ip, #56]\n"
+    "str   r0, [r3, #20]\n"
+    /* v02.51 A: door VALIDATION. The v02.50 brake assumed [r6]
+     * holds lightweight_thread_exit ("the designed death door");
+     * log74 proved an entry-less ghost has NO birth template -
+     * [r6] held 0x81edc2d4, a Java-heap object - and bx through
+     * it crashed the process, destroying the BSS forensics.
+     * Validate the word against the real symbol before jumping
+     * (movw/movt absolute, module-loader-relocated like every
+     * other pad literal; mangled name from nm on the shipped
+     * binary - a signature change fails the LINK, not the run).
+     * Mismatch parks (v02.48 behavior: scene in BSS + watchdog
+     * dump) instead of jumping. flood[16]=door word,
+     * flood[17]=1 good / 0 bad, for the ring_trap.log dumper. */
+    "ldr   r0, [r6]\n"
+    "str   r0, [ip, #64]\n"             /* [16] door word */
+    "movw  r1, #:lower16:_ZN9JVMThread23lightweight_thread_exitEv\n"
+    "movt  r1, #:upper16:_ZN9JVMThread23lightweight_thread_exitEv\n"
+    "mov   r2, #0\n"
+    "cmp   r0, r1\n"
+    "moveq r2, #1\n"
+    "str   r2, [ip, #68]\n"             /* [17] door verdict */
+    "bne   9f\n"                         /* BAD door: park (v02.48),
+     * never bx through garbage again */
     "movw  r0, #:lower16:vita_v250_brakes\n"
     "movt  r0, #:upper16:vita_v250_brakes\n"
     "ldr   r1, [r0]\n"
@@ -383,12 +445,14 @@ extern "C" void vita_landing_pad(void) {
     "str   r1, [ip, #80]\n"             /* [20] brake lap count */
     "cmp   r1, #8\n"
     "bhs   9f\n"                         /* brake budget exhausted:
-     * fall back to the v02.48 park (tripped=1) below */
+     * fall back to the v02.48 park (tripped=1) below. Note
+     * flood[17]==1 in this case: door was good, budget was not -
+     * the dumper can tell the two park reasons apart */
     "mov   r1, #2\n"
     "str   r1, [ip, #4]\n"              /* [1] tripped=2 BRAKE - HANDOFF
      * LAST: scene complete; watchdog dumps + monitors, no kill */
-    "ldr   r0, [r6]\n"                 /* the designed death door:
-     * birth template [0] = lightweight_thread_exit */
+    "ldr   r0, [r6]\n"                 /* the designed death door,
+     * VALIDATED above: [0] == lightweight_thread_exit */
     "bx    r0\n"                        /* leave the ring; lw_exit does
      * terminate (op-2 REM, breaks q5 CYCLE) + yield -> live thread.
      * NOT returning: lw_exit ends in current_thread_to_primordial */

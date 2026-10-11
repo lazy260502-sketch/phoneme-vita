@@ -1332,10 +1332,15 @@ static void vita_wd_snapshot_one(SceUID fd) {
                  vita_sched_switch_count());
     sceIoWrite(fd, buf, n);
     /* v02.50: brake bookkeeping + at-trip cpe (hist 4th word holds
-     * the per-crossing view; flood[14] is the value at trip). */
+     * the per-crossing view; flood[14] is the value at trip).
+     * v02.51: + door verdict - flood[16] is the [r6] word the brake
+     * was about to jump through, flood[17] tells if it matched the
+     * real lightweight_thread_exit (1) or not (0 - parked instead,
+     * the log74 crash mode). */
     n = snprintf(buf, sizeof(buf),
-                 "  v250 brakes=%u cpe_at_trip=%08x\n",
-                 vita_v250_brakes, vita_v245_flood[14]);
+                 "  v250 brakes=%u cpe_at_trip=%08x door=%08x verdict=%u\n",
+                 vita_v250_brakes, vita_v245_flood[14],
+                 vita_v245_flood[16], vita_v245_flood[17]);
     sceIoWrite(fd, buf, n);
     {
         unsigned int c = vita_v231_exit_seq;
@@ -1537,10 +1542,15 @@ void vita_ring_trap(int brake_mode)
     const unsigned int *F = vita_v245_flood;
     const unsigned int *H = vita_v245_hist;
 
+    /* v02.51: door verdict FIRST - the one fact log74 died for.
+     * flood[16] = the [r6] word at the door check, flood[17] = 1
+     * (matches lightweight_thread_exit, safe bx) / 0 (bad door,
+     * parked). */
     n = snprintf(buf, sizeof(buf),
-                 "== RING TRAP v02.50 %s brakes=%u ==\n",
+                 "== RING TRAP v02.51 %s brakes=%u door=%08x verdict=%u ==\n",
                  brake_mode ? "BRAKE" : "PARK",
-                 vita_v250_brakes);
+                 vita_v250_brakes, F[16], F[17]);
+    sceIoWrite(fd, buf, n);
     sceIoWrite(fd, buf, n);
     n = snprintf(buf, sizeof(buf),
                  "consec=%u tripped=%u ct=%08x\n",
