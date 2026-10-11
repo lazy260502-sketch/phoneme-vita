@@ -1375,7 +1375,33 @@ set(VITA_VERSION  "02.45")
 # Read order for log70: ring_trap.log FIRST if present (lr of the
 #   hist entries = ring-closing edge, then the r6 delta naming the
 #   sliding gadget); else watchdog log rd7 flood line.
-set(VITA_VERSION  "02.50")
+set(VITA_VERSION  "02.51")
+# 02.51 (2026-10-11): log74 falsified the v02.50 door premise. The
+#   BRAKE fired (crash scene = exact ring template: fp=0, r5=gp,
+#   r6=0x81edf004, [sp]=pad) but [r6] held 0x81edc2d4 - a JAVA-HEAP
+#   OBJECT, not lightweight_thread_exit - so the unvalidated bx
+#   jumped into the heap and executed object data as code until the
+#   fatal fault at 0x81ee0dd8 (pc=lr, all-zero page). Worse: the
+#   crash beat the 250ms watchdog poll, so no BRAKE line, and
+#   psp2dmp never maps BSS - hist/flood (the cpe answer!) died with
+#   the process. The onion layer under it: an entry-less ghost has
+#   NO birth template AT ALL (never born => setup_stack_asm never
+#   ran for it => the "death door" slot is heap residue). Two fixes:
+#   (1) DOOR VALIDATION (A): before the bx, movw/movt the real
+#       _ZN9JVMThread23lightweight_thread_exitEv and cmp against
+#       [r6]; mismatch parks (v02.48 proven behavior) instead of
+#       jumping. flood[16]=door word, flood[17]=verdict, both in
+#       every dump. A signature change breaks the LINK not the run.
+#   (2) CRASH-PROOF MINI-SCENE (B): before any door decision the
+#       trip stores 6 words at [sp-0x40]: {magic 0x56353144 'V51D',
+#       [r6], [r6+4], [r6+8], [r6+16], cpe}. The C stack page is
+#       ALWAYS in the coredump (log74 proved: 256K main-stack page
+#       present), so even a crash right after the store leaves the
+#       door words + cpe readable straight off the frozen sp.
+#   Expected next-round outcomes: bad door + park -> ring_trap.log
+#   with verdict=0 (v02.48 evidence chain restored, PLUS the hist
+#   cpe answer); good door -> BRAKE proceeds as designed; crash ->
+#   read [sp-0x40] from the psp2dmp mini-scene.
 # 02.50 (2026-10-09): first BEHAVIOR version after log73's verdict.
 #   The onion is peeled: topology (A) extreme - the ring is the bare
 #   pad<->stub bounce, birth-template-exact every lap (fp=0, lr=pad,
