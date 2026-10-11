@@ -8395,6 +8395,71 @@ switch_to 候选 {id, stack_pointer, pe, state}；(3) 根因 notify_wakeup
 3. psp2dmp 只带 fault+栈页，64MB 堆仅 28KB 在 dump——垃圾源词不可寻，
    靠机制签名定谳。详细：debug/notes/log75_verdict.md。
 
+## 2026-10-12：v02.52 ghost-filter 交付（6040f58/505d929）
+
+### 守边选择（log75 定谳的直接推论）
+
+所有 resume 摆件（`primordial_to_current_thread` 尾 `ldr r6,[r1,#0x64];
+ldr lr,[r6,#4]; ldr fp,[r6],#8; mov pc,lr`、lw_exit 尾、switch 后解释器
+恢复）都读 `[current+0x64]`（stack_pointer）作恢复链头——而 **`Thread::
+set_current`（Thread.cpp）是幽灵成为 current 的唯一提交点**（switch_
+thread master/slave、lw_exit 尾全部经过）。守在提交点=一次拦截覆盖
+全部恢复摆件。
+
+### 改动（phoneme-cldc 6040f58，纯新增 120 行）
+
+- `Thread.cpp`：set_current 开头（v231 计数后、commit 前）校验候选
+  `stack_pointer` 是否落在其自身 ExecutionStack `[field_base(header_size),
+  field_base(header_size+length))` 内（`JavaStackDirection=1`：ENABLE_
+  JAZELLE=0→ENABLE_INCREASING_JAVA_STACK=1）。**越界→重铺出生模板**：
+  调用同文件新生儿路径同款 `setup_stack_asm(field_base(header_size))`
+  （External: address setup_stack_asm(address)，GlobalDefinitions.hpp:1950
+  已声明），新 jsp 写回 [obj+0x64]。never-born 幽灵→正常进 Java；
+  pe=0 幽灵→pad→门→lw_exit 合法死亡。防御性：value null / 栈 null /
+  length≤0 → 不动（历史路径保持）。
+- ghost-ring 16×6（id,jsp,lo,pe,caller,act）+ `_vita_ghost_seq/_count`，
+  `__builtin_return_address(0)` 区分来源（lw_exit 尾 vs switch_thread）。
+  dumper `vita_thread_dump_ghost`（Thread.cpp 底部，PRODUCT 段外）。
+- `OS_vita.cpp`：wd_snapshot rd1b 段 + ring_trap 横幅后各接一份 dump。
+- 编译归属：Thread.cpp→`_MergedSrc004.o`（set_current/setup_stack_asm/
+  pad 同单元，调用零链接风险）。
+
+### 验证链
+
+- rebuild_vm.sh 33 objects+29 members（loopgen 宿主链接错=预期噪声）；
+- `_MergedSrc004.o` 反汇编：范围检查 `cmp ip,r0 / cmpls r0,r1 / bcs`
+  极性经 python 真值表验证（在范围→fallthrough，越界→reap）；模板
+  常量 force_terminated/finish/uncaught/lw_exit/pad 全部 movw/movt
+  内联（R_ARM_MOVW/MOVT_ABS 重定位核对）；`str r2,[r3,#0x64]` 写回
+  新 jsp；ring 6 列 + seq/count 齐全。
+- 最终 ELF（vita-port 505d929）：`set_current`@8109d32c、
+  `vita_thread_dump_ghost`@8109e210、`_vita_ghost_ring`@814b7fb8、
+  `_vita_ghost_seq`@814b7fb4、`_vita_ghost_count`@814b8138。
+- VPK `out/vpk/midp_vita_v02.52.vpk` md5 245b03969f5856f858c5a326c8ad91e5，
+  版本串 "J2ME Player v02.52 b459 (505d929)"。
+
+### 下轮判读（v02.52 b459）
+
+- **wd_snapshot rd1b / ring_trap ghost 段有 reap（reaps>0）**：杀手边
+  被拦——caller 列（符号化 against ELF）直接命名提交路径（lw_exit 尾
+  0x810c3xxx 段 vs Scheduler::switch_thread），id+jsp+lo 锁定幽灵。
+  同时观察：重铺后幽灵是否正常死亡（qring 应见 REM）/ 正常运行。
+- **无 reap + 正常运行**：好结局——但需解释为何崩溃消失（可能重铺
+  改变了时序）；留意 set_current 计数照常爬升。
+- **无 reap + 仍崩溃**：幽灵的 [obj+0x64] 竟在范围内（垃圾恰似合法
+  jsp）→ 需要 pe/state 第二道谓词；或崩溃边不经 set_current（直接
+  读 [cur+0x64] 的第四条路径未覆盖——反汇编核对）。
+- slide 预告：v02.52 ELF text 段布局已变（set_current 膨胀 ~0x130），
+  下轮 slide 需重锚定（[sp-4]=pad / r5=gp 双锚点照旧）。
+
+### 遗留
+
+- 根因 notify_wakeup 为何 ADD entry-less 线程（log73 caller=81089f50
+  是 v02.49 地址，归属需旧 VPK 抽 ELF）——v02.52 的 caller 列会给出
+  v02.52 代的新地址，直接可符号化。
+- reap 重铺未清 pending_entries：pe=1 的幽灵重铺后进 Java 可能拿到
+  陈旧 pe——若下轮出现"重铺后异常"，优先查这里。
+
 ## 2026-10-11：log74 判决 + v02.51 门校验+迷你现场（80e20a4/5a5b109）
 
 ### log74 判决（v02.50 首跑=第五种结局：崩溃）
