@@ -8347,6 +8347,45 @@ v02.39 逐指令相同（冻结成员原样）✓。
    ——弹跳者(id4)若 fp=0/坏 fp → 从未真正进过 Java；若有帧名即案发
    第一现场。与 hist lr（闭合边）互为印证。
 
+## 2026-10-11：v02.50 探针+刹车包（4df2961，首个行为版）
+
+1. **起因（log73 判决）**：v249 行全冻结定拓扑 A 极端版——环=纯 asm 的
+   pad↔stub 乒乓（land=261=pe0(256)+pe1(5)，hist 三词恒定），trip 现场=
+   出生模板精确复刻（fp=0/lr=pad/sp=原始主栈/r6=退出表基址）。**finish=0
+   悖论**：蹦床头到 `bl finish` 是无分支直线，255 圈穿越零 finish → 环在
+   +0x1c 前离开；蹦床上唯一无计数器的分支谓词是 `_current_pending_
+   exception`（gp+0x410）守护的 `blne c_o_p_s(uncaught)`，且 c_o_p_s
+   epilogue 与 [r6-4]=pad 逐位吻合——cpe 是最后一个未计数嫌疑者。
+2. **探针**：hist 槽 3→4 词（13→17 词），第 4 词=每次穿越的 cpe 快照。
+   环若骑在 cpe!=0 分支上则四槽全非零；若全零则悖论另有解释（下一层）。
+3. **刹车**：flood 门 trip 时不再永久 park——pad 取 brakes<8 走**设计好
+   的死亡门** `ldr r0,[r6]; bx r0`（=[r6]=lightweight_thread_exit）→
+   terminate（op-2 REM，破 q5 CYCLE(2)）→ yield → 活线程。tripped=2
+   通知 watchdog：dump（同体+brakes 计数）+ **不退出**，监控 CE 泵——
+   CE 恢复=自愈（日志+恢复正常轮次）；30s（120×250ms）不恢复=退出
+   （不愈合的刹车只是更慢的杀）。brakes>=8 回落 v02.48 park 兜底，最坏
+   退化到已验证行为。
+4. **实施教训**：仓库根是 `samples`（phoneme-cldc/vita-port 同库）——
+   `git add -A` 会卷进 j2me/ 下 8/30 遗留的 19MB 杂散补丁
+   0001-save-change.patch，amend 剔除（工作区保留 untracked）；multi_
+   replace 工具的 replacements 数组必须逐项带 filePath（三次校验失败教
+   训）；OS_vita.cpp 顶部 extern 区须提前声明 vita_v250_brakes（两个
+   dump 点在声明前使用）。
+5. **验证链**：33 ARM objects + 29 members；反汇编 pad 核验（hist 四元组
+   [r2,#4/8/12/16]、16i 缩放链 mov r3,r2+add×4、trip cpe 存 [ip,#56]、
+   brakes 自增+镜像 [ip,#80]、cmp #8/bcs 预算分流、BRAKE `ldr r0,[r6];
+   bx r0`、park wfe 兜底）；四新格式串 strings 落地；版本串
+   "J2ME Player v02.50 b452 (4df2961)"；VPK md5 91b4ba0a95e3d358c550d8
+   278e721088（out/vpk/midp_vita_v02.50.vpk）。
+6. **下次日志读法**：(1) 头部 "RING TRAP v02.50 BRAKE"=刹车触发、
+   brakes=N 圈数；(2) hist cpe 词——四槽全非零=环骑 cpe 分支（悖论定
+   谳），全零=下一层；(3) wd 日志 "BRAKE HEALED: CE x -> y"=自愈成功
+   （VM 存活、恢复正常轮次），无此行+退出=刹车未愈合（30s 兜底）；(4)
+   v250 行 cpe_at_trip=trip 瞬间值。**首个行为改变版**：刹车若破坏
+   lw_exit 前提会退化 park 兜底（brakes 停在 8），最坏=v02.48 行为；
+   回滚路径=revert 4df2961 即回 v02.49 纯取证。
+   详细读法见 debug/notes/v02.50_notes.md。
+
 ## 2026-10-09：v02.49 环取证升级包（ff6334c，二进制=ff6334c，注释跟随 d2194c6）
 
 1. **起因（log72 判决续）**：handoff 全链验证成功，环=entry-less 派发的
