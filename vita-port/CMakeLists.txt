@@ -1375,7 +1375,33 @@ set(VITA_VERSION  "02.45")
 # Read order for log70: ring_trap.log FIRST if present (lr of the
 #   hist entries = ring-closing edge, then the r6 delta naming the
 #   sliding gadget); else watchdog log rd7 flood line.
-set(VITA_VERSION  "02.51")
+set(VITA_VERSION  "02.52")
+# 02.52 (2026-10-12): log75 falsified log74's verdict in turn - THREE
+#   reversals: (1) no magic 0x56353144 anywhere in the dump => the
+#   v02.51 trip NEVER EXECUTED (the brake never armed); (2) with the
+#   correct slide (text +0x18000/data +0x20000) BOTH runs' exit
+#   tables are flawless birth templates => log74's "bad door" was a
+#   slide arithmetic error (0x81edc2d4 was r0, not [r6]); (3) both
+#   runs died at identical in-heap offsets => the deterministic
+#   killer path is UNRELATED to the v02.50/51 pad changes. The real
+#   mechanism: pc=lr+fp=0 is the frozen signature of a RESUME-style
+#   load-jump gadget (call_on_primordial_stack/primordial_to_
+#   current_thread: ldr r6,[cur+0x64]; ldr lr,[r6,#4]; mov pc,lr)
+#   eating a garbage stack_pointer as the restore chain head - the
+#   killer edge is NOT in the pad<->stub ring the flood gates guard.
+#   v02.52 guards the REAL edge: ghost-filter in Thread::set_current
+#   (Thread.cpp) - the single chokepoint every resume gadget passes
+#   through BEFORE reading [current+0x64]. It validates the incoming
+#   candidate's stack_pointer against its own ExecutionStack bounds
+#   and REWIRES an out-of-range one to a fresh birth template (same
+#   setup_stack_asm(field_base(header_size)) the newborn path uses):
+#   a never-born ghost then enters Java normally, a pe=0 ghost walks
+#   pad -> door -> lightweight_thread_exit and dies legally - either
+#   way the garbage-PC resume is cut off at the commit point. Probes:
+#   ghost ring 16x6 (id,jsp,lo,pe,caller,act) + reap count, dumped in
+#   wd_snapshot (rd1b) and ring_trap (right after the banner). The
+#   v02.51 door validation + mini-scene stay (harmless hardening).
+#set(VITA_VERSION  "02.51")
 # 02.51 (2026-10-11): log74 falsified the v02.50 door premise. The
 #   BRAKE fired (crash scene = exact ring template: fp=0, r5=gp,
 #   r6=0x81edf004, [sp]=pad) but [r6] held 0x81edc2d4 - a JAVA-HEAP
