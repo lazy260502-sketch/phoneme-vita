@@ -8347,6 +8347,54 @@ v02.39 逐指令相同（冻结成员原样）✓。
    ——弹跳者(id4)若 fp=0/坏 fp → 从未真正进过 Java；若有帧名即案发
    第一现场。与 hist lr（闭合边）互为印证。
 
+## 2026-10-11：log75 判决 + log74 判决修正（★推翻"坏门"）
+
+### log75 三大新事实（v02.51 b455 首跑，无 ring_trap.log + psp2core）
+
+1. **magic 缺席**：全 dump（含必然在的 256K 主栈页）搜 0x56353144
+   零命中 → trip 路径从未执行，**flood 门没 trip、刹车没开**。崩溃
+   又快过 watchdog 250ms。
+2. **★ slide 修正 → log74"坏门"判决错误**：log75 slide=text+0x18000/
+   data+0x20000（锚点 [sp-4]=pad、r5=gp；**slide 每轮漂移，必须每轮
+   重锚定**）。据此 log75 退出表=完璧真模板（[r6]=lw_exit、[r6+4..c]
+   =uncaught/finish/force、[r6+10]=0、[r6-4]=pad sentinel）。用同标准
+   重判 log74：[r6]=0x8109d320=**v02.50 的 lw_exit** ✓——门也是好的。
+   上轮"门装堆对象 0x81edc2d4"是 slide 算术错误（把 r0 误当 [r6]）。
+   v02.51 门校验=无害加固（verdict 将=1），但非崩溃机制。
+3. **崩溃确定论**：两轮堆内偏移逐位一致（r0=+0x7dc2d4、
+   pc=+0x7e0dd8/+0x7e0dcc，Δ0xC）——同一确定性路径，与 v02.50/51
+   代码差异无关。
+
+### 修正后的机制（log75 现场）
+
+thr0：pc=lr=0x81de0dcc（堆内全零页 XN abort）、fp=0、r5=gp、
+r6=0x81ddf378（模板完好）、r8=0x811a9430=_rom_text_block7+0xC
+（ROM 化方法字节码）、**[sp-0x1c..-0x8]=r4..r9 逐位溢出+[sp-4]=pad**
+=解释器寄存器文件现场。pc=lr+fp=0 签名=**resume 型 load-jump 摆件**
+（`ldr lr,[mem]; ldr fp,[mem]; mov pc,lr`）吃进垃圾恢复地址（源词在
+64MB 未 dump 堆区；全 dump 搜 pc 值零命中）。r0..pc 区间 4799 词 57%
+零=活堆对象区，非 NOP 滑橇；崩点=该路径首个取指 abort。
+
+**★ 洋葱新层：杀手边不在 pad↔stub 环里**——log73（PARK）证明幽灵
+有时在环里（pad 可抓）；log74/75 证明崩溃路径可完全不经 pad（无 trip
+无 magic）。调度器对 never-born 幽灵的派发/resume 直接把垃圾当恢复
+PC。flood 门守在错误的边上：v02.45 以来 pad 侧仪器看不到这条边。
+
+### v02.52 方向（未实施）
+
+调度器侧（fresh C++ 可改）：(1) switch/get_next_runnable 派发前置
+校验（ghost-filter：stack_pointer 在合法 Java 栈区？pe/state 合法？
+不合法→记录+拒绝派发，把崩溃变成可抓 dump）；(2) 派发取证：记录每次
+switch_to 候选 {id, stack_pointer, pe, state}；(3) 根因 notify_wakeup
+为何 ADD entry-less 线程（log73 caller 待归属）。
+
+### 教训
+
+1. slide 每轮漂移（log74 +0x50000 / log75 +0x18000）——双锚点重算；
+2. "r0 的值"≠"[r6] 的值"——判表必须直接读内存；
+3. psp2dmp 只带 fault+栈页，64MB 堆仅 28KB 在 dump——垃圾源词不可寻，
+   靠机制签名定谳。详细：debug/notes/log75_verdict.md。
+
 ## 2026-10-11：log74 判决 + v02.51 门校验+迷你现场（80e20a4/5a5b109）
 
 ### log74 判决（v02.50 首跑=第五种结局：崩溃）
