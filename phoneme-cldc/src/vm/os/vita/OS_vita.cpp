@@ -1035,6 +1035,11 @@ extern "C" {
      * trace_stack/print_on/pss are all #ifndef PRODUCT, this is the
      * PRODUCT-surviving equivalent. */
     int  vita_sched_dump_jstack(char *out, int out_size);
+    /* v02.52: ghost-filter ring dump (Thread.cpp, the set_current
+     * chokepoint hook) - every reap with the garbage jsp it caught,
+     * the stack lo bound it validated against, and the caller that
+     * tried to commit the ghost. */
+    int  vita_thread_dump_ghost(char *out, int out_size);
 }
 
 /* v02.17: one text-append helper (avoid the hand-counted sceIoWrite
@@ -1171,6 +1176,18 @@ static void vita_wd_snapshot_one(SceUID fd) {
         int len = vita_sched_dump_dispatch(disp_dump, (int)sizeof(disp_dump));
         if (len > 0) sceIoWrite(fd, disp_dump, len);
         vita_wd_puts(fd, "[rd1 dispatch ok]\n");
+    }
+
+    /* v02.52 (5b) ghost ring: the CAUSE-side record of the killer edge
+     * log75 identified - a resume gadget eating a garbage stack_pointer
+     * after set_current committed it. Empty output = the filter never
+     * fired (healthy run OR the ghost theory needs revision); any hit
+     * names the ghost id, the garbage jsp, and the committing caller. */
+    {
+        static char ghost_dump[1024];
+        int len = vita_thread_dump_ghost(ghost_dump, (int)sizeof(ghost_dump));
+        if (len > 0) sceIoWrite(fd, ghost_dump, len);
+        vita_wd_puts(fd, "[rd1b ghost ok]\n");
     }
 
     /* (6) Top of the Java stacks. The coredump never contains the Java
@@ -1551,6 +1568,15 @@ void vita_ring_trap(int brake_mode)
                  brake_mode ? "BRAKE" : "PARK",
                  vita_v250_brakes, F[16], F[17]);
     sceIoWrite(fd, buf, n);
+    /* v02.52: ghost ring FIRST after the banner - log75 proved the
+     * killer edge is the resume gadget, not the pad<->stub ring this
+     * whole file was built around. If this trap fired with reaps>0
+     * the filter caught at least one ghost before/without parking. */
+    {
+        static char ghost_dump[1024];
+        int len = vita_thread_dump_ghost(ghost_dump, (int)sizeof(ghost_dump));
+        if (len > 0) sceIoWrite(fd, ghost_dump, len);
+    }
     sceIoWrite(fd, buf, n);
     n = snprintf(buf, sizeof(buf),
                  "consec=%u tripped=%u ct=%08x\n",

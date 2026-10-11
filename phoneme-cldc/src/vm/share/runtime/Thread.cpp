@@ -358,6 +358,28 @@ ReturnOop Thread::allocate(JVM_SINGLE_ARG_TRAPS) {
   return thread;
 }
 
+#if defined(VITA)
+/* v02.52: ghost-filter ring. log75's verdict: the killer edge is NOT
+ * in the pad<->stub ring - it is a resume-style load-jump gadget
+ * (primordial_to_current_thread tail: ldr r6,[cur+0x64]; ldr lr,
+ * [r6,#4]; mov pc,lr) eating a garbage stack_pointer as the restore
+ * chain head, with pc=lr+fp=0 as the frozen signature. Every resume
+ * gadget reads [current+0x64] AFTER set_current committed the victim,
+ * so set_current is the single chokepoint all of them (switch_thread
+ * master/slave, lightweight_thread_exit tail) pass through FIRST.
+ * The filter below validates the incoming candidate's stack_pointer
+ * against its own ExecutionStack and REWIRES a bad one to a fresh
+ * birth template (see the set_current hook): a never-born ghost then
+ * enters Java normally, a pe=0 ghost walks the pad -> door ->
+ * lightweight_thread_exit and dies legally. Entry = id, jsp as seen,
+ * stack lo bound, pending_entries!=NULL, caller return address,
+ * action (1=rewired). Single writer = the VM thread; the watchdog
+ * reads after freeze and tolerates torn values. */
+volatile unsigned int _vita_ghost_ring[16][6]; /* id,jsp,lo,pe,caller,act */
+volatile unsigned int _vita_ghost_seq = 0;
+volatile unsigned int _vita_ghost_count = 0;   /* total reaps */
+#endif
+
 void Thread::set_current(Thread* value) {
 #if defined(VITA)
   /* v02.31: set_current is where the VM actually commits a green-
@@ -369,6 +391,48 @@ void Thread::set_current(Thread* value) {
    * count means redispatch is driven from the exit path. */
   extern unsigned int vita_v231_setcur;
   vita_v231_setcur++;
+  /* v02.52 ghost-filter: validate BEFORE the commit. A candidate
+   * whose stack_pointer lies outside its own ExecutionStack can only
+   * be (a) a never-born ghost whose [obj+0x64] was never initialized
+   * by setup_stack_asm, or (b) a live thread whose chain word got
+   * stomped. Either way the resume gadgets downstream would load
+   * garbage as PC. Rewire: lay a fresh birth template at the stack
+   * bottom (same layout setup_stack_asm builds for newborns) and
+   * point stack_pointer at its top. Defensive by construction:
+   * null / early-bootstrap / degenerate-length candidates are left
+   * untouched (the historical path is unchanged for them). */
+  if (value->not_null()) {
+    ExecutionStack::Raw gst_ = value->execution_stack();
+    if (!gst_.is_null()) {
+      jint glen_ = gst_().length();
+      if (glen_ > 0) {
+        const jint ghdr_ = ExecutionStackDesc::header_size();
+        address glo_ = (address)gst_.field_base(ghdr_);
+        address ghi_ = (address)gst_.field_base(ghdr_ + glen_);
+        jint gjsp_ = value->stack_pointer();
+        if ((address)gjsp_ < glo_ || (address)gjsp_ >= ghi_) {
+          /* JavaStackDirection==1 on this target: the template grows
+           * up from the header - same base setup_lightweight_stack
+           * passes to setup_stack_asm for a newborn. */
+          address gsp_ = setup_stack_asm(glo_);
+          value->set_stack_pointer((jint)(address_word)gsp_);
+          {
+            unsigned int gs_ = _vita_ghost_seq;
+            _vita_ghost_ring[gs_ & 15][0] = (unsigned int)value->id();
+            _vita_ghost_ring[gs_ & 15][1] = (unsigned int)gjsp_;
+            _vita_ghost_ring[gs_ & 15][2] = (unsigned int)(address_word)glo_;
+            _vita_ghost_ring[gs_ & 15][3] =
+              (value->pending_entries() != NULL) ? 1u : 0u;
+            _vita_ghost_ring[gs_ & 15][4] =
+              (unsigned int)(uintptr_t)__builtin_return_address(0);
+            _vita_ghost_ring[gs_ & 15][5] = 1u; /* action: rewired */
+            _vita_ghost_seq = gs_ + 1;
+          }
+          _vita_ghost_count++;
+        }
+      }
+    }
+  }
 #endif
   GUARANTEE(_last_handle == NULL, "No handles when switching threads");
   GUARANTEE(last_kni_handle_info == NULL,
@@ -1036,4 +1100,34 @@ bool Thread::is_on_stack(address addr) {
 }
 
 #endif // !PRODUCT
+
+#if defined(VITA)
+/* v02.52: ghost-filter ring dump (see the set_current hook above for
+ * the full rationale). Newest first; the caller column resolves
+ * offline against the ELF symtab - 0x810c3xxx range = the
+ * lightweight_thread_exit tail, Scheduler::switch_thread_* = the
+ * quantum switch path. act: 1=rewired to a fresh birth template. */
+extern "C" int vita_thread_dump_ghost(char *out, int out_size) {
+  int pos = 0;
+  int n;
+  unsigned int seq = _vita_ghost_seq;
+  unsigned int i;
+  n = snprintf(out + pos, out_size - pos,
+               "ghost ring (last %d, newest first, seq=%u, reaps=%u):\n",
+               16 / 2, seq, _vita_ghost_count);
+  if (n > 0) pos += n;
+  for (i = 0; i < 16 && i < (16 / 2); i++) {
+    unsigned int idx = (seq - 1u - i) & 15u;
+    if (_vita_ghost_ring[idx][5] == 0u) continue; /* never written */
+    n = snprintf(out + pos, out_size - pos,
+                 "  [%2u] id=%u jsp=%08x lo=%08x pe=%u from=%08x act=%u\n",
+                 i,
+                 _vita_ghost_ring[idx][0], _vita_ghost_ring[idx][1],
+                 _vita_ghost_ring[idx][2], _vita_ghost_ring[idx][3],
+                 _vita_ghost_ring[idx][4], _vita_ghost_ring[idx][5]);
+    if (n > 0 && pos + n < out_size) pos += n; else break;
+  }
+  return pos;
+}
+#endif
 
