@@ -8347,6 +8347,48 @@ v02.39 逐指令相同（冻结成员原样）✓。
    ——弹跳者(id4)若 fp=0/坏 fp → 从未真正进过 Java；若有帧名即案发
    第一现场。与 hist lr（闭合边）互为印证。
 
+## 2026-10-11：log74 判决 + v02.51 门校验+迷你现场（80e20a4/5a5b109）
+
+### log74 判决（v02.50 首跑=第五种结局：崩溃）
+
+1. **刹车触发确认**：崩溃现场=精确环模板（fp=0、r5=gp_base+slide、
+   r6=0x81edf004、[sp]=pad sentinel、其余 4 线程内核睡眠）。六轮历史
+   证明环永不崩溃，v02.50 唯一新增跳转=bx [r6] → 触发即崩。
+2. **门是坏的**：[r6]=0x81edc2d4=Java 堆对象（非 lw_exit@运行期
+   0x810ed320）。bx 后堆上执行对象数据当指令，至 0x81ee0dd8（门对象
+   +0x2d04）全零页致命故障（pc=lr、内容全零、64MB 堆内+0x7e0dd8）。
+   r0(0x81edc2d4)≠pc 证明垃圾"代码"跑了若干条才死。
+3. **取证全灭**：崩溃快过 watchdog 250ms 轮询（最后心跳到 coredump
+   ~76ms），无 BRAKE 行；psp2dmp 从不映射 BSS → hist/flood/cpe 探针
+   答案随进程死。v02.50 风险 1 精确应验。
+4. **★ 双 slide 发现（符号化基础设施）**：Vita3K 分段独立重定位——
+   text slide=+0x50000（PROCESS_INFO 模块基址 0x81050000），data/BSS
+   slide=+0x120000（seg2 基址 0x81400000；锚点：r5=0x81401924=
+   gp_base_label 0x812e1924+0x120000；watchdog r10=0x815d7824=
+   flood 0x814b7824+0x120000）。**符号化必须先判地址属于哪个段**。
+5. **★ 洋葱新层**：entry-less 幽灵线程**根本没有出生模板**——蹦床读
+   的"退出表"不是 setup_stack_asm 留的帧（从未存在），[r6] 槽是堆残
+   留。环的本质=从未出生的线程被 q5 CYCLE 派发在未初始化栈顶块上
+   弹跳。v02.44 的怀疑以最强形式确认。
+
+### v02.51 改动（A 门校验 + B 迷你现场）
+
+- **A**：bx 前 movw/movt `_ZN9JVMThread23lightweight_thread_exitEv`
+  与 [r6] cmp；不等 → park 兜底（v02.48 已证行为），永不再跳垃圾。
+  flood[16]=门词、flood[17]=verdict，双 dump 站点打印。R_ARM_MOVW/
+  MOVT_ABS 绑定 mangled 符号——签名变更=链接期爆炸（保险）。
+- **B**：门判定前 6 词写 [sp-0x40]：{magic 0x56353144, [r6], [r6+4],
+  [r6+8], [r6+16], cpe}。C 栈页（0x81641000/256K）psp2core 必然
+  带上（log74 实证），崩溃也丢不了门四词+cpe。
+- 验证链：33 objects+29 members；objdump -r 确认 movw/movt 重定位；
+  最终 ELF pad@8109b850 门校验立即数 0x8109d3b0=nm lw_exit 逐位一致；
+  版本串 b455 (5a5b109)；VPK md5 774f0290266caff1e8f70f36a3655041。
+- **下轮判读**：verdict=0（坏门+park 恢复取证，hist cpe 悖论定谳）/
+  verdict=1（好门，BRAKE 照设计）/ 无 ring_trap.log+psp2core（读
+  [sp-0x40] magic+门四词+cpe）。详细读法 debug/notes/v02.51_notes.md。
+- **根因侧（v02.52+ 未动）**：notify_wakeup 为什么把 entry-less、
+  从未出生的线程 ADD 回活跃队列（log73 caller=81089f50 待归属）。
+
 ## 2026-10-11：v02.50 探针+刹车包（4df2961，首个行为版）
 
 1. **起因（log73 判决）**：v249 行全冻结定拓扑 A 极端版——环=纯 asm 的
