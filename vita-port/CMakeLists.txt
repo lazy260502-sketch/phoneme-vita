@@ -1401,7 +1401,29 @@ set(VITA_VERSION  "02.52")
 #   ghost ring 16x6 (id,jsp,lo,pe,caller,act) + reap count, dumped in
 #   wd_snapshot (rd1b) and ring_trap (right after the banner). The
 #   v02.51 door validation + mini-scene stay (harmless hardening).
-#set(VITA_VERSION  "02.51")
+set(VITA_VERSION  "02.53")
+# 02.53 (2026-10-13): log76's corpse-frame verdict ended the guard-the-
+#   mid-chain era: the ghost filter itself never fired because the
+#   killer's [cur+0x64] never passes set_current (the SECOND jsp
+#   publisher, call_on_primordial_stack's prologue str, owns the
+#   dangling value). The lr slot of the 9-save corpse frame decoded to
+#   VerifyMethodCodes::new_object+0xb0 - the return of the bl into
+#   class_format_error(154). 154 is NOT a specific format tag: it is
+#   the generic funnel "verification_error" that VerifierFrame::
+#   verifier_error() hardcodes, because the PRODUCT build's VFY_ERROR
+#   macro (VerifierDefinitions.hpp) drops every specific code. So the
+#   FIRST event of the whole crash chain is a plain verifier failure
+#   inside new_object during a Thread-4-related class verify - and
+#   until now it was invisible by construction. This build makes the
+#   first domino speak: vita_verify_fail() (OS_vita.cpp, TTY via
+#   jvm_printf -> midp_stdout.log) prints class/method/cp-index/tag/
+#   bci at ALL THREE new_object failure sites (new_oob / new_tag /
+#   new_arr - the crash block's inline shape says new_arr: the CP
+#   "class" entry holds an ARRAY descriptor), BEFORE the funnel
+#   swallows the specifics. One Vita3K run answers: which class, which
+#   method, which `new`, which index - and whether the CP is corrupt
+#   or the classfile itself. No behavior change: the throws proceed
+#   exactly as before, so the crash scene stays comparable.
 # 02.51 (2026-10-11): log74 falsified the v02.50 door premise. The
 #   BRAKE fired (crash scene = exact ring template: fp=0, r5=gp,
 #   r6=0x81edf004, [sp]=pad) but [r6] held 0x81edc2d4 - a JAVA-HEAP
