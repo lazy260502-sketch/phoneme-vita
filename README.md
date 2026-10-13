@@ -28,10 +28,10 @@ phoneME Feature (CLDC-HI + MIDP 2.0) JVM/J2ME 运行时移植到 Sony PS Vita
 
 - `phoneme-cldc` ← https://github.com/tberthel/phoneme-components-cldc
   基线提交 `aae56e14a7e3`（phoneME Feature mr2-rel-b23）+ Vita 移植改动
-  （129 文件，+3470/−419，见 `patches/phoneme-cldc.patch`）
+  （130 文件，+6307/−417，见 `patches/phoneme-cldc.patch`）
 - `phoneme-midp` ← https://github.com/tberthel/phoneme-components-midp
   基线提交 `8d44713992fd` + Vita 移植改动
-  （136 文件，+12833/−58，见 `patches/phoneme-midp.patch`）
+  （136 文件，+11333/−57，见 `patches/phoneme-midp.patch`）
 
 `patches/` 下的补丁是工作副本相对上游基线的完整 diff，供对照与向上游回提。
 
