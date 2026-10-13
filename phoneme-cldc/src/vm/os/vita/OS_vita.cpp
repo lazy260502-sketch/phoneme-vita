@@ -563,6 +563,19 @@ extern volatile unsigned int vita_v245_hist[17];   /* v02.50: 4 words/slot */
 extern volatile unsigned int vita_v245_flood[24];  /* v02.50: +[14] cpe, [20] brakes */
 extern volatile unsigned int vita_v250_brakes;     /* v02.50: brake lap counter */
 extern void vita_landing_pad(void);
+
+/* v02.53: called on the failure paths of VerifyMethodCodes::new_object
+ * right before the PRODUCT-mangled VFY_ERROR funnel swallows the
+ * specific error code. Names the class/method/cp-index/tag/bci of the
+ * failing `new` bytecode directly on TTY: log76's corpse frame proved
+ * this throw is the FIRST event of the crash chain (lr slot =
+ * new_object+0xb0 = return of the bl into class_format_error), yet a
+ * PRODUCT build reports every verifier failure as generic tag 154
+ * (verification_error) - see VerifierDefinitions.hpp VFY_ERROR and
+ * VerifierFrame::verifier_error(). jvm_printf goes to stdout
+ * (midp_stdout.log), never stdio - see the site-ring note above. */
+void vita_verify_fail(const char *site, int index, unsigned int tag,
+                      int bci, const char *extra, int extra_len);
 }
 /* v02.49: ring-counter block for ring_trap.log - see the v249 line in
  * vita_wd_snapshot_one(). taskclean is defined in Thread.cpp (inside
@@ -722,6 +735,25 @@ void vita_site_verifier_method(const char *name, int len) {
             vita_verify_method_name[i] = name[i];
     }
     vita_verify_method_name[i] = 0;
+}
+
+/* v02.53: called on the failure paths of VerifyMethodCodes::new_object
+ * right before the PRODUCT-mangled VFY_ERROR funnel swallows the
+ * specific error code. Names the class/method/cp-index/tag/bci of the
+ * failing `new` bytecode directly on TTY: log76's corpse frame proved
+ * this throw is the FIRST event of the crash chain (lr slot =
+ * new_object+0xb0 = return of the bl into class_format_error), yet a
+ * PRODUCT build reports every verifier failure as generic tag 154
+ * (verification_error) - see VerifierDefinitions.hpp VFY_ERROR and
+ * VerifierFrame::verifier_error(). jvm_printf goes to stdout
+ * (midp_stdout.log), never stdio - see the site-ring note above. */
+void vita_verify_fail(const char *site, int index, unsigned int tag,
+                      int bci, const char *extra, int extra_len) {
+    jvm_printf("VVFY %s cls=%s mth=%s idx=%d tag=0x%02x bci=%d extra=%.*s\n",
+               site,
+               vita_verify_class_name[0] ? vita_verify_class_name : "?",
+               vita_verify_method_name[0] ? vita_verify_method_name : "?",
+               index, tag, bci, extra_len, extra);
 }
 
 /* Called from the watchdog thread after a HANG. Appends the current

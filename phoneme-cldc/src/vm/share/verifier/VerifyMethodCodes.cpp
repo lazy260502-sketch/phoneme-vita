@@ -1041,17 +1041,34 @@ void VerifyMethodCodes::throw_exception(JVM_SINGLE_ARG_TRAPS) {
   // Object and array allocation
 void VerifyMethodCodes::new_object(int index JVM_TRAPS) {
   if (!cp()->is_within_bounds(index)) {
+#if defined(VITA)
+    /* v02.53: log76's corpse frame names this throw (new_object+0xb0)
+     * as the FIRST event of the crash chain. PRODUCT VFY_ERROR drops
+     * the specific tag, so name the victim here before the funnel. */
+    vita_verify_fail("new_oob", index, 0, bci(), "", 0);
+#endif
     VFY_ERROR(ve_cp_index_out_of_bounds);
   }
 
   jubyte tag = cp()->tag_value_at(index);
   if (!ConstantTag::is_klass(tag)) {
+#if defined(VITA)
+    vita_verify_fail("new_tag", index, tag, bci(), "", 0);
+#endif
     VFY_ERROR(ve_expect_class);
   }
 
   {
     Symbol::Raw new_name = cp()->name_of_klass_at(index JVM_CHECK);
     if (is_array_name(&new_name)) {
+#if defined(VITA)
+    /* The disassembly of the crash block shows this branch is the one
+     * taken (is_valid_field_type + basic_type==T_ARRAY both inline):
+     * the CP "class" entry holds an ARRAY descriptor - CP corruption
+     * or a mangled classfile. extra = the bogus name itself. */
+      vita_verify_fail("new_arr", index, tag, bci(),
+                       new_name().base_address(), new_name().length());
+#endif
       VFY_ERROR(ve_expect_class);
     }
   }

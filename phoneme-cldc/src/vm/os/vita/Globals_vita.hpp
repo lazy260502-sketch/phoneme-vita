@@ -60,6 +60,12 @@ extern "C" {
     void vita_site_verifier_class(const char *name, int len);
     void vita_site_verifier_method(const char *name, int len);
     void vita_site_dump_verify(const char *path);
+    /* v02.53: TTY forensics for the FIRST event of the log76 crash
+     * chain - the verifier throw inside new_object. Names class/method/
+     * cp-index/tag/bci of the failing `new` before the PRODUCT
+     * VFY_ERROR funnel collapses everything to tag 154. */
+    void vita_verify_fail(const char *site, int index, unsigned int tag,
+                          int bci, const char *extra, int extra_len);
     /* v01.88 clinit tracing - log14 froze with the verifier OFF (verify
      * class=(none)) after 345 frames of normal play: the spin moved
      * into <clinit> execution itself on the green-thread Java stack.
