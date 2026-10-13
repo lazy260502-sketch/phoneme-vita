@@ -1,0 +1,6 @@
+[JVM_Start] classpath=midp_system.jar:games/app (1)/game.jar main=com.sun.midp.main.MIDletSuiteLoader argc=0
+[JVM_Start] set_arguments done, calling JVM::start
+[JVM_Start] JVM::start() loop 0 enter
+[vita] vm_cpu=off aff=0x70000
+[preload] begin load_all_in_classpath
+[preload] done (see site_ring stats for count)

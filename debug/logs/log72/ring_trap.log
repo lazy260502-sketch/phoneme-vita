@@ -1,0 +1,125 @@
+== RING TRAP v02.45 ==
+consec=256 tripped=1 ct=81dde310
+r0=81dde310 r3=81dde310 r4=811fb118 r5=81301924
+r6=81ddf378 r7=81ddd2d0 r8=811a2f28 r9=00000000
+r10=81ddd29c fp=00000000 sp=8157fd88 lr=810ad470
+bounce hist (r6, lr) oldest->newest:
+  r6=81ddf378 lr=810ad470 (d_r6=+0)
+  r6=81ddf378 lr=810ad470 (d_r6=+0)
+  r6=81ddf378 lr=810ad470 (d_r6=+0)
+  r6=81ddf378 lr=810ad470 (d_r6=+0)
+template: exit=810aeefc uncaught=810ad6d4 finish=810ad614 force_term=810ad5e0 flagword(+16)=0 pad=810ad470
+exit-table window [r6-8..r6+24]:
+  81dde888 810ad470 | 810aeefc 810ad6d4 810ad614 810ad5e0 00000000 00000000
+ct: pe=00000000 stack_pointer=81ddf2bc (r6 - sp = +188)
+birth-frame window [sp-8..sp+24]:
+  81ddf29c 811b2f9c | 81ddbfa8 810d3d3c 811f6ae7 81ddf2e8 811a2f28 811f6ab0
+c-stack window [sp..sp+60]:
+  810c8e8c 814d3784 814d77ac 814d76b0 00000000 812d69dc 812d69b4 814d1650
+  81607876 81580d50 00000000 81607850 813018d8 810c9004 00000000 00000000
+-- scheduler forensics --
+queue-op ring (last 32, newest first, seq=536):
+  [ 0] id=4 NRT pri=5 pe=0
+  [ 1] id=4 SEL pri=5 pe=0
+  [ 2] id=2 NRT pri=5 pe=0
+  [ 3] id=2 SEL pri=5 pe=0
+  [ 4] id=4 ADD pri=5 pe=0
+  [ 5] id=2 ADD pri=5 pe=0
+  [ 6] id=3 SEL pri=5 pe=0
+  [ 7] id=3 SEL pri=5 pe=0
+  [ 8] id=3 SEL pri=5 pe=0
+  [ 9] id=3 SEL pri=5 pe=0
+  [10] id=3 SEL pri=5 pe=0
+  [11] id=3 SEL pri=5 pe=0
+  [12] id=3 SEL pri=5 pe=0
+  [13] id=3 SEL pri=5 pe=0
+  [14] id=3 SEL pri=5 pe=0
+  [15] id=3 SEL pri=5 pe=0
+  [16] id=3 SEL pri=5 pe=0
+  [17] id=3 SEL pri=5 pe=0
+  [18] id=3 SEL pri=5 pe=0
+  [19] id=3 SEL pri=5 pe=0
+  [20] id=3 SEL pri=5 pe=0
+  [21] id=3 SEL pri=5 pe=0
+  [22] id=3 SEL pri=5 pe=0
+  [23] id=3 SEL pri=5 pe=0
+  [24] id=3 SEL pri=5 pe=0
+  [25] id=3 SEL pri=5 pe=0
+  [26] id=3 SEL pri=5 pe=0
+  [27] id=3 SEL pri=5 pe=0
+  [28] id=3 SEL pri=5 pe=0
+  [29] id=3 SEL pri=5 pe=0
+  [30] id=3 SEL pri=5 pe=0
+  [31] id=3 SEL pri=5 pe=0
+dispatch ring (last 16, newest first):
+  [ 0] id=2 pri=5 st=00000000 pe=0
+  [ 1] id=2 pri=5 st=00000000 pe=0
+  [ 2] id=3 pri=5 st=00000000 pe=0
+  [ 3] id=3 pri=5 st=00000000 pe=0
+  [ 4] id=3 pri=5 st=00000000 pe=0
+  [ 5] id=3 pri=5 st=00000000 pe=0
+  [ 6] id=3 pri=5 st=00000000 pe=0
+  [ 7] id=3 pri=5 st=00000000 pe=0
+  [ 8] id=3 pri=5 st=00000000 pe=0
+  [ 9] id=3 pri=5 st=00000000 pe=0
+  [10] id=3 pri=5 st=00000000 pe=0
+  [11] id=3 pri=5 st=00000000 pe=0
+  [12] id=3 pri=5 st=00000000 pe=0
+  [13] id=3 pri=5 st=00000000 pe=0
+  [14] id=3 pri=5 st=00000000 pe=0
+  [15] id=3 pri=5 st=00000000 pe=0
+  nrt obj=0x81dde310 id=4 st=00000000 jsp=0x81ddf2bc wait=0x00000000 pe=0x00000000 tobj=0x81dde258
+threads(active-list):
+  t0x81dde310 id=4 st=00000000 wait=0x00000000 timed
+  t0x81ddc2d4 id=3 st=00000000 wait=0x00000000 no-timeout
+  t0x81db8128 id=2 st=00000000 wait=0x81db6ee4 no-timeout
+  t0x81db700c id=1 st=00000000 wait=0x81db6ee4 no-timeout
+  t0x817a58f0 id=0 st=00000000 wait=0x81dd9fe8 no-timeout
+threads(priority-queues):
+  q5: t0x81dde310(id=4,st=00000000) t0x81ddc2d4(id=3,st=00000000) t0x81db8128(id=2,st=00000000) CYCLE(3)
+java stacks (symbolic):
+thread id=4 obj=0x81dde310 stack=[81dde888,81ddf388]
+  (fp=0, not started)
+thread id=3 obj=0x81ddc2d4 stack=[81ddc84c,81ddd34c]
+  [ 0] .unknown...unknown.??IJ bci=0 fp=81ddd290
+  [ 1] .unknown..run??V bci=8 fp=81ddd2b8
+  [ 2] java/lang/Thread.run??V bci=5 fp=81ddd2e8
+  [first frame]
+thread id=2 obj=0x81db8128 stack=[81db86a0,81db91a0]
+  [ 0] com/sun/midp/events/EventQueue.post??V?? bci=0 fp=81db90c0
+  [ 1] .unknown..run??V bci=20 fp=81db910c
+  [ 2] java/lang/Thread.run??V bci=5 fp=81db913c
+  [first frame]
+thread id=1 obj=0x81db700c stack=[81db7584,81db8084]
+  [ 0] java/lang/Object.wait??VJ bci=0 fp=81db7f8c
+  [ 1] java/lang/Object.wait??V bci=2 fp=81db7fb4
+  [ 2] com/sun/midp/events/EventQueue.run??V bci=19 fp=81db7ff0
+  [ 3] java/lang/Thread.run??V bci=5 fp=81db8020
+  [first frame]
+thread id=0 obj=0x817a58f0 stack=[817b4e48,817b5948]
+  [ 0] java/lang/Object.wait??VJ bci=0 fp=817b57d0
+  [ 1] java/lang/Object.wait??V bci=2 fp=817b57f8
+  [ 2] com/sun/midp/midlet/MIDletStateHandler.startSuite??V????I?? bci=121 fp=817b5834
+  [ 3] .unknown...unknown.??V bci=39 fp=817b5878
+  [ 4] .unknown...unknown.??V bci=5 fp=817b5898
+  [ 5] .unknown...unknown.??V bci=132 fp=817b58b8
+  [ 6] com/sun/midp/main/MIDletSuiteLoader.main??V?? bci=9 fp=817b58e0
+  [first frame]
+java-stack-top (current):
+  stack_pointer()=0x81ddf2bc stack_limit()=0x81dde888
+  [jsp+00] 0x81ddbfa8
+  [jsp+04] 0x810d3d3c
+  [jsp+08] 0x811f6ae7
+  [jsp+12] 0x81ddf2e8
+  [jsp+16] 0x811a2f28
+  [jsp+20] 0x811f6ab0
+  [jsp+24] 0x81ddf300
+  [jsp+28] 0x81ddf2c0
+  [jsp+32] 0x81ddf300
+  [jsp+36] 0x81de0d7c
+  [jsp+40] 0x81ddbfa8
+  [jsp+44] 0x81dac924
+  [jsp+48] 0x810d3eac
+  [jsp+52] 0x8122f619
+  [jsp+56] 0x81ddf30c
+  [jsp+60] 0x811a2f28

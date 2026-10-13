@@ -1,0 +1,98 @@
+vita-port J2ME launcher
+vm cpu: unpinned (mask=0, kernel default 3-core)
+kubridge precheck: CALLABLE (enum blind)
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+version: J2ME Player v02.37 b410 (56a4b1e)
+[ANI] thread pool initialized
+[media] tone player thread created
+menu jar: games/app (1)/game.jar
+menu class: com.app.filemanager.FileManagerMIDlet
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_6B15
+classpath: midp_system.jar:games/app (1)/game.jar
+starting MIDlet: com.app.filemanager.FileManagerMIDlet
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app (1)/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='com.app.filemanager.FileManagerMIDlet'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app (1)/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app (1)/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app (1)/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=40 additionalPathLength=38
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app (1)/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580
+BEFORE_NATIVES: heap_top=0x8379d580
+AFTER_NATIVES_CALL: heap_top=0x8379d580

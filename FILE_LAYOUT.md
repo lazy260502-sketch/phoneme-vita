@@ -16,11 +16,12 @@ samples/j2me/
 
 1. **VPK 交付**：构建产物一律拷贝到 `out/vpk/`，命名 `midp_vita_v<版本>[_<标签>].vpk`
    （如 `midp_vita_v01.71_tonediag.vpk`）。`vita-port/` 下的 `midp_vita.vpk` 只是构建输出，不算交付物；不要在别处再放第二份。
-2. **真机日志**：拉回后放 `debug/logs/<会话名>/`（如 `log3/`），一次测试一个子目录，不混放。coredump（`*.psp2dmp`）也放这里。
+2. **真机日志**：拉回后放 `debug/logs/<会话名>/`（如 `log3/`），一次测试一个子目录，不混放。coredump（`*.psp2dmp`）也放这里。**已入库**——取证证据与代码一起版本化。
 3. **构建方式**：vita-port 一律 **out-of-source**：
    `cmake -S vita-port -B vita-port/build-cmake`，产物全在 `build-cmake/`，源码树零污染。
    （历史原因当前是 in-source；新构建逐步迁移，旧 in-source 产物已随 .gitignore 屏蔽）
-4. **`.gitignore`** 已加：CMake in-source 产物、`out/`、`debug/logs/`——git status 保持干净，构建产物永不入库。
+4. **`.gitignore`** 已加：CMake in-source 产物、`out/`——git status 保持干净，构建产物不入库。
+   注：`debug/logs/` **已入库**（取证日志与代码一起版本化），仅 `*.bak` 等仍忽略。
 
 ## 二、真机侧日志（ux0:/data/J2ME00001/）权威清单
 

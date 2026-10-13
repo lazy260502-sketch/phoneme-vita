@@ -1,0 +1,9 @@
+vita-port J2ME launcher
+vm cpu: unpinned (mask=0, kernel default 3-core)
+kubridge precheck: CALLABLE (enum blind)
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+version: J2ME Player v02.48 b445 (bb305ee)
+[ANI] thread pool initialized
+[media] tone player thread created

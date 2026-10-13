@@ -1,0 +1,13 @@
+vita-port J2ME launcher
+vm cpu: unpinned (mask=0, kernel default 3-core)
+kubridge precheck: CALLABLE (enum blind)
+version: J2ME Player v02.43 b431 (048a30c)
+[ANI] thread pool initialized
+[media] tone player thread created
+menu jar: games/app (1)/game.jar
+menu class: com.app.filemanager.FileManagerMIDlet
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_6B15
+classpath: midp_system.jar:games/app (1)/game.jar
+starting MIDlet: com.app.filemanager.FileManagerMIDlet
+runtime Hello.jar size=9203 (expected 9203)

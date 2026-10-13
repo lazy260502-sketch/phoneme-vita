@@ -1,0 +1,6 @@
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000

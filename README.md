@@ -47,8 +47,10 @@ phoneME Feature (CLDC-HI + MIDP 2.0) JVM/J2ME 运行时移植到 Sony PS Vita
 详细文档：`BUILD.md`（构建）、`PORTING.md`（移植总览）、`VM_BUILD.md`（VM 细节）、
 `FILE_LAYOUT.md`（产物/日志位置）、`PROJECT_MEMORY.md`（开发记忆/踩坑记录）。
 
-## 日志与产物（不入库）
+## 产物与日志
 
+- 构建产物（不入库）：`vita-port/build/`、`out/`
 - VPK 交付：`out/vpk/`
-- 设备日志：`debug/logs/<session>/`（含 psp2core 转储）
-- 以上均被 `.gitignore` 排除，不随仓库分发。
+- 真机日志：`debug/logs/<session>/`（含 psp2core 转储）——**已入库**，作为
+  取证依据随代码一起版本化；规则见 `FILE_LAYOUT.md`
+- 其余构建中间物被 `.gitignore` 排除

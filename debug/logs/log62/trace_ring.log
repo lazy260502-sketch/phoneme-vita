@@ -1,0 +1,84 @@
+
+===== v02.27 syscall trace (per-thread slots) =====
+slot: ODD seq = INSIDE (never returned) = deadpoint
+tid 40010003: io_pwrite 400101d7 4b4e2315  (returned)
+tid 40010159: delay_thread 00000fa0 4d381869  <== INSIDE (NEVER RETURNED)
+tid 4001015d: io_write 4009018d 4d381a41  (returned)
+tid 400101c3: delay_thread 00002710 4d38028d  <== INSIDE (NEVER RETURNED)
+
+history (newest first):
+ io_write 4009018d 4d381cd1 I
+ io_write 4009018d 4d381cd1 I
+ io_write 4009018d 4d381cd1 I
+ io_write 4009018d 4d381cd1 I
+ io_write 4009018d 4d381cd1 I
+ io_write 4009018d 4d381f5c I
+ io_write 4009018d 4d38210a I
+ delay_thread 00002710 4d382a17 I
+ io_write 4009018d 4d383b42 I
+ io_write 4009018d 4d385626 I
+ delay_thread 00000fa0 4d3859d8 I
+ delay_thread 00002710 4d387984 I
+ delay_thread 00000fa0 4d387a72 I
+ delay_thread 00000fa0 4d389aef I
+ delay_thread 00000fa0 4d38ab4d I
+ io_write 4009018d 4d38baf3 I
+ delay_thread 00000fa0 4d38cc60 I
+ delay_thread 00000fa0 4d38dd03 I
+ delay_thread 00000fa0 4d38edbd I
+ delay_thread 00000fa0 4d38fd8d I
+ delay_thread 00000fa0 4d390d77 I
+ delay_thread 00000fa0 4d391e14 I
+ io_write 4009018d 4d393901 I
+ delay_thread 00002710 4d3940c4 I
+ io_write 4009018d 4d395245 I
+ io_write 4009018d 4d396b71 I
+ delay_thread 00000fa0 4d396f3d I
+ delay_thread 00002710 4d399047 I
+ io_write 4009018d 4d399df2 I
+ delay_thread 00000fa0 4d39b1aa I
+ delay_thread 00002710 4d39b7cd I
+ io_write 4009018d 4d39d0a4 I
+
+per-thread op counters:
+tid 40010003:
+	io_open=168
+	io_close=106
+	io_read=5884
+	io_write=954
+	io_pwrite=780
+	io_lseek=191
+	io_remove=4
+	io_mkdir=5
+	io_dopen=14
+	io_dread=7
+	io_dclose=8
+	io_getstat=37
+	delay_thread=4
+	disp_setframebuf=139
+	disp_waitvblank=139
+	ctrl_peek=524
+	touch_peek=524
+	mutex_lock=3
+	mutex_unlock=3
+	lwmutex_lock=17655
+	lwmutex_unlock=17656
+	sema_wait=780
+	sema_signal=390
+	evtflag_poll=390
+	io_lseek32=2341
+	io_getstat_byfd=29
+tid 40010159:
+	delay_thread=12551
+tid 4001015d:
+	io_open=553
+	io_close=550
+	io_read=2
+	io_write=713
+	delay_thread=133
+	mutex_lock=1
+	mutex_unlock=1
+	signal_send=1
+tid 400101c3:
+	delay_thread=4639
+===== end syscall trace =====

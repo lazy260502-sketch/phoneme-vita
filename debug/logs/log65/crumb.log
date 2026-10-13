@@ -1,0 +1,44 @@
+
+==== launcher start ====
+version: J2ME Player v02.38 b415 (2c34bdf)
+pin vm cpu mask=0x20000 rc=0x70000
+kubridge CALLABLE (enum blind)
+
+==== net early init done ====
+
+==== ANI_Initialize enter ====
+[pte] sem create init=0 handle=0x81700278 -> 0x40010141 rc=0 from 0x81128217
+[pte] sem create init=0 handle=0x81700270 -> 0x40010143 rc=0 from 0x81129899
+[pte] sem create init=0 handle=0x817002a0 -> 0x40010145 rc=0 from 0x81128217
+[pte] sem create init=0 handle=0x81700298 -> 0x40010147 rc=0 from 0x81129899
+[pte] sem create init=0 handle=0x817002b8 -> 0x40010149 rc=0 from 0x81128217
+[pte] sem create init=0 handle=0x817002d0 -> 0x4001014b rc=0 from 0x81128217
+[pte] sem create init=0 handle=0x81700330 -> 0x4001014d rc=0 from 0x81128217
+[pte] sem create init=0 handle=0x81700328 -> 0x4001014f rc=0 from 0x81129899
+[pte] sem create init=0 handle=0x81700358 -> 0x40010151 rc=0 from 0x81128217
+[pte] sem create init=0 handle=0x81700350 -> 0x40010153 rc=0 from 0x81129899
+[pte] sem create init=0 handle=0x81700370 -> 0x40010155 rc=0 from 0x81128217
+[pte] sem create init=0 handle=0x81700388 -> 0x40010157 rc=0 from 0x81128217
+
+==== ANI_Initialize done ====
+
+==== media init enter ====
+
+==== media init done ====
+round 0: jit cfg=0 -> policy=0
+menu: fb=0x61000000/0x611fe000 block=0x40010163
+menu hb: flips=0 rc=0x7fffffff games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=48 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=106 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=164 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=222 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=280 rc=0x00000000 games=5 btn=0x4000 tab=0 focus=0 view=l
+
+==== menu exit ====
+menu exit: have_sel=1 games=5 sen0=c0de0000
+
+==== round begin ====
+launch: games/app (1)/game.jar / com.app.filemanager.FileManagerMIDlet
+
+==== runMidlet enter ====
+vm UseCompiler(pre)=1 (jit policy=0)
