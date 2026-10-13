@@ -11,7 +11,6 @@ phoneME Feature (CLDC-HI + MIDP 2.0) JVM/J2ME 运行时移植到 Sony PS Vita
 ├── phoneme_source/   # 上游纯净参考树（只读，gitlink → magicus/phoneME）
 ├── vita-port/        # Vita 启动器/菜单/字体/网络/输入（当前主力，产物 midp_vita.vpk）
 ├── jsr75/            # JSR-75 (FileConnection) 实现
-├── patches/          # ★ 工作副本相对上游基线的完整补丁（见下）
 ├── tools/            # 手工重编辅助脚本
 ├── rebuild_vm.sh     # VM 重编脚本（含完整 PRODUCT 旗标配方）
 └── *.md              # 文档（AGENTS.md / BUILD.md / PORTING.md / PROJECT_MEMORY.md …）
@@ -28,12 +27,13 @@ phoneME Feature (CLDC-HI + MIDP 2.0) JVM/J2ME 运行时移植到 Sony PS Vita
 
 - `phoneme-cldc` ← https://github.com/tberthel/phoneme-components-cldc
   基线提交 `aae56e14a7e3`（phoneME Feature mr2-rel-b23）+ Vita 移植改动
-  （130 文件，+6307/−417，见 `patches/phoneme-cldc.patch`）
+  （130 文件，+6307/−417）
 - `phoneme-midp` ← https://github.com/tberthel/phoneme-components-midp
   基线提交 `8d44713992fd` + Vita 移植改动
-  （136 文件，+11333/−57，见 `patches/phoneme-midp.patch`）
+  （136 文件，+11333/−57）
 
-`patches/` 下的补丁是工作副本相对上游基线的完整 diff，供对照与向上游回提。
+需要与上游基线对照时，本地用 `git --git-dir=.nested-git-backups/phoneme-*.git
+--work-tree=phoneme-* diff <基线提交>` 现场生成，补丁文件不入库。
 
 `phoneme_source/phoneME`（magicus/phoneME @ 5a13f65）的 gitlink 目标在公开
 远端，可直接 `git submodule update --init` 获取。
