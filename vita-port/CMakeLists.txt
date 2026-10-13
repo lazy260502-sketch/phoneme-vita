@@ -1420,10 +1420,14 @@ set(VITA_VERSION  "02.53")
 #   bci at ALL THREE new_object failure sites (new_oob / new_tag /
 #   new_arr - the crash block's inline shape says new_arr: the CP
 #   "class" entry holds an ARRAY descriptor), BEFORE the funnel
-#   swallows the specifics. One Vita3K run answers: which class, which
-#   method, which `new`, which index - and whether the CP is corrupt
-#   or the classfile itself. No behavior change: the throws proceed
-#   exactly as before, so the crash scene stays comparable.
+#   swallows the specifics. CHANNEL FIX (v02.53a): stderr not stdout -
+#   every captured run log60..log76 has midp_stdout.log at 0 bytes on
+#   real hardware (the stdout redirect is unproven), while
+#   midp_stderr.log carries content in all 60+ runs unbuffered. One
+#   real-hardware run answers: which class, which method, which `new`,
+#   which index - and whether the CP is corrupt or the classfile
+#   itself. No behavior change: the throws proceed exactly as before,
+#   so the crash scene stays comparable.
 # 02.51 (2026-10-11): log74 falsified the v02.50 door premise. The
 #   BRAKE fired (crash scene = exact ring template: fp=0, r5=gp,
 #   r6=0x81edf004, [sp]=pad) but [r6] held 0x81edc2d4 - a JAVA-HEAP

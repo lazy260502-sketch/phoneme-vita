@@ -749,11 +749,16 @@ void vita_site_verifier_method(const char *name, int len) {
  * (midp_stdout.log), never stdio - see the site-ring note above. */
 void vita_verify_fail(const char *site, int index, unsigned int tag,
                       int bci, const char *extra, int extra_len) {
-    jvm_printf("VVFY %s cls=%s mth=%s idx=%d tag=0x%02x bci=%d extra=%.*s\n",
-               site,
-               vita_verify_class_name[0] ? vita_verify_class_name : "?",
-               vita_verify_method_name[0] ? vita_verify_method_name : "?",
-               index, tag, bci, extra_len, extra);
+    /* v02.53a: stderr, NOT jvm_printf/stdout. EVERY captured run log60..
+     * log76 has midp_stdout.log at 0 bytes - the stdout redirect was
+     * never proven on real hardware, while midp_stderr.log carries
+     * content in every single run (unbuffered, --wrap=sceIoWrite).
+     * The first-event evidence must not ride an unproven channel. */
+    fprintf(stderr, "VVFY %s cls=%s mth=%s idx=%d tag=0x%02x bci=%d extra=%.*s\n",
+            site,
+            vita_verify_class_name[0] ? vita_verify_class_name : "?",
+            vita_verify_method_name[0] ? vita_verify_method_name : "?",
+            index, tag, bci, extra_len, extra);
 }
 
 /* Called from the watchdog thread after a HANG. Appends the current
