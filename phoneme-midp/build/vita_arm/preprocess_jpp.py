@@ -90,8 +90,13 @@ def preprocess_jpp(input_path, output_path):
         f.writelines(output_lines)
 
 def main():
-    src_dir = '/home/zyb/vitasdk/samples/j2me/phoneme-midp/src'
-    out_dir = '/home/zyb/vitasdk/samples/j2me/phoneme-midp/build/vita_arm/all_sources'
+    # Workspace root from J2ME_ROOT env var, else derive from script location
+    # (phoneme-midp/build/vita_arm/ -> repo root is two levels up).
+    root = os.environ.get('J2ME_ROOT')
+    if not root:
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    src_dir = os.path.join(root, 'phoneme-midp', 'src')
+    out_dir = os.path.join(root, 'phoneme-midp', 'build', 'vita_arm', 'all_sources')
     
     os.makedirs(out_dir, exist_ok=True)
     

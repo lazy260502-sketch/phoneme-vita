@@ -1,0 +1,21 @@
+[MIDLET] startSuite: cn.uc.application.app.WebClient
+[MIDLET] creating cn.uc.application.app.WebClient
+[MIDLET] created+registered OK: cn.uc.application.app.WebClient
+[rms] open name='coreA' suite=-1 exists=1 next=2 live=1 ver=47 data=5016 free=0
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0
+[rms] open name='coreA' suite=-1 exists=1 next=2 live=1 ver=47 data=5016 free=0
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0
+[rms] open name='P' suite=-1 exists=1 next=2 live=1 ver=1 data=128 free=0
+[rms] open name='P' suite=-1 exists=1 next=2 live=1 ver=1 data=128 free=0
+[rms] open name='P' suite=-1 exists=0 (new store)
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0
+[rms] open name='G2' suite=-1 exists=0 (new store)
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0
+[rms] open name='B' suite=-1 exists=1 next=2 live=1 ver=1 data=24 free=0
+[rms] open name='B' suite=-1 exists=1 next=2 live=1 ver=1 data=24 free=0
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0
+[MIDLET] startSuite: com.app.filemanager.FileManagerMIDlet
+[MIDLET] creating com.app.filemanager.FileManagerMIDlet
+[MIDLET] created+registered OK: com.app.filemanager.FileManagerMIDlet

@@ -1,0 +1,11 @@
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+[NET] gethostbyname('uc.ucweb.com') = 111.13.216.166
+[NET] socket_open ip=111.13.216.166 port=80
+[NET] set_nbio fd=22 rc=0 errno=0
+[NET] connect EINPROGRESS fd=22 (thread will block)
+[NET] connect DONE fd=22

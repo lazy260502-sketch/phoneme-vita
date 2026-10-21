@@ -1,0 +1,6 @@
+exit round=0 status=0 land=33 shadow_in=33 th_start=32 th_finish=27 lw_exit=27 setcur=2491
+  v242 st=33/33/27/0/27/27/27/27/27/27 rec8.land=0 rec15.land=0
+  v243 trip_rep=0 trip_land=0 rep=0
+exit round=1 status=0 land=40 shadow_in=40 th_start=38 th_finish=31 lw_exit=31 setcur=2641
+  v242 st=40/40/31/0/31/31/31/31/31/31 rec8.land=0 rec15.land=0
+  v243 trip_rep=0 trip_land=0 rep=0

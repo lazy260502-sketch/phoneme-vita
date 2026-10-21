@@ -1,0 +1,5 @@
+[+4540176 us] round=0 round_begin com.app.filemanager.FileManagerMIDlet
+[+4641519 us] round=0 runMidlet_enter
+[+5086360 us] round=0 first_flip
+[+15111735 us] round=0 first_check_events
+[+16531120 us] round=0 first_content_flip flip#=3

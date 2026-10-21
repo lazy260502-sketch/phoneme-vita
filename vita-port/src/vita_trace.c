@@ -51,6 +51,7 @@
  * return. No blocking, no allocation inside the tracer itself.
  */
 
+#include <string.h>          /* v02.50: fd -> path tail (strlen/strncpy) */
 #include <psp2/types.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -171,6 +172,104 @@ void vita_trace_enter(unsigned int op, unsigned int arg)
     g_hist[hist] = *s;
 }
 
+/* v02.47: time spent inside each traced op, VM thread only (single
+ * writer, so no atomics). ts_lo is the 32-bit low word of the system time
+ * stamped at entry; the unsigned subtraction handles wrap-around. */
+extern volatile SceUID vita_wd_vm_tid;
+static unsigned int g_ucnt[TRACE_OP_N];
+static unsigned long long g_usum[TRACE_OP_N];
+
+/* v02.50: fd -> path tail, filled at sceIoOpen. Diagnostic only: entries
+ * may tear if two threads open at once, and a closed fd keeps its old name
+ * until reused, so the watchdog treats the name as a hint. */
+#define TR_FD_N 32
+#define TR_FD_PATH 40
+static struct {
+    volatile int fd;
+    char path[TR_FD_PATH];
+} g_fdp[TR_FD_N];
+static volatile unsigned int g_fdp_next;
+
+/* v02.54: log102 showed "io_write fd=1073807631 (?)": SceUIDs are never
+ * reused and the startup opens dozens of short-lived files (every
+ * vita_boot_log line, every heartbeat), so a 16-slot round-robin table
+ * overwrote the one LONG-LIVED fd we care about. Slots are now freed at
+ * sceIoClose and a free slot is preferred over evicting one. */
+static void tr_forget_fd(int fd)
+{
+    unsigned int i;
+    if (fd <= 0)
+        return;
+    for (i = 0; i < TR_FD_N; i++)
+        if (g_fdp[i].fd == fd)
+            g_fdp[i].fd = 0;
+}
+
+static void tr_note_fd(int fd, const char *file)
+{
+    unsigned int i, n;
+    int slot = -1;
+    size_t len;
+
+    if (fd < 0 || file == NULL)
+        return;
+    for (i = 0; i < TR_FD_N; i++)
+        if (g_fdp[i].fd == fd) { slot = (int)i; break; }
+    if (slot < 0)
+        for (i = 0; i < TR_FD_N; i++)
+            if (g_fdp[i].fd == 0 || g_fdp[i].fd == -1) { slot = (int)i; break; }
+    if (slot < 0)
+        slot = (int)(g_fdp_next++ % TR_FD_N);
+    len = strlen(file);
+    n = (len > TR_FD_PATH - 1) ? (unsigned int)(len - (TR_FD_PATH - 1)) : 0;
+    g_fdp[slot].fd = -1;                       /* hide while rewriting */
+    strncpy(g_fdp[slot].path, file + n, TR_FD_PATH - 1);
+    g_fdp[slot].path[TR_FD_PATH - 1] = '\0';
+    g_fdp[slot].fd = fd;
+}
+
+const char *vita_trace_fd_path(int fd)
+{
+    unsigned int i;
+    for (i = 0; i < TR_FD_N; i++)
+        if (g_fdp[i].fd == fd)
+            return g_fdp[i].path;
+    return "?";
+}
+
+/* VM-thread sceIoWrite calls per fd (count, microseconds inside the call) */
+#define TR_FDW_N 8
+static struct {
+    int fd;
+    unsigned int cnt;
+    unsigned long long us;
+    unsigned long long bytes;   /* v02.54: bytes actually written */
+} g_fdw[TR_FDW_N];
+
+int vita_trace_fdw_get(unsigned int idx, int *fd, unsigned int *cnt,
+                       unsigned long long *us, unsigned long long *bytes)
+{
+    if (idx >= TR_FDW_N || g_fdw[idx].cnt == 0)
+        return 0;
+    *fd = g_fdw[idx].fd;
+    *cnt = g_fdw[idx].cnt;
+    *us = g_fdw[idx].us;
+    *bytes = g_fdw[idx].bytes;
+    return 1;
+}
+
+static void tr_fdw_bytes(int fd, int n)
+{
+    unsigned int k;
+    if (n <= 0)
+        return;
+    for (k = 0; k < TR_FDW_N; k++)
+        if (g_fdw[k].cnt != 0 && g_fdw[k].fd == fd) {
+            g_fdw[k].bytes += (unsigned int)n;
+            return;
+        }
+}
+
 void vita_trace_exit(void)
 {
     unsigned int tid = (unsigned int)sceKernelGetThreadId();
@@ -178,9 +277,70 @@ void vita_trace_exit(void)
 
     for (i = 0; i < VITA_T_MAX; i++) {
         if (g_thr[i].tid == tid) {
+            if (tid == (unsigned int)vita_wd_vm_tid &&
+                g_slot[i].op < TRACE_OP_N) {
+                unsigned int op = g_slot[i].op;
+                unsigned int d = (unsigned int)sceKernelGetSystemTimeWide()
+                                 - g_slot[i].ts_lo;
+                g_ucnt[op]++;
+                g_usum[op] += d;
+                if (op == TRACE_OP_IO_WRITE) {   /* v02.50: per-fd split */
+                    int wfd = (int)g_slot[i].arg;
+                    unsigned int k;
+                    for (k = 0; k < TR_FDW_N; k++)
+                        if (g_fdw[k].cnt == 0 || g_fdw[k].fd == wfd)
+                            break;
+                    if (k < TR_FDW_N) {
+                        g_fdw[k].fd = wfd;
+                        g_fdw[k].cnt++;
+                        g_fdw[k].us += d;
+                    }
+                }
+            }
             g_slot[i].seq &= ~1u; /* even = returned */
             return;
         }
+    }
+}
+
+unsigned int vita_trace_op_count(void) { return TRACE_OP_N; }
+
+const char *vita_trace_op_name(unsigned int op)
+{
+    return op < TRACE_OP_N ? g_opname[op] : "?";
+}
+
+void vita_trace_op_stats(unsigned int op, unsigned int *cnt,
+                         unsigned long long *us)
+{
+    if (op >= TRACE_OP_N) { *cnt = 0; *us = 0; return; }
+    *cnt = g_ucnt[op];
+    *us = g_usum[op];
+}
+
+void vita_trace_peek(unsigned int tid, vita_trace_peek_t *out)
+{
+    int i;
+    unsigned int j;
+
+    out->found = 0; out->op = 0xFF; out->inside = 0; out->ts_lo = 0;
+    out->arg = 0;
+    out->total = 0; out->rd = 0; out->lseek = 0; out->lseek32 = 0;
+    out->lwmutex = 0; out->sema = 0;
+    for (i = 0; i < VITA_T_MAX; i++) {
+        if (g_thr[i].tid != tid) continue;
+        out->found = 1;
+        out->op = g_slot[i].op;
+        out->inside = g_slot[i].seq & 1u;
+        out->ts_lo = g_slot[i].ts_lo;
+        out->arg = g_slot[i].arg;
+        for (j = 0; j < TRACE_OP_N; j++) out->total += g_thr[i].opcnt[j];
+        out->rd = g_thr[i].opcnt[TRACE_OP_IO_READ];
+        out->lseek = g_thr[i].opcnt[TRACE_OP_IO_LSEEK];
+        out->lseek32 = g_thr[i].opcnt[TRACE_OP_IO_LSEEK32];
+        out->lwmutex = g_thr[i].opcnt[TRACE_OP_LWMUTEX_LOCK];
+        out->sema = g_thr[i].opcnt[TRACE_OP_SEMA_WAIT];
+        return;
     }
 }
 
@@ -316,6 +476,7 @@ SceUID __wrap_sceIoOpen(const char *file, int flags, SceMode mode)
     vita_trace_enter(TRACE_OP_IO_OPEN, (unsigned int)file);
     r = __real_sceIoOpen(file, flags, mode);
     vita_trace_exit();
+    tr_note_fd((int)r, file);   /* v02.50: remember fd -> path tail */
     return r;
 }
 
@@ -326,6 +487,7 @@ int __wrap_sceIoClose(SceUID fd)
     vita_trace_enter(TRACE_OP_IO_CLOSE, (unsigned int)fd);
     r = __real_sceIoClose(fd);
     vita_trace_exit();
+    tr_forget_fd((int)fd);          /* v02.54: free the fd -> path slot */
     return r;
 }
 
@@ -346,6 +508,8 @@ int __wrap_sceIoWrite(SceUID fd, const void *data, SceSize size)
     vita_trace_enter(TRACE_OP_IO_WRITE, (unsigned int)fd);
     r = __real_sceIoWrite(fd, data, size);
     vita_trace_exit();
+    if (sceKernelGetThreadId() == vita_wd_vm_tid)   /* v02.54: bytes per fd */
+        tr_fdw_bytes((int)fd, r);
     return r;
 }
 

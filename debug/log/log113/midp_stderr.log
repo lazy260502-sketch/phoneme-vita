@@ -1,0 +1,170 @@
+vita-port J2ME launcher
+vm cpu: unpinned (mask=0, kernel default 3-core)
+kubridge precheck: ABSENT
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+version: J2ME Player v02.67 b329 (1e8533d)
+[ANI] thread pool initialized
+[media] tone player thread created
+menu jar: games/app/game.jar
+menu class: cn.uc.application.app.WebClient
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_1A35
+classpath: midp_system.jar:games/app/game.jar
+starting MIDlet: cn.uc.application.app.WebClient
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='cn.uc.application.app.WebClient'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=36 additionalPathLength=34
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFcoreA.db flags=0x2 size=5016
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFG2.db flags=0x2 size=51344
+[NET] gethostbyname('uc.ucweb.com') = 219.133.46.238
+[NET] socket_open ip=219.133.46.238 port=80
+[NET] set_nbio fd=15 rc=0 errno=0
+[NET] connect EINPROGRESS fd=15 (thread will block)
+[NET] connect DONE fd=15
+[IME] text_wanted -> 1 (t=26361 ms)
+[GXM] initialized (display queue)
+[IME] show: Init rc=0x00000000 (status before=0, -1 ms since last Term, attempt 1, t=26381 ms)
+[CD] map fb base=0x61400000 bytes=4194304 rc=0x00000000
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 1 (+60 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #300 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 2 (+18401 ms)
+[IME] finished: button=0 Term rc=0x00000000 (+18422 ms)
+[IME] dismissed (button=0)
+[IME] text_wanted -> 0 (t=49032 ms)
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFP.db flags=0x2 size=168
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('book.uc.cn') = 49.7.88.220
+[NET] socket_open ip=49.7.88.220 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('t.shuqi.com') = 111.13.239.66
+[NET] socket_open ip=111.13.239.66 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFB.db flags=0x2 size=64
+[IME] text_wanted -> 1 (t=61021 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 16109 ms since last Term, attempt 1, t=61041 ms)
+[NET] connect DONE fd=16
+[IME] show: Init rc=0x8002047f (status before=0, 17164 ms since last Term, attempt 11, t=62096 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 18234 ms since last Term, attempt 21, t=63165 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 19301 ms since last Term, attempt 31, t=64233 ms)
+[IME] Init still failing after 30 retries - giving up
+[IME] text_wanted -> 0 (t=66824 ms)
+[IME] text_wanted -> 1 (t=70702 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 25790 ms since last Term, attempt 1, t=70722 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 26830 ms since last Term, attempt 11, t=71761 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 27929 ms since last Term, attempt 21, t=72861 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 28977 ms since last Term, attempt 31, t=73909 ms)
+[IME] Init still failing after 30 retries - giving up
+[IME] text_wanted -> 0 (t=78326 ms)
+[IME] text_wanted -> 1 (t=79499 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 34588 ms since last Term, attempt 1, t=79519 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 35767 ms since last Term, attempt 11, t=80699 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 36832 ms since last Term, attempt 21, t=81764 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 37936 ms since last Term, attempt 31, t=82868 ms)
+[IME] Init still failing after 30 retries - giving up
+[IME] text_wanted -> 0 (t=84693 ms)
+  midpRunVm returned vmStatus=2001 (MAIN_EXIT=2001)
+  classPath freed
+*** runMidlet: midp_run_midlet_with_args_cp returned status=0
+runMidlet returned 0 - back to menu
+menu jar: games/app (2)/game.jar
+menu class: MiniXplorer
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_38D6
+classpath: midp_system.jar:games/app (2)/game.jar
+starting MIDlet: MiniXplorer
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app (2)/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='MiniXplorer'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app (2)/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app (2)/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app (2)/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=40 additionalPathLength=38
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app (2)/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+  midpRunVm returned vmStatus=2001 (MAIN_EXIT=2001)
+  classPath freed
+*** runMidlet: midp_run_midlet_with_args_cp returned status=0
+runMidlet returned 0 - back to menu
+menu jar: games/app (1)/game.jar
+menu class: com.app.filemanager.FileManagerMIDlet
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_6B15
+classpath: midp_system.jar:games/app (1)/game.jar
+starting MIDlet: com.app.filemanager.FileManagerMIDlet
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app (1)/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='com.app.filemanager.FileManagerMIDlet'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app (1)/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app (1)/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app (1)/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=40 additionalPathLength=38
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app (1)/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+[IME] text_wanted -> 1 (t=128792 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 83880 ms since last Term, attempt 1, t=128812 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 84933 ms since last Term, attempt 11, t=129865 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 85961 ms since last Term, attempt 21, t=130893 ms)
+[IME] show: Init rc=0x8002047f (status before=0, 87020 ms since last Term, attempt 31, t=131951 ms)
+[IME] Init still failing after 30 retries - giving up
+[IME] text_wanted -> 0 (t=142118 ms)

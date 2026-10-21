@@ -1,0 +1,58 @@
+
+===== v02.22 module table =====
+flag 0x81: 14 modules
+  vsh
+  Framecounter
+  SceAppUtil
+  SceLibPvf
+  SceLibft2
+  SceLibDbg
+  SceCommonDialog
+  SceShellSvc
+  SceGxm
+  SceGpuEs4User
+  SceAvcodecUser
+  SceDriverUser
+  SceLibKernel
+  midp_vita
+flag 0x82: 11 modules
+  SceAppUtil
+  SceLibPvf
+  SceLibft2
+  SceLibDbg
+  SceCommonDialog
+  SceShellSvc
+  SceGxm
+  SceGpuEs4User
+  SceAvcodecUser
+  SceDriverUser
+  SceLibKernel
+flag 0x83: 14 modules
+  vsh
+  Framecounter
+  SceAppUtil
+  SceLibPvf
+  SceLibft2
+  SceLibDbg
+  SceCommonDialog
+  SceShellSvc
+  SceGxm
+  SceGpuEs4User
+  SceAvcodecUser
+  SceDriverUser
+  SceLibKernel
+  midp_vita
+flag 0x84: 11 modules
+  SceAppUtil
+  SceLibPvf
+  SceLibft2
+  SceLibDbg
+  SceCommonDialog
+  SceShellSvc
+  SceGxm
+  SceGpuEs4User
+  SceAvcodecUser
+  SceDriverUser
+  SceLibKernel
+tai ux0:0 ur0:0 bundled(app0):1
+===== end module table =====

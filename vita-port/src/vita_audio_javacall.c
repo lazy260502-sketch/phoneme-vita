@@ -13,7 +13,9 @@
  */
 
 #include <psp2/audioout.h>
+#include <psp2/kernel/threadmgr.h> /* sceKernelDelayThread (alog spinlock) */
 #include <stdlib.h>
+#include <stdio.h>   /* vsnprintf (alog) */
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
@@ -22,6 +24,7 @@
 #include "javacall_defs.h"
 #include "javacall_memory.h"
 #include "javanotify_multimedia.h"
+#include "vita_midi.h"   /* v02.60: SMF (MIDI) playback */
 
 /* v01.96: WAV (RIFF/PCM) support, implemented in vita_wav.c */
 typedef struct {
@@ -75,6 +78,13 @@ static void alog(const char *fmt, ...) {
     __sync_lock_release(&lock);
 }
 #define ALOG(name) alog("[IN ] %s\n", name)
+/* v02.64: per-call logging of polled entry points. Every alog() line is a
+ * synchronous sceIoWrite (12-22 ms measured on this device); log110 had
+ * 2757 of them from the VM thread (get_time 1231, get_duration 607, ...).
+ * Log only every 64th call, with the running count. */
+#define ALOG_HOT(name) do { static unsigned _hot_n; \
+        if ((_hot_n++ & 63u) == 0) \
+            alog("[IN ] %s (call #%u)\n", name, _hot_n); } while (0)
 
 
 /* ---------------------------------------------------------------------------
@@ -107,6 +117,13 @@ static void alog(const char *fmt, ...) {
 /* v01.97: hard ceiling for the dynamically grown WAV buffer (32 MB
  * ~ 3 minutes of 44.1 kHz stereo 16-bit; allocated on demand only). */
 #define WAV_MAX_BUFFER      (32 * 1024 * 1024)
+/* v02.64: ceiling / initial size of the MIDI accumulator (a Standard MIDI
+ * File is tens of KB; 4 MB is far beyond any J2ME game). */
+#define MIDI_MAX_BUFFER     (4 * 1024 * 1024)
+#define MIDI_INIT_CAP       (64 * 1024)
+/* v02.66: WAV accumulator. Same aliasing problem as MIDI (see the
+ * vita_player comment); the ceiling stays WAV_MAX_BUFFER above. */
+#define WAV_INIT_CAP        (64 * 1024)
 
 /* One expanded playback event */
 typedef struct {
@@ -134,8 +151,7 @@ typedef struct {
      * grown on demand for large WAV in do_buffering). JTS sequences
      * still fit the initial block, so their path only gains an
      * indirection; the struct shrinks from ~32.5 KB to ~200 bytes. */
-    uint8_t  *jts_data;
-    long     wav_cap;      /* allocated size of jts_data */
+    uint8_t  *jts_data;    /* fixed JTS_MAX_SIZE: KNI staging only */
     long     jts_len;      /* bytes buffered */
     long     whole_size;   /* set via javacall_media_set_whole_content_size */
     long     duration_ms;  /* computed total sequence duration, -1 unknown */
@@ -143,7 +159,32 @@ typedef struct {
     javacall_bool mute;
     /* v01.96: WAV (audio/x-wav) support */
     wav_state wav;
-    uint32_t  wav_buf_len; /* accumulated bytes in jts_data for WAV  */
+    uint32_t  wav_buf_len; /* accumulated bytes in wav_acc for WAV    */
+    /* v02.66: same KNI aliasing as MIDI (get_buffer_address hands out
+     * jts_data, KNI copies each Java window to its START, then calls
+     * do_buffering with buffer == jts_data). Appending to
+     * jts_data + wav_buf_len therefore clobbered the bytes already
+     * collected from the 2nd 4 KB chunk on, and wav_acc_ensure's realloc
+     * could MOVE jts_data while `buffer` still pointed at the freed block
+     * (use-after-free). Long WAVs never worked; no archived log has a
+     * "wav buffered" line to prove otherwise. */
+    uint8_t  *wav_acc;
+    long      wav_acap;
+    /* v02.60: MIDI (audio/midi) support - SMF bytes accumulate in
+     * jts_data exactly like WAV; midi is the MIME discriminator set in
+     * realize(), midi_len the byte count. */
+    int      midi;        /* 1 = this player is a MIDI file           */
+    uint32_t midi_len;    /* accumulated SMF bytes in midi_acc        */
+    /* v02.64: the SMF accumulates in its OWN heap block. KNI copies every
+     * Java window to the START of jts_data (the buffer we hand out in
+     * get_buffer_address) and then calls do_buffering with buffer ==
+     * jts_data; appending to jts_data + midi_len therefore overwrote the
+     * bytes accumulated so far (MThd header included) from the 2nd chunk
+     * on. log110: 198x "[MIDI] parse FAILED (29139 bytes)". jts_data is now
+     * only the fixed KNI staging buffer for MIDI. */
+    uint8_t *midi_acc;
+    long     midi_cap;
+    int      midi_bad;    /* parse failed once - don't retry/log again */
     /* playback progress (touched by player thread) */
     volatile int      playing;
     volatile long     cur_time_ms;
@@ -188,6 +229,11 @@ static vita_player *g_wav_req = NULL;          /* player to play next     */
 static volatile unsigned int g_wav_seq = 0;    /* bumped on each request  */
 static volatile unsigned int g_wav_done = 0;   /* last finished request   */
 
+/* MIDI playback request (Player.start) - same handshake pattern. */
+static vita_player *g_midi_req = NULL;         /* player to play next     */
+static volatile unsigned int g_midi_seq = 0;   /* bumped on each request  */
+static volatile unsigned int g_midi_done = 0;  /* last finished request   */
+
 /* ---------------------------------------------------------------------------
  * caps / configuration (static, tone-only)
  * ------------------------------------------------------------------------- */
@@ -209,6 +255,15 @@ static javacall_media_caps g_caps_tone[] = {
      * memory protocol to stream bytes via nBuffering. */
     { JAVACALL_MEDIA_FORMAT_MS_PCM,
       "audio/x-wav",
+      JAVACALL_MEDIA_MEMORY_PROTOCOL | JAVACALL_MEDIA_FILE_LOCAL_PROTOCOL,
+      0 },
+    /* v02.60: MIDI (audio/midi). Manager.createPlayer(DataSource) checks
+     * getSupportedContentTypes(protocol) against the javacall caps, so
+     * without this entry the game's BGM .mid fails with
+     * "Player cannot be created for audio/midi" (log97). The bytes are
+     * streamed via nBuffering like WAV and synthesized in vita_midi.c. */
+    { JAVACALL_MEDIA_FORMAT_MIDI,
+      "audio/midi",
       JAVACALL_MEDIA_MEMORY_PROTOCOL | JAVACALL_MEDIA_FILE_LOCAL_PROTOCOL,
       0 },
     { 0, NULL, 0, 0 } /* array terminator - do not remove */
@@ -595,7 +650,9 @@ static long jts_total_duration(const jts_event *evs, long n) {
 
 /** Volume-scaled sample fetch; 8-bit WAV is unsigned, 16-bit signed. */
 static int32_t wav_sample_at(const vita_player *pl, long frame, int ch) {
-    const uint8_t *base = pl->jts_data + pl->wav.data_off;
+    /* v02.66: the PCM lives in the accumulator, not in the KNI staging
+     * buffer (see the vita_player comment). */
+    const uint8_t *base = pl->wav_acc + pl->wav.data_off;
     long bytes_per_frame = (long)pl->wav.channels * (pl->wav.bits >> 3);
     const uint8_t *p = base + frame * bytes_per_frame + ch * (pl->wav.bits >> 3);
     int32_t s;
@@ -614,7 +671,7 @@ static void wav_render_player(vita_player *pl, unsigned int my_seq) {
     int bytes_per_frame;
 
     pl->playing = 1;
-    pl->stop_flag = 0;
+    /* v02.66: stop_flag is cleared by javacall_media_start(), not here. */
     pl->cur_time_ms = 0;
 
     if (audio_out_open() != 0) {
@@ -671,8 +728,41 @@ static void wav_render_player(vita_player *pl, unsigned int my_seq) {
  * watchdog (vita_watchdog.c). -1 until javacall_media_initialize runs. */
 volatile SceUID vita_tone_tid = -1;
 
+/* v02.60: MIDI playback callbacks for vita_midi_play. The context
+ * carries the player (for mute/stop_flag) and the request sequence so a
+ * newer start() can preempt the current render. */
+typedef struct {
+    vita_player *pl;
+    unsigned int my_seq;
+    unsigned long frames;     /* v02.65: frames handed out so far */
+} midi_ctx_t;
+
+static void midi_out_cb(const int16_t *stereo, int frames, void *ctx) {
+    midi_ctx_t *mc = (midi_ctx_t *)ctx;
+    /* v02.65: keep getMediaTime() moving. cur_time_ms used to stay 0 for the
+     * whole song (only set to the duration at the end), so a game that waits
+     * for or syncs to the media clock saw it frozen. */
+    mc->frames += (unsigned long)frames;
+    mc->pl->cur_time_ms =
+        (long)(((unsigned long long)mc->frames * 1000ULL) / OUT_SAMPLE_RATE);
+    if (mc->pl->mute) {
+        /* v02.65: sceAudioOutOutput() is what paces the render loop to real
+         * time. A muted player skipped it and rendered flat out (a whole song
+         * in seconds, one core pinned) - sleep one chunk instead. */
+        sceKernelDelayThread((unsigned int)((unsigned long long)frames *
+                                            1000000ULL / OUT_SAMPLE_RATE));
+        return;
+    }
+    sceAudioOutOutput(g_audio_port, stereo);
+}
+
+static int midi_stop_cb(void *ctx) {
+    midi_ctx_t *mc = (midi_ctx_t *)ctx;
+    return (mc->pl->stop_flag != 0) || (g_midi_seq != mc->my_seq);
+}
+
 /* Dedicated tone player thread: waits for requests, streams them out.
- * Handles both simple playTone requests and JTS sequence playback. */
+ * Handles simple playTone, JTS sequence, WAV and MIDI playback. */
 static int tone_player_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
 
@@ -692,7 +782,8 @@ static int tone_player_thread(SceSize args, void *argp) {
                                     &tempo_dummy, &res_dummy);
                 if (n > 0) {
                     pl->playing = 1;
-                    pl->stop_flag = 0;
+                    /* v02.66: stop_flag is cleared by javacall_media_start(),
+                     * not here - see the comment there. */
                     pl->cur_time_ms = 0;
                     if (audio_out_open() == 0) {
                         for (long i = 0; i < n; i++) {
@@ -728,6 +819,61 @@ static int tone_player_thread(SceSize args, void *argp) {
             g_wav_done = my_seq;
             if (pl != NULL && pl->wav.valid) {
                 wav_render_player(pl, my_seq);
+            }
+            continue;
+        }
+
+        /* --- MIDI playback request? (v02.60) --- */
+        if (g_midi_seq != g_midi_done) {
+            vita_player *pl = g_midi_req;
+            unsigned int my_seq = g_midi_seq;
+            g_midi_done = my_seq;
+            if (pl != NULL && pl->midi && pl->midi_len > 0) {
+                midi_ctx_t mc;
+                long dur = -1;
+                int failed = 0;
+                pl->playing = 1;
+                /* v02.66: stop_flag is cleared by javacall_media_start(),
+                 * not here - see the comment there. */
+                pl->cur_time_ms = 0;
+                mc.pl = pl;
+                mc.my_seq = my_seq;
+                mc.frames = 0;
+                if (pl->midi_bad || pl->midi_acc == NULL) {
+                    failed = 1;      /* known-bad: no re-parse, no log */
+                } else if (audio_out_open() == 0) {
+                    int r = vita_midi_play(pl->midi_acc, (long)pl->midi_len,
+                                           pl->volume, midi_out_cb,
+                                           midi_stop_cb, &mc, &dur);
+                    if (dur > 0) pl->duration_ms = dur;
+                    if (r < 0) {
+                        pl->midi_bad = 1;
+                        failed = 1;
+                    }
+                }
+                /* v02.64: a failed play must not report end-of-media at
+                 * once - a looping game answers with set_time(0)+start()
+                 * immediately, which log110 showed as 308 rounds in 133 s
+                 * (each with a dozen synchronous log writes). Pace it to
+                 * ~1/s, interruptibly, on this thread (not the VM thread). */
+                if (failed) {
+                    int w;
+                    for (w = 0; w < 20 && !pl->stop_flag &&
+                                g_midi_seq == my_seq; w++) {
+                        sceKernelDelayThread(50 * 1000);
+                    }
+                }
+                pl->playing = 0;
+                pl->cur_time_ms = pl->duration_ms;
+
+                if (!pl->stop_flag && g_midi_seq == my_seq) {
+                    ALOG("notify END_OF_MEDIA (midi done)");
+                    javanotify_on_media_notification(
+                        JAVACALL_EVENT_MEDIA_END_OF_MEDIA,
+                        pl->app_id, pl->player_id, JAVACALL_OK,
+                        (void *)(long)(pl->duration_ms / 1000));
+                }
+                pl->stop_flag = 0;
             }
             continue;
         }
@@ -790,6 +936,8 @@ javacall_result javacall_media_finalize(void) {
         sceAudioOutReleasePort(g_audio_port);
         g_audio_port = -1;
     }
+    /* v02.60: free the MIDI sound bank on VM shutdown. */
+    vita_midi_shutdown();
     return JAVACALL_OK;
 }
 
@@ -880,13 +1028,14 @@ javacall_result javacall_media_create(int appID, int playerID,
     pl->mute = JAVACALL_FALSE;
 
     /* v01.97: initial heap block; small WAVs and every JTS sequence fit
-     * without realloc churn. */
+     * without realloc churn. v02.66: WAV/MIDI payloads accumulate in
+     * their own blocks (wav_acc / midi_acc), this one stays fixed size
+     * as the KNI staging buffer. */
     pl->jts_data = (uint8_t *)javacall_malloc(JTS_MAX_SIZE);
     if (pl->jts_data == NULL) {
         javacall_free(pl);
         return JAVACALL_OUT_OF_MEMORY;
     }
-    pl->wav_cap = JTS_MAX_SIZE;
 
     *handle = (javacall_handle)pl;
     return JAVACALL_OK;
@@ -901,6 +1050,7 @@ javacall_result javacall_media_close(javacall_handle handle) {
     pl->stop_flag = 1;
     if (g_jts_req == pl) g_jts_req = NULL;
     if (g_wav_req == pl) g_wav_req = NULL;
+    if (g_midi_req == pl) g_midi_req = NULL;
     /* v01.97: jts_data is heap now and a long BGM render can still be
      * inside wav_render_player - give the player thread time to notice
      * stop_flag before freeing. Bounded: one output chunk is ~10 ms,
@@ -910,6 +1060,8 @@ javacall_result javacall_media_close(javacall_handle handle) {
         spins++;
     }
     if (pl->jts_data != NULL) javacall_free(pl->jts_data);
+    if (pl->midi_acc != NULL) javacall_free(pl->midi_acc);
+    if (pl->wav_acc != NULL) javacall_free(pl->wav_acc);   /* v02.66 */
     javacall_free(pl);
     return JAVACALL_OK;
 }
@@ -924,10 +1076,20 @@ javacall_result javacall_media_get_player_controls(javacall_handle handle,
                               /*OUT*/ int* controls) {
     ALOG("get_player_controls");
     vita_player *pl = (vita_player *)handle;
-    (void)pl;
     if (controls == NULL) return JAVACALL_INVALID_ARGUMENT;
-    /* ToneControl + VolumeControl: makes Manager pick DirectTone */
-    *controls = JAVACALL_MEDIA_CTRL_TONE | JAVACALL_MEDIA_CTRL_VOLUME;
+    /* v02.61: advertise the controls that match THIS player's content.
+     * HighLevelPlayer.getPlayerFromType() is an else-if over
+     * nIsToneControlSupported -> nIsMIDIControlSupported -> DirectPlayer.
+     * Returning TONE for a MIDI player routed it to DirectTone, whose JTS
+     * validator (checkSequence) rejects SMF bytes with "Tone sequence
+     * check failed ... missing version information" (log109). A MIDI
+     * player must advertise MIDI (not TONE) so it lands in DirectMIDI,
+     * which inherits DirectPlayer's javacall-backed doBuffering/start. */
+    if (pl != NULL && pl->midi) {
+        *controls = JAVACALL_MEDIA_CTRL_MIDI | JAVACALL_MEDIA_CTRL_VOLUME;
+    } else {
+        *controls = JAVACALL_MEDIA_CTRL_TONE | JAVACALL_MEDIA_CTRL_VOLUME;
+    }
     return JAVACALL_OK;
 }
 
@@ -940,6 +1102,12 @@ javacall_result javacall_media_get_format(javacall_handle handle,
         /* HighLevelPlayer throws Unsupported unless realize's
          * nGetMediaFormat returns a known caps format string. */
         *format = JAVACALL_MEDIA_FORMAT_MS_PCM;
+        return JAVACALL_OK;
+    }
+    if (pl != NULL && pl->midi) {
+        /* Same for MIDI: report the known caps format string so
+         * HighLevelPlayer does not throw Unsupported. */
+        *format = JAVACALL_MEDIA_FORMAT_MIDI;
         return JAVACALL_OK;
     }
     /* UNKNOWN lets HighLevelPlayer map device://tone to DEVICE_TONE
@@ -966,6 +1134,20 @@ javacall_result javacall_media_release_device(javacall_handle handle) {
  * Player state machine (device tone)
  * ------------------------------------------------------------------------- */
 
+/* Case-sensitive ASCII match of a UTF-16 MIME string (the MIDP media
+ * subsystem passes content types as ASCII, so the UTF-16 units are the
+ * ASCII code points). */
+static int mime_equals(javacall_const_utf16_string mime, long mimeLength,
+                       const char *ascii) {
+    long m = (long)strlen(ascii);
+    long i;
+    if (mime == NULL || mimeLength < m) return 0;
+    for (i = 0; i < m; i++) {
+        if (mime[i] != (javacall_utf16)ascii[i]) return 0;
+    }
+    return 1;
+}
+
 javacall_result javacall_media_realize(javacall_handle handle,
                                        javacall_const_utf16_string mime,
                                        long mimeLength) {
@@ -973,24 +1155,28 @@ javacall_result javacall_media_realize(javacall_handle handle,
     vita_player *pl = (vita_player *)handle;
     if (pl == NULL) return JAVACALL_INVALID_ARGUMENT;
 
-    /* Remember whether this player is a WAV by its requested MIME
-     * ("audio/x-wav" arrives as UTF-16 from HighLevelPlayer.realize).
-     * Anything that is neither tone (handled elsewhere in Java) nor WAV
-     * still realizes fine here - the format check that surfaces the
-     * MediaException is nGetMediaFormat below. */
+    /* Classify the player by its requested MIME ("audio/x-wav" /
+     * "audio/midi" arrive as UTF-16 from HighLevelPlayer.realize). Tone
+     * is handled elsewhere in Java; the format check that surfaces an
+     * Unsupported MediaException is nGetMediaFormat below. */
     pl->wav.valid = 0;
-    {
-        static const char wav_mime[] = "audio/x-wav";
-        long m = (long)sizeof(wav_mime) - 1;
-        long i;
-        if (mime != NULL && mimeLength >= m) {
-            int match = 1;
-            for (i = 0; i < m; i++) {
-                if (mime[i] != (javacall_utf16)wav_mime[i]) { match = 0; break; }
-            }
-            if (match) pl->wav.valid = 1;   /* MIME says WAV; header check
-                                               happens in do_buffering */
-        }
+    pl->midi = 0;
+    if (mime_equals(mime, mimeLength, "audio/x-wav")) {
+        pl->wav.valid = 1;   /* MIME says WAV; header check in do_buffering */
+        /* v02.66: a re-download starts from empty (mirrors the MIDI reset
+         * below); leftover data_off would skip the end-of-stream parse. */
+        pl->wav_buf_len = 0;
+        pl->wav.data_off = 0;
+        pl->wav.data_len = 0;
+    } else if (mime_equals(mime, mimeLength, "audio/midi") ||
+               mime_equals(mime, mimeLength, "audio/x-midi") ||
+               mime_equals(mime, mimeLength, "audio/mid") ||
+               mime_equals(mime, mimeLength, "audio/sp-midi")) {
+        pl->midi = 1;        /* MIME says MIDI; parsed in do_buffering */
+        /* v02.64: realize precedes the download; start from empty so a
+         * re-download can never append to a previous copy. */
+        pl->midi_len = 0;
+        pl->midi_bad = 0;
     }
 
     if (pl->state == 0) pl->state = 1;
@@ -1013,9 +1199,28 @@ javacall_result javacall_media_start(javacall_handle handle) {
     vita_player *pl = (vita_player *)handle;
     if (pl == NULL) return JAVACALL_INVALID_ARGUMENT;
 
+    /* v02.66: clear the stop request HERE (VM thread, before the request is
+     * queued). The player thread used to clear it after entering its branch,
+     * which lost a pause()/stop() that arrived before the thread was
+     * scheduled: playing was still 0, so "if (pl->playing) stop_flag = 1"
+     * did nothing, and even an unconditional set was wiped by the thread.
+     * log111 shows start -> pause on every player. */
+    pl->stop_flag = 0;
     pl->state = 3;
 
-    if (pl->wav.valid) {
+    if (pl->midi) {
+        /* MIDI: hand off to the player thread. The whole SMF must have
+         * been accumulated in do_buffering; otherwise report EOM. */
+        if (pl->midi_len > 0) {
+            g_midi_req = pl;
+            g_midi_seq++;
+        } else {
+            ALOG("notify END_OF_MEDIA (midi no data)");
+            javanotify_on_media_notification(JAVACALL_EVENT_MEDIA_END_OF_MEDIA,
+                                             pl->app_id, pl->player_id,
+                                             JAVACALL_OK, (void *)0);
+        }
+    } else if (pl->wav.valid) {
         /* WAV: hand off to the player thread like JTS. Header must have
          * been parsed in do_buffering; otherwise report END_OF_MEDIA. */
         if (pl->wav_buf_len > 0) {
@@ -1047,7 +1252,9 @@ javacall_result javacall_media_stop(javacall_handle handle) {
     ALOG("stop");
     vita_player *pl = (vita_player *)handle;
     if (pl == NULL) return JAVACALL_INVALID_ARGUMENT;
-    if (pl->playing) pl->stop_flag = 1;
+    /* v02.66: unconditional. Gating on pl->playing lost a stop that arrived
+     * before the player thread had started (it set playing = 1 itself). */
+    pl->stop_flag = 1;
     if (pl->state == 3) pl->state = 2;
     return JAVACALL_OK;
 }
@@ -1056,7 +1263,8 @@ javacall_result javacall_media_pause(javacall_handle handle) {
     ALOG("pause");
     vita_player *pl = (vita_player *)handle;
     if (pl == NULL) return JAVACALL_INVALID_ARGUMENT;
-    if (pl->playing) pl->stop_flag = 1;
+    /* v02.66: unconditional - see javacall_media_stop. */
+    pl->stop_flag = 1;
     if (pl->state == 3) pl->state = 2;
     return JAVACALL_OK;
 }
@@ -1069,7 +1277,7 @@ javacall_result javacall_media_resume(javacall_handle handle) {
 
 javacall_result javacall_media_get_time(javacall_handle handle,
                                         /*OUT*/ long* ms) {
-    ALOG("get_time");
+    ALOG_HOT("get_time");
     vita_player *pl = (vita_player *)handle;
     if (pl == NULL || ms == NULL) return JAVACALL_INVALID_ARGUMENT;
     *ms = pl->cur_time_ms;
@@ -1089,7 +1297,7 @@ javacall_result javacall_media_set_time(javacall_handle handle,
 
 javacall_result javacall_media_get_duration(javacall_handle handle,
                                             /*OUT*/ long* ms) {
-    ALOG("get_duration");
+    ALOG_HOT("get_duration");
     vita_player *pl = (vita_player *)handle;
     if (pl == NULL || ms == NULL) return JAVACALL_INVALID_ARGUMENT;
     *ms = pl->duration_ms;   /* -1 until a sequence has been buffered */
@@ -1113,8 +1321,9 @@ javacall_result javacall_media_get_java_buffer_size(javacall_handle handle,
     *java_buffer_size = JTS_MAX_SIZE;
     /* v01.96: WAV slides a window through this buffer, so the first
      * packet is bigger (must cover a whole RIFF header comfortably);
-     * JTS keeps its original small first chunk. */
-    *first_chunk_size = (pl != NULL && pl->wav.valid) ? 4096 : JTS_FIRST_CHUNK;
+     * MIDI does the same; JTS keeps its original small first chunk. */
+    *first_chunk_size = (pl != NULL && (pl->wav.valid || pl->midi))
+                            ? 4096 : JTS_FIRST_CHUNK;
     return JAVACALL_OK;
 }
 
@@ -1143,19 +1352,39 @@ javacall_result javacall_media_get_buffer_address(javacall_handle handle,
  * The Java download loop advances its read offset by the length we
  * report, so dropping bytes would desync the stream permanently -
  * growth (doubling, WAV_MAX_BUFFER ceiling) is the only safe answer.
+ * v02.66: grows the separate WAV accumulator, never the KNI staging
+ * buffer pl->jts_data (reallocing that would free the `buffer` the caller
+ * passed in - see the vita_player comment).
  * Returns 0 on success, -1 on allocation failure/ceiling. */
-static int wav_ensure_cap(vita_player *pl, long needed) {
+static int wav_acc_ensure(vita_player *pl, long needed) {
     long new_cap;
     uint8_t *nb;
-    if (needed <= pl->wav_cap) return 0;
+    if (needed <= pl->wav_acap) return 0;
     if (needed > WAV_MAX_BUFFER) return -1;
-    new_cap = pl->wav_cap;
+    new_cap = pl->wav_acap > 0 ? pl->wav_acap : WAV_INIT_CAP;
     while (new_cap < needed) new_cap *= 2;
     if (new_cap > WAV_MAX_BUFFER) new_cap = WAV_MAX_BUFFER;
-    nb = (uint8_t *)javacall_realloc(pl->jts_data, (unsigned int)new_cap);
+    nb = (uint8_t *)javacall_realloc(pl->wav_acc, (unsigned int)new_cap);
     if (nb == NULL) return -1;
-    pl->jts_data = nb;
-    pl->wav_cap = new_cap;
+    pl->wav_acc = nb;
+    pl->wav_acap = new_cap;
+    return 0;
+}
+
+/* v02.64: grow the MIDI accumulator (separate from the KNI staging buffer
+ * pl->jts_data, see the vita_player comment). Returns 0 on success. */
+static int midi_acc_ensure(vita_player *pl, long needed) {
+    long new_cap;
+    uint8_t *nb;
+    if (needed <= pl->midi_cap) return 0;
+    if (needed > MIDI_MAX_BUFFER) return -1;
+    new_cap = pl->midi_cap > 0 ? pl->midi_cap : MIDI_INIT_CAP;
+    while (new_cap < needed) new_cap *= 2;
+    if (new_cap > MIDI_MAX_BUFFER) new_cap = MIDI_MAX_BUFFER;
+    nb = (uint8_t *)javacall_realloc(pl->midi_acc, (unsigned int)new_cap);
+    if (nb == NULL) return -1;
+    pl->midi_acc = nb;
+    pl->midi_cap = new_cap;
     return 0;
 }
 
@@ -1184,7 +1413,9 @@ javacall_result javacall_media_do_buffering(javacall_handle handle,
         *next_chunk_size = 0;
         if (pl->wav.valid && !pl->wav.data_off) {
             wav_info info;
-            if (vita_wav_parse_header(pl->jts_data, pl->wav_buf_len, &info)) {
+            /* v02.66: parse the accumulator, not the KNI staging buffer. */
+            if (pl->wav_acc != NULL &&
+                vita_wav_parse_header(pl->wav_acc, pl->wav_buf_len, &info)) {
                 pl->wav.data_off = info.data_off;
                 pl->wav.data_len = info.data_len;
                 pl->wav.rate     = info.rate;
@@ -1197,16 +1428,12 @@ javacall_result javacall_media_do_buffering(javacall_handle handle,
             } else {
                 alog("wav parse FAILED (%ld bytes)\n", pl->wav_buf_len);
                 pl->wav.valid = 0;
-                /* v01.97: a big heap buffer is of no use now - drop back
-                 * to the initial block so a failed stream does not pin
-                 * megabytes until close(). */
-                {
-                    uint8_t *nb = (uint8_t *)javacall_malloc(JTS_MAX_SIZE);
-                    if (nb != NULL) {
-                        javacall_free(pl->jts_data);
-                        pl->jts_data = nb;
-                        pl->wav_cap = JTS_MAX_SIZE;
-                    }
+                /* v01.97: a big heap buffer is of no use now - release it
+                 * so a failed stream does not pin megabytes until close(). */
+                if (pl->wav_acc != NULL) {
+                    javacall_free(pl->wav_acc);
+                    pl->wav_acc = NULL;
+                    pl->wav_acap = 0;
                 }
                 return JAVACALL_INVALID_ARGUMENT;
             }
@@ -1216,12 +1443,15 @@ javacall_result javacall_media_do_buffering(javacall_handle handle,
 
     /* v01.97: WAV chunks - KNI copies each sliding window to the START
      * of jts_data (see vita_wav.c), so append into our storage here.
+     * v02.66: `buffer` IS pl->jts_data, so the append target is the
+     * separate accumulator (appending into jts_data overwrote the bytes
+     * already collected from the 2nd window on).
      * The Java loop advances by the length we report, so we must take
      * every byte: grow the buffer instead of clamping (v01.96 clamped
      * at 32 KB and truncated long BGMs). */
     if (pl->wav.valid) {
         long take = *length;
-        if (wav_ensure_cap(pl, (long)pl->wav_buf_len + take) != 0) {
+        if (wav_acc_ensure(pl, (long)pl->wav_buf_len + take) != 0) {
             /* Ceiling hit or OOM: fail the stream cleanly instead of
              * silently corrupting the PCM data. */
             alog("wav buf grow FAILED at %lu+%ld bytes\n",
@@ -1233,7 +1463,7 @@ javacall_result javacall_media_do_buffering(javacall_handle handle,
             return JAVACALL_OUT_OF_MEMORY;
         }
         if (take > 0) {
-            memcpy(pl->jts_data + pl->wav_buf_len, buffer, take);
+            memcpy(pl->wav_acc + pl->wav_buf_len, buffer, take);
             pl->wav_buf_len += (uint32_t)take;
         }
         /* Keep pulling until Java reports stream EOF (it then sends the
@@ -1242,6 +1472,32 @@ javacall_result javacall_media_do_buffering(javacall_handle handle,
          * returned size becomes Java's next packetSize; a nonzero
          * regular-read value is required (0 would make KNI treat the
          * next nBuffering call as the end marker). */
+        *need_more_data = JAVACALL_TRUE;
+        *next_chunk_size = 4096;
+        *length = take;
+        return JAVACALL_OK;
+    }
+
+    /* v02.60: MIDI chunks - accumulate the whole SMF the same way as
+     * WAV. The parse (tml_load_memory) happens on the player thread at
+     * start(), not here, so buffering is a straight byte append. */
+    if (pl->midi) {
+        long take = *length;
+        /* v02.64: `buffer` IS pl->jts_data (KNI staging); append into the
+         * separate accumulator so the next window cannot clobber it. */
+        if (midi_acc_ensure(pl, (long)pl->midi_len + take) != 0) {
+            alog("midi buf grow FAILED at %lu+%ld bytes\n",
+                 (unsigned long)pl->midi_len, take);
+            pl->midi = 0;
+            *length = 0;
+            *need_more_data = JAVACALL_FALSE;
+            *next_chunk_size = 0;
+            return JAVACALL_OUT_OF_MEMORY;
+        }
+        if (take > 0) {
+            memcpy(pl->midi_acc + pl->midi_len, buffer, take);
+            pl->midi_len += (uint32_t)take;
+        }
         *need_more_data = JAVACALL_TRUE;
         *next_chunk_size = 4096;
         *length = take;
@@ -1300,7 +1556,7 @@ javacall_result javacall_media_get_volume(javacall_handle handle,
 
 javacall_result javacall_media_set_volume(javacall_handle handle,
                                           /*INOUT*/ long* level) {
-    ALOG("set_volume");
+    ALOG_HOT("set_volume");
     vita_player *pl = (vita_player *)handle;
     if (pl == NULL || level == NULL) return JAVACALL_INVALID_ARGUMENT;
     if (*level < 0)   *level = 0;

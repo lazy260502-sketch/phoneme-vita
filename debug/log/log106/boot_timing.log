@@ -1,0 +1,11 @@
+[+62779849 us] round=0 round_begin com.app.filemanager.FileManagerMIDlet
+[+62863783 us] round=0 runMidlet_enter
+[+63294379 us] round=0 first_flip
+[+68125020 us] round=0 first_check_events
+[+69200321 us] round=0 first_content_flip flip#=3
+[+76890520 us] round=0 runMidlet_exit status=0
+[+81780853 us] round=1 round_begin cn.uc.application.app.WebClient
+[+81876434 us] round=1 runMidlet_enter
+[+82263370 us] round=1 first_flip
+[+88636410 us] round=1 first_check_events
+[+92056446 us] round=1 first_content_flip flip#=3

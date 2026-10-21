@@ -45,4 +45,17 @@ public class VirtualKeyboardInputMode extends KeyboardInputMode{
             return false;
         }
 
+    // v02.52: system keyboard bridge. TextFieldLFImpl/TextBoxLFImpl call
+    // these directly when a text component gains/loses focus; the native
+    // implementation (lfj_native_input_mode.c, VITA) forwards to the
+    // vita-port vita_ime_show()/vita_ime_abort(). On other platforms they
+    // are no-ops (the native symbols are only built under WINCE/VITA, so
+    // the linker resolves them only for those targets).
+    public static native void showNativeKeyboard();
+    public static native void hideNativeKeyboard();
+
+    // v02.74: hand the focused TextBox's content + capacity to the native
+    // side so the system keyboard opens with it (and its result replaces it).
+    public static native void setNativeKeyboardText(String text, int maxSize);
+
 }

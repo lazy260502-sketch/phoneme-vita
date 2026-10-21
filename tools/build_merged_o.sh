@@ -3,11 +3,13 @@
 # tree with the exact PRODUCT-ABI flags, as a drop-in replacement member for
 # the hybrid libcldc_vm.a. Usage: build_merged_o.sh 003 /tmp/out.o
 set -eo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../build_env.sh"
 N="$1"; OUT="$2"
-GEN=/home/zyb/vitasdk/samples/j2me/phoneme-cldc/build/vita_arm/loopgen/generated
-SRC=/home/zyb/vitasdk/samples/j2me/phoneme-cldc/src
+GEN="$J2ME_ROOT/phoneme-cldc/build/vita_arm/loopgen/generated"
+SRC="$J2ME_ROOT/phoneme-cldc/src"
 cd $GEN
-/home/zyb/.local/vitasdk/bin/g++ -O2 -Wuninitialized \
+"$VITASDK/bin/arm-vita-eabi-g++" -O2 -Wuninitialized \
   -DPRODUCT -DROMIZING=1 -DARM -DVITA -D__PSP2__ \
   -Wno-narrowing -fpermissive \
   -marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3 \

@@ -1,0 +1,46 @@
+[+113591396 us] [JVM_Start] classpath=midp_system.jar:games/app/game.jar main=com.sun.midp.main.MIDletSuiteLoader argc=0
+[+113600681 us] [JVM_Start] set_arguments done, calling JVM::start
+[+113606891 us] [JVM_Start] JVM::start() loop 0 enter
+[+113614903 us] [vita] vm_cpu=off aff=0x70000
+[+113622007 us] [v257] tramp@0x81140a78 w0-3=e59f5078 e595040c e5901068 e3a02000 w4-7=e3110101 15802024 0affff42 e5960010
+[+113629198 us] [v257] tramp w8-11=e5951410 e3500000 1a00000c e3510000 w12-15=15960004 1bffff48 e5960008 ebffff46
+[+113640942 us] [v257] ipe@0x811407a0 w0-3=e59f0028 e5900000 e5901024 e3510000
+[+113649089 us] [v257] bleq(w6)=0affff42 L=0 cond=0 | blne(w13)=1bffff48 L=1 cond=1 | bl(w15)=ebffff46 L=1 cond=e
+[+113657240 us] [v258] shared_entry+0x358 blne=1bffff28 L=1 cond=1
+[+113665487 us] [v258] shared_entry+0x488 blne=1bfffedc L=1 cond=1
+[+113673651 us] [v258] shared_entry+0x5a4 blne=1bfffe95 L=1 cond=1
+[+113761467 us] [preload] begin load_all_in_classpath
+[+113772291 us] [jarmem] enabled=1
+[+113914433 us] [jarmem] loaded midp_system.jar size=1281346 us=133741 total=1281346
+[+114092530 us] [jarmem] loaded games/app/game.jar size=530861 us=61831 total=1812207
+[+114380105 us] [preload] jar[0] entries=932 defined=859 fast=11 us=609861
+[+114450357 us] [jarmem] loaded games/app/game.jar size=530861 us=59299 total=530861
+[+114625541 us] [jarmem] loaded midp_system.jar size=1281346 us=134444 total=1812207
+[+114918770 us] [preload] jar[1] entries=68 defined=67 fast=0 us=528670
+[+114928620 us] [preload] done defined=926 entries=1000 fast=11 total_us=1167316 open_us=7408 read_us=261332 resolve_us=623594
+[+114938353 us] [preload] phases2 sym_us=11372 verify_us=0 iter_us=5481 skipped=506
+[+114948629 us] [preload] sys(VM thread, delta): io_open n=15 us=27177 io_close n=14 us=40304 io_read n=6 us=381226 io_write n=10 us=39245 io_lseek n=10 us=1017 io_getstat n=21 us=10640 lwmutex_lock n=258 us=781 lwmutex_unlock n=258 us=743 io_lseek32 n=28 us=2895 io_getstat_byfd n=10 us=1311
+[+115181785 us] [jarmem] loaded midp_system.jar size=1281346 us=136900 total=1281346
+[+115364154 us] [jarmem] loaded games/app/game.jar size=530861 us=107746 total=1812207
+[+240541217 us] [JVM_Start] JVM::start() loop 0 returned 2001
+[+245299223 us] [JVM_Start] classpath=midp_system.jar:games/app (1)/game.jar main=com.sun.midp.main.MIDletSuiteLoader argc=0
+[+245311584 us] [JVM_Start] set_arguments done, calling JVM::start
+[+245323449 us] [JVM_Start] JVM::start() loop 0 enter
+[+245337901 us] [vita] vm_cpu=off aff=0x70000
+[+245349842 us] [v257] tramp@0x81140a78 w0-3=e59f5078 e595040c e5901068 e3a02000 w4-7=e3110101 15802024 0affff42 e5960010
+[+245361929 us] [v257] tramp w8-11=e5951410 e3500000 1a00000c e3510000 w12-15=15960004 1bffff48 e5960008 ebffff46
+[+245374468 us] [v257] ipe@0x811407a0 w0-3=e59f0028 e5900000 e5901024 e3510000
+[+245386931 us] [v257] bleq(w6)=0affff42 L=0 cond=0 | blne(w13)=1bffff48 L=1 cond=1 | bl(w15)=ebffff46 L=1 cond=e
+[+245399468 us] [v258] shared_entry+0x358 blne=1bffff28 L=1 cond=1
+[+245412002 us] [v258] shared_entry+0x488 blne=1bfffedc L=1 cond=1
+[+245424561 us] [v258] shared_entry+0x5a4 blne=1bfffe95 L=1 cond=1
+[+245517810 us] [preload] begin load_all_in_classpath
+[+245648014 us] [jarmem] loaded games/app (1)/game.jar size=23646 us=24729 total=1835853
+[+245936249 us] [preload] jar[0] entries=932 defined=859 fast=9 us=404973
+[+245975405 us] [jarmem] loaded games/app (1)/game.jar size=23646 us=24664 total=1835853
+[+246002942 us] [preload] jar[1] entries=9 defined=9 fast=0 us=53238
+[+246016231 us] [preload] done defined=1794 entries=1941 fast=20 total_us=498637 open_us=12298 read_us=409935 resolve_us=867370
+[+246029575 us] [preload] phases2 sym_us=21717 verify_us=0 iter_us=10297 skipped=1006
+[+246043461 us] [preload] sys(VM thread, delta): io_open n=9 us=6853 io_close n=9 us=37233 io_read n=2 us=45433 io_write n=7 us=47168 io_lseek n=7 us=699 io_getstat n=14 us=6357 lwmutex_lock n=159 us=479 lwmutex_unlock n=159 us=452 io_lseek32 n=18 us=1846 io_getstat_byfd n=7 us=910
+[+246346352 us] [jarmem] loaded games/app (1)/game.jar size=23646 us=25624 total=1835853
+[+323710030 us] [JVM_Start] JVM::start() loop 0 returned 2001

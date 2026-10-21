@@ -13,10 +13,15 @@
 #==============================================================================
 set -eo pipefail
 
-CLDC=/home/zyb/vitasdk/samples/j2me/phoneme-cldc
+# Paths (J2ME_ROOT / JDK_DIR / VITASDK) come from build_env.sh; the rest are
+# derived from J2ME_ROOT. No hard-coded machine path.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/build_env.sh"
+
+CLDC="$J2ME_ROOT/phoneme-cldc"
 BD=$CLDC/build/vita_arm
 L=$BD/dist/lib/libcldc_vm.a
-AR=/home/zyb/.local/vitasdk/bin/arm-vita-eabi-ar
+AR="$VITASDK/bin/arm-vita-eabi-ar"
 FLAVOR=release            # debug=AZZERT gaps; product=compiler member; release=OK
 # 2026-09-03: FLAVOR=release gives CPP_DEF_FLAGS_release="" (jvm.make:834),
 # so -DPRODUCT is NOT added automatically. The library baseline is a
@@ -38,8 +43,8 @@ EXCLUDE="AsmStubs_x86_64.o|Interpreter_arm.o|InterpreterSkeleton.o|OopMapsSkelet
 
 export JVMWorkSpace=$CLDC
 export JVMBuildSpace=$CLDC/build
-export JDK_DIR=/home/zyb/tools/jdk8u502-b07
-export TOOLS_DIR=/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/tools
+export JDK_DIR="$JDK_DIR"
+export TOOLS_DIR="$J2ME_ROOT/phoneme_source/phoneME/tools"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -49,7 +54,15 @@ build_tools() {
     make BUILD_DIR_NAME=vita_arm IsLoopGen=true CLDCBUILD=fp \
          ENABLE_ENABLING_CHECK=false -j"$(nproc)" loopgen
     [ -x $BD/loopgen/app/loopgen ] || die "loopgen missing"
-    make BUILD_DIR_NAME=vita_arm IsLoopGen=true ROMGENERATOR_DIR=romgen/app \
+    # 2026-10-13 fix: romgen must be IsRomGen=true, NOT IsLoopGen=true.
+    # IsLoopGen=true (command line) leaks through romgen/app (its Makefile
+    # writes IsRomGen=true) and triggers jvm.make:425 "override
+    # ENABLE_INTERPRETER_GENERATOR := true", which defeats vita_arm.cfg's
+    # "export ENABLE_INTERPRETER_GENERATOR := false" for romgen -> the
+    # arch=c romgen compiles FloatSupport.hpp "class FloatSupport: public
+    # SourceMacros" where SourceMacros only exists under arch=arm -> build
+    # fails with "expected class-name before '{' token".
+    make BUILD_DIR_NAME=vita_arm IsRomGen=true ROMGENERATOR_DIR=romgen/app \
          CLDCBUILD=fp ENABLE_ENABLING_CHECK=false -j"$(nproc)" romgen
     [ -x $BD/dist/bin/romgen ] || die "romgen missing"
     echo "== host tools OK =="
@@ -99,7 +112,7 @@ build_target() {
     make BUILD_DIR_NAME=vita_arm IsLoopGen=true \
          LOOP_GENERATOR_DIR=../../linux_arm/loopgen/app \
          ENABLE_ENABLING_CHECK=false \
-         FORCE_GCC= GNU_TOOLS_DIR=/home/zyb/.local/vitasdk \
+         FORCE_GCC= GNU_TOOLS_DIR="$VITASDK" \
          CPP_DEF_FLAGS="$CPP_DEF_FLAGS_TARGET" \
          -j"$(nproc)" _$FLAVOR || true   # final exe link fails on crt0: expected
 
@@ -148,9 +161,9 @@ pack_lib() {
     # matches nothing, so under "set -e" the ccount assignment aborted the
     # script *after* a perfectly good repack (exit 1, no message) and the
     # library looked half-built.  Guard the counters, not the script.
-    local dcount; dcount=$(/home/zyb/.local/vitasdk/bin/arm-vita-eabi-nm $L 2>/dev/null | grep -c " D jvm_fast_globals" || true)
+    local dcount; dcount=$("$VITASDK/bin/arm-vita-eabi-nm" $L 2>/dev/null | grep -c " D jvm_fast_globals" || true)
     [ "$dcount" -eq 1 ] || die "jvm_fast_globals: expected exactly 1 D definition, got $dcount"
-    local ccount; ccount=$(/home/zyb/.local/vitasdk/bin/arm-vita-eabi-nm $L 2>/dev/null | grep -cE "g_jpc|g_jsp|interpreter_dispatch_table" || true)
+    local ccount; ccount=$("$VITASDK/bin/arm-vita-eabi-nm" $L 2>/dev/null | grep -cE "g_jpc|g_jsp|interpreter_dispatch_table" || true)
     [ "$ccount" -eq 0 ] || die "C-interpreter symbols leaked into library ($ccount)"
 
     local cnt; cnt=$($AR t $L | wc -l)

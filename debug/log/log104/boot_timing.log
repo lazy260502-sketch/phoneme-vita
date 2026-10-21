@@ -1,0 +1,6 @@
+[+56046731 us] round=0 round_begin cn.uc.application.app.WebClient
+[+56134108 us] round=0 runMidlet_enter
+[+56571004 us] round=0 first_flip
+[+63837171 us] round=0 first_check_events
+[+67565316 us] round=0 first_content_flip flip#=3
+[+135838322 us] round=0 runMidlet_exit status=0

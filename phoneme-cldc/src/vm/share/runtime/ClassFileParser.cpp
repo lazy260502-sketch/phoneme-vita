@@ -2154,9 +2154,19 @@ ReturnOop ClassFileParser::parse_class_internal(ClassParserState *stack JVM_TRAP
      * "POST_NATIVES idx=166 ..." still in the write buffer. The
      * conditional CORRUPT scanners above stay: they are silent
      * unless a real corruption is found. */
+#if !defined(VITA)
     fprintf(stderr, "BEFORE_NATIVES: heap_top=%p\n", (void*)_heap_top);
+#endif
     Natives::register_natives_for(&this_class JVM_CHECK_0);
+#if !defined(VITA)
+    /* v02.56: log105 vm_boot "[preload] io_write fd=(midp_stderr.log)
+     * n=58 us=1260827 bytes=2204" - these two lines, once per class with
+     * natives (29 of them), were 58 sceIoWrite calls of ~38 bytes at
+     * ~22 ms each = 1.26 s of the ~5.8 s preload white screen. The
+     * latency is per call, not per byte. Same story as PRE/POST_NATIVES
+     * above; the silent CORRUPT scanner below is kept. */
     fprintf(stderr, "AFTER_NATIVES_CALL: heap_top=%p\n", (void*)_heap_top);
+#endif
   }
   // DEBUG: Check after register_natives
   {

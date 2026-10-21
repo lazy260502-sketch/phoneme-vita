@@ -37,9 +37,13 @@ CC      = /usr/bin/gcc-13 -m32
 CXX     = /usr/bin/g++-13 -m32
 
 # Include paths - MIDP source and phoneme-cldc headers
-INCLUDES = -I/home/zyb/vitasdk/samples/j2me/phoneme-midp/src \
-           -I/home/zyb/vitasdk/samples/j2me/phoneme-midp/build/vita_arm \
-           -I/home/zyb/vitasdk/samples/j2me/phoneme-cldc/build/vita_arm/dist/include \
+# J2ME_ROOT is the workspace root (env var, default derived from this file).
+ifndef J2ME_ROOT
+J2ME_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
+endif
+INCLUDES = -I$(J2ME_ROOT)/phoneme-midp/src \
+           -I$(J2ME_ROOT)/phoneme-midp/build/vita_arm \
+           -I$(J2ME_ROOT)/phoneme-cldc/build/vita_arm/dist/include \
            -I/usr/include
 
 # Compiler flags for Vita 32-bit target

@@ -495,6 +495,58 @@ void JVMSPI_DebuggerNotification(jboolean is_active) {
 }
 #endif
 
+/* v02.48: LINE-BUFFER the two VM-output sinks. log97/log98 (real hardware)
+ * showed MediaException.printStackTrace() freezing the VM for 3+ s each: a
+ * core taken mid-stall had pc=sceIoWrite with r2=1 (ONE byte per write) and
+ * the chain JVMStream::print -> print_raw -> crumb_append, and the watchdog
+ * counted ~19 sceIoWrite per 250 ms = ~13 ms each. On ux0: every
+ * synchronous small write costs ~13 ms, and every character was written
+ * TWICE (vm_output.log via crumb_append, vm_stderr.log via
+ * pcsl_print_chars; the two logs are byte-identical). Characters now
+ * accumulate and go out as ONE write per sink per line, or per
+ * PR_BUF_SIZE-1 bytes. Same bytes, same files, same order; only the
+ * number of syscalls changes. A half line is lost only if the process dies
+ * before the next newline (the watchdog flushes before its own aborts).
+ * pcsl_print_chars() takes a NUL-terminated string (it uses strlen), so
+ * the buffer is always terminated.
+ * Locking: a plain try-gate. Writers wait for it (short, the holder is
+ * mid-write); the flush path only TRIES, because the watchdog must never
+ * block behind a VM thread that is itself stuck inside sceIoWrite. */
+#define PR_BUF_SIZE 200
+static char pr_buf[PR_BUF_SIZE];
+static int pr_len = 0;
+static volatile int pr_gate = 0;
+
+static void pr_emit(void) {
+  if (pr_len > 0) {
+    pr_buf[pr_len] = '\0';
+    crumb_append("ux0:/data/vm_output.log", pr_buf, pr_len);
+    pcsl_print_chars(pr_buf, pr_len);
+    pr_len = 0;
+  }
+}
+
+static void pr_put(const char* s, int length, int wait) {
+  int i;
+  if (wait) {
+    while (__atomic_exchange_n(&pr_gate, 1, __ATOMIC_ACQUIRE) != 0) {
+      /* spin */
+    }
+  } else if (__atomic_exchange_n(&pr_gate, 1, __ATOMIC_ACQUIRE) != 0) {
+    return;   /* flush path: someone is writing; do not block */
+  }
+  for (i = 0; i < length; i++) {
+    pr_buf[pr_len++] = s[i];
+    if (s[i] == '\n' || pr_len >= PR_BUF_SIZE - 1) {
+      pr_emit();
+    }
+  }
+  if (!wait) {
+    pr_emit();    /* flush request: drain the partial line */
+  }
+  __atomic_store_n(&pr_gate, 0, __ATOMIC_RELEASE);
+}
+
 /**
  * This function provides an implementation
  * used by the logging service, as well as by the
@@ -521,8 +573,16 @@ void JVMSPI_PrintRaw(const char* s, int length) {
    * r5=0). Route the bytes through the launcher's sceIo-based channel
    * (vita_crumb.c crumb_append) instead: no FILE*, no locks, unbuffered,
    * crash-safe. */
-  crumb_append("ux0:/data/vm_output.log", s, length);
-  pcsl_print_chars(s, length);
+  /* v02.48: line-buffered, see pr_put() above. */
+  pr_put(s, length, 1);
+}
+
+/* v02.48: write out whatever JVMSPI_PrintRaw still holds. Called by the
+ * watchdog right before a deliberate abort and by the launcher after a
+ * round. Never blocks: if another thread is mid-write the gate is taken
+ * and that thread is about to emit the line anyway. */
+void vita_printraw_flush(void) {
+  pr_put("", 0, 0);
 }
 
 /**

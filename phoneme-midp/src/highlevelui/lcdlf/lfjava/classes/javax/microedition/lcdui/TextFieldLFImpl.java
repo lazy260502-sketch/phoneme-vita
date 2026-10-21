@@ -1596,6 +1596,9 @@ class TextFieldLFImpl extends ItemLFImpl implements
             oldDisplay.hidePopup(inputModeIndicator);
             oldDisplay = null;
         }
+
+        // v02.61: auto-dismiss moved to TextBoxLFImpl.uCallHideNotify();
+        // doing it here fired on every Form item traverse-out as well.
         
         inputModeAnchor[0] = 0;
         inputModeAnchor[1] = 0;
@@ -1825,6 +1828,14 @@ class TextFieldLFImpl extends ItemLFImpl implements
         // Update input mode indicator
         InputMode im = is.getCurrentInputMode();
         inputModeIndicator.setDisplayMode(im.getName());
+
+        // v02.61: do NOT auto-pop the system keyboard here. This is the
+        // shared focus-gained path for BOTH TextBox and TextField, and
+        // TextField (a Form item) re-enters it every time navigation
+        // crosses it (firstTimeInTraverse toggles), so popping here made
+        // the system IME flash on/off during in-game Form navigation
+        // (log109 problem 2). The auto-pop now lives only in
+        // TextBoxLFImpl.uCallShowNotify()/uCallHideNotify().
     }
     
     /**

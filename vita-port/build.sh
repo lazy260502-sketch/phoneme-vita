@@ -12,8 +12,9 @@
 set -e
 
 PORT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-J2ME_DIR="$PORT_DIR/.."
-export VITASDK="${VITASDK:-/home/zyb/.local/vitasdk}"
+# Paths (J2ME_ROOT / JDK_DIR / VITASDK) come from build_env.sh.
+. "$PORT_DIR/../build_env.sh"
+J2ME_DIR="$J2ME_ROOT"
 
 MODE="${1:-all}"
 

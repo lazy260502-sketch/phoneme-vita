@@ -622,6 +622,11 @@ JarFileParser::filtered_do_next_entries(JvmNameFilterProc entry_filter_proc,
   // NOTE: max_entries can be -1 that indicates no limitation on the number of
   // entries processed.
   for (total_size = 0; total_size < max_size;) {
+#if defined(VITA)
+    /* v02.47: time the central-directory walk (find_entry + entry-name
+     * read) separately from the per-entry work done by the filter proc. */
+    unsigned long long vi0 = vita_now_us();
+#endif
     bool found = find_entry(NULL JVM_MUST_SUCCEED);
     if (!found) {
       break;
@@ -648,6 +653,9 @@ JarFileParser::filtered_do_next_entries(JvmNameFilterProc entry_filter_proc,
       }
     }
     entry_name[name_length] = '\0';
+#if defined(VITA)
+    vita_preload_us_iter += vita_now_us() - vi0;
+#endif
 
     if (((entry_filter_proc == NULL) || 
          (entry_filter_proc(entry_name, caller_data) == KNI_TRUE)) &&
@@ -1162,6 +1170,9 @@ ReturnOop JarFileParser::load_entry(JVM_SINGLE_ARG_TRAPS) {
  */
 bool JarFileParser::find_entry(const char *match_name JVM_TRAPS)
 {
+#if defined(VITA)
+  VitaPhaseScope vps1(1); /* v02.47 stall phase marker */
+#endif
   UsingFastOops fast_oops;
   BufferedFile::Fast jar_buffer = buffered_file();
   const bool use_entry_cache = CacheJarEntries && enable_entry_cache();
@@ -1280,6 +1291,7 @@ bool JarFileParser::find_entry(const char *match_name JVM_TRAPS)
 ReturnOop JarFileParser::open_entry(int flags JVM_TRAPS) {
 #if defined(VITA)
   vita_site_mark(); /* v01.84: log10 - class-file entry read marker */
+  VitaPhaseScope vps2(2); /* v02.47 stall phase marker */
 #endif
   UsingFastOops fast_oops;
   BufferedFile::Fast jar_buffer = buffered_file();

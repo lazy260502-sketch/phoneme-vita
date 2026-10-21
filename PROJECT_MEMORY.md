@@ -8142,3 +8142,3498 @@ v02.39 逐指令相同（冻结成员原样）✓。
 - `--allow-multiple-definition` 仍在链接线（MIDP 侧 mffd_true 与 VM 侧
   mffd_false 现在是两个不同符号，不再冲突，但该旗标历史上掩盖过混入物，
   长期应移除）。
+
+---
+
+## 2026-09-28 log85（v02.40 干净基线）卡死根因正面追查
+
+> 回滚到 v02.40（1e8533d）后，真机 log85 卡死现场。目标：正面攻破
+> "pe=0 幽灵线程 pad↔蹦床 空转"根因（与 log67 同源）。无任何防御代码。
+
+### 1. 已确证事实（无争议）
+
+1. **纯用户态 livelock**：VMPROG verdict = ticker RUNS / VM NOT EXECUTING。
+   内核调度器活着（ticker 在跑），CPU/亲和性方向（方向 B）已排除，聚焦用户态。
+2. **环 = pad↔蹦床 空转**：land=3.17亿→3.23亿（+580万/400ms，14.5M/s 热
+   旋转）；switch=181383 完全静止（不经过 switch_thread）。pc=landing_pad+0x18，
+   lr=landing_pad（入口），fp=0（出生帧 ABI）。
+3. **4 个 worker**：id=1/id=2 正常 wait（entry=null）；id=3/id=4 卡死。
+   q5 CYCLE(2)。born_dsp=4（4 个 Thread.run 出生）。finish=0 / lw_exit=0 /
+   force=0 / term=0——**死亡路径从未走**。
+4. **id=4 stack_pointer=0x81ede710 不在出生帧**：site_ring 读出的
+   [jsp+0]=0x81edb770（对象）、[jsp+4]=0x8114ba58（= fast_invokeinterface
+   模板 L318+0x8 返回地址）、[jsp+8/16/20]=rodata 常量。即 id=4 曾执行 run()
+   里的方法调用，stack_pointer 停在 Java 帧，未恢复到出生帧。
+
+### 2. 关键修正（推翻之前的错误判读）
+
+- **pe_enter 是死探针**：汇编补丁写进了 InterpreterRuntime_arm.o，但 loopgen
+  frozen 的 Interpreter_arm.o 没重编，补丁根本没进最终二进制。之前把
+  pe_enter=0 当"invoke 未消费 entry"是**错误判断**，pe=0 未必等于 entry 丢
+  失。pe 写点只有 2 个（Thread.cpp:55 append 时 set、:177 terminating 时
+  set null），正常 run 线程 pe=0 只是 entry 已消费完。
+
+### 3. 蹦床 exit 表读取约定（v02.40 反汇编 @0x810d3540）
+
+primordial_to_current_thread（0x810d351c）：`ldr r6,[r1,#0x64]`（stack_pointer）
+→ `ldr lr,[r6,#4]`（sentinel）→ `ldr fp,[r6],#8`（fp，r6 += 8）→ `mov pc,lr`。
+
+蹦床 r6 = stack_pointer+8，读 exit 表：
+- [r6+16] = TestCompiler 槽（0 则 PRODUCT 直走）
+- [r6+8]  = finish 槽
+- [r6+12] = force 槽
+- [r6+0]  = lw_exit 槽
+
+**对照 setup_stack_asm 播种**：出生帧 stack_pointer 应指向
+`field_base(stack_size) - 28`，其中 [sp+4]=pad（sentinel）、[sp+0]=fp=0，
+exit 表在 [sp+8] 起的 EntryFrame。蹦床读的正是 EntryFrame 槽位。
+
+### 4. 核心矛盾（未定死，下轮攻）
+
+id=4 stack_pointer=0x81ede710 不在出生帧 → 蹦床读 [r6+16] 读到 Java 帧内容
+（非 0）→ 走 L444 → [r6]=rodata 地址 → call_on_primordial_stack 跳 rodata →
+按 XN 应 data-abort，**但实际是 livelock（land 涨，无崩溃）**。矛盾未解。
+
+两个待验证分支：
+- (A) stack_pointer 未恢复到出生帧是"结果"（run 返回时 unwind 已错位），
+  环的真实闭合点还在蹦床 invoke→finish 之间某条 jmpx lr；
+- (B) 我对 r6 语义或 slide 的换算有偏差（.rodata 段 slide 可能 ≠ code 段
+  0x7a000），需用 gp_base（.data slide=0x100000）与 land（.text slide=
+  0x7a000）分别校准后再判 XN。
+
+### 5. 下一步
+
+1. 精确校准三段 slide（.text=.rodata? vs .data），重判 [r6] 是否真跳 rodata。
+2. 追 run() 返回的完整 unwind：bc_return（TemplateTable_arm.cpp:1289）→
+   entry_return_void → shared_entry_return（SharedStubs_arm.cpp:224）→
+   invoke_pending_entries pop → 蹦床。逐段核对 jsp 恢复偏移是否一致。
+3. 定死"run() 返回后 stack_pointer 为何没回出生帧"。
+
+---
+
+## 2026-10-16 log85 卡死根因第二轮：master-mode 确认 + 环闭合点精确定位
+
+### 1. 推翻第一轮的错误前提
+
+- **VM 是 master mode（非 slave mode）**：`Main_vita.cpp` 里
+  `JVM_CONFIG_SLAVE_MODE == KNI_FALSE` 走 `JVM_Start()`（阻塞直到 VM 完成），
+  **不进入 `JVM_TimeSlice()` 循环**。所以 `ts_enter=0 / ts_gadget=0` 是
+  **正常的**，不是异常——第一轮把 ts_gadget=0 当"time_slice 未执行"是
+  正确观察，但推论"landing_pad 只能来自 call_on_primordial_stack"漏掉了
+  **第三个 gadget**。
+
+### 2. landing_pad 进入的三大 gadget（读 [stack_pointer+4] 跳转）
+
+| gadget | 位置 | 读什么 | 何时跳 landing_pad |
+|---|---|---|---|
+| primordial_to_current_thread | InterpreterStubs_arm.cpp:222 | [sp+4] | bootstrap（JVM::run 一次）+ slave time_slice（master 不调） |
+| call_on_primordial_stack 返回点 | SharedStubs_arm.cpp:697 | [sp+4] | 目标函数返回后若 stack_pointer 指向出生帧 |
+| **shared_call_vm 返回点** | SharedStubs_arm.cpp:516 | pop fp=[sp], lr=[sp+4] | **master mode 首次调度/切回出生帧** |
+
+**第三轮核心修正**：master mode 下线程切换完全走
+`switch_thread → shared_call_vm 返回点`（读 next 的 stack_pointer，pop
+fp/lr 跳转）。next 的 stack_pointer = 出生帧（[sp]=0, [sp+4]=landing_pad）
+时，pop 出 fp=0、lr=landing_pad，`jmpx(lr)` 跳 landing_pad。这就是 land 涨
+的正常来源（首次调度）。
+
+### 3. 卡死环的精确定位（未 100% 定死，但矛盾已收敛）
+
+铁的事实（无争议）：
+- land=3.17亿→3.23亿（14.5M/s），switch=181383 冻结，finish=0/lw_exit=0/
+  force=0，born_dsp=4，dispatch ring 全 id=3 pe=0，q5 CYCLE(2)。
+- **land(3.23亿) >> switch(18万)**：landing_pad 进入次数远超线程切换次数，
+  证明 land 涨来自**自环**，不是正常调度。
+- 进入 landing_pad 的 ABI 正常（lr=sentinel=landing_pad, fp=0）→ 读的是
+  出生帧 [sp+4]=landing_pad、[sp]=0。
+- TestCompiler = bool 全局默认 false（Globals.hpp:495）→ 蹦床走 finish 路径。
+
+收敛后的核心矛盾：
+- land 涨要求 stack_pointer 指向出生帧（[sp+4]=landing_pad）。
+- dispatch ring 全 id=3 pe=0 = shared_entry 已开始（run_entry 已消费）。
+- 但 finish=0 / lw_exit=0 = 蹦床从未走到 finish/lw_exit。
+- 若 run() 正常返回，蹦床必走 finish（TestCompiler=0），finish 必涨。finish=0
+  说明 **run() 返回的 unwind 出错，蹦床没回到正常的 finish 路径**。
+
+### 4. 根因方向（下一步攻）
+
+**run() 返回的 unwind 出错**：`shared_entry_return`（SharedStubs_arm.cpp:194）
+恢复 fp/lr 后 `jmpx(real_return_address)`，real_return_address 应 =
+invoke_pending_entries 返回地址（0x810d328c）。若这个返回地址或 r6(jsp)
+恢复出错，控制流偏离"invoke_pending_entries 返回点 → 蹦床 → finish"的
+正常路径，落入 landing_pad 自环（land 涨、switch 冻结、finish 永不到）。
+
+待验证（下轮）：
+1. 反汇编 shared_entry(0x810d2acc)/entry_return_void/shared_entry_return，
+   核对 run() 返回的精确 unwind，重点看 real_return_address 与 jsp 恢复。
+2. 确认 id=3 的 stack_pointer 字段值（Java 堆未 dump，尝试其他推断）。
+3. 符号化蹦床第5个 call_on_primordial_stack 目标 = thread_task_cleanup
+   （0x810aba9c，ENABLE_ISOLATES 启用），确认它是否切换线程。
+
+---
+
+## 2026-10-16 v02.41：着陆垫寄存器/退出表记录器（纯探针，无行为变更）
+
+### 1. 触发：log85 推翻"内核冻核"解读
+
+- watchdog 两次快照间 `v240 land` 317,984,101 -> 323,798,186（约 550ms，
+  约 10.6M 次/秒；coredump r1=336,593,514 仍在涨），而 switch=181383 /
+  ttk=346 / site_seq=182837 不动，VMPROG verdict = "ticker RUNS, VM NOT
+  EXECUTING"。coredump：pc=pad+0x18、lr=pad 入口、fp=0（slide=0x7a000，
+  pad 地址与 v02.40.sym 互验）。
+- 结论：VM 线程在**用户态汇编里高速空转**经过 vita_landing_pad，不是内核
+  停摆。log61..66 的"死点"都是同一循环的随机采样。cpu0 idle/switchN d=0
+  与 runClocks d=0 是"核被不可抢占死循环占满"的表象。
+- 循环不经过任何带打点的 C++，所以现有探针全静止。
+
+### 2. 改动（3 个文件，+131 行，均 `#if defined(VITA)` 内或 VITA 专属文件）
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-cldc/src/vm/cpu/arm/InterpreterRuntime_arm.cpp` | `vita_landing_pad` 在 land++ 之后，对 land=1..8 与 land=1000000..1000007 共 16 次进入，把 r4-r12/sp/lr、`[r6+0..16]`、`_current_thread` 及其 `+0x64/+0x68/+0x24` 写入 `vita_v241_rec[16][24]`；其余进入只多 4 条指令；仍 `bx` 蹦床 |
+| `phoneme-cldc/src/vm/os/vita/OS_vita.cpp` | extern 声明 + watchdog v240 行后输出 `v241 rec[i]`（每条记录两行） |
+| `vita-port/CMakeLists.txt` | 版本块 02.41（位于最后一个 set(VITA_VERSION) 之后） |
+
+- 记录布局（24 字）：0 land；1..9 = r4..r12；10 sp（push 前值）；11 lr；
+  12..16 = `[r6+0/4/8/12/16]`；17 cur_thread；18 cur+0x64（stack_pointer）；
+  19 cur+0x68（status）；20 cur+0x24（pending_entries）。
+- 线程字段偏移取自 v02.40 蹦床反汇编（`str r2,[r0,#36]` / `ldr r6,[r1,#100]` /
+  `ldr r1,[r0,#104]`），因为 naked 函数里只能用 basic asm。
+- `_current_thread` 由 Interpreter_arm.o 定义（.data+0x40c，静态 0x81301cf8，
+  即 jvm_fast_globals.current_thread，与蹦床 `ldr r0,[r5,#0x40c]` 读的是同一个槽），
+  库内是 U 引用。
+- **rebuild_vm.sh 末尾 `undefined reference to _current_thread/fast_memclear`
+  的原因（2026-10-16 核实，与线程运行时无关）**：`make _release` 最后一步链接
+  宿主工具 loopgen（jvm.make:1718-1722），命令只含 `$(Obj_Files)`（34 个 ARM
+  对象）+ `InterpreterSkeleton.o` + `OopMapsSkeleton.o`，**不含 Interpreter_arm.o**。
+  两个符号都由 Interpreter_arm.o（loopgen 生成的汇编）定义：`fast_memclear`
+  =.text+0x60d0（SharedStubs_arm.cpp:1212 生成）、`_current_thread`=.data+0x40c；
+  Skeleton 里没有它们的桩。同一链接还有 23 处 multiple definition（jvm_fcmpl 等），
+  本就不可能成功，loopgen 文件不存在。引用方：fast_memclear <- _MergedSrc003.o
+  （ObjectHeap），_current_thread <- _MergedSrc004.o（v02.41 垫，新增引用，同类
+  原因）。
+  - 不影响产物：pack_lib 把旧库的 Interpreter_arm.o 原样放回新库；v02.41.sym
+    里 `_current_thread`=0x81301cf8(D)、`fast_memclear`=0x810d34d0(T) 均已定义；
+    pre-v02.41 的 libcldc_vm.a.bak 里 _MergedSrc003.o 同样 `U fast_memclear`。
+  - 勘误：此前此处写作"既有 final exe link fails 预期现象"不严谨——脚本注释与
+    本文件 3292 行说的是 crt0 失败，与本次原因（链接命令缺 Interpreter_arm.o）
+    不同；更早版本是否同样报这两个符号未找到当时日志，仅凭 .bak 符号分布推断。
+- sp 仍是 primordial 栈（绿线程模型），push {r2,r3}/pop 成对，安全。
+
+### 3. 构建与验证
+
+- `rebuild_vm.sh build`：34 个 ARM 对象 / 库 21 成员；先删 `_MergedSrc004.o`
+  （防 MergedSrc 壳文件时间戳陷阱）；`touch OS_vita.cpp`。
+- `cmake --build vita-port/build/cmake -j8` EXIT=0 -> `out/vpk/midp_vita_v02.41.vpk`
+  (3727080B) + `.sym`；v02.40.sym md5 未变（fdd71fe3...）。
+- **v02.41 新锚点**：`vita_landing_pad`=0x810aa2c8（长度 0xf8）、
+  `start_lightweight_thread_asm`=0x810d3738、`vita_v241_rec`=0x814d4a58、
+  `vita_v240_land`=0x814d5060。（v02.40：0x810aa198 / 0x810d3540，不可混用）
+- 未真机验证。
+- **版本串**：boot_log 会显示 `v02.41 b329 (1e8533d)`——构建时工作区未提交，
+  git 哈希仍是 v02.40 的提交；提交后重编才会更新。
+
+### 4. 判读矩阵（下一轮 watchdog 的 `v241 rec[i]` 行）
+
+| 读数 | 判定 |
+|---|---|
+| 无 rec[8..15] | land 没到 100 万：循环不经过垫，或根本不是同一循环——重看 v240 land |
+| rec[8..15] 彼此完全相同 | 固定环；对比 rec[0..7]（健康）找出差异字段 |
+| r6 / `[r6+16]` 与健康组不同 | run() 返回 unwind 的 jsp 恢复错位；`[r6+16]!=0` 会走蹦床 L444（用 `[r6]` 当函数跳转） |
+| cur.sp 不等于 r6-8 | stack_pointer 未回出生帧（前一轮 PM 第 4 节的核心矛盾） |
+| cur.st 含 bit30（0x40000000） | THREAD_TERMINATING：蹦床把 pending_entries 清零后跳过 invoke，可能构成死循环 |
+| rec[8..15] 的 r6/cur 逐条漂移 | 非固定环，是在推进的长循环（如大量线程创建/死亡） |
+
+### 5. log86（v02.41 真机）判读结果
+
+- 环内 8 条记录（land=1000000..1000007）所有字段逐字节相同，rec[5..7] 也与之相同
+  → **固定周期环，land=6 起即已形成**，此后空转约 2.66 亿圈。
+- 退出表健康：`[r6+0/4/8/12/16]` = lightweight_thread_exit / uncaught_exception /
+  finish / force_terminated / 0（TestCompiler=0），cur.st=0，cur.pe=0。
+  按真蹦床自身代码这一状态必须调用 Thread::finish，但 finish=0、lw_exit=0。
+- 卡点：id=4（cur=0x81edd764）land=5 时正常出生（r6-cur.sp=8，pe 非 0）；
+  land=6 起 cur.sp 变为 0x81ede710（Java 栈深处，比出生帧深 0xb4）、pe=0，
+  但 **r6 仍是出生帧值 0x81ede7cc**（r6-cur.sp=188）→ 环里没有任何指令写
+  cur.sp/r6。
+- 未证实：具体哪一跳回到垫。候选：call_on_primordial_stack 返回时
+  `ldr jsp,[cur,#100]; ldr lr,[jsp,#4]; mov pc,lr`，用线程保存的 stack_pointer
+  取哨兵——**它不返回到调用者下一条指令**。
+
+# v02.42：影子蹦床（本节在 v02.41 小节之后）
+
+## 改动（均 `#if defined(VITA)` 内 / VITA 专属文件）
+
+| 文件 | 改动 |
+|---|---|
+| `InterpreterRuntime_arm.cpp` | 垫尾部：`land >= 1000000`（r1 仍为 land）时 `b vita_tramp_shadow`，否则仍 `bx` 真蹦床；新增 naked 函数 `vita_tramp_shadow`（真蹦床逐条副本）+ `vita_v242_stage[16]` |
+| `OS_vita.cpp` | extern + watchdog 输出 `v242 st=a/b/c/...` 一行 |
+| `vita-port/CMakeLists.txt` | 版本块 02.42（位于最后一个 set 之后） |
+
+- 字面量替换：`ldr r5,=0x813018ec`→`&gp_base_label`；`0x810abc94`→`thread_task_cleanup`；
+  `0x814d4470`→`&_next_runnable_thread`（均核对 v02.41 字面量池）。
+- **设计约束（写影子时发现）**：真 `call_on_primordial_stack` 返回时重取
+  `cur->stack_pointer`，跳 `[jsp+4]`（哨兵=垫），**不回到 bl 的下一条**。所以所有
+  探针都在各步骤**之前**；`st[0]`=进入次数，`st[i]`=到达阶段 i 的圈数，第一个
+  低于 st[0] 的阶段就是离开蹦床体的位置。
+- `st` 下标：0 入口；1 ipe#1 前；2 TestCompiler 判断前；3 uncaught 调用前
+  （仅 pending 异常）；4 finish 调用前；5 force_terminated 调用前；6 task_cleanup
+  调用前；7 ipe#3 前；8 L444/尾汇合；9 lw_exit 调用前。输出另含 st[10]=最近一次入口
+  r6、st[11]=最近入口 lr、st[13]=最近入口 pending exception。
+- 探针只用 r2/r3，不动 r0/r1 与标志位。
+- 影子在 land<1000000 的健康线程上**不启用**，行为与 v02.41 相同。
+
+## 构建验证
+
+- `rebuild_vm.sh build` 通过（21 成员）；`cmake --build vita-port/build/cmake -j8`
+  EXIT=0 → `out/vpk/midp_vita_v02.42.vpk`（3727245B）+ `.sym`；v02.41 产物未被覆盖。
+- 反汇编核对影子与真蹦床逐条等价；垫尾 `cmp r1,0xF4240; bcs → b vita_tramp_shadow`。
+- **v02.42 锚点**：`vita_landing_pad`=0x810aa358、`vita_tramp_shadow`=0x810ab968、
+  `start_lightweight_thread_asm`=0x810d3948、`vita_v242_stage`=0x814d4a58、
+  `vita_v241_rec`=0x814d4a98。（与 v02.40/41 均不同，勿混用）
+- 未真机验证。git 哈希同 v02.41：工作区未提交，boot_log 仍显示 1e8533d。
+
+## 判读矩阵（下一轮 `v242 st=` 行）
+
+| 读数 | 判定 |
+|---|---|
+| st[0]=0 | 影子从未进入：垫的分流没生效，或环里 land 没到 100 万，重核对 |
+| st[1]<st[0] | 入口后 tst 命中 THREAD_TERMINATING（bne 8f） |
+| st[2]=st[0] 而 st[4]<st[0] | TestCompiler/pending 分支离开，看 st[3]、pendexc |
+| st[4]=st[0] 且 finish 仍 0 | 调用 finish 但返回垫前没执行 finish 体——call_on_primordial_stack 内部问题 |
+| st[4]=st[0] 且 finish 开始增长 | 影子行为与真蹦床不同（说明有 bug 或真蹦床的寄存器假设不成立） |
+| st[5..9] 递进 | 流程走完 finish/uncaught 之后，看停在哪一步 |
+
+## 遗留
+
+- 前面（2026-09-28 / 2026-10-16 两节）是此前会话留下的未提交分析，日期有误，
+  其中"id=4 stack_pointer 不在出生帧"的读数来自 site_ring，仍待本探针验证。
+- 只说"需要探针"，根因尚未定死；不要把 v02.41 当修复。
+
+---
+
+## 2026-10-16 log85 coredump 寄存器分析：根因定位（real_return_address=landing_pad）
+
+### 1. coredump 寄存器精确读数（psp2dmp thread note 0）
+
+```
+pc=0x811241b0 (landing_pad+0x18)  lr=0x81124198 (landing_pad 入口)
+fp(r11)=0x00000000  r6=0x81ede7cc  r3=0x81edd764 (=id=4 ThreadDesc=current)
+r5=0x814018ec (gp)  sp=0x8167fd58 (primordial 栈)
+```
+
+primordial 栈顶 [sp]=0x81140638 = `JVM::start+0x198` = 调
+`primordial_to_current_thread`(0x810c6634 bl) 的返回地址。调用链
+midp_run_midlet_with_args_cp → JVM_Start → JVM::start。确认 master mode，
+landing_pad 热旋转发生在绿线程 Java 栈上，primordial 栈停在 bootstrap。
+
+### 2. 根因：run() 返回时 fp 弹帧错位，shared_entry_return 读到 sentinel
+
+- landing_pad 进入时 r6=0x81ede7cc、lr=landing_pad、fp=0。若从 gadget 进入
+  则 r6=stack_pointer+8 → stack_pointer=0x81ede7c4；但 **r3=id=4 只能是
+  `shared_entry_return`(0x810d2b94 `ldr r3,[r5,#1036]` get_thread) 的残留**
+  ——三个 gadget（primordial_to_current / call_on_primordial_stack 返回点 /
+  shared_call_vm 返回点）都不写 r3。
+- 故 landing_pad 从 `shared_entry_return` 的 `jmpx(real_return_address)` 进入，
+  r6 = EntryFrame fp + 8 = 0x81ede7cc → **EntryFrame fp = 0x81ede7c4**，
+  real_return_address = [0x81ede7c4] = landing_pad（本应是 0x810d328c =
+  invoke_pending_entries 里 `bl shared_entry` 的返回点）。
+- 而出生帧布局 [stack_pointer=0x81ede7c0]=0(fp 字)、[+4]=landing_pad(sentinel)。
+  **EntryFrame fp(0x81ede7c4) = 出生帧 stack_pointer+4 = sentinel 位置**，比
+  正确值（出生帧 stack_pointer - 36）高了 **40 字节**（=EntryFrame 大小 36
+  + 一个字 4）。
+- 即 **run() 返回的 unwind 弹帧多了 40 字节**，fp 从 EntryFrame fp 弹到出生帧
+  sentinel 处，shared_entry_return 读 [fp]=landing_pad，jmpx 跳回 landing_pad。
+
+### 3. 自环与所有观察的自洽解释
+
+landing_pad → bx 蹦床 → bleq invoke_pending_entries（pe=0 因 run 已消费 entry，
+立即 `moveq pc,lr` 回 0x810d355c）→ `ldr r0,[r6,#16]`（r6=EntryFrame fp+8，
+读到的是 push 的寄存器旧值，**非 0**）→ bne L444 → `ldr r0,[r6]`（同为垃圾）
+→ call_on_primordial_stack(垃圾) → 跳垃圾回到 landing_pad。
+
+- land 涨（landing_pad 反复进入）✓
+- finish=0 / lw_exit=0（蹦床走 L444 跳垃圾，两个死亡路径都到不了）✓
+- switch=181383 冻结（自环不经过 switch_thread）✓
+- r6/lr/fp/r3 四个寄存器与"从 shared_entry_return 进入"完全吻合 ✓
+
+### 4. 待 v02.41 真机验证（判读矩阵补充）
+
+---
+
+## 2026-10-16 第三轮：推翻"40 字节错位"，核心矛盾重新聚焦
+
+### 1. 重要修正（上一轮 §2/§3 的"40 字节错位"是错的）
+
+- 用 `field_base` 精确重算出生帧 stack_pointer：
+  - `OopDesc::field_base(offset) = this + offset`（OopDesc.hpp:95）
+  - `ExecutionStackDesc` header_size = `sizeof` = 16（_klass@0,_length@4,
+    _thread@8,_next_stack@c），数据区@0x10
+  - `stack_pointer = field_base(StackSize) - 24 = this + 4096 - 24 = this + 4072`
+  - `stack_limit  = field_base(StackPadding) = this + 1280`
+  - 二者差 = 2792 = 0xae8；由 site_ring 的 stack_limit=0x81eddcdc 反推
+    **出生帧 stack_pointer = 0x81ede7c4**
+- 故 coredump `r6 = 0x81ede7cc = 出生帧 stack_pointer + 8`，是**三个 gadget
+  的正常进入态**（primordial_to_current / call_on_primordial_stack 返回点 /
+  shared_call_vm 返回点 都是 `ldr fp,[r6],#8` → r6=stack_pointer+8），
+  **不是** shared_entry_return 的 `EntryFrame fp + 8` 错位。
+- 若真是 EntryFrame fp 错位，则 fp=0x81ede7c4=stack_pointer，[fp]=0（fp 字），
+  与 lr=landing_pad 矛盾。所以"错位"不成立。
+
+### 2. 新矛盾（比上一轮更尖锐，尚未解）
+
+铁的事实链：
+1. `r6 = stack_pointer + 8`（正常）→ `[r6+16] = [stack_pointer+24] = TestCompiler`
+2. `TestCompiler = bool false = 0`（Globals.hpp:495 默认 false，命令行无 +TestCompiler）
+3. 蹦床 `cmp r0,#0 / bne L444` → TestCompiler=0 走 **finish 路径**（`ldr r0,[r6,#8]
+   / bl call_on_primordial_stack`），`Thread::finish` 里 `vita_thread_finish_count++`
+   和 `vita_v231_finish++` 必然涨
+4. 但 watchdog `th_finish=0`、`v231 finish=0`、`lw_exit=0`
+
+即：**r6 正常 → 蹦床必然走 finish → finish 必然涨 → 但 finish=0**。land=3.17亿
+（HANG 快照）说明蹦床已转了 3 亿次 landing_pad，finish 却一直是 0。
+
+### 3. 已排除的方向（本轮反汇编验证）
+
+| 假设 | 结论 |
+|---|---|
+| "40 字节 EntryFrame fp 错位" | **排除**（field_base 计算证明 r6 正常） |
+| TestCompiler != 0（走 L444） | 排除（默认 false，无 +TestCompiler） |
+| bc_return 的 fp 恢复有 VITA bug | 排除（反汇编 0x810d068c = 标准 `ldr r7,[fp,#-12];
+  ldr lr,[fp,#-20]; ldr fp,[fp]; add r6,r7,#4`，与上游源码一致） |
+| 计数器读取 bug | 待排除（Thread.cpp:464 finish 的 ++ 看起来对） |
+| r3=current 是"三个 gadget 残留" | 修正：shared_entry(0x810d2acc) **也** `ldr r3,[r5,#1036]`，
+  所以 r3=current 更准确说是 shared_entry/shared_entry_return 家族残留 |
+
+### 4. 最可能的解释（需 v02.41 探针的 [r6+0..16] 数据定死）
+
+唯一能让"r6 正常但 finish=0"自洽的解释：**出生帧 exit 表
+[stack_pointer+8..+24] 的内容在运行时被破坏**（[r6+16] 实际非 0 走 L444，或
+[r6+8]=finish 槽被覆盖调了别的函数）。破坏来源待查：
+- 栈重定位（GC `ExecutionStackDesc::relocate_all_pointers` 改 stack_pointer
+  后 exit 表偏移错位）；
+- run 执行期间某条路径覆写了出生帧上方。
+
+v02.41 探针会直接记录 `[r6+0/4/8/12/16]` 和 `cur->status(+0x68)`、
+`cur->pending_entries(+0x24)`——若 `[r6+16]!=0` 或 `[r6+8]!=finish 地址`，即证
+exit 表被破坏；若 `cur.st` 含 bit30 或 `cur.pe!=0`，则是另一条路径。
+
+### 5. 待 v02.41 真机验证（判读矩阵补充）
+
+- 关键判读：**`v241 rec[i]` 的 r6 应 ≈ cur+0x64(stack_pointer)+40**（而非 +8），
+  且 `[r6+16]` 非 0、cur.st 不含 bit30。若如此则确认"fp 弹帧错位 40 字节"。
+- 真正要修的是 **run() 返回（bc_return/entry_return_void/shared_entry_return）
+  的 fp 弹帧偏移**，不是调度层。方向：查 bc_return（TemplateTable_arm.cpp:1289）
+  与 interpreter_method_entry（0x810cd210，caller_fp=`str fp,[r6,#20]`）在
+  EntryActivation 入口方法上的 fp 链是否少存/多弹了一层。
+
+---
+
+## 2026-10-16 第四轮：静态追 exit 表破坏来源——三个决定性结论
+
+### 1. setup_stack_asm 反汇编（0x810ab6cc）确认 exit 表播种 100% 正确
+
+```
+[sp+0]  = 0                 (TestCompiler 槽，被编译器优化成常量 0，str lr,lr=0)
+[sp-4]  = 0x810aa1d8 force_terminated
+[sp-8]  = 0x810aa218 Thread::finish
+[sp-12] = 0x810aa2d8 lightweight_thread_uncaught_exception
+[sp-16] = 0x810abc88 lightweight_thread_exit
+[sp-20] = 0x810aa198 vita_landing_pad (sentinel)
+[sp-24] = 0 (fp 字)，返回 sp-24 = stack_pointer
+```
+
+- **TestCompiler 槽 = 0 是编译期常量优化**（`product(bool,TestCompiler,false)`
+  被优化为 `str lr, [r3]` + `mov lr, #0`），非运行时读全局变量。所以蹦床
+  `cmp r0,#0 / bne L444` 必然不跳 L444，走 finish 路径。
+- exit 表布局与蹦床注释（InterpreterStubs_arm.cpp:239-243）逐字吻合：
+  r6=stack_pointer+8 → [r6]=lw_exit, [r6+4]=uncaught, [r6+8]=finish,
+  [r6+12]=force, [r6+16]=TestCompiler=0。
+
+### 2. GC 帧重定位不碰 exit 表、不碰 real_return_address
+
+- `EntryFrame::relocate_internal_pointers`（Frame.cpp:816）只重定位
+  stored_last_fp / stored_last_sp（且 stored_fp==NULL 时跳过），**不碰
+  real_return_address([fp+0])**。
+- `JavaFrame::relocate_internal_pointers`（Frame.cpp:603）只重定位 caller_fp /
+  locals / stack_bottom。
+- `relocate_internal_pointers`（ExecutionStackDesc.cpp:89）的
+  `*stored_fp_addr += delta` 只碰 [stack_pointer]（fp 字，出生帧=0 跳过），
+  set_stack_pointer(+delta) 只移 stack_pointer 字段。
+- **exit 表函数指针是代码段地址，GC 只移堆对象，不碰代码地址。GC 重定位
+  完全自洽，exit 表不会被 GC 破坏。**
+
+### 3. 关键机制发现：call_on_primordial_stack 的 push 会覆盖 sentinel
+
+- call_on_primordial_stack（0x810d329c）进入时 r6=stack_pointer+8，push lr →
+  r6=stack_pointer+4，`[stack_pointer+4]=返回地址`（**覆盖 sentinel**）；push fp →
+  r6=stack_pointer，`[stack_pointer]=fp`。
+- 所以**一旦蹦床走 finish/lw_exit（都经 call_on_primordial_stack），sentinel
+  就被覆盖**，之后 gadget 读 [stack_pointer+4] = 返回地址（非 landing_pad），
+  landing_pad 无法再通过 sentinel 进入。
+- **推论**：land=3亿（landing_pad 反复进入）且 lr 一直=landing_pad（watchdog
+  读 vita_v240_lr=pad），意味着 **sentinel 从未被覆盖** → 蹦床从未走完
+  finish/lw_exit 路径。这与 finish=0 一致（不是"finish 涨了没读到"，而是
+  finish 真的没执行）。
+
+### 4. site_ring vs coredump 的 stack_pointer 不一致（关键时序证据）
+
+- site_ring（sample 1/2，间隔 400ms）：stack_pointer=0x81ede710（Java 帧），
+  [jsp+04]=0x8114ba58 = **fast_invokevirtual 返回点**（L318+0x8，0x810d1a58），
+  [jsp+00]=0x81edb770（对象）。
+- coredump：r6=0x81ede7cc → stack_pointer=0x81ede7c4（出生帧）。
+- 差 0xb4=180 字节 = run() 返回的 unwind 量。
+- **结论**：site_ring 采样时 run() 卡在 fast_invokevirtual 返回点（Java 帧），
+  之后 run() 返回（stack_pointer 恢复出生帧），landing_pad 进入（coredump）。
+
+### 5. 收敛后的核心矛盾（静态已穷尽，需探针定死）
+
+铁链：r6=出生帧+8（正常）→ [r6+16]=TestCompiler=0 → 蹦床必然走 finish →
+finish 必然 ++。但 finish=0，且 sentinel 未被覆盖（land=3亿 + lr=landing_pad）。
+
+唯一自洽的解释：**run() 返回后，控制流在蹦床头（invoke_pending_entries）处
+反复回到 landing_pad，既不前进到 finish，也不覆盖 sentinel。** 具体机制
+（real_return_address 被写坏 / invoke_pending 的 pe 状态 / 蹦床某条 jmpx lr
+读到 landing_pad）静态无法区分，v02.41 探针的 `[r6+0..16]` + `cur.pe/cur.st`
+实测数据是唯一能定死的手段。
+
+### 6. 已排除清单（四轮累计，均经反汇编/源码验证）
+
+| 假设 | 状态 |
+|---|---|
+| 40 字节 EntryFrame fp 错位 | 排除（field_base 计算） |
+| TestCompiler != 0 走 L444 | 排除（常量优化 0） |
+| bc_return fp 恢复 bug | 排除（标准 ldr fp,[fp]） |
+| GC 破坏 exit 表 | 排除（relocate 不碰 exit 表/real_return_address） |
+| exit 表播种错误 | 排除（setup_stack_asm 反汇编逐字核对） |
+| landing_pad ABI（r0/r1 clobber） | 排除（只碰 r0/r1，读 fp/lr 不写） |
+| call_on_primordial_stack 返回点读 sentinel 自环 | 排除（push 覆盖 sentinel，读的是返回地址） |
+
+---
+
+## 2026-10-16 log86（v02.41 探针）真机数据：根因精确锁定
+
+> v02.41 探针（landing_pad 记录 r4-r12/sp/lr + [r6+0..16] + cur.sp/pe/st）
+> 真机 log86 卡死现场。slide=**0x53000**（v02.41，不是 v02.40 的 0x7a000）。
+
+### 1. 探针黄金数据（rec[0..15]，land=1..8 和 land=1000000..1000007）
+
+**exit 表五槽完全正确**（每次进入都一样）：
+```
+[r6+0]  = 810fee80 = lightweight_thread_exit
+[r6+4]  = 810fd4d0 = lightweight_thread_uncaught_exception
+[r6+8]  = 810fd410 = Thread::finish
+[r6+12] = 810fd3d0 = force_terminated
+[r6+16] = 00000000 = TestCompiler = 0
+```
+→ **彻底排除"exit 表被破坏"假设**（上一轮的核心假设不成立）。
+
+**健康组（land=1..4）**：cur 依次 = id=0（主线程，pe=818b4768 非0）、id=1
+（pe 非0）、id=2（pe 非0）、id=3（pe 非0）。每个 r6 = cur.sp + 8，一致。
+这是 4 个线程的出生 dispatch（born_dsp=4 对应），全部正常。
+
+**关键转折 land=5 → land=6**：
+```
+rec[4] land=5: cur=id=4(81edd764)  cur.sp=81ede7c4(出生帧)  cur.pe=81ede7ec(非0)
+rec[5] land=6: cur=id=4(81edd764)  cur.sp=81ede710(Java帧)  cur.pe=0
+```
+land=5 是 id=4 出生（primordial_to_current_thread 读出生帧，正常）。land=5→6
+之间，shared_entry 消费 run entry（pe 非0→0），run() 压栈（cur.sp 出生帧→
+Java帧 81ede710）。
+
+**自环组（land≥6，rec[5..15] 完全一致，冻结）**：
+```
+r6=81ede7cc(出生帧+8，陈旧)  lr=810fd2c8(landing_pad)  fp=0
+r7=818b5570(locals) r8=81201e4c(cpool) r9=811e171c r10=818b5528
+cur.sp=81ede710(Java帧)  cur.pe=0  cur.st=0
+```
+
+### 2. coredump 寄存器（与 rec 完全一致）
+
+```
+pc=0x810fd3a8(landing_pad+0xe0=记录fp的movt)  lr=0x810fd2c8(landing_pad)
+fp(r11)=0  r6=0x81ede7cc  r3=0x81edd764(id=4=current)
+r7/r8/r9/r10 = run()的Java帧寄存器  sp=0x813bfd58(primordial)
+```
+
+primordial 栈顶 [sp]=0x81119830=JVM::start+0x198（bootstrap 调
+primordial_to_current_thread 的返回点），无 shared_call_vm/switch_thread 残留。
+→ 自环纯在 Java 栈上，primordial 栈停在 bootstrap。
+
+### 3. run() 卡死点：invokeinterface 字节码
+
+site_ring 的 java-stack-top `[jsp+04]=0x81124c50` = L318+0x8。反汇编确认
+L318（0x810d1c48）= **fast_invokeinterface 的返回点**（`mov lr,pc; mov pc,r2`
+跳接口方法，返回时 `ldr r7,[fp,#-12]; ldr lr,[fp,#-16]; ldr pc,[r5,ip,lsl#2]`
+dispatch 下一条字节码）。
+
+→ run()（id=4）最后执行 invokeinterface 字节码（接口方法调用），卡在接口
+方法调用处，此后 landing_pad 自环开始。
+
+### 4. 核心矛盾（更精确，尚未闭合）
+
+land≥6 自环里，**r6/lr/fp 是"出生帧"状态（land=5 带入的陈旧值），但
+cur.sp/r7/r8/r9/r10 是"run() 执行中 Java 帧"状态（停在 invokeinterface）**。
+
+- r6 = 81ede7cc = 出生帧 stack_pointer + 8
+- cur.sp = 81ede710 = Java 帧（run 的 jsp）
+- r6 ≠ cur.sp + 8（差 188 字节 = run() 压栈量）
+
+**结论：landing_pad 自环的进入路径不重载 r6/lr/fp（复用 land=5 的出生帧
+dispatch 状态），而 cur.sp 和解释器寄存器保持 run() 中断时的 Java 帧快照。**
+
+铁链（仍矛盾）：r6=出生帧+8 → [r6+16]=TestCompiler=0 → 蹦床必然走 finish →
+finish 必然 ++。但 finish=0、sentinel 未覆盖（lr 一直=landing_pad，说明
+call_on_primordial_stack 从未执行）。
+
+### 5. 最可能机制（下一轮攻）
+
+run() 的 invokeinterface（接口方法调用）触发线程切换（switch_thread，接口
+方法可能 native 或 synchronized，走 shared_call_vm）。切回时，某个 gadget 读
+到**出生帧的 stack_pointer**（而非 Java 帧），r6=出生帧+8、lr=sentinel=
+landing_pad、fp=0，跳 landing_pad；而 ThreadDesc.stack_pointer 字段仍是 Java
+帧（81ede710，cur.sp 读到的）。→ r6（寄存器）与 cur.sp（字段）分裂。
+
+**这个"gadget 读的 stack_pointer 来源"与"ThreadDesc 字段"不一致，是根因的
+关键特征。**
+
+### 6. 已排除清单（累计，均经反汇编/源码/探针验证）
+
+| 假设 | 状态 |
+|---|---|
+| exit 表被破坏 | **探针排除**（[r6+0..16] 五槽完全正确） |
+| 40 字节 EntryFrame fp 错位 | 排除（field_base 计算） |
+| TestCompiler != 0 走 L444 | 排除（常量优化 0） |
+| bc_return fp 恢复 bug | 排除（标准 ldr fp,[fp]） |
+| GC 破坏 exit 表 | 排除（relocate 不碰 exit 表） |
+| call_on_primordial_stack 返回点读 sentinel | 排除（push 覆盖 sentinel） |
+
+### 7. 下一步验证方案（精确）
+
+1. **蹦床 bleq invoke_pending_entries 返回点（810d3754）加探针**，记录 lr
+   和 pe 实际值——区分"bleq 正常返回(lr=蹦床返回地址)" vs "bleq 未执行(lr=
+   landing_pad，即 status 含 TERMINATING)"。
+2. **shared_call_vm / call_on_primordial_stack 返回点加探针**，记录 r6 和
+   [r6+4]——定位"哪个 gadget 读到了出生帧 stack_pointer"。
+3. 查 fast_invokeinterface 的接口方法是否 native（走 shared_call_vm）。
+
+---
+
+## 2026-10-16 log86 第五轮：核心矛盾收敛为"寄存器 vs 字段"分裂
+
+### 1. 反汇编确认三个 gadget 都读字段（非寄存器）
+
+| gadget | 读 stack_pointer 的方式 |
+|---|---|
+| primordial_to_current_thread (810d3714) | `ldr r6, [r1, #100]`（字段）|
+| call_on_primordial_stack 返回点 (810d34bc) | `ldr r6, [r1, #100]`（字段）|
+| shared_call_vm 返回点 (810d2fec) | `ldr r2, [r5,#1036]; ldr r6, [r2,#100]`（字段）|
+
+**关键**：三个 gadget 都 `ldr r6, [current+0x64]`（读 ThreadDesc 的
+`_stack_pointer` 字段）。所以从任何 gadget 进入 landing_pad，r6 都 =
+`字段值 + 8`。
+
+### 2. 决定性矛盾（铁的事实）
+
+land=6 进入 landing_pad 时（rec[5]，冻结后所有 land≥6 完全一致）：
+
+```
+r6（寄存器）= 0x81ede7cc = 出生帧 stack_pointer + 8
+lr          = landing_pad（sentinel）
+fp（r11）   = 0
+r7/r8/r9/r10 = run() 的 Java 帧寄存器（locals/cpool/tmp3/tmp4）
+cur.sp（字段）= 0x81ede710 = Java 帧
+```
+
+**如果 landing_pad 从任何 gadget 进入，r6 应该 = 字段 + 8 = 0x81ede718
+（Java 帧 + 8），但实际 r6 = 0x81ede7cc（出生帧 + 8）。**
+
+**矛盾本质：gadget 读到的 stack_pointer = 出生帧（0x81ede7c4），但字段 =
+Java 帧（0x81ede710）。即"gadget 读的 stack_pointer"与"ThreadDesc 字段"
+不一致。**
+
+### 3. 矛盾的时间线解释（唯一自洽）
+
+- land=5：id=4 出生，字段 = 出生帧（0x81ede7c4），pe 非0。shared_call_vm
+  返回点读出生帧 → r6=出生帧+8，lr=sentinel → 跳 landing_pad（land=5）。
+- land=5 之后：蹦床调 invoke_pending_entries（pe 非0）→ shared_entry 消费
+  run entry → run() 压栈 → shared_call_vm 保存字段 = Java 帧（0x81ede710）。
+- **land=6 进入 landing_pad 时，字段已经是 Java 帧，但 r6 仍是出生帧+8
+  （land=5 带入的旧值，未重新从字段加载）。**
+
+**结论：land=6 进入 landing_pad 的路径，r6 沿用 land=5 的旧值（出生帧+8），
+没有重新读字段。即 landing_pad 的进入路径不是三个 gadget（读字段），而是
+蹦床里某条 `jmpx lr`，lr = landing_pad（sentinel 旧值），r6 沿用。**
+
+### 4. 与"蹦床必走 finish"的矛盾（未解）
+
+蹦床 bleq invoke_pending_entries 返回后，TestCompiler=0 → 必然走 finish
+（call_on_primordial_stack → Thread::finish → finish++）。但 finish=0。
+
+唯一自洽解释：蹦床在 bleq invoke_pending_entries 返回前，控制流就偏离了
+（通过某条 jmpx lr 跳回 landing_pad），从未走到 finish。
+
+**关键待验证：蹦床 bleq invoke_pending_entries 的返回点（810d3754）是否
+被到达。若 invoke_pending_entries 里的 shared_entry（执行 run()）在 run
+卡死时，某个 gadget 切回读出生帧跳 landing_pad，则蹦床永远停在
+invoke_pending_entries（bl shared_entry），不返回，不走到 finish。**
+
+### 5. 下一步（决定性探针，加在 v02.42）
+
+1. **蹦床 bleq invoke_pending_entries 返回点（810d3754）加探针**：记录 lr
+   和 r6，确认 invoke_pending_entries 是否返回、返回后 r6/lr 是什么。
+2. **shared_call_vm 返回点（810d2fec）加探针**：记录读到的 r2（current）、
+   [r2+0x64]（stack_pointer）、[r6+4]（lr 来源）——定位"切回时读出生帧
+   stack_pointer"的 current 是谁。
+3. **call_on_primordial_stack 返回点（810d34bc）加探针**：同 2。
+
+判读：若 shared_call_vm 返回点读到的 stack_pointer = 出生帧（而字段 =
+Java 帧），则"切回读错字段"成立；若读到的 = Java 帧，则 landing_pad 从
+别的路径进入（蹦床 jmpx lr），需看蹦床返回点探针。
+
+### 6. 已排除清单（累计）
+
+| 假设 | 状态 |
+|---|---|
+| exit 表被破坏 | 探针排除（五槽正确）|
+| 40 字节 EntryFrame fp 错位 | 排除 |
+| TestCompiler != 0 | 排除（常量 0）|
+| bc_return fp 恢复 bug | 排除 |
+| GC 破坏 exit 表 | 排除 |
+| rec 的 cur/cur.sp 是 slide bug 垃圾 | 基本排除（rec cur 序列与 site_ring active-list 完全一致，movw/movt 被 eboot 重定位）|
+| landing_pad 从 gadget 读字段进入 | **排除**（r6 ≠ 字段+8）|
+
+---
+
+## 2026-10-17 v02.42 构建完成：shadow 蹦床探针就绪
+
+### 1. 探针设计（已实现，指令级验证通过）
+
+上一轮结论（log86 v02.41）：landing_pad 自环里 r6≠字段+8，且蹦床必然走
+finish 但 finish=0。要区分"invoke_pending_entries 里的 shared_entry 执行
+run() 卡死（蹦床永远停在 bl shared_entry，不返回）"vs"蹦床走完但 finish
+槽被改"。真实蹦床在 loopgen-frozen Interpreter_arm.o 里无法插探针，所以：
+
+- **vita_landing_pad** 在 land≥1000000 时 divert 到 `vita_tramp_shadow`
+  （`cmp r1,#0xf4240; bcs vita_tramp_shadow`），健康线程（land<1000000）
+  仍走真实蹦床。
+- **vita_tramp_shadow** = 手写指令级复刻的真实蹦床，每个 stage 前一个
+  计数器（`vita_v242_stage[0..9]` + r6/lr/pendexc 快照）。
+- 关键设计约束（写代码时发现）：call_on_primordial_stack **不返回**给
+  bl 之后，而是读 [cur->stack_pointer+4]（sentinel）跳 landing_pad。所以
+  每个探针都放在其描述的 step **之前**；第一个计数低于 st[0] 的 stage
+  标记"laps 从哪里离开蹦床体"。
+
+### 2. stage 语义（判读矩阵）
+
+| stage | 含义 | 判读 |
+|---|---|---|
+| st[0] | 进入 shadow 次数 | 分母（= land≥1000000 的 lap 数）|
+| st[1] | before invoke_pending_entries#1 | st[1]<st[0] → status 含 TERMINATING（bit30），跳过 invoke |
+| st[2] | before TestCompiler test | **st[2]<st[1] → invoke_pending_entries 没返回（shared_entry 执行 run 卡死）——最可能命中的判读** |
+| st[3] | before uncaught-call | 仅 pending_exc≠0 时 |
+| st[4] | before finish call | st[4]<st[2] → 在 finish 前偏离 |
+| st[5] | before force_terminated | st[5]<st[4] → finish 调用未返回 |
+| st[6] | before task_cleanup | |
+| st[7] | before invoke#3 | |
+| st[8] | L444 入口 | TestCompiler≠0 时（预期 0）|
+| st[9] | before lw_exit | |
+| st[10/11/13] | 最后进入时 r6/lr/pending_exc | 辅助 |
+
+**核心判读**：st[2] vs st[1]。若 st[2] 冻结而 st[0]/st[1] 涨 → run() 在
+invoke_pending_entries 的 shared_entry 里卡死（bl shared_entry 永不返回），
+蹦床停在 bleq 返回点之前，从不走到 finish —— 这直接解释 finish=0 和
+sentinel 未覆盖（lr 一直=landing_pad）。若 st[2]==st[1]（invoke 每次正常
+返回）且 st[4]==st[0]（每次到达 finish 调用）但 finish 计数器仍 0 → 说明
+call_on_primordial_stack(finish) 跳错了目标（[r6+8] 槽被改），需看 rec 的
+[r6+8]。
+
+### 3. 构建验证（2026-10-17 04:44）
+
+- `rebuild_vm.sh build`：34 ARM objects OK，库重打包成功。
+- loopgen 生成器 exe 链接失败（`undefined reference to _current_thread /
+  current_thread_to_primordial_fast`）是**既有预期现象**（这些符号是 U
+  引用，只在最终 VPK 里解析），非本次引入。
+- VPK 链接成功：`out/vpk/midp_vita_v02.42.vpk`（3727245B）+ `.sym`
+  （4320804B）。
+- **符号锚点（v02.42，slide 待真机定）**：
+  - vita_landing_pad = 0x810aa358
+  - vita_tramp_shadow = 0x810ab968
+  - start_lightweight_thread_asm = 0x810d3948
+  - invoke_pending_entries = 0x810d3670
+  - call_on_primordial_stack = 0x810d36a4
+  - current_thread_to_primordial_fast = 0x810d39d8
+  - thread_task_cleanup = 0x810abea8
+  - gp_base_label = 0x813018ec
+  - _next_runnable_thread = 0x814d4470
+  - vita_v242_stage = 0x814d4a58
+  - vita_v241_rec = 0x814d4a98
+  - vita_v240_land = 0x814d50a0
+
+### 4. 指令级验证（反汇编核对）
+
+- landing_pad divert：`cmp r1,#0xf4240; bcs vita_tramp_shadow` ✓
+- shadow 蹦床 9 个 V242_PROBE 位置正确，stage 偏移 = idx*4 ✓
+- literal 替换正确：gp_base_label(0x813018ec) / thread_task_cleanup
+  (0x810abea8) / _next_runnable_thread(0x814d4470) ✓
+- shadow 的 bl 目标与真实蹦床一致（invoke_pending_entries=0x810d3670,
+  call_on_primordial_stack=0x810d36a4, current_thread_to_primordial_fast=
+  0x810d39d8）✓
+- watchdog 输出 `v242 st=...` 行已就位（OS_vita.cpp:1301）✓
+
+### 5. 待真机（log87）
+
+下一轮跑 v02.42，读 `v242 st=` 行。核心看 st[2] vs st[1]：
+- st[2] < st[1]（且 st[2] 冻结）→ run() 卡在 invoke_pending_entries 的
+  shared_entry，根因是"run() 返回的 unwind / shared_call_vm 切回"。
+- st[2] == st[1] 且 st[4] == st[0] 但 finish 仍 0 → [r6+8] 槽被改。
+
+---
+
+## 2026-10-17 log87（v02.42）：卡死消失，但改动全是探针——时序/布局副作用
+
+### 1. log87 现场：MIDlet 完整跑完，卡死消失
+
+- boot_log: `runMidlet returned 0 - back to menu`
+- vm_boot: `JVM::start() loop 0 returned 2001`
+- midp_debug: `after midpRunVm, vmStatus=2001 (MAIN_EXIT=2001)`
+- midp_stderr 尾: `midpRunVm returned vmStatus=2001` + `classPath freed`
+- crumb: jsr75 `listOpen/listNext/listClose` 循环（文件枚举正常）+ 回到菜单
+  继续 `menu hb flips`（渲染恢复）
+- input_debug: HEARTBEAT 持续（#1→#705+），**CE 持续增长**（vs log85/86
+  的 ce=406/409 冻结）——事件泵一直在跑
+- watchdog: 只有 STORM（preload 阶段），**无 HANG**
+
+**结论：v02.42 里卡死根本没发生**（land 没涨到 100 万，shadow 蹦床没被
+触发），MIDlet 正常执行完文件枚举并返回菜单。
+
+### 2. v02.42 改了什么（全部梳理）
+
+git diff 相对 v02.40（1e8533d）的改动文件，逐一归类：
+
+| 文件 | 改动 | 是否行为改变 |
+|---|---|---|
+| InterpreterRuntime_arm.cpp | +197 行：v02.41 rec 记录 + v02.42 shadow 蹦床 + landing_pad divert | **纯探针** |
+| OS_vita.cpp | +49 行：v241/v242 输出 | 纯探针 |
+| CMakeLists.txt | +29 行：版本号 02.41/02.42 | 无 |
+| vita_audio_javacall.c | +2 include | 工具链兼容 |
+| vita_main.c | +1 include | 工具链兼容 |
+| vita_media_notify.c | +1 include | 工具链兼容 |
+| vita_menu.c | +1 include | 工具链兼容 |
+| vita_net.c | +2 include | 工具链兼容 |
+
+**没有任何一处改动是"逻辑修复"**。rec 记录和 shadow 蹦床的 probe 只写
+`vita_v241_rec` / `vita_v242_stage`（BSS 探针数组），读 exit 表和 current
+字段；landing_pad 的 divert（`cmp land,#1000000; bhs shadow`）只设置 flags
++ 跳转。所有内存写都是探针数组，不碰 VM 状态。
+
+（10-15 15:14 有 4 个文件 Scheduler.cpp/Thread.cpp/Globals_vita.hpp/
+VerifyMethodCodes.cpp 被 touch，但 git diff 为空 = 内容与 HEAD 完全一致，
+只是 mtime 变了，无实际改动。）
+
+### 3. 卡死消失的真实原因：时序/代码布局副作用，非根因修复
+
+- shadow 蹦床（land≥100万 触发）在正常运行中**不会被触发**（land 到不了
+  100万），所以它不是卡死消失的原因。
+- 真正改变的是**时序**：
+  1. rec 记录在 land=1..8（4 个线程的出生 dispatch）时，每次多执行 ~40
+     条指令（push + 24 个 str/ldr + pop），拉长了出生 dispatch 的时序；
+  2. landing_pad 每次进入多执行 4 条 divert 指令（movw/movt/cmp/bhs）；
+  3. 新增 shadow 蹦床 ~150 字节，改变了 .text 段布局，landing_pad 从
+     0x810aa2c8（v02.41）移到 0x810aa358（v02.42），真实蹦床从 0x810d3738
+     移到 0x810d3948，所有函数地址 + icache 对齐都变了。
+- 卡死本质是**时序敏感的竞态**（此前 log57/58 已记录 "timing race"：
+  "a deterministic deadlock would not walk; this is a timing race"，
+  set_current 总数每次运行不同 126/100/104 vs 97）。探针的时序变化恰好让
+  竞态窗口不再命中。
+
+### 4. 诚实判断与验证建议
+
+**v02.42 不是真正的根因修复**。它只是改变了时序/布局，让竞态这次没触发。
+风险：竞态仍在，可能在其他时序条件下（换 build、换 SDK 版本、加/删代码）
+复发。
+
+验证"稳定修复 vs 时序巧合"的方法：
+1. **多跑几次 v02.42**（比如 5-10 次真机），看是否稳定不卡。
+   - 若稳定 → 时序变化恰好"稳定化"了某个竞态，但根因未明，仍建议继续追；
+   - 若偶发卡死 → 确认时序竞态，继续追根因。
+2. 若要真正定死根因，需回到"r6/lr/fp 陈旧值 vs cur.sp Java帧 分裂"这个
+   核心矛盾（log86 第五轮结论），在**不改变时序**的前提下加探针——但这
+   本身就会改变时序，是两难。
+
+### 5. 下一步
+
+- 短期：真机多跑 v02.42 确认稳定性，如实报告。
+- 中期：若确认稳定，需要理解"哪个时序参数是竞态的关键"，从 run() 卡在
+  invokeinterface（log86 site_ring [jsp+04]=L318+0x8=fast_invokeinterface
+  返回点）这个点切入，查 invokeinterface 的线程切换路径。
+
+---
+
+## 2026-10-17 log88/log89（v02.42 换程序复现）：v242 探针抓到了根因实证
+
+### 1. 现场：换程序（WebClient/MainMidlet）卡死复现
+
+- log88：先跑 FileManager（返回菜单），再跑 WebClient（cn.uc...WebClient）
+  卡死。**land=1000008，shadow 蹦床首次被触发**。
+- log89：跑 WebClient/MainMidlet，两次 HANG，两个 coredump。vm_output 有
+  `RecordStoreException: invalid record store contents`（RMS 损坏，另一问题）。
+
+### 2. v242 探针黄金数据（shadow 蹦床 stage 计数）
+
+log88：`v242 st=9/9/3/0/3/3/3/3/3/3`
+
+stage 语义（探针都放在其描述的 step **之前**）：
+```
+st[0]=9   进入 shadow 次数（land=1000000..1000008，共 9 次）
+st[1]=9   before invoke_pending_entries#1（9 次都执行了 invoke）
+st[2]=3   before TestCompiler test（只有 3 次从 invoke 返回）
+st[3]=0   before uncaught（pending_exc 恒 0）
+st[4]=3   before finish call
+st[5..9]=3  finish→force→task_cleanup→invoke#3→lw_exit 各 3 次
+```
+
+**决定性判读：st[1]=9 但 st[2]=3 → invoke_pending_entries 9 次调用只有 3
+次返回，6 次卡死在 shared_entry 里的 run()。**
+
+这 3 次返回 = `th_finish=3 / lw_exit=3 / force=3`（FileManager 的 3 个线程
+正常退出）。6 次卡死 = WebClient 创建的线程（clinit 里有 socket/http 协议
+类，网络线程 bi.run 等）。
+
+### 3. 实证了 log86 第五轮的核心假设
+
+第五轮假设："run() 卡在 invoke_pending_entries 的 shared_entry（bl
+shared_entry 永不返回），蹦床停在 bleq 返回点之前，从不走到 finish"。
+**v242 st[2]=3 < st[1]=9 直接证实了这一点**：6 次 invoke 进入 shared_entry
+后 run() 执行时卡死，bl 永不返回，蹦床停在 invoke 调用处，走不到 finish。
+
+### 4. 关键区别：log88 卡死 ≠ log85/86 卡死（两种现象，可能同根）
+
+| | log85/86（FileManager） | log88（WebClient） |
+|---|---|---|
+| land | 3.17亿→3.23亿（**热旋转，无限涨**） | **停在 1000008** |
+| vm 状态 | RUNNING（用户态死循环） | **WAITING event(0x10)**（内核等待）|
+| 卡死线程 | id=3/4，固定自环 q5 CYCLE(2) | id=6（bi.run），q3 CYCLE(1) |
+| java site | （invokeinterface 返回点） | `.unknown..read`（网络读）|
+| rec[8..15] cur.pe | 全 0（entry 已消费） | **非 0（有 pending entry）** |
+
+- FileManager：landing_pad 自环（land 无限涨），r6/lr/fp 陈旧值复用。
+- WebClient：invoke_pending_entries 卡死（run() 不返回），land 停在 1000008
+  不再涨，VM 最终陷入内核事件等待（网络 read + evtflag 等）。
+
+**共同点**：都是 run() 执行时的线程切换/栈状态竞态。FileManager 表现为
+自环，WebClient 表现为网络线程卡死，底层可能是同一竞态的不同触发路径。
+
+### 5. 结论
+
+1. **v02.42 纯探针，没修复根因**（上一轮判断正确）。FileManager 不卡是
+   时序巧合；换程序触发同一竞态的其他路径。
+2. **根因确认**：Thread.run 的 run() 在 shared_entry 里执行时卡死，bl
+   shared_entry 永不返回。这是 log86 第五轮假设的实证。
+3. **下一步**：run() 卡死点已知（log88 site_ring `java site=read`，卡在线
+   程读/网络），需追 run() 执行时哪个线程切换路径导致栈状态分裂（r6≠字段
+   +8 的陈旧值复用）。
+
+---
+
+## 2026-10-17 log88/log89 网络卡死：确认 VM 是 master mode + 网络适配问题的完整链路
+
+### 1. 重大修正：VM 是 master mode（不是 slave mode）
+
+- **决定性证据**：`midpRunVm` 汇编（0x81054928）= `mov r0,#0; bl
+  midp_thread_set_timeslice_proc; b JVM_Start`，与
+  `master_mode_events.c:348-355` 完全对应：
+  ```c
+  int midpRunVm(...) {
+      midp_thread_set_timeslice_proc(NULL);   // r0=0
+      return JVM_Start(...);                   // b JVM_Start
+  }
+  ```
+  slave 版本 `midp_slave_mode_events.c:81` 会调
+  `JVM_SetConfig(JVM_CONFIG_SLAVE_MODE, KNI_TRUE)` + `midp_slavemode_event_loop()`，
+  但汇编里**都没有**。
+- `JVM_Start loop 0 returned 2001` = FileManager **正常跑完退出**（MIDlet
+  结束），不是 slave mode 特征。之前"slave mode"判断是错的，第一轮"master
+  mode"判断才对。
+
+### 2. master mode 下网络 poll 的驱动链（正常时）
+
+- `switch_thread`（每个 quantum 必经）→ `pump_events_vita()`（50ms 门控）
+  → `check_blocked_threads(0)` → `JVMSPI_CheckEvents`（vita_checkevents.c
+  强符号）→ `vita_net_poll()`（select 所有 fd + midp_thread_signal 唤醒
+  网络线程）。
+- 网络模型：non-blocking socket（SCE_NET_SO_NBIO）+ 事件泵驱动。read 阻塞
+  → `midp_thread_wait(NETWORK_READ_SIGNAL, fd)` → 事件泵 `select` 到 fd 可读
+  → `midp_thread_signal` → `midp_thread_unblock`。
+
+### 3. 网络卡死的因果链（log88 WebClient）
+
+1. WebClient（cn.uc.WebClient）启动网络线程（id=6，bi.run，clinit 里
+   socket/http 协议类），`connect OK fd=16/17`（两个 TCP 连接成功）。
+2. 网络线程 read 阻塞，等 `vita_net_poll` 的 select 唤醒。
+3. **v242 探针证实**：`st=9/9/3/0/3/3/3/3/3/3` → `st[1]=9` 但 `st[2]=3`，
+   即 9 次 invoke_pending_entries 只有 3 次返回，**6 次卡死在 shared_entry
+   的 run() 里**（6 个网络线程的 run() 永不返回）。
+4. run() 卡死后，VM 停止线程切换（switch=577万 冻结），事件泵停
+   （pump=9201 冻结），`vita_net_poll` 不再被调。
+5. 网络线程永远等不到 select 唤醒 → `vm status=WAITING event(0x10)`，
+   内核事件等待，整个 VM 卡死。
+
+### 4. 回答用户问题："网络是不是没适配好？"
+
+**部分正确，但不是"网络层没适配"的简单 bug。** 分层看：
+
+| 层 | 状态 |
+|---|---|
+| 网络层本身（vita_net.c） | **适配正确**：non-blocking + select 事件泵，connect 成功，DNS 解析成功 |
+| 事件泵驱动（switch_thread→pump→net_poll） | 机制正确，但依赖线程切换持续进行 |
+| **run() 卡死（真正的根因）** | 网络线程的 run() 在 shared_entry 里卡死 → switch 停 → 泵停 → 网络线程等不到唤醒 |
+
+**核心结论**：网络卡死是 **run() 卡死这个共同根因** 的触发路径之一，不是
+独立的网络适配 bug。FileManager 不联网，run() 卡在 invokeinterface 导致
+landing_pad 自环；WebClient 联网，run() 卡在网络 read 导致 switch 冻结 +
+内核等待。**两者同根：run() 在 shared_entry 执行时的线程切换竞态。**
+
+### 5. 下一步
+
+- 根因仍是 log86 第五轮的"run() 卡死"：`shared_call_vm` /
+  `call_on_primordial_stack` 返回点读 stack_pointer 时状态分裂（r6 陈旧
+  出生帧 vs 字段 Java 帧）。
+- 网络层本身不用改。要修的是 run() 返回的线程切换路径。
+- 但可以验证：让网络线程的 read 走不同的阻塞路径（如 timeout 而非无限
+  等待），观察是否绕过卡死——作为旁证。
+
+---
+
+## 2026-10-17 网络卡死机制完整梳理（回答"网络是否没适配好"）
+
+### 1. 网络读阻塞→唤醒的完整链路（master mode，机制正确）
+
+```
+Java read0 (Protocol.read0)
+  → shared_call_vm → pcsl_socket_read_start → recv() → EWOULDBLOCK
+  → PCSL_NET_WOULDBLOCK
+  → midp_thread_wait(NETWORK_READ_SIGNAL, fd)
+  → SNI_BlockThread → Scheduler::block_current_thread
+      (async_redo=1 + remove_from_active + add_to_asynchronous
+       + _yield_on_thread_switch=true)
+  → native 返回 → shared_call_vm 返回点 → bl switch_thread
+  → switch_thread:
+      pump_events_vita → vita_net_poll → select(fd 可读)
+      → midp_thread_signal → unblock_thread → add_to_active
+      消费 _yield_on_thread_switch → yield()
+  → 网络线程重新 runnable → 重新执行 read0 → recv 成功
+```
+
+### 2. 关键结论：网络层适配正确，不是网络 bug
+
+- `vita_net.c` 的 non-blocking + select 事件泵机制**完全正确**（源码逐行
+  核对 socketProtocol.c read0、midp_thread.c wait/signal、sni.cpp、
+  Scheduler.cpp block/unblock_thread）。
+- log88：`gethostbyname` 成功、`socket_open` 成功、`connect immediate OK
+  fd=16/17`（两个 TCP 连接都成功）。
+- `net_epoll_wait` 只是 vita_trace.c 的 trace 名称，不是真用 epoll。
+
+### 3. 卡死的真正原因：run() 卡死（v242 铁证），非网络唤醒链断
+
+- v242 `st=9/9/3/0/3/3/3/3/3/3`：`st[1]=9` 但 `st[2]=3` = 9 次
+  invoke_pending_entries 只有 3 次返回，**6 次卡死在 shared_entry 的
+  run() 里**。
+- 网络线程的 run() 卡死后，VM 停止线程切换（switch=577万冻结），
+  `pump_events_vita` 停（pump=9201 冻结），`vita_net_poll` 不再被调，
+  网络线程永远等不到 select 唤醒 → `vm WAITING event(0x10)`。
+- 这是**循环依赖**：网络线程等 net_poll 唤醒，net_poll 等 switch_thread
+  运行，switch_thread 等 run() 返回，run() 卡死。
+
+### 4. 最终回答用户问题
+
+**"网络是不是没适配好？" —— 网络层本身适配正确。** 卡死是 run() 卡死这个
+共同根因的触发路径之一：
+- FileManager（不联网）：run() 卡 invokeinterface → landing_pad 自环
+  （land 无限涨 3亿）
+- WebClient（联网）：run() 卡网络 read → switch 冻结 + 内核事件等待
+
+两者同根：**run() 在 shared_entry 执行时的线程切换竞态**（log86 第五轮
+定位的 r6 陈旧出生帧 vs cur.sp Java 帧分裂）。
+
+### 5. 下一步（根因不变）
+
+根因仍是 run() 卡死。要在 shared_call_vm / call_on_primordial_stack 返回点
+抓"切回时读到的 stack_pointer"，定位 r6 状态分裂的确切指令。
+
+---
+
+## 2026-10-17 v02.43：log88/89 复核（与前文数处冲突）+ 退出读出 + 网络探针
+
+> 本节只依据 log88/log89 原始日志与二进制反汇编。**与 8891–8967 行（log87 小节）
+> 和 9160 行附近"根因仍是 run() 卡死"的结论有冲突，冲突点见 §2。**
+
+### 1. 分析 3：影子蹦床为什么起作用（部分回答）
+
+直接证据（log88 `site_ring.log` 的 `v241 rec`）：
+- `rec[0..7]` 是**进程最早 8 次落地**，即 round 0（FileManager）。`rec[5..7]`
+  （land=6/7/8）是同一个环线程 `cur=81eddad8 cur.sp=81edea84 pe=0`，逐字段相同。
+- `rec[8]`（land=**1000000**）的 cur/cur.sp/pe 与 `rec[5..7]` 相同：**FileManager 阶段
+  环空转到了 100 万圈**。
+- `rec[8]→rec[9]`：影子那一圈后下一次落地线程变成 `81eb6b04`（老线程，land=2），
+  之后 `rec[10..15]` 为 pe≠0 的新线程出生（= round 1 的 WebClient 线程，数量与
+  `st[1]-st[2]=6` 吻合）。**环确实在影子处被打破，线程被切走。**
+- log89 #1/#2 同型（land=6..8 与 1000000 记录一致，st 走完整死亡流程）。
+
+未回答：真蹦床与影子逐条对照（条件码、寄存器、字面量）未找到差异，**无法解释
+为什么同一状态下真蹦床 99.9 万圈不调 finish 而影子第一圈就调**。影子仍只是绕过。
+
+**更正**：v02.42 注释/CMake/本文 8361 行起写的"call_on_primordial_stack 不返回到
+bl 下一条"过强。实际：压 lr/fp → 存 sp 到 cur->stack_pointer → 调目标 → 返回时按
+**当前线程**的 stack_pointer 取 `[jsp+4]` 跳。目标不切线程（finish、
+force_terminated）时就是调用者下一条；只有切线程（lightweight_thread_exit）才
+去别的线程保存点。探针放"步骤之前"仍成立。源码与 CMake 注释已改。
+
+### 2. 与前文的冲突
+
+| 前文说法 | 本次依据 | 判断 |
+|---|---|---|
+| log87 小节："land 没涨到 100 万，影子没被触发" | log87 无 dump，**没有 land 数据**；log88 round 0 同版本同应用 FileManager 的 land 经过了 100 万 | 前文无依据，被反驳 |
+| "FileManager 不卡是时序巧合，非影子救援" | 同上：影子在 FileManager 阶段触发并打破环 | **倾向影子救援**，但见 §4 的预测检验 |
+| "6 次 ipe 进去没出来 = run() 卡死" | VM 线程停在 `recv`（内核 WAITING），VM 单线程被冻，其余线程自然回不来 | 因果倒置：是网络阻塞冻住了 VM，不是 run() 自身卡 |
+| "根因仍是 run() 卡死" | 同上；环（FileManager）与网络阻塞（WebClient）是**两个独立问题** | 需分开 |
+
+### 3. 三种 dump 形态（勿混）
+
+1. log85/86 FileManager：用户态固定环（v02.42 下被影子在 100 万圈后打破）。
+2. log88、log89#2 WebClient：VM 线程 `WAITING event(0x10)`，栈
+   `recv+0x1f ← pcsl_socket_available+0x1b ← Java_..._socket_Protocol_available0+0xa4
+   ← quick_int_native_method_entry`（两次独立运行完全一致）。四次 `connect` 全是
+   "immediate OK"、**从无 EINPROGRESS**——对远端 TCP 非阻塞 connect 几乎不可能立刻
+   成功，强烈提示 `SCE_NET_SO_NBIO` 没生效（**间接证据，未证实**）。
+3. log89#1 main.MainMidlet：VM RUNNING，栈在 `sceIoWrite ← crumb_append`，调用链含
+   类加载（`JarFileParser::find_entry`/`JVMBufferedFile::get_bytes`）。可能是读 jar
+   慢被 watchdog 误判，**证据不足，不下结论**。
+
+### 4. v02.43 改动（纯探针，无行为变更）
+
+| 文件 | 改动 |
+|---|---|
+| `OS_vita.cpp` | 新增 `vita_exit_probe(round,status)`：写 `exit_probe.log`（land、shadow_in、th_start/finish、lw_exit、setcur、v242 st、rec8/rec15.land） |
+| `vita_main.c` | `runMidlet` 返回后调用一次（最小补丁；该文件已有他人未提交的 include 改动，未触碰） |
+| `vita_net.c` | 探针变量；`vita_set_nbio` 检查并记录 `sceNetSetsockopt` 返回值（`[NET] set_nbio fd= rc=`）；`vita_socket_available` 在 recv 前后更新 enter/exit/fd/lastn/lasterr（无 I/O） |
+| `vita_watchdog.c` | HANG 时输出 `[WD] net nbio ok/fail/lastrc \| avail enter/exit/inside/fd/lastn/lasterr` |
+| `InterpreterRuntime_arm.cpp` / `CMakeLists.txt` | 仅注释更正 + 02.43 版本块 |
+
+- 验证：`rebuild_vm.sh build` 通过；VPK 链接 EXIT=0 → `midp_vita_v02.43.vpk`
+  （3727989B）+ `.sym`；v02.42 产物未覆盖。**垫与影子蹦床的助记符序列 md5 在
+  v02.42/v02.43 完全一致（仅地址平移）**，环行为未改。`vita_exit_probe` 1 处调用。
+- 锚点（v02.43）：`vita_landing_pad`=0x810aa5f0、`vita_tramp_shadow`=0x810abc00、
+  `start_lightweight_thread_asm`=0x810d3be0、`vita_v242_stage`=0x814d4a98、
+  `vita_v241_rec`=0x814d4ad8、`vita_exit_probe`=0x81065bd0。
+- 未真机验证；git 哈希仍为 1e8533d（工作区未提交）。
+
+### 5. 判读（下一轮真机）
+
+**可证伪预测（exit_probe.log，FileManager 正常退出）**：
+- `land >= 1000000` 且 `shadow_in > 0`：环每次都形成并被影子救出（§1 成立）；
+  FileManager 每次运行有约 100 万圈空转（约 0.1 秒）。
+- `land` 只有几十、`shadow_in = 0`：环这次没形成，"影子救援"不成立，前文
+  "时序/布局副作用"的解释更对。
+- 注意 land/计数器是**进程级累计**，不按 round 清零；多 round 看增量。
+
+**网络（watchdog.log 的 `[WD] net` 行）**：
+- `nbio fail>0` 或 `lastrc` 为负 → NBIO 设置失败，修 `vita_set_nbio`/选项值。
+- `nbio ok>0` 且 `inside=1`（enter>exit）→ NBIO 已设但 MSG_PEEK recv 仍阻塞，
+  改用 `sceNetRecv(..., SCE_NET_MSG_PEEK|SCE_NET_MSG_DONTWAIT)`。
+- `net_log.txt` 里每个 socket 一行 `[NET] set_nbio fd= rc=`。
+
+### 6. 未做 / 遗留
+
+- 未修网络阻塞（本版只诊断）。
+- 未解释真蹦床为何不调 finish。
+- log89#1 的 MainMidlet 现象未分析。
+
+
+---
+
+## 2026-10-17 v02.43 探针就绪（网络阻塞假设 + 正常退出 land 数据）
+
+### 1. 探针设计（Cline 已写好，指令级验证通过）
+
+三组探针，全部纯探针无行为改变（vita_net 的 nbio 探针是读返回值+记日志，
+set_nbio 逻辑不变）：
+
+| 探针 | 位置 | 回答的问题 |
+|---|---|---|
+| `vita_exit_probe` | OS_vita.cpp，vita_main.c 在 runMidlet 正常返回后调 | **正常退出时 land/v242 是多少？** 验证"shadow 蹦床是否在每次 FileManager 跑时都打破循环" |
+| `vita_net_nbio_*` | vita_net.c `vita_set_nbio` | `sceNetSetsockopt(NBIO)` 是否成功？log88 connect 全"immediate OK"从未 EINPROGRESS，怀疑 NBIO 没生效 |
+| `vita_net_avail_*` | vita_net.c `vita_socket_available` | VM 是否卡在 MSG_PEEK recv 里？avail_enter>avail_exit = 卡在 peek recv |
+
+### 2. 重大发现（CMakeLists 02.43 注释里的推断）
+
+> log88 round 0 (FileManager) 已显示 rec[8] (land=1000000) 在同一线程
+> rec[5..7] (land=6..8)——**FileManager 里 landing_pad 自环也形成了，
+> shadow 蹦床在 ~100万 lap 后打破它**。
+
+这解释了 log87 的"FileManager 不卡"：**不是时序巧合避免了循环，而是循环
+照样形成，但 shadow 蹦床（v02.42 新增）在 land 到 100万时 divert 到
+instrumented copy，打断了自环**。
+
+所以 v02.42 的 shadow 蹦床**实际上是一个偶然的"修复"**——它改变了蹦床的
+执行（divert 到 shadow 后 shadow 里 stage 探针改变了时序/布局），打断了
+FileManager 的 landing_pad 自环。但这**不是根因修复**，因为 WebClient
+（log88）的卡死是另一种模式（run() 卡在网络 read，不是 landing_pad 自环）。
+
+### 3. v02.43 判读矩阵（下一轮真机）
+
+**exit_probe.log（FileManager 正常退出时）**：
+| 读数 | 判定 |
+|---|---|
+| land>=1000000 且 shadow_in>0 | 自环形成 + shadow 打破（证实"shadow 是偶然修复"）|
+| land 只有几十 且 shadow_in=0 | 自环没形成（时序/布局碰巧避免）——推翻上一条 |
+
+**watchdog [WD] net nbio 行（WebClient 卡死时）**：
+| 读数 | 判定 |
+|---|---|
+| nbio_fail>0 或 nbio_lastrc<0 | SCE_NET_SO_NBIO 设置失败 → connect/recv 会阻塞（网络层真 bug）|
+| nbio_ok>0 但 avail inside=1（卡在 peek recv）| NBIO 设置了但 MSG_PEEK recv 忽略它 → 网络层另一 bug |
+| avail enter==exit（不卡 peek）| 卡在别处（回到 run() 卡死根因）|
+
+### 4. 下一步
+
+真机跑 v02.43：
+1. 先跑 FileManager → 看 exit_probe.log 证实/推翻"shadow 偶然修复"。
+2. 再跑 WebClient → 看 watchdog net 行证实/推翻"NBIO 未生效"网络假设。
+
+
+---
+
+## 2026-10-18 log90/log91（v02.43）：环救援已证实；NBIO 失败根因钉死；MainMidlet 是长停顿
+
+> 只依据 log90/log91 原始日志与 v02.43 二进制反汇编。本节会**推翻**本文件
+> 2198 行（"newlib fd 直通 sceNetSocket id"）和 9164 行节 §3 对 NBIO 的"间接推断"。
+
+### 1. log90（非卡死）：第 2 项预测成立
+
+`exit_probe.log`：`exit round=0 status=0 land=1000001 shadow_in=2 th_start=4
+th_finish=2 lw_exit=2 setcur=404`；`v242 st=2/2/2/0/2/2/2/2/2/2 rec8.land=1000000
+rec15.land=0`。
+
+- FileManager 正常退出时 land=1000001（≥ 阈值），影子被进入 2 次且 2 次都走完
+  finish→force→cleanup→lw_exit。**FileManager 的环每次运行都形成，被影子在 100 万圈
+  后救出**；"FileManager 不卡是时序巧合"不成立（9164 行 §2 的判断得到确认）。
+- 代价：每次运行约 100 万圈空转；land≥100 万后**所有新线程出生都走影子**，影子已是
+  生产路径。log90/91 中影子表现正常（st 各阶段计数相等），未见偏离迹象，但影子与
+  真蹦床为何行为不同仍未解释。
+
+### 2. log91 dump1/dump2（WebClient）：NBIO 失败根因确证
+
+- `net_log.txt`：4 个 socket 全是 `set_nbio fd=15/16 rc=0x80410109` 后 `connect
+  immediate OK`。
+- `watchdog.log`：`[WD] net nbio ok=0 fail=2 lastrc=0x80410109 | avail enter=6
+  exit=5 inside=1 fd=16`（第二次 enter=9 exit=8）。`inside=1`：VM 此刻在 peek recv
+  里；`lastn=1` 是上一次已返回的 peek（有数据），第 6 次无数据而阻塞。
+- core：`recv+0x1f ← pcsl_socket_available+0x37 ← Java_..._socket_Protocol_available0
+  +0xa4 ← quick_int_native_method_entry`，与 log88/log89#2 共 **4 次独立运行栈一致**。
+- **`0x80410109` = `SCE_NET_ERROR_EBADF`**（`psp2common/net.h:26`，已核对头文件，不再是
+  推断）。
+- **根因**：newlib `socket()` 反汇编（`0x81118868`）：调 `sceNetSocket` 得 sceNet id，
+  再 `__vita_acquire_descriptor` 分配 **newlib 描述符**，把 sceNet id 存进描述符表
+  （表基址 0x814D7AF8，表项偏移 0 = `sce_uid`，偏移 4 = 类型 2），**返回给调用者的是
+  newlib fd**。`vita_set_nbio(fd)` 却把 newlib fd 直接当 sceNet id 传给
+  `sceNetSetsockopt` → EBADF → NBIO 从未设置 → socket 始终阻塞。
+- newlib `setsockopt`（0x81118784）正确做法的证据：`__vita_fd_grab(fd)`（fd 范围
+  1..255，查表；查不到 errno=EBADF）→ 取 `[desc+0]` 作 sce id → `sceNetSetsockopt`；
+  除 optname 0x1005/0x1006（收发超时，timeval→微秒）外 **level/optname 原样透传**。
+  `recvfrom`（0x81118664）同样先 `fd_grab` 再 `sceNetRecvfrom`，flags 原样透传；
+  `MSG_PEEK=0x2`、`MSG_DONTWAIT=0x80` 在 BSD 头与 `psp2common/net.h` 数值一致。
+- **更正 2198 行**：fd 并非"直通"；v01.33 的 NBIO"修复"**从未生效过**，因此
+  `connect→EINPROGRESS→select→midp_thread_signal` 这条事件驱动网络路径在真机上
+  **从未被执行过**（`vita_net_poll` 在 `vita_checkevents.c:92` 每轮调用，
+  `connect/read/write` 对 WOULDBLOCK 的处理代码都在，但无真机验证）。
+- 同文件里 `setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE...)` 和 `TCP_NODELAY` 走的是
+  newlib 路径，所以不受此 bug 影响。
+
+### 3. log91 dump3（main.MainMidlet）：不是永久卡死，是约 28 秒长停顿
+
+- 心跳按 CE 重置分三段：run1 CE 1→193（3.1s）、run2 CE 1→577（9.3s）、run3 CE 1→961
+  （46.6s）。run1/run2 在最后心跳后停止，与 HANG 吻合；**run3 在 CE=577 处有一次
+  `d=28011ms` 的间隙，HANG（CE=515）判在间隙内，之后 CE 继续增长到 961。**
+- 快照间推进：sample1 `setcur=510 switch=103060`，sample2（+400ms）`setcur=540`；
+  而 HANG 判定时 `switch=92991`。VM 在 abort 流程中已恢复运行。
+- `[WD] net avail enter=0 exit=0`：与网络无关。VM 线程 RUNNING 且满转
+  （census d=871702 ≈ 0.76×watchdog），`java site=ISO8859_1_Writer.write`，land=1000000
+  （影子进入 1 次），两次快照 land 不变 → **不是 pad 环**。
+- **方法论警告**：core 文件时间戳比 HANG 晚约 30–38 秒（三份均如此），此时 run3 已恢复，
+  所以 dump3 的 `pc=sceIoWrite+8` 栈**不能代表停顿期间的状态**；trace_ring 里 VM 线程
+  最后 syscall 是 `lwmutex_unlock(returned)`，与 core 的 pc 不一致，也印证了这点。
+  run1/run2 的 core 之所以可信，是因为那两次 VM 一直被 recv 阻塞。
+- 停顿原因**未定**。线索：栈为 Java Writer→print→crumb_append→sceIoWrite（同步文件写在
+  VM 热路径）；vm_output 含 `RecordStoreException: invalid record store contents`
+  的堆栈打印。均未证实。
+- watchdog 3 秒阈值把本可恢复的停顿判成 HANG 并 abort 了进程。
+
+### 4. 未做 / 建议（需用户决定，涉及行为变更）
+
+1. **修 NBIO**：把 `vita_set_nbio` 改为经 newlib 的
+   `setsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &on, sizeof on)`（自动
+   fd→sce id）。风险：会**首次激活**从未真机运行过的事件驱动网络路径
+   （EINPROGRESS/select/signal/SO_ERROR/读写 WOULDBLOCK），可能暴露新 bug；
+   Vita3K 与真机行为也可能不同。
+2. watchdog 区分"暂时停顿"与"永久卡死"（例如 HANG 后再确认 CE 若干秒不涨才
+   abort，并记录是否恢复）。
+3. 影子蹦床为何有效仍未解释；dump1 的 `v240 fp=ff6b0828`（非 0）未分析。
+
+---
+
+## v02.44：NBIO 根因确诊 + 修复（log90/log91 对照）
+
+### 1. log90（不卡）= FileManager，证实"shadow 偶然修复"
+
+```
+exit_probe.log: exit round=0 status=0 land=1000001 shadow_in=2 th_start=4 th_finish=2 lw_exit=2
+v242 st=2/2/2/0/2/2/2/2/2/2 rec8.land=1000000 rec15.land=0
+```
+- land=1000001 → FileManager **确实形成 landing_pad 自环**（land 到 100万）
+- shadow_in=2 → shadow 蹦床触发 2 次
+- st=2/2/2/...（全部相等）→ 2 次进入 shadow 都走完，无卡死
+- 对比 log88 卡死 st=9/9/3/0/3/...（st[2]=3<st[1]=9）→ **证实 shadow 蹦床是偶然修复**
+- 结论：FileManager 的 landing_pad 自环（run() 竞态）仍存在，但 shadow 打破它
+
+### 2. log91（卡死）= 联网游戏，NBIO 根因（独立网络 bug）
+
+```
+net_log.txt（三次运行，每次两个 socket）:
+  [NET] set_nbio fd=15 rc=0x80410109   ← 每次都失败！
+  [NET] set_nbio fd=16 rc=0x80410109
+  [NET] connect immediate OK fd=15      ← connect 却成功（阻塞模式下手动完成握手）
+
+watchdog: [WD] net nbio ok=0 fail=2 lastrc=0x80410109 | avail enter=6 exit=5 inside=1
+          VMPROG verdict: VM stuck in a kernel wait
+          vm status=WAITING wait=event(0x10)
+```
+
+**0x80410109 = SCE_NET_ERROR_EBADF（Bad file descriptor）**（net.h:26）
+
+### 3. 根因（决定性证据链）
+
+newlib 的 socket() 返回**小整数用户态 fd（15,16）**，真正的 sceNetSocket id
+存在 `__vita_fdmap[fd]` 里（libc.a socket.o 反汇编证实：`sceNetSocket()` →
+`__vita_acquire_descriptor()` → `__vita_fdmap[fd]=id`）。
+
+`vita_set_nbio()` 却用 `sceNetSetsockopt(fd, ...)` 直接传 newlib fd，而
+sceNetSetsockopt 期望 raw sceNetSocket id → **EBADF，NBIO 从未生效**。
+
+socket 一直是**阻塞模式**：
+- `connect immediate OK`（不是 EINPROGRESS）＝阻塞 connect 手动完成握手
+- `recv(MSG_PEEK)`（pcsl_socket_available）阻塞在内核 → VM 卡死
+- watchdog "avail enter=6 exit=5 inside=1" + "VM stuck in a kernel wait" 铁证
+
+**纠正此前结论**："网络层适配正确，不是独立网络 bug" 是**错的**。这是确凿的
+独立网络 bug：sceNetSetsockopt 传错 fd 类型。
+
+### 4. 修复（v02.44）
+
+`vita_set_nbio()`：`sceNetSetsockopt(fd,...)` → `setsockopt(fd,...)`
+newlib 的 setsockopt 内部走 `__vita_fd_grab(fd)` 翻译 fd → sceNetSocket id
+（libc.a setsockopt.o 反汇编证实），再透传 level/optname/optval 给 sceNetSetsockopt。
+
+验证：vita_net.c.obj 引用 `U setsockopt`（无 sceNetSetsockopt），v02.44 已编译
+（16:38，midp_vita_v02.44.vpk 3728132B）。
+
+### 5. 两个独立卡死路径（已区分）
+
+| 路径 | 触发 | 机制 | 状态 |
+|---|---|---|---|
+| 网络阻塞 | 联网程序（WebClient/封神榜） | NBIO 未生效→recv 阻塞内核 | **v02.44 已修复** |
+| run() 竞态 | 不联网程序（FileManager） | shared_entry 线程切换竞态→landing_pad 自环 | 仍开放（shadow 只是偶然打破） |
+
+### 6. 下一步
+
+1. 真机跑 v02.44 联网游戏 → 看 watchdog `[WD] net nbio ok>0 fail=0`（NBIO 修复生效）
+   + avail inside=0（不卡 peek recv）→ 网络卡死消失
+2. run() 竞态仍需正面修复：在 shared_call_vm / call_on_primordial_stack 返回点
+   抓"切回时读到的 stack_pointer"，定位 r6 陈旧出生帧 vs cur.sp Java 帧分裂的确切指令
+
+---
+
+## 2026-10-18 v02.44 复核（只读核对，无代码改动）+ MainMidlet 白屏线索 + 卡死根因现状
+
+### 1. NBIO 修复的二进制核对（v02.44.sym）
+
+- `pcsl_socket_open_start`（0x8100f704）调用序列：`socket → setsockopt ×3
+  （KEEPALIVE、TCP_NODELAY、NBIO，均为 newlib 0x81118784）→ connect`；直调
+  `sceNetSetsockopt` 的路径已消失。版本串 `v02.44 b329 (1e8533d)`。
+- v02.43/v02.44 的 `vita_landing_pad`、`vita_tramp_shadow` 助记符序列 md5 相同。
+- **仅核对到代码与二进制，没有修复后的真机日志**，修复效果未验证。
+- **可观察性回退（建议补）**：newlib `setsockopt` 失败返回 -1，错误在 errno；现有
+  `vnet_log("[NET] set_nbio fd=%d rc=0x%08x")` 只会打出 `rc=0xffffffff`，**看不到
+  errno**。若修复后仍失败，无法区分原因。应同时记录 `errno`。
+- 另：该修复会**首次激活**事件驱动网络路径（connect→EINPROGRESS→select→
+  midp_thread_signal→SO_ERROR；读写 WOULDBLOCK），此前从未在真机运行过，可能暴露
+  新问题。
+
+### 2. MainMidlet 白屏：RMS 0 字节文件线索（有直接证据）
+
+- `main.MainMidlet.<init>` → `RecordStore.openRecordStore("NEZHA_DOWN")` 抛
+  `RecordStoreException: invalid record store contents`（vm_output 堆栈）。
+- `midp_stderr.log`：`[pcsl] open path=…/appdb_BC41/FFFFFFFFNEZHA_DOWN.db flags=0x2
+  size=0` → **文件存在但为 0 字节**；`[rms] open name='NEZHA_DOWN' exists=1 next=0
+  live=0 ver=0 data=0 free=0`（头部全 0）。
+- `RecordStoreImpl.java:1792-1797`：`exists` 分支读 header 后校验 8 字节签名
+  `midp-rms`，全 0 必然失败并抛该异常。**构造器就失败，所以 MIDlet 起不来，表现为
+  白屏。**
+- 0 字节文件的来源**未知**。假设之一：创建文件后、写头之前进程被杀（如 watchdog
+  abort）。这只是假设。
+- 廉价检验：删除设备上 `rms/appdb_BC41/` 里 0 字节的 `NEZHA_DOWN.db`（及同目录其它
+  0 字节 db）再启动；若能起来，坏文件就是诱因。
+  **【更正】此处曾写"已证实：删除 rms 后 MainMidlet 不再白屏"——不准确。用户实际观察
+  是：删除 rms 后白屏仍在，只是变短；所有应用打开都白屏数秒。见文末
+  "白屏与全量预载"节。坏 RMS 只是让白屏变长的因素之一，不是白屏的基线原因。**
+- 上游行为：0 字节文件被当作已存在而非新建。若要在 Vita 端对 0 字节文件按"不存在"
+  处理，是行为变更，需另行决定。
+- **未解释**：白屏 MIDlet 理应空闲，但 VM 满转并有 28 秒不泵事件（见上一节 §3），
+  与 RMS 异常的联系**未证实**。watchdog 杀进程是因为 3 秒阈值，不等于"杀得合理"。
+
+### 3. 卡死根因现状（回答"是否只是偶然修复"）
+
+已证实：
+- 环存在且位置明确：垫↔蹦床固定环，land=6 起形成，VM 满转，cur/r6/退出表字段不变
+  （log85/86/88/90 一致）；影子在 100 万圈后打破它（log88 rec[8]→rec[9] 线程切换；
+  log90 exit_probe：land=1000001、shadow_in=2、st 全相等）。**这是有因果证据的绕过，
+  不是巧合。**
+- 联网程序的卡死是独立问题，根因已定位并在 v02.44 修（待验证）。
+
+未证实 / 未找到：
+- **环为什么形成、真蹦床为什么 99.9 万圈不调 `finish` 而影子第一圈就调，没有机理
+  解释。** 逐条对照指令没有找到差异。因此对环这一项，"只是绕过、没有理解"的判断
+  成立。
+- 本文件 9394 行"对比 log88 卡死 st=9/9/3…证实 shadow 蹦床是偶然修复"：log88 的
+  st[2]<st[1] 是 WebClient 的 VM 被 recv 冻住造成，不是"卡死 vs 不卡"的对照，**不能
+  作为该结论的证据**。
+- 本文件 9443 行把环的机理写成"shared_entry 线程切换竞态 / r6 陈旧出生帧 vs cur.sp
+  分裂"：这是**未证实的假设**，没有数据支持其为机理。
+- 代价/风险：land≥100 万后所有新线程走影子；每次运行约 100 万圈空转；环的成因未知，
+  换触发条件可能以别的形态出现。
+
+可行的判别实验（需另行决定，涉及改探针/行为）：让"同一线程连续第 2 次进入垫且
+r6/cur.sp 与上次相同"就改走影子（而不是等 100 万次），看影子是否从环形成后的第一
+圈就打破——这回答"同一状态下两者是否真的不同"，并把影子的作用范围缩到已确认的
+环线程。
+
+
+---
+
+## 2026-10-18 v02.44 调试迭代：errno 记录 + 环检测实验 + RMS 白屏证实
+
+> 版本策略（用户决定）：**不升版本号**，以下改动全部并入 v02.44（该版本整体尚未
+> 上真机，`out/vpk/midp_vita_v02.44.vpk/.sym` 已被覆盖重建）。git 哈希仍为 1e8533d
+>（工作区未提交）。
+
+### 1. MainMidlet 白屏：RMS 只是加长因素（本节首版结论已更正）
+
+> **更正**：本节首版写"删除 rms 后不再白屏 → 0 字节 RMS 是白屏诱因（假设证实）"，
+> 与用户后续反馈不符。实际：**删除 rms 后白屏仍在，只是没那么久；所有应用打开都白屏
+> 数秒。** 因此 0 字节 RMS 只能解释"MainMidlet 的白屏比别的应用更长"，不能解释
+> 基线白屏。基线白屏见文末"白屏与全量预载"节。
+
+`NEZHA_DOWN.db size=0`、`RecordStoreImpl.java:1792` 的签名校验使 MainMidlet 构造器
+抛 `invalid record store contents`，这一点仍有直接证据；它让该应用的白屏变长，但
+并非白屏本身的原因。
+
+- 0 字节文件**从何而来仍未知**（猜测：文件创建后、写头前进程被 watchdog abort 杀掉，
+  未证实）。上游对 0 字节文件按"已存在"处理并抛异常；若要在 Vita 端把 0 字节 db 当
+  "不存在"处理，是行为变更，未做。
+- **未回答**：删除 rms 后那次是否仍有 28 秒停顿？（用户只报告了白屏消失。）若停顿
+  也消失，说明 28 秒与坏 RMS 有关；若仍在，则是独立问题。
+
+### 2. 改动（均在 v02.44 内）
+
+| 文件 | 改动 |
+|---|---|
+| `vita_net.c` | `vita_set_nbio` 失败时先取 `errno`（再调 `vnet_log`，避免被 fopen 冲掉）；日志改为 `[NET] set_nbio fd= rc= errno=`（十进制）；新增探针变量 `vita_net_nbio_lasterrno` |
+| `vita_watchdog.c` | `[WD] net nbio ok= fail= lastrc= errno= \| avail …`（原 `lastrc=0x%08x` 改为十进制 + errno） |
+| `InterpreterRuntime_arm.cpp` | 垫内新增**环检测器**（见 §3）；新增 `vita_v243_{last_cur,last_r6,rep,trip_rep,trip_land}`；宏 `VITA_V243_REP_TRIP=2`，汇编里通过 `V243_STR` 字符串化引用，避免与宏脱节 |
+| `OS_vita.cpp` | extern + watchdog 新增 `v243` 行；`exit_probe.log` 新增 `v243 trip_rep= trip_land= rep=` |
+| `CMakeLists.txt` | 仅在 02.44 注释里补充上述两项（未新增 set） |
+
+### 3. 环检测实验（用户要求"按你的思路分析和调试"）
+
+目的：回答"**同一状态下，影子是第一圈就能打破环，还是只有 ~100 万圈后才行**"。这是
+目前能区分"真蹦床与影子存在代码差异"与"打破与圈数/时间有关"的最直接实验。
+
+- 判据：垫每次进入记录 `(当前线程, r6)`，与上一次相同则 `rep++`，否则清零。**连续第
+  3 次进入且 `(cur, r6)` 不变（rep>=2）→ 立即改走影子**；原来的 `land>=1000000`
+  判据保留作兜底。
+- 依据：健康线程最多连续进入垫 2 次且 `(cur, r6)` 相同——出生一次、死亡一次（log88
+  `rec[4]` 与 `rec[5]`：r6 相同、cur.sp 变了）；环线程则永远相同。理论上健康线程不会
+  触发。
+- 汇编核对（v02.44.sym）：
+  - `vita_landing_pad`=0x810aa6e0、`vita_tramp_shadow`=0x810abda8、
+    `start_lightweight_thread_asm`=0x810d3d88、`vita_v243_trip_land`=0x814d4ad8、
+    `vita_v243_rep`=0x814d4ae0。（与 v02.43 不同，勿混用）
+  - 垫内**没有任何对 r4–r11 的写入**；push/pop 各 3 条、平衡；`cmp r0,#2` 来自宏；
+    影子蹦床助记符序列 md5 与 v02.43 完全相同。
+  - r2/r3 在检测前后 push/pop 保护；`r1`(land) 不动；`r0` 在检测后带着 rep 离开。
+- **判读矩阵**（FileManager 正常退出后的 `exit_probe.log`，或卡死时的 watchdog 日志）：
+
+| 读数 | 含义 |
+|---|---|
+| `v243 trip_rep` 小（约 1–几），`trip_land`≈7，`land` 只有几十，`shadow_in` 很小，`st` 各阶段相等 | **影子第一圈就打破环**：同一状态下两条代码路径行为不同；100 万圈空转消失 |
+| `trip_rep` 与 `land` 一起变得很大（≥1e6） | 影子也在环里：此前"100 万圈后被救"**不是代码差异**，与圈数/时间/并发有关 |
+| `trip_rep=0` 但 `land≥1e6` | 检测器没触发（判据不适用于这个环），兜底阈值救出——需重看环的 `(cur, r6)` 是否真的不变 |
+| `trip_rep>0` 但 FileManager 之外的程序也触发、且之后行为异常 | 检测器误触发（健康线程重复进入 3 次）——此时影子仍应等价，但要看 `st` 是否异常 |
+
+- 注意：这个改动把影子的作用范围从"land≥100 万后所有线程"缩到"已识别为环的线程"；
+  `rec[8..15]`（land≥1e6 才写）通常不再写入，`rec8.land` 预期为 0，属预期。
+- 这仍是**调试实验，不是修复**：它并不解释环为什么形成。
+
+### 4. 仍未验证 / 未做
+
+- v02.44 的任何内容都没上真机：NBIO 修复、errno 记录、环检测实验。
+- NBIO 修复会首次激活 EINPROGRESS→select→signal 事件路径，可能暴露新问题。
+- watchdog 3 秒阈值误杀长停顿的问题未改（需要的话再做"HANG 后确认若干秒不恢复才
+  abort 并记录是否恢复"）。
+- 0 字节 RMS 的来源、是否改成"0 字节按不存在处理"未决。
+
+### 5. 对更早记录的修正（避免误导）
+
+- 9394 行"对比 log88 卡死 st=9/9/3…证实 shadow 蹦床是偶然修复"：log88 的 st[2]<st[1]
+  是联网程序被 recv 冻住造成，**不是卡死/不卡死的对照**，不能作为该结论的证据。
+- 9443 行把环的机理写成"shared_entry 线程切换竞态 / r6 陈旧出生帧 vs cur.sp 分裂"：
+  **未证实的假设**。已证实的只有：环的位置与现象、影子能打破它。
+
+
+
+---
+
+## 2026-10-18 白屏与全量预载（用户反馈 + 只读核对，无代码改动）
+
+### 1. 用户反馈
+
+- 删除 rms 后 MainMidlet **白屏仍在，只是变短**；**所有应用**打开都白屏好几秒。
+- 用户判断：可能是之前把 jar 加载方式改成了"全量加载"。
+
+### 2. 已核实的事实
+
+- 机制确实存在：`JVM::load_main_class`（`JVM.cpp:192-223`）在 VITA 下于首字节执行前调
+  `Universe::load_all_in_classpath`，对 `app_classpath` 的**每个 jar 的每个 `.class`**
+  执行 `load_jar_entry`（`Universe.cpp:1095`）：`open_entry` → `read_completely`（读并
+  解压整个类文件）→ `SystemDictionary::resolve`；`UseVerifier`/`VerifyOnly` 时才 verify
+  （midp_run.c 已关校验，故一般不 verify）。每轮 `JVM::start` 都重做。
+- classpath 是 `midp_system.jar:games/app/game.jar`（boot_log），两个都被遍历。
+  `midp_system.jar`（`phoneme-midp/build/vita_arm/midp_system.jar`）含 **932 个 .class，
+  解压后约 1.93 MB**（`com/sun/midp` 489、lcdui 98、mmedia 96、j2me 62、cldc 30…）。
+- **不是最近才改的**：该机制由 `2654265 v01.91 (2026-09-20)` 引入，之后只有
+  `a001299 v01.92` 去掉 PRE/POST_NATIVES 的 stderr 洪水、`c2ab010 v02.17` 加计数器。
+  我没有查到更近的 jar 加载方式改动（查了 Universe/JVM/JarFileParser/os/vita 的 git 历史）。
+  若用户感觉"以前不白屏"，不能由此判断是哪一次变化引入的。
+- 预载的由来（PM 4466 行起）：log17 的按键触发 lazy 加载链（`UI←MenuCanvas←…←Timer`，
+  35 层 clinit）在纯 native pending-entry 循环里不经 tick/yield，CE 被饿死，watchdog
+  杀进程；预载用于把 lazy 加载面消灭掉。**去掉它可能让那类问题复活。**
+
+### 3. 推断（未量化）
+
+- "每个应用都白屏数秒" 与 "预载对 midp_system.jar 的 932 个类 / 1.9 MB 每轮重做" 吻合，
+  但**没有计时数据**：`vm_boot.log` 的 `[preload] begin/done` 无时间戳，其它日志也没有
+  `runMidlet enter` 的毫秒时间，因此预载耗时、以及它占白屏的比例**未知**。
+- `preload=` 计数（FileManager 868、WebClient 888、MainMidlet 932）**不能**拆成
+  "系统类 + 应用类"：932 恰等于 midp_system.jar 的类数，但 868/888 又小于它；
+  `load_jar_entry` 里 resolve 命中已存在类时的返回语义我没有核实。
+- 另一个相关点：条目的读取与解压发生在 resolve **之前**，所以即使类已在 ROM/字典里，
+  `open_entry`+`read_completely` 的 I/O 与解压成本仍然付出（resolve 命中与否我没验证）。
+
+### 4. 候选缩短白屏的做法（未实施，需先量化）
+
+| 做法 | 收益 | 风险 |
+|---|---|---|
+| a. 在 `open_entry` 之前先按类名查字典/ROM，已存在则跳过读取与解压 | 省掉已 ROM 化类的 I/O + 解压；语义不变 | 收益取决于有多少类已在 ROM；需确认查询 API |
+| b. 只预载应用 jar，跳过 `midp_system.jar` | 工作量约降 90%（按类数） | 系统类回到 lazy 加载，可能重现 log17 的 lazy 链卡死 |
+| c. 分批/后台预载 | 白屏变短 | 复杂，涉及 VM 线程与事件泵 |
+| d. 白屏期间显示启动画面/进度 | 体验改善，不改加载 | 只是缓解 |
+
+先决条件：加计时。建议给 `vita_boot_log` 每行加自进程启动的微秒时间戳，并让
+`[preload] done` 输出 `count` 与耗时；必要时再区分读/解压/resolve 的耗时与命中数。
+
+### 5. v02.44 计时探针（已实现，已编译，未上机）
+
+只加探针，不改行为。单一时钟 `sceKernelGetProcessTimeWide()`（自进程启动的微秒），
+下列日志可直接对齐到同一条时间线。
+
+**关键文件修改记录**
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-cldc/src/vm/os/vita/OS_vita.cpp` | 新增 `vita_now_us()`；定义 `vita_preload_entries/fast/us_open/us_read/us_resolve` |
+| `phoneme-cldc/src/vm/os/vita/Globals_vita.hpp` | 上述符号的 extern 声明，`VITA_PRELOAD_FAST_US`=50 |
+| `phoneme-cldc/src/vm/share/handles/Universe.cpp` | `load_jar_entry` 分别累计 open/read/resolve 耗时；`load_all_in_classpath` 每个 jar 一行小计（均在 `#if defined(VITA)` 内） |
+| `phoneme-cldc/src/vm/share/runtime/JVM.cpp` | `[preload] done` 改为输出完整汇总 |
+| `phoneme-cldc/src/vm/os/vita/JVM_vita.cpp` | `vita_boot_log` 每行加 `[+N us]` 前缀 |
+| `vita-port/src/vita_main.c` | 新增 `vita_timing_markf()` → `boot_timing.log`（追加、逐行 open/close）；打点 round_begin / runMidlet_enter / runMidlet_exit |
+| `vita-port/src/vita_display.c` | `flip_to_display` 记录 first_flip 与 first_content_flip（首个非全白帧，采样约 2048 像素，≥8 个非白即算内容，仅检查每轮前 900 帧） |
+| `vita-port/src/vita_checkevents.c` | 每轮第一次进入事件泵打点 first_check_events |
+| `vita-port/CMakeLists.txt` | 版本注释 |
+
+**为什么要测 first_content_flip，而不只测 first_flip**：应用可能先提交一个空白帧再绘制，
+此时 first_flip 恰恰是白屏的开头而非结尾。白屏时长 = first_content_flip − round_begin。
+
+**日志怎么读**（`ux0:/data/J2ME00001/`）
+
+- `boot_timing.log`：`round_begin` → `runMidlet_enter` → `first_check_events` → `first_flip`
+  → `first_content_flip flip#=N` → `runMidlet_exit`。
+- `vm_boot.log`：
+  - `[preload] jar[0] ...`：`midp_system.jar`（classpath 顺序固定，0 为系统 jar，1 为应用 jar）
+  - `[preload] jar[1] ...`：应用 jar
+  - `[preload] done defined= entries= fast= total_us= open_us= read_us= resolve_us=`
+- 判读：
+  - `read_us` 占大头 → 瓶颈是读/解压，候选 a（跳过已存在类）或 b（只预载应用 jar）有效。
+  - `resolve_us` 占大头 → 瓶颈是解析/定义，a 无效，b 或 c 才有效。
+  - `fast` 接近 `entries` → 多数类其实已存在，a 的收益大。`fast` 是启发式（resolve < 50us），
+    不是精确命中数。
+  - `total_us` 与 `open+read+resolve` 之差 → 目录迭代与符号表开销。
+  - `runMidlet_enter` 到 `[preload] begin` 的间隔 → 预载之前的 VM 初始化开销。
+  - `[preload] done` 到 `first_check_events` / `first_content_flip` 的间隔 → 预载之后、应用自身
+    初始化（clinit、构造器、首次绘制）的开销。若这段很长，白屏的主因不是预载。
+
+**限制**：`open_us+read_us+resolve_us` 分阶段累计未排除 `JVM_CHECK` 异常提前返回的条目；
+`bytes` 未统计（未确认 `Buffer` 的长度接口）；`first_content_flip` 对"白底黑字但像素极少"的画面
+可能晚一帧检出。
+
+**构建核对**：`J2ME Player v02.44 b329 (1e8533d)`（当前工作区含未提交改动，版本串的提交号是旧的）；
+符号、格式串齐全；`load_jar_entry` 内 6 处 `vita_now_us` 调用；陷阱 pad 反汇编复核：
+r4–r11 无写入，push/pop 各 3 且平衡。
+
+
+---
+
+## v02.45：非阻塞 connect 完成检测不可靠 → 改回阻塞 connect（log94）
+
+### 1. 现象
+- 网络不再卡死（v02.44 NBIO 修复生效），但"卡在网络测试中，连不上网"
+- log94 net_log: `set_nbio fd=15 rc=0 errno=0`（NBIO 生效）+ `connect EINPROGRESS
+  fd=15`（非阻塞 connect 返回），之后**再无任何 connect DONE/FAILED**
+
+### 2. 决定性证据
+- input_debug.log HEARTBEAT 跑到 #14913（158 秒），CE 每轮 +1 → 事件泵每 0.67ms
+  都在跑，vita_net_poll → select → sceNetEpollWait 每次都被调用
+- **158 秒、14942 轮 select，零 EPOLLOUT** → connect 完成从未被检测到
+- `curl http://219.133.46.205/` = HTTP 200，connect=0.0027s → **同一服务器可达**
+- 官方 net_http_bsd sample 用**阻塞 connect**（不设 NBIO）
+- log88（阻塞模式）connect 是 "immediate OK"
+
+### 3. 根因
+Vita 的 **sceNetConnect 非阻塞 connect + sceNetEpoll 完成检测不可靠**：
+- SO_NBIO 让 connect 返回 EINPROGRESS（正确），但 TCP 握手完成后 epoll 不报告
+  EPOLLOUT，select 永远检测不到可写 → Java 线程永久 block 在
+  midp_thread_wait(NETWORK_WRITE_SIGNAL)
+- select 底层是 sceNetEpoll（libc.a select.o 反汇编：sceNetEpollCreate/Control/
+  Wait），事件映射正确（writefds→EPOLLOUT=2），实现没问题，是 Vita 网络栈的
+  非阻塞 connect 完成报告有 bug
+
+### 4. 修复（v02.45）
+`pcsl_socket_open_start()`：connect 用**阻塞**（connect 前不设 NBIO），connect
+成功后（返回 0）再 `vita_set_nbio(fd)` 让后续 read/write 保持非阻塞。
+- 阻塞 connect 是官方做法，网络通时立即返回（curl 2.7ms 佐证）
+- open_start 不再返回 WOULDBLOCK，open_finish 成死代码（保留防御）
+- 权衡：不可达主机 connect 阻塞 ~27s（回退到 v02.44 前的"27s freeze"），但能
+  返回错误（可恢复），远好于永久卡 EINPROGRESS；后续可用 connect 超时方案优化
+
+验证：反汇编确认调用顺序 setsockopt(keepalive)→setsockopt(nodelay)→connect→
+setsockopt(nbio)。v02.45 已编译（17:51，midp_vita_v02.45.vpk 3729255B）。
+
+### 5. 下一步
+真机跑 v02.45 联网游戏：net_log 应显示 `connect OK fd=15`（阻塞 connect 成功）
+，后续 HTTP 请求正常。若仍连不上，再查 HTTP 层/协议问题。
+
+---
+
+## v02.46：log92/93/94 分析——白屏量化 + 网络唤醒描述符错配
+
+### 1. 白屏：计时数据（v02.44 探针首次上机）
+
+| | log92 FileManager | log93 MainMidlet | log94 WebClient |
+|---|---|---|---|
+| 白屏（round_begin → first_content_flip） | 12.15 s | 15.40 s | 14.96 s |
+| 预载（begin → done） | 9.87 s（81%） | 12.13 s（79%） | 10.62 s（71%） |
+| 预载 jar[0] = midp_system.jar | 9.78 s | 9.27 s | 9.44 s |
+| 预载 jar[1] = 应用 jar | 0.06 s（9 类） | 2.83 s（73 类） | 1.14 s（68 类） |
+| 预载完 → 首个非白帧 | 1.42 s | 2.44 s | 3.89 s |
+
+结论（已由数据支持）：
+- **预载是白屏的主因，占 71–81%**。预载完成后到首个有内容的帧只要 1.4–3.9 s。
+- **`midp_system.jar` 固定占 9.3–9.8 s，与运行哪个应用无关**（932 条目，约 10 ms/条）。
+  应用 jar 的开销随类数涨（约 17–39 ms/条），但绝对值小。
+- `first_flip` 很早（runMidlet_enter 后 0.4 s），`first_content_flip` 是第 3 帧：前两帧是白屏，
+  印证了"首帧不等于白屏结束"。
+- 预载内部分解（占 total）：`open_entry` 32–40%，`resolve` 22–24%，`read_completely` 仅 3–4%，
+  **未被这三段覆盖的部分 34–41%**。读和解压几乎不花时间，慢在别处。
+- `fast`（resolve < 50µs）在 jar[0] 里约 503/932，即约一半条目 resolve 极快。
+  这是启发式，不是精确命中数；`defined=859` 说明 jar[0] 里 859 个类走了真实定义，
+  因此"约一半已在 ROM/字典里"这一说法**不成立**，不能据此推出"跳过一半读取"。
+
+**未解决**：`open_entry` 平均约 4 ms/条偏慢（它只做 seek + 读 30 字节 LOC 头 + 分配解码器），
+以及 34–41% 的未覆盖耗时（目录迭代 `do_next_entries`、`SymbolTable::symbol_for`、
+`vita_boot_log`/校验等）。需要更细的探针才能定位，**目前不应据此选定优化方案**。
+候选方案 b（只预载应用 jar）收益最大（可省约 9.3–9.8 s），但会让系统类回到 lazy 加载，
+有重新触发 log17 链式加载卡死的风险，需要实测。
+
+### 2. 网络（log94）：唤醒描述符错配（静态可证）
+
+- log94 net_log：`set_nbio fd=15 rc=0 errno=0`（v02.44 NBIO 修复有效）→ `connect EINPROGRESS`
+  → 之后无任何 `connect DONE/FAILED`；事件泵一直在转（CE 到 14942），所以不是 VM 卡死。
+- **根因**：MIDP 用 `midp_thread_wait(NETWORK_*_SIGNAL, (int)pcslHandle, ...)` 挂起线程，
+  `pcslHandle` 是 `pcsl_socket_open_start` 返回的 `NetHandle*`（`&g_handles[i]`）；
+  `midp_thread_signal_list()` 按 `descriptor ==` 精确匹配。`vita_net_poll()` 却用**裸 fd**
+  （15、16…）发信号，所以任何 WOULDBLOCK 等待者都永远唤不醒。
+  上游 `socket_notify_export.c` 也是按 handle 匹配，确认约定。
+- v02.45（另一会话）把原因归为"Vita 非阻塞 connect + epoll 不报 EPOLLOUT"，并改成阻塞 connect。
+  **该结论没有证据**：没有任何日志记录过 `select` 的返回值，"158 秒零 EPOLLOUT"是从"select 被调用了"
+  推出来的。log92/93 之外 log88 的"阻塞 connect immediate OK"只能说明阻塞 connect 能工作。
+  阻塞 connect 只是把卡点后移：connect 成功后第一次 `recv` 遇到 EWOULDBLOCK 仍会挂在同一个
+  永远不被 signal 的 handle 上，所以 v02.45 大概率仍会卡在网络测试。
+- **修复（v02.46）**：`vita_net_poll()` 改为 `midp_thread_signal(..., (int)(intptr_t)&g_handles[i], ...)`。
+  v02.45 的阻塞 connect 保留不动（它自己有 27 s 阻塞不可达主机的代价，后续可改回非阻塞）。
+- 反汇编核对：`vita_net_poll` 三处 `midp_thread_signal` 的 r1 都来自遍历 `g_handles` 的指针 r4，
+  不再是 fd。
+
+**未验证**：上机。真机上若 `connect` 的 EPOLLOUT 确实不报，则 v02.46 仍会卡；
+为此建议下一轮在 `vita_net_poll` 里记录 select 返回值（目前没有）。
+
+### 3. log93：不是死锁，是停滞后恢复
+
+- HANG 判据是事件泵 CE 计数 12 个轮询（约 3 s，`WD_STALL_POLLS`=12 × 250 ms）不动。
+- log93 的 CE 在 HANG 之后仍从 4376 涨到 5138，并且 `[INPUT]` 在 HANG 之后仍持续被处理，
+  说明 VM 一直活着；HANG 对应 `CE` 在 #4353→#4481 之间的约 8.8 s 停滞（常态约 1.5 s）。
+- HANG 时刻 `VMPROG` 全零（解释器不推进）但 VM 线程 `RUNNING`、有约 25% CPU：停在原生代码里，
+  不是内核等待（watchdog 的 "VM stuck in a kernel wait" 结论仅凭 exec=0 推断，与 RUNNING 状态矛盾）。
+- watchdog 在 HANG 后主动 `requesting coredump via data abort` 杀掉进程，coredump 时已是恢复之后，
+  `trace_ring`（VM 线程在 `sema_wait` = 事件泵空转）和 `site_ring` 不反映停滞期。
+  这就是之前记过的"停滞后恢复的现场不可信"。
+- 声音相关：`MediaException: Player cannot be created for audio/midi` 出现 2 次，audio_debug 只有
+  `initialize / get_configuration`，没有 create/realize。**与那 8.8 s 停滞的关系未证实。**
+- **未定位**：停滞期 VM 在原生代码里做什么。候选：游戏线程加载资源（jar 内资源解压在 VM 线程同步完成，
+  与预载同一机制）、GC。需要在停滞期做采样，而不是事后 dump。
+
+### 4. 关键文件修改记录（v02.46）
+
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_net.c` | `vita_net_poll`：唤醒描述符 fd → `(int)(intptr_t)&g_handles[i]`；加 `<stdint.h>` |
+| `vita-port/CMakeLists.txt` | `VITA_VERSION` 02.46 + 说明（不覆盖另一会话已出的 v02.45 产物） |
+
+构建：`J2ME Player v02.46 b329 (1e8533d)`，`midp_vita_v02.46.vpk` 3729236 B。
+
+
+---
+
+## v02.47：watchdog 误杀修复 + 早期停滞采样 + 预载细探针 + FileManager 复现开关
+
+### 1. 确定性 bug：watchdog 把可恢复的停滞升级成自杀（已修）
+
+`vita_watchdog.c` 里 KICK0 打开的 `if (!moved) {` 的右括号原本在 "KICK RECOVERED / re-arm /
+continue" 块**之后**。KICK0（SendSignal + 4 个 poll）期间只要泵恢复（moved=1），整个恢复块被跳过，
+控制流直接落到 coredump 的 data abort。log93 吻合：watchdog.log 里只有 `KICK0 signal` 和
+`requesting coredump`，没有 `KICK RECOVERED`；而 CE 在 HANG 之后仍从 4376 涨到 5138、输入仍被处理。
+修法：右括号移到恢复块之前。**这意味着 log91/93 里"HANG 后进程被杀"至少部分是 watchdog 自己造成的**。
+
+### 2. FileManager 卡死：现状与诚实结论
+
+- **没有消失，被兜住了**：log92（FileManager 正常退出）的 `exit_probe.log` 有
+  `v243 trip_rep=2 trip_land=7`。即 v02.44 的循环检测器在 land=7 触发了 2 次。同一状态在没有检测器时
+  就是 log85/86 的死循环。log93 的 site_ring 里 `trip_rep=3 trip_land=9` 同理（MainMidlet 的线程退出）。
+  所以"复现不到"的准确说法是"每次都出现，每次都被 shadow 救回"。
+  之后每一份正常退出的 `exit_probe.log` 里 `trip_rep>0` 就是一次"本会死循环"的事件，可用来统计发生率。
+- **根因仍未知**。已排除的假设：
+  - "运气/时序"：log88/90 + log92 反复证伪。
+  - "真实 trampoline 里写死了过期的绝对地址"：v02.46 二进制里 `start_lightweight_thread_asm` 的字面量池
+    是 `0x813018f4`(gp_base_label) / `0x810ac138`(thread_task_cleanup) / `0x814d44d8`(_next_runnable_thread)，
+    与当前符号表**逐项一致**（链接期重定位，不是冻结的旧值）。
+  - 真实 trampoline 与 shadow 的前 17 条指令逐条一致（含 `[gp+1036]/[gp+1040]/[r0+104]` 访问和
+    `invoke_pending_entries` 调用）。差异只可能在 `call_on_primordial_stack` 之后的某个运行期状态上。
+- **未解释的事实**：同一 (cur, r6) 重复进入 pad 3 次时，真实 trampoline 不调用 `Thread::finish`
+  （finish=0），shadow 调用了（th_finish=2）。
+- **新增对照实验开关（默认关，v02.47）**：在 `ux0:/data/J2ME00001/` 放 `pad_nodivert.cfg`，
+  launcher 置 `vita_v247_nodivert=1`，landing pad 跳过两条分流规则，**总是跑真实 trampoline**。
+  这会让原始死循环重新出现。配合 `wd_early_dump.cfg`（见下），watchdog 在循环开始约 2 s 时
+  取 coredump，PC/LR 才是循环里的真实值。反汇编核对：pad 488 字节，push/pop 各 4 且平衡，
+  r4–r11 无写入，`bne` 目标 `0x810a945c` → `movw/movt/bx r0` 到 `start_lightweight_thread_asm`(0x810d2e40)。
+  **用法**：只在专门复现 FileManager 退出时启用，用完删掉文件；它会让游戏真的卡死。
+
+### 3. watchdog 早期停滞采样（PC/LR 的现实边界）
+
+- **user 态读不到别的线程的 PC/LR**：kubridge 未装（kernel_forensics.log `ABSENT`）；
+  `sceKernelGetThreadContextForVM` 在 stub 里有导出但**没有头文件、结构体未知**；
+  `sceKernelSuspendThreadForVM` 在本机返回 0x80020008；`GetThreadRunStatus` 在 log33/34 杀掉了调用者。
+  不盲调未知结构体的内核接口。
+- **替代**：
+  1. 默认开启、零内核风险：CE 与 clinit/GC/preload 计数器都冻结的每个 250 ms poll 采一个内存样本
+     （VM 线程状态/等待类型/runClocks、interpreter 计数器、`vita_phase_id`、VM 线程 syscall 计数增量）。
+     停滞 >= 1 s 后恢复时，或 HANG 报告开头，写 `[WD-STALL]` 行。**之前 <3 s 的停滞完全不记录**。
+  2. 取证模式（opt-in，**会杀进程**）：放 `wd_early_dump.cfg`，冻结约 2 s（8 个 poll）就取 coredump，
+     而不是约 25 s。coredump 里 VM 线程的 PC/LR 才反映停滞期。用 `debug/tools/parse_psp2dmp.py` 解析。
+- **VitaPhaseScope 标记**（RAII，所有 return 路径都恢复外层）：1 jar_find_entry / 2 jar_open_entry /
+  3 read_completely / 4 preload_resolve / 5 preload_verify / 6 lazy_class_load / 7 gc /
+  8 resource_open / 9 clinit_setup。0 = 解释器或无标记的原生代码（本身就是信息）。
+  注意 `InstanceClass::clinit()` 只是 `append_pending_entry`，Java 的 `<clinit>` 在解释器里跑，不在 9。
+- **log93 停滞的两条新结论**（来自 HANG 判据本身）：HANG 要求 CE **和** clinit/gc/preload 计数全部冻结
+  12 个 poll，所以那次约 8.8 s 的停滞**不是 GC、不是 clinit 风暴、不是预载**。它在原生代码里
+  （RUNNING，约 25% CPU，解释器计数全 0）。具体在做什么**仍未知**，需要下一轮的 `[WD-STALL]`。
+
+### 4. 预载细探针（回答白屏里"没被覆盖的 34-41%"）
+
+- `UseVerifier` 默认 **true**（Globals.hpp:292），`load_jar_entry` 对每个预载类都调 `verify()`，
+  v02.44 没计时 —— 是未覆盖部分的首要嫌疑，但**未证实**。
+- `open_entry` 平均约 4 ms/条与代码不匹配（只有 seek + 读 30 字节）。trace_ring 里 VM 线程
+  `io_read=13477 io_lseek32=2762`，1005 条目 ≈ 13 次 read/条；BufferedFile::BUFFERSIZE=256，
+  `find_entry`/`open_entry` 之间每条目至少 2-3 次来回 seek。**假设**：慢在小块乱序 I/O 的次数而非数据量。
+  `[preload] sys(...)` 行会直接给出 n 与 us。
+- 新输出（vm_boot.log）：`[preload] phases2 sym_us verify_us iter_us` 与
+  `[preload] sys(VM thread, delta): io_read n= us= io_lseek ...`。
+  解读：`open+read+resolve+sym+iter`（verify 在 resolve 之后单独计）与 total 之差应显著缩小；
+  `sys` 行里 `io_*` 的 `us` 之和 / total 是 I/O 占比。
+
+### 5. 关键文件修改记录（v02.47）
+
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_watchdog.c` | 括号 bug 修复；早期采样 `wd_early_sample/flush`；`wd_early_dump.cfg` 取证模式 |
+| `vita-port/src/vita_trace.c/.h` | VM 线程 per-op 耗时累计；`vita_trace_op_stats/peek/op_name` |
+| `vita-port/src/vita_main.c` | 读 `pad_nodivert.cfg` |
+| `phoneme-cldc/.../cpu/arm/InterpreterRuntime_arm.cpp` | landing pad 加 nodivert 开关（5 条指令，`9:` 标签） |
+| `phoneme-cldc/.../os/vita/OS_vita.cpp, Globals_vita.hpp` | `VitaPhaseScope`、phase/sym/verify/iter 变量、`vita_trace_preload_mark/report` |
+| `phoneme-cldc/.../share/{handles/Universe,InstanceClass; runtime/JarFileParser,FileDecoder,SystemDictionary,JVM; memory/ObjectHeap; natives/Natives}.cpp` | 全在 `#if defined(VITA)` 内的计时与相位标记 |
+| `vita-port/CMakeLists.txt` | 版本 02.47 + 说明 |
+
+构建：`J2ME Player v02.47 b329 (1e8533d)`，`midp_vita_v02.47.vpk` 3731865 B。
+注意：`rebuild_vm.sh` 在编译失败时仍返回 EXIT=0（本轮 OS_vita.cpp 的 `extern "C"` 链接冲突就是靠
+grep ` error:` 才发现），其中 `loopgen` 链接错误是脚本里**已知且被容忍**的步骤（v02.44 日志同样存在）。
+
+### 6. 下一轮真机怎么跑
+
+1. 常规：各跑一个应用，看 `vm_boot.log` 的 `phases2` / `sys(...)` 行和 `watchdog.log` 的 `[WD-STALL]`。
+2. 抓 log93 型停滞：玩 MainMidlet，停滞发生后看 `[WD-STALL]` 的 `phase` / `calls+` / `rd+` / `dclk_us`。
+3. 要 PC/LR：放 `wd_early_dump.cfg`，复现停滞，取 `psp2core-*.psp2dmp`。
+4. 要复现 FileManager：再放 `pad_nodivert.cfg`，开 FileManager 并退出。**两个开关都会让进程卡死/被杀**，用完删除。
+
+
+---
+
+## v02.48：log95~99 分析（v02.47 首次上机）
+
+### 0. 三种卡死的指纹（v02.47 的 `[WD-STALL]` 采样 + coredump 对得上）
+
+| 指纹 | VM 线程状态 | syscall 增量 | 对应 |
+|---|---|---|---|
+| 用户态死循环 | `RUNNING wait=none`，`dclk_us=0`，`sw/site/jsmp+0` | `calls+0` | log99：FileManager |
+| 同步 I/O 风暴 | `WAITING wait=event`，`lastop=io_write inside=1`，dclk≈11 ms/poll | `calls+19/poll`，rd/lseek=0 | log97/98：音频开关 |
+| 阻塞在未被 trace 的内核调用 | `WAITING wait=event`，`runClocks` 冻结 | `calls+0`，`inside=0` | log96：UC 网络 |
+
+注意：`RUNNING` 的线程 `runClocks` 不增长（`dclk=0`）**不代表没在跑**——log99 的 `land` 已 1500 万次。
+runClocks 只在线程被切出时结算，一个不被抢占的线程不更新它。早年"ghost thread"的说法要带着这条看。
+
+### 1. log95 白屏：确定性数据
+
+两轮（FileManager，然后 MiniXplorer）。`[preload] sys(VM thread, delta)`：
+- round0：`io_read n=4338 us=7,683,542`（预载总 8.95 s 的 **86%**），平均 1.77 ms/次；`io_lseek32 n=2302 us=258,153`。
+- round1：`io_read n=5157 us=9,641,258`（总 11.08 s 的 **87%**），平均 1.87 ms/次。
+- `verify_us=0`（**上一轮的"verify 是首要嫌疑"被证伪**），`sym_us≈6 ms`，resolve 1.2 s，lwmutex 13516 次仅 0.04 s。
+- 4338 次读 / 941 条目 ≈ 4.6 次/条；`BufferedFile::BUFFERSIZE=256`；jar 末尾中央目录与前部数据区交替访问，单个 FILE 缓冲被来回颠簸。
+  这证实了上一轮"慢在小块乱序读的次数而非数据量"的假设。
+- **`fast=502/932`**：`fast` 是 resolve<50µs 的启发式；`defined=859` 只是 `vita_preload_count`（命中 ROM 也 ++），
+  所以"859 个类都真 define 了"不成立，约一半是字典/ROM 命中。
+
+**v02.48 的修法**：`Universe::load_jar_entry` 在 `open_entry` **之前**用 `SystemDictionary::find_class_or_null`
+（不分配、忽略 fake class）判断，已存在就跳过读取。`resolve()` 对已存在的类本来就直接返回、丢弃缓冲，语义等价。
+`vita_preload_count` 仍 ++。日志 `[preload] phases2 ... skipped=N`。预期省 ~4–5 s，**未验证**，以 `total_us` 和 `skipped` 为准。
+
+**没做**：调大 `BUFFERSIZE`（`BufferedFileDesc` 的对象布局常量，牵涉 romgen/ROM 布局，风险高）；
+`setvbuf` 大缓冲（中央目录与数据区交替访问，单缓冲会更糟）；整 jar 读入内存（要改 JarFileParser，需设计+验证）。
+
+### 2. log96：UC 网络"操作期间卡死"
+
+- coredump（VM 线程）：`r0=0x4d r1=0x8137fc88 r2=0x10`，pc/lr 是内核地址，`[KERNEL pc blocked in syscall slot 0x39b]`。
+  **`r1` 指向的内存 = `00 02 00 50 0e 74 8f a3`** = `AF_INET, port 80, 14.116.143.163`（`safe.ucweb.com`），`r2=16=sizeof(sockaddr_in)`。
+  即线程阻塞在 **sceNetConnect**。watchdog：`WAITING wait=event(0x10)`，runClocks 冻结，`avail enter=exit`（不在 peek recv 里）。
+- net_log 最后一行 `socket_open ip=14.116.143.163 port=80`，之后没有 `set_nbio`，吻合 v02.45 的"先阻塞 connect、成功后才 set_nbio"。
+- 这是 v02.45 自己写下的代价（"不可达主机阻塞 ~27 s"）真实发生：**阻塞 connect 冻结整个 VM 线程，UI 一并冻结**。
+  此前 14 次 connect 全部 OK，是因为目标可达。
+- **间接证据**：UC 做了十几个 HTTP 请求并读到数据，说明 v02.46 的"唤醒描述符改为 handle"在 recv 的 WOULDBLOCK 路径上起作用
+  （否则会像 log94 一样卡在第一次读）。它也削弱了 v02.45 "epoll 不可靠"的说法：同一个 `select` 能报可读。
+  但**仍未证实 EPOLLOUT 对 connect 完成会不会报**，所以没有恢复非阻塞 connect。
+- **v02.48**：阻塞 connect 前设 `SCE_NET_SO_SNDTIMEO=5 s`（经 newlib setsockopt 透传，同 NBIO 的做法），connect 后清 0；
+  每次 connect 记 `ms=` 与 setsockopt 的 rc/errno。**sceNet 是否对 connect 遵守 SNDTIMEO 未验证**，日志会回答。
+  若不遵守，对不可达主机仍会冻结，下一步才是非阻塞 connect + 超时（需先在 `vita_net_poll` 记录 select 返回值）。
+
+
+### 3. log97/98：开关音频卡顿 / 卡死
+
+- **没有声音是另一回事**：`MediaException: Player cannot be created for audio/midi` 反复抛出，audio_debug 只有
+  `initialize/get_configuration`。音频 Player 没有实现，**本轮未处理**。
+- **卡顿的原因找到了，是日志写得太碎**：
+  - log98 coredump（VM 线程）：`pc=sceIoWrite+0x8`，`lr=__wrap_sceIoWrite+0x1c`，**`r2=1`（一次写 1 字节）**；
+    栈上返回地址链 `JVMStream::print → JVMDefaultStream::print_raw → crumb_append`；缓冲区内容含 ` - ` 和 `bci=135`，是异常栈行。
+  - `[WD-STALL]`：每 250 ms 约 19 次 `io_write`，rd/lseek 全 0，每次约 13 ms。log97 的三次 HANG 全是这个指纹（19、18、18…）。
+  - `vm_output.log` 与 `vm_stderr.log` **逐字节相同**（log97 均 1451 B）：每个字符被写了**两次**
+    （`crumb_append` → vm_output.log；`pcsl_print_chars` → vm_stderr.log），都是无缓冲同步 `sceIoWrite`。
+  - 量级：1451 B × 2 路 × ≈13 ms ≈ 38 s，与 log97 的三次 ≥3 s 停滞吻合。
+- 前人在 `PROJECT_MEMORY.md:9366` 记过"栈为 Java Writer→print→crumb_append→sceIoWrite … 停顿原因未定"，现在证实。
+  CLDC `PrintStream.write(int)` 逐字符调 `JVMSPI_PrintRaw(s,1)`（v01.33 已记）。
+- **v02.48**：`midp_run.c` 的 `JVMSPI_PrintRaw` 行缓冲（200 B 或换行才写），两路各一次。字节、文件、顺序不变。
+  `vita_printraw_flush()`：watchdog 在两条 abort 路径前调用（只 try 门，绝不阻塞），launcher 在每轮 `runMidlet_exit` 后调用。
+  代价：进程在换行之前被杀会丢半行。
+- log98 开了 `wd_early_dump.cfg`，8 个冻结 poll（2 s）后取 dump：它杀掉的正是 log97 里本可自己恢复的那种停滞。
+
+### 4. log99：FileManager 死循环被复现并在循环中取证
+
+- 配置 `pad_nodivert.cfg + wd_early_dump.cfg`。VM 线程：`pc=vita_landing_pad+0x20`，`lr=vita_landing_pad+0x0`，
+  `r0=0x00ea3343 r1=0x00ea3344`（= land 计数 **15,348,547**），`r5=0x814018f4`（gp，正常），`RUNNING`，`dclk=0`，`calls+0`。
+  这就是 log85 的签名（`pc=pad+0x18`，lr=pad 入口），**第一次在循环进行中取到的真实 PC/LR**。
+  结论：`pad_nodivert` 生效，原始死循环可按需复现；**v02.44 的检测器 + shadow 是 FileManager 不再卡死的唯一原因**。
+- **更正（上一轮措辞不准确）**：我写过"FileManager 退出路径上的重复进入"。证据不支持"退出"：
+  log99 的 boot_timing 没有 `runMidlet_exit`，CE 冻结在 414（`first_content_flip` 后约数秒，用户未必退出）；
+  log85 记的是"from land=6"，而一整轮正常 FileManager 的 land 总数才 10（log92）。
+  所以循环发生在**应用启动后数秒内、land≈6~7 的某个线程死亡**，不一定是应用退出。`exit_probe.log` 是退出时才写，
+  `trip_land` 只是触发时的 land 值，不能据此推断发生在退出。"每次都出现、每次被兜住"的结论不变。
+- **dump 里读不到内存**：`.data/.bss`、Java 堆都不在 coredump（`psp2dmp.py mem` 读 `gp+1036`、`r6` 的退出表、
+  `_next_runnable_thread` 全是 NOT IN DUMP）。拿不到 trampoline 实际读到的状态，**根因仍未知**。
+- **本轮发现的我自己的缺陷**：`wd_early_dump.cfg` 路径（log98/99）没有 `site_ring.log` / `trace_ring.log`——
+  v02.47 写这个快捷路径时漏了 HANG 路径里的 `vita_site_dump*` / `vita_wd_snapshot` / `vita_trace_dump`，
+  丢掉了 `v241 rec[]`、`v242/v243` 与 syscall 槽。v02.48 已补，下一次 log99 型复现才有 pad 记录可看。
+
+### 5. 构建注意（给下一个人）
+
+- `phoneme-midp/build_vita.sh` 写死了构建机路径（`/home/zyb/...`），本机直接跑会 `No such file`。
+  我没改仓库里的脚本（最小 diff），而是 `sed` 替换路径做成 `/tmp/build_vita_ws.sh` 来跑：
+  `/home/zyb/vitasdk/samples/j2me → /workspace/psvita/phoneme-vita`，`jdk8u502-b07 → /usr/lib/jvm/java-8-openjdk-amd64`，
+  `/home/zyb/.local/vitasdk → /usr/local/vitasdk`。
+  改 midp 侧源码后必须先 `rm build/vita_arm/obj/arm/midp_run.o`（PM 718~725 行的老教训），否则 `libobj.a` 里还是旧对象，
+  VPK 链接报 `undefined reference to vita_printraw_flush`（本轮踩了一次）。
+  尾部 `vita_stubs.o` 找不到规则是 `libmidp.so` 检查链接的已知无害项。
+- `rebuild_vm.sh` 编译失败仍返回 EXIT=0，要 grep ` error:`；其中 `loopgen` 的 ld 错误是被容忍的。
+
+### 6. 关键文件修改记录（v02.48）
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-midp/src/ams/ams_base_cldc/reference/native/midp_run.c` | `JVMSPI_PrintRaw` 行缓冲 + `vita_printraw_flush()` |
+| `phoneme-cldc/src/vm/share/handles/Universe.cpp` | `load_jar_entry`：`find_class_or_null` 命中则跳过读取（`#if defined(VITA)`） |
+| `phoneme-cldc/src/vm/os/vita/{OS_vita.cpp,Globals_vita.hpp}`, `share/runtime/JVM.cpp` | `vita_preload_skipped` 与日志 `skipped=` |
+| `vita-port/src/vita_net.c` | 阻塞 connect 加 `SO_SNDTIMEO` 5 s + `ms=` 日志 |
+| `vita-port/src/vita_watchdog.c` | early-dump 路径补写 site_ring/trace_ring；abort 前 `vita_printraw_flush` |
+| `vita-port/src/vita_main.c` | 每轮 `runMidlet_exit` 后 flush |
+| `vita-port/CMakeLists.txt` | 版本 02.48 + 说明 |
+
+构建：`J2ME Player v02.48 b329 (1e8533d)`，`midp_vita_v02.48.vpk` 3733171 B。
+
+### 7. 下一轮真机要看什么
+
+1. 白屏：`vm_boot.log` 的 `[preload] done total_us` 与 `phases2 ... skipped=`，以及 `boot_timing.log` 的
+   `first_content_flip − round_begin`（对比 log95 的 ~11 s/13 s）。
+2. 音频开关：`watchdog.log` 里不应再有 `calls+19` 的 `io_write` 风暴；停滞应缩短到 <1 s。
+3. UC：`net_log.txt` 每次 `connect OK/FAILED ... ms=... (sndtimeo rc=...)`。连 `safe.ucweb.com` 时 `ms` 是否 ≈5000，
+   决定 SNDTIMEO 对 connect 是否有效。
+4. FileManager：再放 `pad_nodivert.cfg + wd_early_dump.cfg` 复现一次，这回 `site_ring.log` 会带 `v241 rec[]`。
+
+
+---
+
+## v02.49：恢复非阻塞 connect（纠正 v02.45 的错误归因）
+
+### 背景
+Cline 在 v02.45 把 log94（"网络测试卡住"）归因成"sceNetEpoll 不报 EPOLLOUT"，
+改用阻塞 connect。但 log94 同时还有 wait-descriptor bug（vita_net_poll 发 signal
+传 bare fd，MIDP 用 handle 等），v02.46 才修 desc。两条证据并列，v02.45 只取了
+epoll 那条，阻塞 connect 随后引出 log96（UC 连不可达的 safe.ucweb.com 冻结整个
+VM/UI ~27s）。
+
+### 修正（v02.49）
+- `pcsl_socket_open_start()` 恢复非阻塞 connect：`vita_set_nbio(fd)` 在 connect
+  **之前**，connect 返回 `EINPROGRESS` → `na_create` + 返回 `WOULDBLOCK`（Java
+  线程 park 在 NETWORK_WRITE_SIGNAL，事件泵 vita_net_poll 完成它）。
+  非阻塞 connect 永不阻塞 VM 线程。
+- 移除 v02.48 的 SO_SNDTIMEO 阻塞 connect 上限代码（死代码），顺带删掉
+  `VITA_NET_CONNECT_TIMEOUT_MS` 宏和 `processmgr.h` include（已失效）。
+- 新增 select/epoll 探针（vita_net.c + watchdog `[WD] net poll` 行）：
+  - `vita_net_poll_calls`  select() 调用次数
+  - `vita_net_poll_ready`   返回 n>0 次数（有就绪 fd）
+  - `vita_net_poll_writable` 至少一个 fd 可写次数（非阻塞 connect 完成信号）
+  - `vita_net_poll_lastn`   最后一次 select 返回值
+  真机判读：connect 卡住时若 `poll_writable>0` → desc bug 是 log94 根因（本修正确
+  认）；若 `poll_ready==0`/`poll_writable==0` → EPOLLOUT 真不报，需
+  sceNetGetSockInfo 兜底。
+
+### 验证
+反汇编确认顺序 setsockopt(keepalive)→setsockopt(nodelay)→setsockopt(NBIO)→
+connect。4 探针符号就位（vita_net_poll_calls=0x813662fc 等）。v02.49 已编译
+（06:21，midp_vita_v02.49.vpk 3733000 B）。
+
+### 教训
+CMakeLists 的 `set(VITA_VERSION)` 是按版本**递增**物理顺序、最后一个生效。新版本
+块必须放在上一个版本块之后（注释是倒序、set 是正序，别插错位置——v02.49 第一次
+构建插到 02.48 前，被覆盖成了 v02.48.vpk）。
+
+---
+
+## v02.50：log100/101 分析（v02.49 首次上机，含 v02.48 的行缓冲与预载跳过）
+
+### 1. 白屏：同一应用前后对比（first_content_flip − round_begin）
+
+| 应用 | 之前 | log100 | 变化 |
+|---|---|---|---|
+| FileManager | 11.45 s（log95） | **7.97 s** | −3.48 s（−30%） |
+| MiniXplorer | 13.58 s（log95） | **9.40 s** | −4.18 s（−31%） |
+| WebClient | 15.50 s（log96） | **11.30 s** | −4.20 s（−27%） |
+
+- 预载 `total_us`：8.95→**5.82 s**（−35%，log95→log100 round0）；上轮预期省 4–5 s，实测 3.5–4.2 s。
+- `skipped=500/501/506`（每轮），`fast` 降到 2~3：被跳过的正是原先 resolve<50µs 的那批，吻合。
+- `io_read`：4338 次/7.68 s → **2594 次/3.88 s**（−40% / −50%），单次 1.77→1.50 ms。
+  仍读 441 个条目，**5.9 次 sceIoRead/条**。
+- **预载仍占白屏 73%**（5.82/7.97 s）。预载内 `io_read` 67%，`io_write` 22%，其余 12%。
+  预载之后到首个有内容的帧：FileManager 1.25 s、MiniXplorer 1.13 s、WebClient 3.39 s（应用自身初始化）。
+- **新瓶颈：`io_write n=63 us=1.27 s`**（单次约 20 ms）。log95 同一应用同样 63 次却只有 0.24 s（3.7 ms/次），
+  log96 也是 1.25 s。次数恒为 63、与条目数无关，耗时随设备/存储状态波动。写的是哪个文件**未知**，v02.50 加了探针。
+- 还没动的大头：剩余 441 个条目每个 5.9 次小读（中央目录与数据区交替访问）；round1/2 每轮都要重做一遍。
+
+### 2. 网络：log100 实际是 v02.49（非阻塞 connect），首次真机验证
+
+- 注意：另一个会话把我的 v02.48 `SO_SNDTIMEO` 方案撤掉并改回非阻塞 connect（v02.49），所以**阻塞 connect 的 5 s 超时没被测到**。
+- `net_log.txt` 统计：65 次 `socket_open`，65 次 `connect EINPROGRESS`，**62 次 `connect DONE`**，2 次 `connect FAILED SO_ERROR=60`
+  （ETIMEDOUT，都是 `vs1.szcm.u2.ucweb.com` 120.241.3.228），3 次 EINPROGRESS 到日志末尾没有结果（`ucsec.ucweb.com`）。
+  WebClient 连续运行 341 s（boot_timing: 55.0→396.8 s），用户反馈无网络卡死。
+- 结论：**EINPROGRESS → select 可写 → `midp_thread_signal(handle)` → `connect DONE` 整条链在真机上工作**。
+  这实证推翻了 v02.45 的"sceNetEpoll 不报 EPOLLOUT"：log94 的 158 s 就是 v02.46 修的描述符错配。
+- 2 次 ETIMEDOUT 经非阻塞路径正常报错，没冻结 VM。同一个 IP 在 log96 连得上、这次超时 → 服务器时好时坏。
+- 局限：log100 里没有出现 `safe.ucweb.com`，log96 的触发场景没有被原样复现。
+
+### 3. log100 的那次 HANG：单次 sceIoWrite 阻塞 >3 s
+
+- `[WD-STALL] HANG ce 5530`：12 个样本全是 `WAITING wait=event lastop=io_write inside=1`，`calls+0`，`dclk=0`；
+  报告时 VMPROG 已 `exec=1`，KICK0 后 `KICK RECOVERED (ce 6258 -> 6281)`。即**同一次 sceIoWrite 卡了 3 秒多然后返回**。
+  这也是 v02.47 括号修复在真机上的首次验证（以前这一步会直接走 coredump abort）。
+- 写的是哪个文件：当时没记。v02.50 的 `[WD-STALL]` sys 行带 `arg=fd(path)`。
+- 用户反馈：开关音频已没有明显卡顿 → 与 v02.48 行缓冲一致（没抓 log，无法量化）。
+
+### 4. log101：FileManager 死循环的 pad 记录（第一次拿到）
+
+配置 `pad_nodivert.cfg + wd_early_dump.cfg`；这次 `site_ring.log` 有了（v02.48 补的）。
+- 计数：`land=16,336,506`，`th_start=4 th_finish=0 lw_exit=0`，`finish=0 force=0 term=0`，`rep=21,348,003`，
+  `trip_rep=0`（nodivert 生效），`v242 st=0/…`（shadow 从未运行）。
+- **形成过程**：`rec[0..3]` land 1~4 是四个线程的 birth；`rec[4] land=5`：线程 `cur=0x81d29174`（`r6=0x81d2a1dc`）
+  birth，`cur.sp=r6-8`，`cur.pe=0x81d2a1fc`（有待执行入口）。`rec[5] land=6`：**同一线程再次进入**，`cur.pe=0`，
+  `cur.sp=0x81d2a120`（= r6−0xbc）。这是线程跑完后的**死亡型进入**。
+  `rec[6..15]`（land 7、8、1000000…）与 rec[5] **逐字段完全相同** → 严格的不动点，**从第一次死亡型进入就停住了**。
+- 退出表（`[r6+0..16]`）全程健康：`lightweight_thread_exit / lightweight_thread_uncaught_exception / Thread::finish /
+  force_terminated / 0`（用 log101 的 pad 地址反推 slide=0x27000 符号化得到）。
+- **对照**：birth 进入满足 `r6 = cur.sp + 8`（rec[0..4]）；死亡型进入 `r6 = cur.sp + 0xbc`。前者是 `call_on_primordial_stack`
+  尾部/birth tail 的形态，后者不是——死亡型进入来自解释器 `run()` 返回。log93 的 rec[6]（land 7）同构（`cur.sp = r6−0xbc`，pe=0）。
+- **矛盾（未解）**：`pe=0` 且 `[r6+16]=0` 时，trampoline 的静态读法必然走到 `bl call_on_primordial_stack(Thread::finish)`，
+  而 `call_on_primordial_stack` 第 5 条 `str r6,[r1,#100]` 会把 `cur.sp` 改成 `r6−8`（=0x81d2a1d4）。
+  记录里 cur.sp 始终是 0x81d2a120，`th_finish` 始终 0。**所以循环的这些轮次里 trampoline 没走到那里，而静态上它必须走到。**
+  可能的缺口：`[gp+1040]`（pending exception）是 trampoline 的输入里唯一没记录的；`[cur.sp+4]`（`call_on_primordial_stack`
+  尾部"返回"的槽）也没记录。**这些是假设，没有证据。** v02.50 把这三个值写进 rec 的 21/22/23 号字。
+- **dump 仍读不到 `.data/.bss/堆`**，所以只能靠 pad 自己记。
+
+### 5. v02.50 改动（全是探针，不改行为）
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-cldc/src/vm/cpu/arm/InterpreterRuntime_arm.cpp` | pad rec 增 `[gp+1040]`、`[cur.sp]`、`[cur.sp+4]`（gp 取自符号，不用 r5：birth 路径上 r5 未定义） |
+| `phoneme-cldc/src/vm/os/vita/OS_vita.cpp` | `v241 rec[i] pendexc[gp+1040]=.. [cur.sp]=.. [cur.sp+4]=..`；预载 `[preload] io_write fd=N (path) n= us=` |
+| `vita-port/src/vita_trace.c/.h` | fd→路径尾表、VM 线程 per-fd `io_write` 计数/耗时、`peek` 带 `arg` |
+| `vita-port/src/vita_watchdog.c` | `[WD-STALL] ... lastop=io_write arg=fd(path)` |
+| `vita-port/CMakeLists.txt` | 版本 02.50（02.49 是另一个会话的） |
+
+反汇编核对：pad 536 B，push/pop 各 4，r4–r11 无写入，`r1`（land）不被破坏，新字段偏移 +84/+88/+92，nodivert 仍 `bx` 真实 trampoline。
+构建：`J2ME Player v02.50 b329 (1e8533d)`，`midp_vita_v02.50.vpk` 3733622 B。
+
+### 6. 下一轮真机要看什么
+
+1. 白屏：`vm_boot.log` 里新增的 `[preload] io_write fd=.. (path) n= us=`——那 63 次写是谁的。
+2. 单次 sceIoWrite 阻塞：`watchdog.log` 的 `[WD-STALL] ... arg=..(path)`。
+3. FileManager：再放 `pad_nodivert.cfg + wd_early_dump.cfg` 复现一次，看 `site_ring.log` 里 rec[5..] 的
+   `pendexc[gp+1040]` 和 `[cur.sp+4]`：若 `[cur.sp+4]` 等于 pad 入口地址，说明循环是 `call_on_primordial_stack` 尾部"返回"到哨兵；
+   若 `pendexc` 非 0，则走 uncaught_exception 分支。两者都不是的话，现有假设全部作废。
+
+
+---
+
+## v02.49 补充：log100 确认 + 智能体恢复 + 输入法调研
+
+### 1. log100：UC 联网不再卡死（v02.49 非阻塞 connect 修复生效）
+
+- net_log：`connect EINPROGRESS` → `connect DONE` 成对出现（fd=20/26，多个服务器
+  ucweb/dh.uc.cn/wap.ifeng.com 全部正常）。**证明 v02.49 恢复非阻塞 connect 正确，
+  desc bug 是 log94 根因，epoll 实际能报 EPOLLOUT**。
+- watchdog 尾部有一次 `VM/Java-layer livelock` 判读 + `io_write inside=1`，但最
+后 `KICK RECOVERED (ce 6258 -> 6281)` —— 是**短暂卡顿后恢复**（io_write 日志风暴，
+非永久卡死）。
+- 附带发现：`SceCommonDialogWorker` 线程出现（系统 CommonDialog 被唤起），与输入
+法调研呼应。
+
+### 2. 智能体恢复（回退代码丢的 agent/skill）
+
+回退到 v02.40 时丢了 `161b644` 提交的 agent/skill。已恢复：
+- `.github/agents/jvm-dev.agent.md`（JVM/J2ME 开发专家智能体）
+- `.github/skills/psp2dmp-analysis/SKILL.md`（coredump 判读 skill）
+- `AGENTS.md`（指针 `../../AGENTS.md` → `.github/agents/jvm-dev.agent.md`，改动规
+模 103/15 → 130/136，验证脚本 `midp-vita/build_midp_vita.sh` → `vita-port/build.
+sh`，加智能体/skill 入口表）
+
+**路径适配**（容器环境 vs 构建机 /home/zyb）：
+- `/home/zyb/.local/vitasdk` → `/usr/local/vitasdk`
+- `source /home/zyb/vitasdk/vitasdk.sh` → 工具链已在 PATH（`$VITASDK/bin`）
+- `debug/logs/` → `debug/log/`；skill 里 ELF `vita-port/build/midp_vita` →
+  `vita-port/build/cmake/midp_vita`
+
+### 3. 输入法调研（Java 程序无输入法的根因 + 方案）
+
+**根因**：Vita 移植只映射了物理按键（方向键/CROSS/CIRCLE/SQUARE/TRIANGLE/START/
+SELECT → keymap），**没有 0-9 数字键**。phoneME 的 TextField 输入靠
+InputMode（KeyboardInputMode/NumericInputMode 等）把**数字键序列**映射成字符，而
+Vita 无数字键 → 无法输入任何字符。
+
+**phoneME 输入法架构**（已摸清）：
+- `nim_port/include/nim.h` + `stubs/nim_impl.c`：native 输入模式 API，stub 返回 6
+ 个模式 ID（KEYBOARD/NUMERIC/ALPHANUMERIC/PREDICTIVE/SYMBOL/VIRTUAL）
+- `virtual_keyboard/vk{java,default,platform}`：虚拟键盘三实现。**vkplatform** 是
+ "平台原生键盘"接口位：`VirtualKeyboardInputMode extends KeyboardInputMode`，
+  `beginInput()` 调 native `showNativeKeyboard()`，`endInput()` 调
+  `hideNativeKeyboard()`；字符仍走父类 KeyboardInputMode 的 key 事件处理
+- WINCE 已用 vkplatform 调 `SipShowIM`（Windows 软键盘），是 Vita 的直接模板
+
+**Vita 系统输入法**：`sceImeDialog`（psp2/ime_dialog.h + libime.h）
+- 支持 20 种语言（`SCE_IME_LANGUAGE_SIMPLIFIED_CHINESE=0x8000`、日/韩/英等）
+- 异步 API：`sceImeDialogInit` → `sceImeDialogGetStatus`（轮询 FINISHED）→
+  `sceImeDialogGetResult`（button + UTF-16 inputTextBuffer）→ `sceImeDialogTerm`
+
+**方案**（推荐 A）：
+- A. 切 vkplatform + `USE_NATIVE_VIRTUAL_KEYBOARD=true`，实现 native
+  showNativeKeyboard/hideNativeKeyboard 调 sceImeDialog，结果拆字符 emit
+  MIDP_KEY_EVENT 回填 TextField
+- B. vkjava 自绘 Java 键盘 + 触摸适配（已有实现，需触摸驱动）
+- C. 物理按键映射数字键（临时，体验差）
+
+---
+
+## v02.51：系统输入法（sceImeDialog）桥接 — 首个文字输入能力
+
+### 根因
+Vita 移植只映射物理按键（方向/CROSS/CIRCLE/SQUARE/TRIANGLE/L/R/START/SELECT），
+**没有 0-9 数字键**。phoneME 的 TextField/TextBox 输入靠 InputMode 把「数字键序列」
+映射成字符（九宫格 multi-tap），无数字键 → 永远无法产出字符 → "Java 程序没有输入法"。
+
+### 关键机制发现（phoneME 已内置 IME 回填通道，之前未接线）
+- `DisplayEventListener` 处理 KEY_EVENT 时：`if (intParam1 == EventConstants.IME)`
+  → `dc.handleInputMethodEvent(stringParam1)` → `TextBox.insert(text, caret)`。
+- `EventConstants.IME = 4 = KEYMAP_STATE_IME`（keymap_input.h），`intParam1` 是
+  ACTION，`stringParam1` 是 pcsl_string（jchar* UTF-16 + length + IN_HEAP flag）。
+- 这是**批量（整串）**输入回填通道，正好匹配 Vita `sceImeDialog` 一次性返回全文
+  的语义（区别于 WINCE 软键盘的逐键 WM_KEYDOWN）。
+- 限制：`handleInputMethodEvent` **只处理 TextBox**，不处理 TextField（TextField
+  需 Java 层扩展，后续）。
+
+### 实现（v02.51，MVP）
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_ime.c`（新）+ `vita_ime.h` | sceImeDialog 生命周期：show→Init（异步）、poll→GetStatus/GetResult/Term + 构造 IME 事件、abort→Term |
+| `vita-port/src/vita_input.c` | SELECT 键触发 `vita_ime_show()`（不再发 '#'）；`checkForSystemSignal` 里 media poll 之后调 `vita_ime_poll()` |
+| `vita-port/CMakeLists.txt` | 加 `src/vita_ime.c` + `SceCommonDialog_stub` 链接 + 版本 02.51 |
+
+关键点：
+- **触发**：SELECT 键（MVP；TextField 焦点自动弹出需 Java 层改 InputMode，后续）
+- **回填**：IME 事件 `type=MIDP_KEY_EVENT, ACTION=KEYMAP_STATE_IME, stringParam1=文本`
+- **UTF-16**：`SceWChar16`（uint16_t）与 phoneME `jchar`（unsigned short）同宽，
+  `pcsl_string_convert_from_utf16` 直接构造，无需转码
+- **所有权**：`vita_ime_poll` 直接填 `pNewMidpEvent`（**不走 SPSC ring**，避免浅
+  拷贝 alias stringParam1 指针）；stringParam1 所有权转移给 MIDP 事件队列（midp
+  侧 freeMIDPEventFields 释放）
+- **语言**：supportedLanguages = 英文+简中+繁中+日文
+- **sceImeDialog* 符号在 `SceCommonDialog_stub`**，不在 `SceIme_stub`（后者只有
+  sceImeOpen/Close/SetText 底层接口）
+
+验证：vita_ime_show/poll/abort + sceImeDialog* 符号就位，vita_input 反汇编确认调
+vita_ime_show/poll。v02.51 已编译（08:12，midp_vita_v02.51.vpk 3733897 B）。
+
+### 下一步
+1. 真机跑 v02.51：MIDlet 里进 TextBox，按 SELECT → 弹系统键盘 → 输入 → ENTER →
+   文本 insert 进 TextBox。
+2. TextField 支持：扩展 Display.jpp 的 handleInputMethodEvent 或走 handleKeyEvent
+   逐字符注入（需重编 midp Java 类）。
+3. 自动弹出：TextField 焦点时自动 show（改 Java 层 InputMode 默认值或 native 侧
+   探测焦点）。
+
+## v02.52：TextField 支持 + 焦点自动弹收系统键盘
+
+承接 v02.51 的"下一步 2/3"，把系统输入法从"只支持 TextBox + SELECT 手动触发"
+扩展到"TextBox + Form 焦点 TextField + 焦点自动弹出"。
+
+### 关键发现：`current instanceof TextBox` 是死代码
+v02.51 已接线 `handleInputMethodEvent`，但原判断 `if (current instanceof TextBox)`
+永远为 false——`current` 是 **DisplayableLF**（`TextBoxLFImpl`/`FormLF`），而
+`TextBox` 是 **Displayable**（API 对象），两者无继承关系。必须经
+`current.lGetDisplayable()` 解回 API 对象再 instanceof。此前 v02.51 的 TextBox
+回填若真机验证大概率也注入不进去，这是本次一并修掉的隐藏 bug。
+
+### 改动（4 个 midp Java/native 文件，全部 `#if VITA` / 最小补丁）
+| 文件 | 改动 |
+|---|---|
+| `.../virtual_keyboard/vkdefault/classes/com/sun/midp/chameleon/input/VirtualKeyboardInputMode.java` | 加 `public static native void showNativeKeyboard()/hideNativeKeyboard()`（无 VITA 限定，native 符号只在 WINCE/VITA 编译，其余平台链接期无符号但从未被调用） |
+| `.../lcdlf/lfjava/native/lfj_native_input_mode.c` | `#ifdef VITA` 声明 `vita_ime_show/abort`；`#if defined(WINCE)||defined(VITA)` 包住两个 KNI 导出，VITA 分支转发 `vita_ime_show()/vita_ime_abort()` |
+| `.../lcdlf/lfjava/classes/javax/microedition/lcdui/TextFieldLFImpl.java` | `enableInput()`（获焦）末尾加 `showNativeKeyboard()`；`disableLayers()`（失焦）加 `hideNativeKeyboard()` |
+| `.../lcdui/reference/classes/javax/microedition/lcdui/Display.jpp` | `handleInputMethodEvent`：`current.lGetDisplayable() instanceof TextBox` 修死代码；新增 `current instanceof FormLF` → `lGetCurrentItem()` 若为 TextField → `TextFieldLFImpl.commit(inputText)` 注入 |
+
+### 机制
+- **自动弹出**：TextField/TextBox 获焦 → `enableInput()` → `showNativeKeyboard()`
+  → native → `vita_ime_show()`；失焦 → `disableLayers()` → `hideNativeKeyboard()`
+  → `vita_ime_abort()`。SELECT 键触发（v02.51）仍保留，二者互不冲突（重复 show
+  幂等）。
+- **回填**：整串文本经 `MIDP_KEY_EVENT(ACTION=KEYMAP_STATE_IME)` 进
+  `handleInputMethodEvent`，TextBox 走 `insert()`，Form 焦点 TextField 走
+  `TextFieldLFImpl.commit()`（与 TextBox 同一条 IME 通道，无需逐字符）。
+- **改 midp Java 类不需 romize**（UseROM=true 只读 ROMImage 的系统类快照，但
+  midp Java 类在 `midp_system.jar`，重新 repack 即生效），本次只重编了 4 个类 +
+  repack midp_system.jar。
+
+### 验证（静态，未真机）
+- native 符号就位（`arm-vita-eabi-nm midp_vita_v02.52.sym`）：
+  `Java_..._VirtualKeyboardInputMode_showNativeKeyboard/hideNativeKeyboard` (T)、
+  `vita_ime_show`/`vita_ime_abort` (T)。
+- `javap -p` 确认 midp_system.jar 内
+  `VirtualKeyboardInputMode` 有 `public static native void showNativeKeyboard()/
+  hideNativeKeyboard()`（mangled 名与 C 侧匹配）。
+- 产物：`midp_vita_v02.52.vpk` 3734751 B / `.sym` 4333260 B（08:39），
+  `midp_system.jar` 08:38 重打包。
+- 版本号教训复述：CMake 的 `set(VITA_VERSION ...)` 是递增物理顺序最后一个生效，
+  v02.52 必须写在 02.51 之后（本次已修正顺序后重建）。
+
+### 已知限制 / 待真机验证
+1. **未上真机**：自动弹出 + TextField 注入均需真机/模拟器实测。重点看：进 Form
+   焦点落在 TextField 时是否自动弹键盘、输入后文本是否正确进 TextField（而非
+   TextBox）、失焦是否收键盘。
+2. `commit()` 的语义需确认：它可能先 `delete` 原内容再插入（本意是覆盖），若
+   焦点 TextField 已有内容，整串注入是否会清空原有文本。
+3. 自动弹出依赖 `enableInput()` 被正确调用：若某些 Form 导航路径不触发
+   `enableInput`，则键盘不弹（此时仍可手动按 SELECT 兜底）。
+
+## v02.53：让系统 IME 真正渲染（补 CommonDialog 三件套）
+
+### 现象
+log103（真机，模块表含 SceCommonDialog/SceGxm/vsh/SceShellSvc）跑 v02.52，
+进 TextField 只弹 phoneME 内置软键盘，系统键盘（sceImeDialog）完全不出现。
+全部日志 grep 不到任何 IME 痕迹——因为 vita_ime.c 当时没有任何日志。
+
+### 根因
+sceImeDialog 是 Vita **CommonDialog 框架**的上层，而移植只调了
+`sceImeDialogInit/GetStatus/GetResult/Term`，漏了 CommonDialog 的三件套：
+1. `sceCommonDialogSetConfigParam()` —— 一次性配置，缺失时 Init 可报
+   `SCE_COMMON_DIALOG_ERROR_NOT_CONFIGURED` (0x80020407)
+2. `sceGxmInitialize()` —— CommonDialog 经 GXM 渲染，缺失时报
+   `SCE_COMMON_DIALOG_ERROR_GXM_IS_UNINITIALIZED` (0x80020436)；本移植用
+   `sceDisplaySetFrameBuf` 软件 blit，从未初始化过 GXM
+3. `sceCommonDialogUpdate()` —— 每帧驱动渲染，renderTarget 指向 back buffer；
+   不调它对话框永不绘制
+
+对照官方 sample `/usr/local/vitasdk/share/gcc-arm-vita-eabi/samples/ime/src/main.c`
+验证：sample 先 `sceCommonDialogSetConfigParam` + `gxm_init`，主循环每帧
+`sceCommonDialogUpdate(renderTarget=backbuffer)` + swap。三步缺一不可。
+
+### 改动
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_ime.c` | 首次 show 前 `sceCommonDialogSetConfigParam`（ConfigParamInit → MAX_VALUE=系统默认语言/确认键）；加 stderr 日志：Init rc、首次 poll status、dismiss/commit 长度、abort |
+| `vita-port/src/vita_ime.h` | 加 `vita_ime_is_active()` 声明 |
+| `vita-port/src/vita_display.c` | 懒初始化 `sceGxmInitialize`（vsync 回调 NULL——本移植继续用 SetFrameBuf 提交，避免 GXM display-queue 双重提交）；`vita_common_dialog_update()` 构造 renderTarget=back buffer（LINEAR/A8B8G8R8/960x544/stride 960）；`flip_to_display()` blit 之后、SetFrameBuf 之前调用，仅当 `vita_ime_is_active()` |
+| `vita-port/CMakeLists.txt` | 版本 02.53 |
+
+关键点：
+- **renderTarget 格式**：`SCE_GXM_COLOR_SURFACE_LINEAR`(0) + `SCE_GXM_COLOR_FORMAT_A8B8G8R8`(0=ABGR)，
+  与 `rgb565_to_abgr` 的输出一致；framebuffer 是 CDRAM（GPU 本地内存，无需
+  `sceGxmMapMemory`）。
+- **vsync 回调 NULL**：CommonDialog 只画进 buffer，提交仍由 `flip_to_display`
+  的 `sceDisplaySetFrameBuf` 完成；若注册 GXM display-queue 回调会双重提交。
+- **displaySyncObject NULL**：CommonDialog 渲染与提交之间暂无 GPU 同步，真机
+  可能偶发撕裂/闪烁（后续如需再引入 sync object）。
+- **GXM 初始化时机**：懒初始化（首次 `vita_common_dialog_update` 时），仅在
+  IME active 时才启动，menu 阶段零开销。
+- 链接：`SceGxm_stub` / `SceCommonDialog_stub` 此前已链接（2309/2314 行），本次
+  无需新增。
+
+### 验证（静态）
+- 符号就位：`sceGxmInitialize`/`sceCommonDialogUpdate`/`sceCommonDialogSetConfigParam`
+  /`sceImeDialogInit`/`vita_ime_is_active`/`vita_ime_show` 全部 T。
+- 反汇编确认 `flip_to_display` 在 0x8100957c `blx sceCommonDialogUpdate`。
+- 产物 `midp_vita_v02.53.vpk` 3735381 B / `.sym` 4334412 B（10:36）。
+
+### 待真机验证（log104）
+1. 进 TextField/TextBox 是否自动弹系统键盘（重点看 midp_stderr.log 的
+   `[IME] show: Init rc=0x...`——rc<0 说明 Init 失败，查错误码；`[IME] poll:
+   first status=1` 说明对话框已上屏，`status=0` 说明仍没渲染）。
+2. 输入文本后按 ENTER 是否回填（`[IME] committed N chars`）。
+3. GXM 初始化是否与 `sceDisplaySetFrameBuf` 冲突（若菜单/游戏画面异常，说明
+   GXM vsync 或 display-queue 与软件提交打架，需改 GXM 初始化参数）。
+4. 撕裂/闪烁：若出现，需加 GXM sync object 同步。
+
+---
+
+## v02.54：log102 分析（FileManager 循环）+ 哨兵实验 + fd 路径修正
+
+> v02.51~53 是别的会话的输入法/TextField 工作，与本节无关；本版把它们的未提交改动一并编入
+> （midp 侧未重编，`libobj.a` 与 v02.53 相同）。
+
+### 1. log102（v02.52，`pad_nodivert.cfg + wd_early_dump.cfg`）
+
+- 复现与 log101 同构：`th_start=4 th_finish=0 lw_exit=0`，`land=15,966,556`，`rep=22,086,438`，`trip_rep=0`。
+  循环线程 `cur=0x81d29860`（Java 线程 **id=4**，活动链表里 `st=0 wait=0x0 timed`，与 id=3 同在优先级 5 队列 `CYCLE(2)`），
+  `r6=0x81d2a8c8`。**land=5 birth，land=6 起死亡型进入，之后是不动点**——和 log85/log101 的 land 完全一致，
+  即总是第 5 个进入 pad 的线程。
+- **证伪两个假设**（v02.50 的新字段）：
+  - `pendexc[gp+1040] = 0`（全部记录）→ 不是 uncaught_exception 分支。
+  - 死亡型记录 `[cur.sp]=0x81d2786c`，`[cur.sp+4]=0x811201d8`，符号化为 `L318+0x8`（`Interpreter_arm.o` 里的局部标号，
+    即线程上次让出时的解释器返回点），**不是 pad 入口**。birth 记录里才是 `{fp=0, lr=pad}`。→ 不是
+    `call_on_primordial_stack` 尾部"返回"到哨兵。
+- **三份 dump（log99/101/102）VM 线程的 pc 都在 `vita_landing_pad` 内**：`+0x20` / `+0x140` / `+0x8`。从没落在
+  `start_lightweight_thread_asm` 或 `call_on_primordial_stack`。样本只有 3 个，只能算提示。
+- `Thread::finish` 的计数器 `vita_thread_finish_count++` 是函数体**第一条语句**（`Thread.cpp:464` 起、`:471`），
+  所以 `th_finish=0` 确实说明 finish 一次都没进。上一轮据此的推论成立。
+- **仍未解的矛盾**：`pe=0`、`[r6+16]=0`、`pendexc=0` 时 trampoline 的静态读法必然 `bl call_on_primordial_stack(Thread::finish)`，
+  但 `th_finish=0`、`cur.sp` 与 `r12` 都没有被它改写的迹象（`call_on_primordial_stack` 设 `ip=0x40c`；rec 里 `r12=0x81d29dd8`）。
+  注意：`cur.sp`/`r12` 这两条证据不如 `th_finish` 强（`finish` 若执行会改它们），**只有 th_finish=0 是硬证据**。
+- 我自己要纠正的一点：上一轮我在没核实 `th_finish` 计数点位置时就把它当证据，这轮核实后成立，但中间那一步是漏的。
+
+### 2. v02.54 哨兵实验（只在 nodivert 模式，正常路径零改动）
+
+nodivert 分支（`bne 12f`）先把 `r5=0xdead0505`、`r12=0xdead0c12` 写进去，再 `b 9b` 落到原来的 `movw/bx start_lightweight_thread_asm`。
+下一次进入 pad 时 rec 里的 `r5`/`r12` 回答"真实 trampoline 走到了哪一步"：
+
+| rec 里的值 | 含义 |
+|---|---|
+| `r12 = 0xdead0c12` | `call_on_primordial_stack` 的 `mov ip,#12; add ip,ip,#0x400` 没执行 |
+| `r12 = 0x40c` | 执行了，且返回后没人再改 ip |
+| `r12` 其它 | 执行过（finish 等把 ip 当 scratch 改了），或别处写了 r12 |
+| `r5 = 0x814018f4`（slid gp） | trampoline 第 1 条 `ldr r5,[pc,#120]` 执行了，字面量已重定位 |
+| `r5 = 0x813018f4`（unslid） | 执行了但**字面量没被重定位**（会读错 `_current_thread`） |
+| `r5 = 0xdead0505` | 第 1 条都没执行：控制流没进 trampoline |
+
+反汇编核对（pad 556 B，push/pop 各 4）：对 r4–r12 的写入**只有哨兵块**（`movw/movt r5`、`movw/movt ip`）；
+正常路径 `bcs → 810aa384: movw/movt r0; bx r0` 之间没有任何哨兵写入；`12:` 块 `b` 回 `810aa384`。
+r5 在 pad 入口本来"未定义"（trampoline 第一条就覆盖它），r12/ip 是 scratch，所以不改变任何输入。
+
+### 3. 预载 58 次写的 fd 是谁（log102 vm_boot）
+
+- log102：`[preload] io_write fd=1073807631 (?) n=58 us=1312475`——**63 次里 58 次落在同一个长寿命 fd**，约 22 ms/次。
+- `(?)`：fd→路径表 16 槽轮转，被启动期几十个短命 fd 挤掉了（SceUID 不复用，`vita_boot_log` 每行一次 open/close）。
+- v02.54：槽位在 `sceIoClose` 释放，空槽优先、32 槽；per-fd 增加 `bytes=`，输出 `io_write fd=0x%x (path) n= us= bytes=`。
+- **更正我上一轮的预期**：我说过"若是 stderr 就做行缓冲，预计再省 ~1.3 s"。这不一定成立：newlib 对无缓冲流的
+  `fprintf` 本来就是格式化到栈缓冲、一次 `write` 一整行，58 次大概率就是 58 个 fprintf。行缓冲不会减少调用数，
+  只有"合并多行"才会。要等 `bytes/n` 才能判断是延迟问题还是体积问题。
+
+### 4. 关键文件修改记录（v02.54）
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-cldc/src/vm/cpu/arm/InterpreterRuntime_arm.cpp` | nodivert 分支 `bne 12f` + `12:` 哨兵块（r5/r12） |
+| `vita-port/src/vita_trace.c/.h` | fd→路径槽 close 时释放（32 槽）；per-fd `bytes`；`vita_trace_fdw_get` 增 `bytes` 参数 |
+| `phoneme-cldc/src/vm/os/vita/OS_vita.cpp` | `[preload] io_write fd=0x.. (path) n= us= bytes=` |
+| `vita-port/CMakeLists.txt` | 版本 02.54 + 说明（set 放在 02.53 块之后） |
+
+构建：`J2ME Player v02.54 b329 (1e8533d)`，`midp_vita_v02.54.vpk` 3735559 B。
+
+### 5. 下一轮真机
+
+1. 常规启动一次：看 `vm_boot.log` 的 `[preload] io_write fd=0x.. (路径) n= us= bytes=`。
+2. FileManager 再复现一次（`pad_nodivert.cfg + wd_early_dump.cfg`）：看 `site_ring.log` 里 rec[5] 起的 `r5`/`r12`，按上表判读。
+   这是三分类实验，不管结果是哪一类都会改变下一步方向。
+3. 不复现时默认配置下 FileManager 不卡死（v02.44 的检测器 + shadow 兜底），`exit_probe.log` 的 `trip_rep>0` 就是兜住的次数。
+
+---
+
+## v02.55：修复系统 IME 的 GXM 鸡生蛋死锁（log104）
+
+### 现象（log104，真机）
+每次 show 都打 `[IME] show: Init rc=0x80020436`（`SCE_COMMON_DIALOG_ERROR_GXM_IS_UNINITIALIZED`），
+系统键盘始终不出，仍只有 phoneME 内置软键盘。
+
+### 根因：v02.53 的 GXM 初始化位置错了，形成死锁
+v02.53 把 `sceGxmInitialize` 放在 `vita_display.c` 的每帧 `vita_common_dialog_update()` 里，
+而该函数只在 `vita_ime_is_active()` 为真时执行；但 `g_ime_active` 只在 `sceImeDialogInit`
+成功后才置 1；而 Init 又要求 GXM 已初始化。三环相扣：**Init 永不成功 → GXM 永不初始化 → 死锁**。
+log104 的 `Init rc=0x80020436` 正是这一环的直接证据。
+
+### 改动（v02.55）
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_gxm.c`（新）+ `vita_gxm.h`（新） | 共享的幂等 `vita_gxm_ensure_init()`（vsync 回调 NULL，flags=0，displayQueueMaxPendingCount=2） |
+| `vita-port/src/vita_ime.c` | `vita_ime_show()` 在 `sceImeDialogInit` **之前**调用 `vita_gxm_ensure_init()`；失败则放弃 show 并打日志 |
+| `vita-port/src/vita_display.c` | 删掉本地重复的 GXM 初始化，`vita_common_dialog_update()` 改调共享 `vita_gxm_ensure_init()`（幂等，首次成功后 no-op） |
+| `vita-port/CMakeLists.txt` | 加 `src/vita_gxm.c` + 版本 02.55 |
+
+关键点：
+- **顺序是唯一修复点**：GXM 必须在 `sceImeDialogInit` 前就绪，其它（config param、update 每帧渲染）保持不变。
+- `vita_display.c` 仍保留 `vita_gxm_ensure_init()` 调用作为保险（此时已 no-op）。
+
+### 验证（静态）
+- 反汇编 `vita_ime_show`：`0x81013e1c bl vita_gxm_ensure_init` 在 `0x81013e7e blx sceImeDialogInit` **之前**，顺序正确。
+- 符号：`vita_gxm_ensure_init`(T) / `sceGxmInitialize`(T) / `sceImeDialogInit`(T) / `vita_ime_show`(T) 全就位。
+- 产物 `midp_vita_v02.55.vpk` 3735466 B / `.sym` 4334668 B（13:50）。
+
+### 待真机验证（log105）
+1. `midp_stderr.log` 应出现 `[GXM] initialized`，随后 `[IME] show: Init rc=0x00000000`。
+2. `[IME] poll: first status=1`（对话框已上屏）——若还是 0，说明渲染路径仍有问题。
+3. 输入后 `[IME] committed N chars` 回填成功。
+4. 遗留风险仍同 v02.53：① GXM 初始化与 `sceDisplaySetFrameBuf` 是否冲突（画面异常即此）；② `displaySyncObject=NULL` 无 GPU 同步，可能偶发撕裂。
+
+
+---
+
+## v02.56：log105 分析（v02.54 哨兵实验结果）+ 预载 58 次写的元凶
+
+### 1. 预载 58 次 sceIoWrite = `BEFORE/AFTER_NATIVES` 两行 fprintf（已修）
+
+- log105 `vm_boot.log`：`io_write fd=0x4001010f (ux0:/data/J2ME00001/midp_stderr.log) n=58 us=1260827 bytes=2204`。
+  2204/58 = 38 B/次，是**延迟问题不是体积问题**（每次约 21.7 ms）。
+- 源头 `ClassFileParser.cpp:2157/2159`：`BEFORE_NATIVES: heap_top=%p` / `AFTER_NATIVES_CALL: heap_top=%p`，
+  每个带 native 方法的类各一对；`midp_stderr.log` 里 `grep -c NATIVES` = 58，即 29 个类。
+  v01.92 删掉了同函数里的 PRE/POST_NATIVES，漏了这一对。
+- v02.56：两行都用 `#if !defined(VITA)` 包住；后面静默的 `AFTER_NATIVES CORRUPT` 扫描保留。
+  预期预载 5.78 s → ~4.5 s（省 1.26 s，约 22%）。验证：`vm_boot.log` 的 `[preload] io_write` 行应消失，
+  `[preload] done total_us` 下降。
+- 纠正我 v02.54 记录的预期：当时"行缓冲省 1.3 s"的**方向是错的、结论是对的**——不是合并，是直接不写。
+
+### 2. 哨兵实验结果（log105，`pad_nodivert.cfg` 确认生效：`crumb.log:28`）
+
+事实（循环圈 rec[5]、rec[6]… 全部相同）：
+- `r12 = 0xdead0c12`（哨兵原样）；`r5 = 0x814018f4`（已重定位 gp，不是 `0xdead0505`）。
+- `pendexc=0`、`cur.pe=0`、`cur.st=0`、`[cur.sp]=0x81d2786c`、`[cur.sp+4]=0x81119360`（=静态 `L318+0x8`，解释器返回点）。
+- coredump：VM 线程 **pc = 0x8111ab78**，静态 `0x810d3b78`（slide 0x47000）= **`invoke_pending_entries`+0x8**
+  （`ldr r1,[r0,#36]` 读 `cur.pe` 之前一条）。r12 仍是哨兵，lr = pad。
+  这是第 4 个 dump 样本，**前三个在 pad 内、这个在 `invoke_pending_entries` 内**——即循环圈确实经过 trampoline 的 `bleq invoke_pending_entries`。
+
+由此：
+- trampoline 第 1 条（`ldr r5,[pc,#120]`）执行了且字面量正确 → "字面量没重定位" 排除。
+- 循环圈经过 `invoke_pending_entries`（pc 在其中）。
+- r12 没变 → 圈内没走到 `call_on_primordial_stack` 的 `mov ip,#12`。
+
+**对照静态代码（已逐条核实，反汇编见 /tmp/tramp_diff.out）**：真实 trampoline 与 `vita_tramp_shadow`
+的 17 条+其后分支结构**语义一致**，`invoke_pending_entries` / `call_on_primordial_stack` 是同一份共用代码。
+所以"真实走不到、shadow 走得到"**不能用指令序列差异解释**。
+
+### 3. 矛盾未闭合（不要当成已解释）
+
+- 静态读：pe=0 → `invoke_pending_entries` 的 `moveq pc,lr` 返回 → trampoline 必 `bl call_on_primordial_stack`。观测 ip 未变。
+- 还没排除的：
+  1. `invoke_pending_entries` 里的 `ldr r0,[pc,#40]`（字面量 `0x81301d00`，**在 invoke_pending_entries 自己后面**，
+     不是 trampoline 的那个字面量）若在真实代码段里未被重定位，会读错 cell。r5 的字面量正确**不能**推出这个也正确
+     （shadow/pad 用 movw/movt，走另一类重定位）。**这是下一个最便宜的核实点**：pad 用 movw/movt 取 `0x81301d00`
+     并成功读到 `cur`（rec 里 `cur=0x81d29860` 合理），而 `invoke_pending_entries` 用 PC 相对字面量取同一地址。
+     若两者重定位不一致，真实路径读到的是错的 `_current_thread` → 错的 `cur.pe`。
+  2. 同理 trampoline 内 `0x813018f4`（已证对）、`0x814d6b78`（svc 前的 `_primordial` 标志）、`0x810abe18`（Thread::finish 之后的 fn ptr）。
+- 下一步：dump 里读 `invoke_pending_entries` 字面量对应的运行时内容（需要 `.text` 页——本 dump 没有；
+  改用 v02.5x 探针：在 `vita_tramp_shadow` 之外增加一份"真实路径 + 运行时自检"，
+  或在 pad 里 `ldr` 该字面量地址（`pc` 相对读取 `invoke_pending_entries+0x30`）写入 rec，直接看值是 `81301d00` 还是 `814xxxxx`）。
+  这是只读探针，不改行为。
+
+### 4. 关键文件修改记录（v02.56）
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-cldc/src/vm/share/runtime/ClassFileParser.cpp` | `BEFORE_NATIVES` / `AFTER_NATIVES_CALL` 两行 `#if !defined(VITA)` |
+| `vita-port/CMakeLists.txt` | 版本 02.56（02.55 是别的会话的 GXM/IME 修复，未动） |
+
+构建：`midp_vita_v02.56.vpk` 3735224 B；`strings` 中 `BEFORE_NATIVES` 0 处（v02.54 为 1 处）。
+
+
+---
+
+## v02.57：FileManager 循环——"条件 BL 运行时不链接"假说 + 读回探针
+
+### 1. 为什么回到 `bleq`（以及我之前撤回它的依据为什么不够）
+
+v02.31 CMakeLists 写过"bleq 微循环假说撤回（`0x0bffff42` 的 L=1，BL+EQ 正确链接）"。**那个依据只看了
+文件里的指令编码**，没有看加载器重定位之后内存里的字。本轮发现两个事实：
+
+1. **`.sce.rel` 里 5 个条件 BL 全部是 SCE code 29（= `R_ARM_JUMP24`）**，不是 code 28（`R_ARM_CALL`）。
+   这 5 个就是整个镜像里仅有的条件 BL：`blne shared_entry` ×3（`810d36fc/382c/3948`，v02.56 地址）、
+   trampoline 的 `bleq invoke_pending_entries`（`+0x18`）、`blne call_on_primordial_stack`（`+0x34`）。
+   全镜像 `R_ARM_JUMP24`=1025 条，其余 1020 条是无条件/条件 `b`（L 位本来就是 0），所以"加载器若丢 L 位"
+   只会影响这 5 处——**恰好解释为什么系统其它部分正常**。（脚本 `/tmp/scerel.py` 解码 `.sce.rel`。）
+2. **log105 coredump：VM 线程 `pc=invoke_pending_entries+0x8`，`lr=landing pad`**。镜像里
+   `invoke_pending_entries` 只有 6 个调用点：shadow 里 3 个（`nodivert` 下从不运行）+ 真 trampoline 里 3 个
+   （`bleq`@+0x18、`bl`@+0x2c、`bl`@+0x44，后两个无条件）。如果是被 `bleq` 正常链接进来的，`lr` 应是
+   `trampoline+0x1c`，不会是 pad。
+
+### 2. 假说能解释的全部观测
+
+"trampoline 的 `bleq` 在运行时不设置 lr"（即退化成 `beq`）：
+
+- `pe=0` → `invoke_pending_entries` 的 `moveq pc,lr`，lr 仍是 pad → **回到 pad** → 再进 trampoline → 无限（log101/102/105 的不动点）。
+- `r12` 保持哨兵（`bl call_on_primordial_stack` 从未执行）、`r5=gp`（trampoline 第 1 条执行了）、`th_finish=0`。
+- **birth 为什么表面正常**：birth 时 `pe≠0`，`invoke_pending_entries` 里 `stmdb{...,lr}` 存的是 pad，`shared_entry`
+  跑完 `run()` 后 `ldm` 恢复 lr=pad → `mov pc,lr` → **回到 pad**，这就是"land=6 的死亡型进入"，pe 此时为 0。
+  这解释了为什么循环总从某线程的第二次进入开始（birth land=5 → land=6 起不动点）。
+- **shadow 免疫**：shadow 用 `bne` 跳过 + 无条件 `bl`（`R_ARM_CALL`）。解释了 v02.44 检测器 `rep>=2 → shadow` 每次都能兜住
+  （`trip_land≈7`）以及 v02.42 之前"100 万圈后被救"。
+
+### 3. 我自己的反证（必须写明，假说尚未证实）
+
+- **Vita3K 的 `relocate_entry` 把 `Call` 与 `Jump24` 同样处理**：`write_call()` 只写 `imm24`，不碰高 8 位（cond+L）。
+  模拟器上 L 位不会丢。真机 `SceModulemgr` 的实现没有公开证据；我没有任何证据说它会丢。
+- 若全局丢 L，`blne shared_entry`×3 同样会坏（`shared_call_vm` 返回路径，`pending_entries!=0` 时）。这三处是否被走到我没核实，
+  可能很少走。
+- 另一种解释也能产生 `lr=pad`：别的路径用 `lr=pad` 跳进 `invoke_pending_entries`（但全镜像只有上述 6 个调用点）。
+
+结论：**假说只由 coredump 的 lr 一条数据支撑，需要读回运行时字才能定案。**
+
+### 4. v02.57 探针（只读，不改行为）
+
+`Os::initialize()` 的 `#if defined(VITA)` 块末尾（`OS_vita.cpp`），启动即写 `vm_boot.log`，**不需要复现卡死**：
+
+```
+[v257] tramp@0x... w0-3=... w4-7=...
+[v257] tramp w8-11=... w12-15=...
+[v257] ipe@0x...   w0-3=...
+[v257] bleq(w6)=XXXXXXXX L=n cond=c | blne(w13)=... | bl(w15)=...
+```
+
+静态文件值（v02.57 sym，已核对）：`w6=0bffff42`（cond=0 EQ, L=1）、`w13=1bffff48`（cond=1 NE, L=1）、`w15=ebffff46`（AL, L=1）。
+
+| 运行时读回 | 含义 |
+|---|---|
+| `bleq` 的 `L=0`（`0affff42`），`bl(w15)` 仍 `L=1` | **假说成立**：加载器对 code 29 丢了 L 位。修复方向见 §5 |
+| `bleq` 的 `L=1` 且 imm24 与文件一致 | 假说**否定**；lr=pad 另有来源，回到 pad 之外的路径找 |
+| imm24 与文件不同 | 加载器重写了偏移（非 L 问题），要看目标地址 |
+| `w15` 也异常 | 无条件 bl 也被改，说明是整段重定位问题而不是条件 BL |
+
+### 5. 若假说成立，修复方案（尚未实现，先别做）
+
+- **最小改动**：`vita_landing_pad` 的 `9:` 块永远 `b vita_tramp_shadow`，不再 `bx` 真 trampoline。shadow 已逐条等价且已在每次 `rep>=2` 路径上
+  兜住循环，其条件跳转用 `bne` + 无条件 `bl`。副作用：每次线程启动/退出多几条计数器指令；r2/r3 在 shadow 里当临时（真 trampoline 不用 r3，r2 是它自己
+  `mov r2,#0` 的，所以不应是输入）。
+- **根治但重**：改 `InterpreterStubs_arm.cpp:252`（`bl("invoke_pending_entries", eq)`）与 `SharedStubs_arm.cpp:558`（`bl("shared_entry", ne)`）为
+  "反条件分支 + 无条件 bl"，需要重新生成 `Interpreter_arm.s`。`rebuild_vm.sh` 明确说"regenerated .s 丢了 jvm_f2i/jvm_d2i"，所以不能直接重生成；
+  要么二进制补丁冻结的 `.o`，要么修好生成器。**同时要处理 `shared_entry` 的 3 处**，因为它们是同一类。
+- 验证标准：默认配置（无 `pad_nodivert.cfg`）下 `exit_probe.log` 的 `trip_rep` 应变为 0（不再需要检测器兜底）。
+
+### 6. 关键文件修改记录（v02.57）
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-cldc/src/vm/os/vita/OS_vita.cpp` | 文件作用域 `vita_v257_tramp/ipe`（`__asm__` 取符号）+ `Os::initialize` 里 4 行 `[v257]` 读回日志 |
+| `vita-port/CMakeLists.txt` | 版本 02.57 + 说明 |
+
+构建：`midp_vita_v02.57.vpk` 3734846 B；`strings` 含 4 条 `[v257]`；反汇编核对偏移 `+0x18=0bffff42 / +0x34=1bffff48 / +0x3c=ebffff46`。
+v02.56 的预载修复（去掉 `BEFORE/AFTER_NATIVES`）一并包含。
+
+### 7. 下一轮真机
+
+只需**正常启动任意应用一次**，把 `vm_boot.log` 发来，看 `[v257] bleq(w6)=` 那一行。不需要 `pad_nodivert.cfg` / `wd_early_dump.cfg`，也不需要复现卡死。
+
+
+---
+
+## v02.58：log107 定案——加载器丢了 `bleq` 的 L 位；landing pad 恒走 shadow
+
+### 1. log107（v02.57）读回结果——假说成立
+
+`vm_boot.log`：
+
+```
+[v257] tramp@0x810d4f30 w0-3=e59f5078 e595040c e5901068 e3a02000 w4-7=e3110101 15802024 0affff42 e5960010
+[v257] tramp w8-11=e5951410 e3500000 1a00000c e3510000 w12-15=15960004 1bffff48 e5960008 ebffff46
+[v257] bleq(w6)=0affff42 L=0 cond=0 | blne(w13)=1bffff48 L=1 cond=1 | bl(w15)=ebffff46 L=1 cond=e
+```
+
+- 文件镜像（`.velf`/`.sym`）：`+0x18 = 0bffff42`（`bleq`，L=1）；内存：**`0affff42`（`beq`，L=0）**。
+- 同函数里的 `blne`（`1bffff48`）与无条件 `bl`（`ebffff46`）与文件一致。imm24 三处都没变，只有这一个字的 bit24 被清。
+- slide：`tramp@0x810d4f30` 对 sym `0x810d3f30` = `+0x1000`。（v02.57 sym 地址；log105 的 slide 0x47000 是另一个构建。）
+
+**机制**：`bleq` 退化成 `beq` → 不设 lr → lr 仍是 landing pad → `invoke_pending_entries` 在 `pe==0` 时 `moveq pc,lr` 回到 **pad** →
+pad 再跳 trampoline → 又是 `beq ipe` → … 无限。`call_on_primordial_stack`（→ `Thread::finish`）从不被执行。
+这与 log101/102/105 的全部观测一一对应（`th_finish=0`、`r12` 哨兵不变、`r5=gp`、`lr=pad`、pc 在 pad 或 `ipe+0x8`、第 5 个线程 land=6 起不动点）。
+birth 路径（`pe≠0`）同样返回 pad，这就是"land=6 的死亡型进入"。
+
+**教训/更正**：v02.31 的"bleq 微循环假说撤回"依据是文件里 L=1，没有读回内存里加载后的字。那次撤回是错的。
+
+### 2. 为什么只有这一条被改（未完全解释）
+
+- `.sce.rel` 里 6 个相关条目（用 `/tmp/scerel2.py` 解码；注意程序头的 `p_filesz` 是 `rel[4]`，`rel[3]` 是 `p_paddr`，我第一次读错得到 0 条）：
+  `bleq ipe`@`0xd3f48` code **29**、`blne call_on_primordial_stack`@`0xd3f64` code **29**、`bl`@`0xd3f6c` code **28**，
+  `blne shared_entry`×3 全是 code 29。**`blne` 同样是 code 29，却完好**——所以"code 29 一律丢 L"不对。
+- 差异只剩 **cond=EQ(0)**：`0bffff42` 的 bits31..28 = 0b0000。猜测：真机加载器 `R_ARM_JUMP24` 处理按"cond==0 视作…"改写了 bit24，或
+  对该 cond 的 B/BL 做了归一。这是**猜测，没有证据**。若能拿到加载器的实现可定案；现在不需要，因为修复不依赖它。
+- 副作用面：如果规律是"cond=EQ 的 BL 都被改"，则整个镜像里 cond=EQ 的 BL 只有这一条（5 个条件 BL：EQ×1、NE×4）。
+  v02.58 新增 `[v258] shared_entry+0x358/0x488/0x5a4` 读回 3 个 `blne shared_entry`，看它们是否完好。
+
+### 3. 修复（v02.58）
+
+`InterpreterRuntime_arm.cpp` `vita_landing_pad`：非 nodivert 路径在 `bne 12f` 之后加一条无条件 `b 4f`（→ `b vita_tramp_shadow`）。
+- **shadow 的 ipe 调用是 `bne` 跳过 + 无条件 `bl`**（`R_ARM_CALL`），不受影响；它已逐条等价于真 trampoline，并且每次 `rep>=2` 都被用来兜住循环（所有 `trip_rep>0` 的正常退出日志）。
+- 真 trampoline 仅在 `pad_nodivert.cfg` 存在时可达（诊断用）。检测器/land 阈值变成死代码，保留是为了"删除这一条 `b` 即可恢复"。
+- 反汇编核对（v02.58 sym）：`bne 810aa530`（nodivert→哨兵→`810aa520 movw/movt/bx r0` 真 trampoline）；否则 `810aa504 b 810aa52c`，
+  `810aa52c: b 810aba74 <vita_tramp_shadow>`。
+- 栈平衡逐块核对（v02.58，pad 内共 4 对块）：record 块 `push{r2,r3}`@380 / `pop`@450；检测器块 @46c / @4e4；nodivert 块 `push{r2}`@4e8 / `pop`@4fc；
+  `7:` 分支 `push{r2,r3}`@544 / `pop`@570。新增的 `b`@504 在 nodivert 块的 `pop{r2}`@4fc **之后**，栈已平衡，不用 r0/r1，直达 shadow。
+  （我最初写的"push 5 / pop 4"解释是错的：那个计数把 `ldr/pop` 文本和范围外的 `push{lr}`@580 也算进去了，不代表不平衡。）
+
+**未验证**：真机行为。预期：
+- `exit_probe.log`：`v243 trip_rep=0`（之前正常退出日志里是 2），~~`th_finish == th_start`~~（**此预期是错的**，见 log108 节：退出时仍有存活线程，`th_start=4 th_finish=2` 在修复前后都一样），`shadow_in` = 线程总进入数（每个线程 2 次）。
+- FileManager 退出/MainMidlet 线程退出：不再出现 `trip_land≈7`。
+- 默认配置（无 cfg 文件）下，原先要靠检测器兜底的场景，现在第一圈就走对。
+
+### 4. log107 其它观察
+
+- 白屏（FileManager）：`round_begin→first_content_flip` = 4.79→11.84 s ≈ 7.05 s；v02.56 的去 `BEFORE/AFTER_NATIVES` 生效：
+  `[preload] io_write n=5 us=22131`（log105：n=58 us=1260827），preload 总 4.60 s（log105：5.78 s，−20%）。`first_flip` 到 `first_check_events` 仍 5.0 s 的 preload 窗口。
+- `exit_probe.log`：`land=10 shadow_in=2 th_start=4 th_finish=2 lw_exit=2 trip_rep=2 trip_land=7`——本轮是**正常退出**（`runMidlet_exit status=0`），
+  循环被检测器在 land=7 兜住，`th_finish=2` 来自 shadow。**这正是"每次都出现、每次被兜住"的又一例**。
+- `watchdog.log`：启动期 `[WD-STALL]` 两次 `io_write → midp_stderr.log inside=1`（#0、#2），即仍有 stderr 写阻塞；`io_getstat arg=81700cc0`、
+  `lwmutex_unlock since_ms=4838`（#3，`inside=0`，上一个 syscall 在 4.8 s 前）。preload 中的 stderr 写仍是 5 次（`n=5`），下一步可以继续查。
+
+### 5. 关键文件修改记录（v02.58）
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-cldc/src/vm/cpu/arm/InterpreterRuntime_arm.cpp` | `vita_landing_pad`：非 nodivert 路径 `b 4f`（恒走 shadow）+ 注释 |
+| `phoneme-cldc/src/vm/os/vita/OS_vita.cpp` | `vita_v258_se`（`shared_entry` 符号）+ 3 行 `[v258]` 读回 |
+| `vita-port/CMakeLists.txt` | 版本 02.58 + 说明 |
+
+构建：`midp_vita_v02.58.vpk` 3735232 B，编译/链接错误 0，版本串 `v02.58 b329`。
+
+### 6. 下一轮真机
+
+1. **正常启动 FileManager，进入后退出**（不放任何 cfg）。看 `exit_probe.log`：`trip_rep` 应为 0，`th_finish` 应等于 `th_start`。
+2. `vm_boot.log` 里 3 行 `[v258] shared_entry+...`：看 `blne` 的 L 位是否完好（预期 L=1）。
+3. 若 `trip_rep` 仍 >0 或再次冻结：说明 shadow 路径也有问题，回到 pad→shadow 的逐条对比，再对 `[v258]` 读回结果。
+
+
+---
+
+## log108（v02.58 真机）：FileManager 循环修复验证通过
+
+### 1. 判据与结果（FileManager 启动、停留约 52 s、正常退出，无 cfg 文件）
+
+| 项 | log107（v02.57，修复前） | log108（v02.58） |
+|---|---|---|
+| `exit_probe` land（pad 进入次数） | 10 | **5** |
+| `shadow_in` | 2 | 5（= land，全部走 shadow） |
+| `v243 trip_rep / trip_land` | 2 / 7（检测器兜底） | **0 / 0**（无需兜底） |
+| `th_start / th_finish / lw_exit` | 4 / 2 / 2 | 4 / 2 / 2 |
+| 退出 | status=0 | status=0（`midpRunVm returned 2001`，无 coredump） |
+
+- 修复前同样的退出路径要靠检测器在 land=7 兜住，pad 进入 10 次；现在 5 次，**第一圈就走对**。这正是 §v02.58 预期的 `trip_rep=0`。
+- shadow 阶段计数 `st=5/5/2/0/2/2/2/2/2/2`：5 次进入、5 次到 `bl ipe`、2 次回到 `8:`（死亡进入，`pe=0`）、0 次 pendexc、
+  2 次走完整 `finish → force_terminated → thread_task_cleanup`。5 = 2 个已结束线程（birth+death 各一次）+ 1 个到退出仍存活线程的 birth。
+- **更正我写在 v02.58 里的预期**：我写过"`th_finish == th_start`"，**这是错的**。`th_start=4 th_finish=2` 在修复前后相同，
+  另 2 个线程到进程退出时仍活着。判据应是 `land == shadow_in` 且 `trip_rep == 0`。（已在 PROJECT_MEMORY v02.58 节与 CMakeLists 注释里改。）
+- `[v258]` 读回：三处 `blne shared_entry` = `1bffff28 / 1bfffedc / 1bfffe95`，**L=1 完好**。`[v257]` 再次读到 `bleq=0affff42 L=0`（与 log107 完全相同，稳定复现）。
+  所以被加载器改写的**只有 cond=EQ 的那一条**，不是 code 29 的普遍问题；镜像里 cond=EQ 的 BL 仅此一条，没有其它受害站点。
+  为什么 EQ 特殊仍是未知（猜测不入库）。
+
+### 2. 这次的证据强度要如实说
+
+- 一次运行，退出路径本来就有检测器兜底，所以"没卡死"本身区分不了；**区分性证据是 `trip_rep=0` 和 land 减半**。
+- 没有覆盖：FileManager 之外的应用、多次退出、`pad_nodivert.cfg`（诊断路径，仍会循环，这是预期）。
+- 建议再积累几份常规日志，`trip_rep` 全为 0 即可认为稳固。
+
+### 3. 白屏时间线（round_begin → first_content_flip）
+
+| 版本 | 总白屏 | first_flip → first_check_events（preload 窗口） |
+|---|---|---|
+| log105 (v02.54) | 7.81 s | 6.17 s |
+| log107 (v02.57) | 7.05 s | 5.03 s |
+| log108 (v02.58) | **6.83 s** | 4.92 s |
+
+- 相对最初测量（FileManager 11.45 s）累计 −4.6 s（−40%）。
+- preload（4.47 s）里 `io_read n=2607 us=3,782,330`（1.45 ms/次）占 **85%**，是现在最大的一块；`io_write n=5 us=21047` 已不是问题。
+- 另外 JVM_Start 之前（`runMidlet_enter`→`JVM_Start`）有约 0.74 s，期间 `midp_stderr.log` 要写 ~38 行（共 42 行，1887 B），每行一次
+  `sceIoWrite`（~20 ms/次，与 log105 的 21.7 ms 一致），估计占 0.7–0.8 s 的大头。watchdog 启动期 4 个 `[WD-STALL]` 样本里 3 个
+  `lastop=io_write arg=midp_stderr.log inside=1`，时间戳（4.84–5.59 s）正好落在这个窗口，互相印证。**这是下一个便宜的目标**：
+  launcher 与 `runMidlet`/`getClassPathPlus` 的 stderr 诊断行（`*** runMidlet: argv[i]`、`[getClassPathPlus]` 等）可合并/静默。
+
+### 4. 下一步（按性价比）
+
+1. **启动期 stderr**：把 `runMidlet`、`midp_run_midlet_with_args_cp`、`getClassPathPlus` 的逐行 `fprintf(stderr)` 在 VITA 下合并成一次写（或 `setvbuf` 全缓冲 + 退出时 flush），
+   预期省 ~0.7 s。小改动，不碰 VM。
+2. **preload 的 io_read**（2607 次，3.78 s）：约 3 次读/类。需要先设计（缓存 central directory / 批量读），不要直接动 `JarFileParser`。
+3. 继续收集常规日志确认 `trip_rep==0`。
+
+---
+
+## v02.59：系统 IME 真正渲染（方案1 — 补齐 GXM renderTarget 资源）
+
+### 现象（log106，v02.57）
+```
+[GXM] initialized
+[IME] show: Init rc=0x00000000      ← v02.55 已解决 GXM 鸡生蛋，Init 成功
+[IME] poll: first status=1          ← 对话框逻辑上已上屏
+```
+但屏幕上看不到键盘，且画面冻结（只能强制退出）。watchdog：
+```
+[WD-STALL] #3 vm=RUNNING wait=none ... sw+0 site+0 jsmp+0 since_ms=6081
+lastop=lwmutex_unlock inside=0
+```
+`vm=RUNNING` 但 `sw+0 site+0 jsmp+0`（无线程切换、无 Java 执行）+ 6 秒无 syscall =
+**用户态停滞**；同时 input_debug 心跳仍在走（事件泵独立存活）。
+
+### 根因
+`sceImeDialog` 基于 CommonDialog，经 **GXM** 渲染。v02.53/55 只补了
+`sceGxmInitialize`（解决 0x80020436），但 CommonDialog 渲染还缺两样：
+1. **`sceGxmMapMemory` 没调**：framebuffer 是 CDRAM 块（`vita_fbmem_alloc` 只
+   做了 `sceKernelAllocMemBlock`+`GetMemBlockBase`，没映射给 GPU）。GXM 访问不
+   到 → 渲染不可见。
+2. **`displaySyncObject = NULL`**：CommonDialog 渲染完无处 signal，渲染与软件
+   `sceDisplaySetFrameBuf` 提交之间无同步 → 竞态/停滞。
+
+对照官方 sample `samples/ime/src/main.c`：`dram_alloc` 后立刻 `sceGxmMapMemory`，
+每帧 `sceCommonDialogUpdate` 传有效 `SceGxmSyncObject`。
+
+### 改动（v02.59，最小补丁）
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_display.c` | 加 `vita_cd_ensure_resources()`：`vita_gxm_ensure_init` 后 `sceGxmMapMemory` 双缓冲 CDRAM 块（READ\|WRITE，round 到 256KB）一次 + `sceGxmSyncObjectCreate` 一次；`vita_common_dialog_update()` 每帧传 `vita_cd_sync` |
+| `vita-port/CMakeLists.txt` | 版本 02.59 |
+
+关键点：
+- **stride 保持 960**（`VITA_PHYS_W`）：`sceDisplaySetFrameBuf` 的 pitch 就是
+  960，两者一致显示才正确；960 = 8×120 满足 8 对齐。sample 用 1024 是因为它
+  的 display pitch 就是 1024。
+- 诊断日志到 stderr：`[CD] map fb base=.. bytes=.. rc=..` / `[CD] sync create rc=..`。
+- 未做 GPU 完成等待（撕裂风险仍在）：`sceDisplaySetFrameBuf` 用 NEXTFRAME +
+  `sceDisplayWaitVblankStart` 给了 GPU 一帧窗口，先解决"可见 + 不卡死"，撕裂
+  若仍出现再加 sync 等待。
+
+### 验证（静态）
+- 编译通过，符号全 T：`sceGxmMapMemory` / `sceGxmSyncObjectCreate` /
+  `sceCommonDialogUpdate`。
+- 反汇编确认 `flip_to_display` 里 `blx sceGxmMapMemory`（r1=0x400000=4MB）、
+  `blx sceGxmSyncObjectCreate`。
+- 产物 `midp_vita_v02.59.vpk` 3735313 B / `.sym` 4335452 B（01:45）。
+
+### 待真机验证（log109）
+1. `midp_stderr.log` 应出现 `[CD] map fb base=0x.. bytes=4194304 rc=0x00000000`
+   和 `[CD] sync create rc=0x00000000`；rc<0 说明 map/sync 失败。
+2. 进 TextField/TextBox 应看到系统键盘，且画面不冻结。
+3. 输入后按 ENTER 应回填（`[IME] committed N chars`）。
+4. 若仍不显示：检查 `rc` 错误码；若撕裂/闪烁：在提交前加 `SceGxmSyncObject` 等待。
+5. 若 map/sync 成功但仍卡死：说明不是资源问题，考虑方案2（改用 `sceImeOpen/SetText` 底层接口自绘软键盘，彻底绕开 GXM）。
+
+
+---
+
+## 条件 BL 加载器测试（cond_bl_test，独立 VPK）+ 生成器修复可行性（未采用）
+
+### 决定
+
+- **保持 v02.58 的 pad 修复**（`InterpreterRuntime_arm.cpp:364` 的 `b 4f`），不改 `InterpreterStubs_arm.cpp`，不改 `rebuild_vm.sh`。
+- 生成器路线只做了可行性验证（全部在 `/tmp/lg` 隔离副本，工作区未动，`git status` 确认）：
+  - 用 `g++-13 -B/usr/bin -m32` 能编出宿主 `loopgen`；未改生成器时生成物与冻结的 `target/release/Interpreter_arm.s`
+    **逐字节一致**（441533 B，md5 `cbeb0157…`），含 `jvm_f2i/jvm_d2i`。
+  - 把 `bl("invoke_pending_entries", eq)` 改成 `bne skip; bl; skip:` 后，归一化标签号再对比，15735 行里只有这 1 处不同；
+    汇编后 `R_ARM_JUMP24` → `R_ARM_CALL`，`.o` 97528→97552 B（+1 条指令）。
+  - `rebuild_vm.sh` / `VM_BUILD.md` 说的"重生成的 .s 丢浮点桩"，对完整生成不成立；丢桩的很可能是 `loopgen/app/` 下 17758 B 的
+    `-generate +GenerateGPTableOnly` 产物（无 `jvm_f2i`、无 `invoke_pending_entries`）。这是推断，未找到当年的操作记录。
+  - 未采用的原因/代价：`-DVITA` 不传给宿主 `loopgen`，无法用 `#if defined(VITA)` 隔离；蹦床后偏移 +4，`[v257]` 探针的固定偏移要同步；
+    `rebuild_vm.sh` 要改成用新生成的 `.o`。pad 修复已足够，生成器修复留作备选。
+- 复制构建目录到别处会踩坑：`loopgen/app/Makefile`、`target/*/Makefile`、`generated/Dependencies` 里写死了原绝对路径，
+  不删掉重新生成的话会悄悄编译原目录的源码（我第一次就这样"验证"了一个没生效的补丁，已发现并重做）。
+
+### 新增文件（`tools/vita_cond_bl_test/`，独立 VPK，title id `CONDBL001`）
+
+| 文件 | 内容 |
+|---|---|
+| `cond_bl.S` | 15 种条件码（eq ne cs cc mi pl vs vc hi ls ge lt gt le + al 对照）× 3 变体（A 同文件向后 / F 同文件向前 / E 另一个目标文件）= 45 个 `bl<cond>` 站点；每个站点置位对应 NZCV 使条件为真并**真正执行**，`lr` 预置为失败标签，callee 记录收到的 `lr` |
+| `ext_callee.S` | 变体 E 的外部 callee |
+| `main.c` | 读回**已加载镜像**中每个站点的指令字（cond / L / 目标是否仍等于 callee）+ 执行结果，屏幕和 `ux0:data/cond_bl_test.log` 同时输出，附固件版本 |
+| `CMakeLists.txt`、`README.md` | 构建与读法 |
+
+- 构建：`cmake -S tools/vita_cond_bl_test -B /tmp/condbl_build && cmake --build /tmp/condbl_build`，无 error/warning。
+  产物复制为 `vita-port/out/vpk/cond_bl_test_v01.00.vpk`（54887 B，gitignored）。
+- `cond=0xF`（NV）不测：该编码是 `BLX <imm>`，不是条件 BL。
+- 设计要点：目标都是**全局符号**，链接器才会产生重定位（局部标签会被汇编器直接解析，什么都测不到）。
+  42 个条件站点是 `R_ARM_JUMP24`，3 个无条件是 `R_ARM_CALL`，与真实镜像同构。变体 A 的 callee 与站点相隔 ≥0x2f0 字节，量级同真实的 0x2e8。
+
+### 机下验证（没有真机）
+
+- 静态：45 个站点在 ld / `.velf` / `.self`（zlib 解压后）三阶段的指令字**完全一致**，且高字节都等于 `(cond<<4)|0xB`。
+- 逻辑：用 Unicorn（venv 在 `/tmp/uc`，不影响系统 Python）直接执行链接后的 `run_cond_bl_tests`：
+  基线 45/45 PASS；只清 `site_A_eq` 的 L 位 → 恰好 A_eq 失败；清 `F_ne`+`E_gt` → 恰好这两个失败；清全部 42 个 → 3/45 通过（只剩无条件的）。
+  全程不挂死。这验证的是测试本身能检出"L 位被清"，**不是**加载器行为。
+- **没有在真机或 Vita3K 上运行**，加载器的结论只能来自真机。
+
+### 读结果
+
+| 屏幕/日志 | 含义 |
+|---|---|
+| 45 个全正常 | 加载器不动这些；真实 bug 另有触发条件（镜像大小、位置、距离…） |
+| 仅 `eq` 异常 | EQ 特殊，真实 bug 复现 |
+| 多个条件异常 | 规则比 EQ 宽，列表给出具体是哪些 |
+| A / F / E 表现不同 | 与目标位置有关 |
+
+汇总行把失败拆成：L 位被清 / cond 或 opcode 不对 / 目标不对 / 调用没链接；最后一行按条件码汇总每个条件在 3 个变体里的失败数。
+把 `ux0:data/cond_bl_test.log` 和固件版本发回即可。
+
+---
+
+## v02.60：软件 MIDI（SMF）播放 — 方案 C（TinySoundFont + TimGM6mb）
+
+### 背景（log97 音频开启无声音的根因）
+封神榜 BGM 是 `.mid` 文件，但移植的 javacall 层只声明了 tone + WAV 两种 caps，
+`Manager.createPlayer("audio/midi")` 在 Java 层就抛
+`MediaException: Player cannot be created for audio/midi`（`vm_output.log` 反复
+4 次），根本没走到 native 的 `javacall_media_create`。phoneME 开源版**不含 MIDI
+合成器**（SUN 的 MIDI 渲染器有版权，开源时被移除），`jsr135` 里只有 `DirectMIDI`
+的 Java 壳，出声依赖 javacall 层。
+
+### 方案 C：移植现成库（用户指定，尽量兼容通用格式）
+| 组件 | 来源 | 许可证 | 体积 |
+|---|---|---|---|
+| TinySoundFont v0.9 | `src/tsf.h`（单头文件） | MIT | 92 KB 源 |
+| TinyMidiLoader v0.7 | `src/tml.h`（单头文件） | ZLIB | 20 KB 源 |
+| TimGM6mb.sf2 | `assets/TimGM6mb.sf2` | GPL-2（与 phoneME GPL-2 兼容） | 5.7 MB |
+
+TML 支持 SMF Format 0/1/2（.mid/.midi），兼容卡拉 OK `.kar`、RMID `.rmi` 等
+同构变体；TML 解析时已把 tempo meta-event 换算进每条消息的绝对毫秒时间戳，
+所以渲染循环只需处理 PROGRAM_CHANGE/NOTE_ON/NOTE_OFF/PITCH_BEND/CONTROL_CHANGE
+（官方 example3.c 同款），无需手写 SMF 解析。
+
+### 改动
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_midi.c/.h`（新） | TSF+TML 实现（TSF_IMPLEMENTATION/TML_IMPLEMENTATION + *_NO_STDIO）；`vita_midi_init()` 从 ux0:→app0: 读 TimGM6mb.sf2；`vita_midi_play()` 阻塞渲染整个 MIDI 到 48kHz stereo（输出/停止回调） |
+| `vita-port/src/vita_audio_javacall.c` | caps 加 `audio/midi`；`realize` 用 `mime_equals` 识别 audio/midi/x-midi/mid/sp-midi；`do_buffering` 累积 SMF 字节（同 WAV）；`start` 加 g_midi_req/seq；`tone_player_thread` 加 MIDI 渲染分支 + midi_out_cb/midi_stop_cb 回调；`get_format` 返回 MIDI；close/finalize/get_java_buffer_size 同步 |
+| `vita-port/assets/TimGM6mb.sf2`（新） | GM 音色库 |
+| `vita-port/assets/TimGM6mb.COPYING.txt`（新） | GPL-2 许可证存档 |
+| `vita-port/src/tsf.h`、`src/tml.h`（新） | 第三方单头文件库 |
+| `vita-port/CMakeLists.txt` | 加 src/vita_midi.c + soundfont 打进 VPK（data/J2ME00001/TimGM6mb.sf2）+ 版本 02.60 |
+
+### 关键机制
+- **路由**：`HighLevelPlayer.getPlayerFromType()` 是 `else if` 链——只要
+  `nIsToneControlSupported`（=`get_player_controls` 含 TONE）为真，MIDI 文件也走
+  `DirectTone`。但 `DirectTone` 继承 `DirectPlayer` 的 doRealize/doBuffering/start，
+  底层都走同一套 javacall 调用，而 `realize` 用 MIME 识别（`pl->midi=1`）确保
+  `do_buffering`/`start` 走 MIDI 分支——所以**不需要**改 `get_player_controls`
+  （保持 TONE|VOLUME，最小 diff）。局限：`getControl("MIDIControl")` 仍会失败
+  （DirectTone 无 MIDIControl），封神榜只用 `start()` 不受影响；需要 MIDIControl
+  的游戏后续再处理。
+- **soundfont 只读**：打包在 VPK 的 `data/J2ME00001/TimGM6mb.sf2`，`vita_midi_init`
+  从 `app0:` 直读（永不 copy 到 ux0:）；ux0: 优先是给未来覆盖调试留的口。
+- **内存**：`tsf_load_memory` 后 soundfont 常驻系统堆 ~10 MB（不占 CLDC Java 堆，
+  Vita 有充足 RAM）；`vita_midi_shutdown()` 在 `javacall_media_finalize` 释放。
+- **渲染**：48kHz stereo interleaved S16，512 帧/chunk（与 SceAudioOut port 的
+  OUT_CHUNK_FRAMES 一致）；尾部 `tsf_channel_note_off_all` + 1.5 s 释放衰减，避免
+  尾音截断。
+
+### 验证
+- **宿主机 smoke test**（`/tmp/tsf/smtest.c`，x86_64 编译）：TimGM6mb.sf2 解析出
+  **136 presets**；venture.mid 解析出 5 ch / 6 prog / 2098 notes / 48000 ms；
+  渲染 4502 chunk、active voices=28、末 chunk 非零 PCM——库与 soundfont 完全兼容。
+- **Vita 交叉编译通过**：`arm-vita-eabi-gcc` 无 error 无 warning。
+- 符号全 T：`vita_midi_play`/`vita_midi_init`/`tsf_render_short`/`tsf_load_memory`
+  /`tml_load_memory`/`tsf_channel_note_on`。
+- 产物 `midp_vita_v02.60.vpk` 9321630 B（原 3.7 MB + 5.7 MB soundfont），VPK 内
+  含 `data/J2ME00001/TimGM6mb.sf2`。
+
+### 待真机验证（log109 或后续）
+1. 封神榜（或任何 MIDI BGM 游戏）开启音频后应出声；`midp_stderr.log` 应出现
+   `[MIDI] soundfont loaded: ... 136 presets` + `[MIDI] play: N ch ... N ms`。
+2. 若 `[MIDI] soundfont not found`：VPK 打包路径问题（app0: 挂载）。
+3. 若 `[MIDI] parse FAILED`：游戏 MIDI 是 TML 不支持的变体（发样本回来）。
+4. 音量/时长语义：`cur_time_ms`/`duration_ms` 现在按 MIDI 总时长（含 release），
+  与 Java 侧 `getDuration`/`getMediaTime` 的单位换算需实测。
+
+
+---
+
+## log109：cond_bl_test 真机结果——加载器只清 `bleq` 的 L 位
+
+`debug/log/log109/cond_bl_test.log`（固件 3.99，45 站点）：
+
+| 条件 | A 向后 | F 向前 | E 外部文件 |
+|---|---|---|---|
+| **eq** | **`0affff38` L=0 FAIL** | **`0a000201` L=0 FAIL** | **`0a00015e` L=0 FAIL** |
+| ne cs cc mi pl vs vc hi ls ge lt gt le | L=1 PASS | L=1 PASS | L=1 PASS |
+| al（无条件，`R_ARM_CALL`） | L=1 PASS | L=1 PASS | L=1 PASS |
+
+- 汇总：L 位被清 3 / cond 或 opcode 不对 0 / 目标不对 0 / 调用没链接 3。**只有 EQ，三个变体全中，其余 12 个条件码和无条件 bl 全部完好。**
+- 被改的字只丢 bit24：`0bffff38`→`0affff38`；cond 仍是 0，目标地址仍正确（`tgt ok`）；失败站点的 callee 收到的 `lr` 是预置的失败标签
+  （obs 比 exp 大 8，即 `adr lr` 指向的 `9:` 标签），与真实 bug 的"lr 不被设置"一致。
+- **与方向、距离、callee 在哪个文件无关**（A/F/E 一致）；只和条件码 EQ 有关。前两轮的猜测（"cond=EQ 特殊"）成立。
+- 重定位类型对 NE 等同为 `R_ARM_JUMP24` 却完好，说明不是"类型 29 丢 L"，而是加载器对 cond=EQ(0b0000) 的单独处理。
+  **机制仍未知**（猜测不入库）；对"为什么"的追问需要 Sony 加载器实现，不影响结论。
+
+### 对项目的含义
+
+1. 真实 bug 的根因再次坐实：`bleq` 的 L 位在加载时被清，不是我们的代码、不是 SDK 工具链、也不是 phoneME 上游问题。
+2. **整个 v02.60 镜像里 ARM 态的条件 BL 只有 5 条：`bleq`×1、`blne`×4**（objdump 扫描），唯一的 `bleq` 就是蹦床里
+   `810d9810 bleq invoke_pending_entries`，已被 pad 绕开。**没有其它受害站点**。
+3. 以后新增汇编/生成代码时的规则：**不要生成 `bl` + EQ**。要用就写成 `bne skip; bl target; skip:`。
+   可在构建后加一条检查：`objdump -d | grep -E '\sbleq\s'`，但被 pad 绕开的那条（冻结的 `Interpreter_arm.o`）会命中，
+   检查要按"只允许这一处"写，或等生成器路线采用后再加。
+4. 影响面外推（未验证）：Thumb 的条件 BL 编码不同（不存在条件 BL，条件分支用 `b<cond>`），所以不在本次测试范围。
+
+### 状态
+
+- v02.58 的 pad 修复保持不变；生成器修复（`InterpreterStubs_arm.cpp`）仍是备选，不采用。
+- `cond_bl_test` 已完成使命，工具与 VPK 保留在 `tools/vita_cond_bl_test/` 以备复测（例如换固件）。
+
+---
+
+## v02.61/02.62：log109 三个问题（声音/频繁弹输入法/卡死）
+
+### 1. 声音没有（v02.61 修复）
+封神榜 BGM 是 `.mid`。v02.60 加了 `audio/midi` cap + TinySoundFont 合成器，但
+`get_player_controls()` 对所有 player 都返回 `TONE|VOLUME`。`HighLevelPlayer.
+getPlayerFromType()` 是 else-if（nIsToneControlSupported → nIsMIDIControlSupported
+→ DirectPlayer），MIDI player 被路由到 **DirectTone**，其 JTS `checkSequence()`
+校验 `seq[0]==ToneControl.VERSION`，对 MIDI 字节（首字节 0x4D）必然失败：
+`Tone sequence check failed at offset 0: missing version information`
+（log109 vm_output，DirectTone bci=153）。修复：`get_player_controls` 按 `pl->midi`
+分流，MIDI player 返回 `MIDI|VOLUME` → 落 `DirectMIDI`（继承 DirectPlayer 的
+javacall doBuffering/start，即我们的 MIDI 分支）。
+
+### 2. 游戏中频繁弹输入法（v02.62 修复）
+v02.52 把 `show/hideNativeKeyboard` 放在**共享的** `TextFieldLFImpl.enableInput()/
+disableLayers()`。但 Form 的 TextField 在 `lCallTraverseOut` 时 `firstTimeInTraverse
+=true`，下次 `lCallTraverse` 又走 enableInput——导航每跨越一次就弹/收一轮键盘
+（封神榜登录界面方向键导航反复横跳）。修复：auto-pop 移到
+`TextBoxLFImpl.uCallShowNotify()/uCallHideNotify()`（仅全屏编辑器）；TextField 不再
+调 native 键盘，仍靠 SELECT 手动触发。**MIDP Java 改动必须 romize**（classes.zip →
+ROMImage_*.cpp → ROMImage.o → libobj.a；make 自动级联，5.7 s）。
+
+### 3. 卡住不动（未修复，需真机迭代）
+log109 UC web 阶段证据：`[IME] show Init rc=0` + `poll first status=1`（逻辑上弹了）
++ `[CD] map fb rc=0 / sync create rc=0`，但键盘不可见，且 watchdog 显示
+`vm=RUNNING/WAITING ... lastop=io_write inside=1 since_ms=6034`（6 秒卡顿）。
+根因仍是 **CommonDialog(GXM) 渲染与软件 `sceDisplaySetFrameBuf` 提交不兼容**：
+`vita_common_dialog_update()` 每帧调 `sceCommonDialogUpdate()`，但缺了 GXM 完整
+渲染管线——sample 是 `sceGxmInitialize(displayQueueCallback=vsync_cb)` +
+`sceGxmPadHeartbeat` + `sceGxmDisplayQueueAddEntry`，我们只做了 map+sync（NULL
+vsync callback），GXM 渲染命令无法正确提交/同步，导致 VM 线程在渲染路径卡顿。
+问题 2 修复后（TextField 不再频繁弹）可显著减少触发，但 TextBox 弹出时仍会卡。
+待定方向：A) 补 GXM 同步（PadHeartbeat + sync 等待）；B) 改用 `sceImeOpen/SetText`
+底层接口自绘软键盘，彻底绕开 CommonDialog/GXM。
+
+### 构建注意（本会话踩坑）
+- midp 重编用 `sed` 替换 `build_vita.sh` 的 `/home/zyb` 路径（规则见 v02.48 节）；
+  另需**重建 `phoneme-midp/build/vita_arm/vita_overlay.mk`**（gitignore 的构建胶水，
+  git show 2eb1a4b 可恢复），否则 make 报 `No such file or directory`。
+- `vita_stubs.o` No rule 是 `libmidp.so` 检查链接的已知无害项（同 v02.48）。
+- 验证 Java 改动进产物：`javap -c` 需先 `jar xf classes.zip`（本机无 unzip），
+  确认 TextFieldLFImpl 0 处、TextBoxLFImpl 各 1 处 native 调用。
+
+## v02.63：方案A — GXM display queue 补全（问题3 修复）
+
+问题3（卡死）根因确认：`sceGxmInitialize` 时传 `displayQueueCallback=NULL`，
+GXM 渲染命令没有 vsync 驱动的提交路径。方案A 补全三件套：
+
+- `vita_gxm.c` 的 `vita_gxm_ensure_init()` 增加 `gxm_display_cb`（vsync 回调），
+  双缓冲 sync objects（`sceGxmSyncObjectCreate`）。
+- 新增 `vita_gxm_dialog_frame(uint32_t *fb)`：每帧 `sceCommonDialogUpdate` +
+  `sceGxmPadHeartbeat` + `sceGxmDisplayQueueAddEntry`。
+- `vita_display.c` 的 `flip_to_display()`：IME active 时分流到
+  `vita_gxm_dialog_frame(vita_fb)`，不再走软件 `sceDisplaySetFrameBuf`。
+- `vita_cd_ensure_resources()` 只保留 `sceGxmMapMemory`。
+
+产物 `midp_vita_v02.63.vpk`（9321627 B，15:13）。符号确认：
+`vita_gxm_dialog_frame` / `sceGxmPadHeartbeat` / `sceGxmDisplayQueueAddEntry` 全 T。
+
+## 构建环境重构：去掉 /home/zyb 硬编码，环境变量化
+
+用户要求编译环境不能写死 `/home/zyb`，改为环境变量/配置控制。核心：
+
+- **新增 `build_env.sh`**（仓库根）：统一解析并 `export` 三个变量
+  `J2ME_ROOT`（仓库根，默认由脚本位置推导）、`JDK_DIR`（JDK8，探测
+  `/usr/lib/jvm/java-8-openjdk-amd64`）、`VITASDK`（探测 `/usr/local/vitasdk` /
+  `~/.local/vitasdk`）。失败时 `return 1`（source 场景）或 `exit 1`。
+- **13 个构建脚本/配置文件 source build_env.sh**，路径全部从 `$J2ME_ROOT` /
+  `$VITASDK` 推导：
+  - 顶层脚本：`rebuild_vm.sh`、`phoneme-midp/build_vita.sh`、
+    `vita-port/build.sh`、`vita-port/build_jar.sh`、
+    `vita-port/build_nokia_stubs.sh`、`tools/build_extra_o.sh`、
+    `tools/build_merged_o.sh`、`tools/symcheck.sh`。
+  - 平台配置：`phoneme-cldc/build/vita_arm/vita_arm.cfg`（GNU_TOOLS_DIR →
+    `$(VITASDK)` + 默认 `/usr/local/vitasdk`）、
+    `phoneme-cldc/build/vita_arm/vita_arm.mk`（VITASDK_INCLUDES/LIBS）、
+    `phoneme-cldc/build/linux_arm/linux_arm.cfg`（同 vita_arm.cfg）、
+    `phoneme-midp/build/vita_arm/Makefile`（INCLUDES 用 `$(J2ME_ROOT)`）、
+    `phoneme-midp/build/vita_arm/preprocess_jpp.py`（src/out_dir 用 `J2ME_ROOT`
+    环境变量）。
+- **清除 skip-worktree**：`rebuild_vm.sh` 和 `vita_arm.cfg` 之前被
+  `git update-index --skip-worktree` 标记（隐藏本机硬编码改动），现已清除，
+  改动可正常 `git diff` / 提交。
+
+**遗留**：
+- ~~`vita_arm.cfg` 的 `LINK_FLAGS` 仍写死 GCC 版本目录 `15.2.0`~~
+  **已修复（v02.74 整理提交）**：改为
+  `VITA_GCC_VER := $(shell ls -1 $(GNU_TOOLS_DIR)/lib/gcc/arm-vita-eabi | sort -V | tail -1)`，
+  crtbegin/crtend/crti/crtn 用 `$(GNU_TOOLS_DIR)/lib/gcc/arm-vita-eabi/$(VITA_GCC_VER)/`，
+  10.3.0 / 15.2.0 均可用，不再需要"本机改动勿提交"的提醒。
+- 文档（BUILD.md / PORTING.md / PROJECT_MEMORY.md 历史记录）与 patches/*.patch、
+  debug/tools/*.py 里的 `/home/zyb` 是历史记录，未清理（不改历史）。
+
+
+---
+
+## log110（v02.63 真机）分析：MIDI 无声+卡顿 = 缓冲别名覆盖；UC 输入法不显示；游戏弹输入法无证据
+
+> 本节只有分析，**未改任何代码**。`vita_audio_javacall.c`、`vita_ime.c`、`vita_gxm.c`、`vita_display.c` 等当前都有别的会话的未提交改动，
+> 改之前要先和那边对齐。log110 含两次运行：封神榜（`main.MainMidlet`）约 133 s，之后 UC（`WebClient`）。
+
+### 1. 封神榜：无声 + 很卡（根因已定位，高置信）
+
+**现象（midp_stderr / audio_debug）**
+- `[MIDI] soundfont loaded: 5969788 bytes, 136 presets` 正常；之后 **198 次** `[MIDI] parse FAILED (29139 bytes)`，字节数每次相同。
+- audio_debug 共 3237 行：`start`/`set_volume`/`END_OF_MEDIA (midi done)` 各 308 次，`set_time` 303，`get_time` 1231，`get_duration` 607。
+  即游戏每次收到 END_OF_MEDIA 就 `set_time(0)` + `start` 重播（循环 BGM），解析又失败，如此 308 轮。
+- 5 个播放器共 45 次 `do_buffering` = 5 × 9：每个播放器 8 个数据块 + 1 个结束标记。29139 = 7 × 4096 + 467 → 恰好 8 块。
+
+**根因**：`do_buffering` 的 MIDI 分支把块追加到 `pl->jts_data + pl->midi_len`，而 KNI 传进来的 `buffer` **就是 `pl->jts_data` 的起点**：
+- `KNIMediaDownload.c:116-124`：先 `javacall_media_get_buffer_address`（我们返回 `pl->jts_data`），再 `KNI_GetRawArrayRegion(..., nBuffer)` 把**当前窗口**
+  拷到这个缓冲的**起点**，然后才调 `do_buffering(buffer=nBuffer)`。`vita_wav.c:23-25` 的注释也写明"KNI copies the CURRENT window to the START of the native buffer"。
+- 所以第 2 块起，新块先**覆盖**了已累积的前面数据（含文件头 `MThd`），再被复制到末尾。最终缓冲的开头 = 最后一块。长度计数照样累加到 29139，
+  所以日志里字节数正确、内容却已损坏；`tml_load_memory` 在 `MThd` 校验处返回 NULL（`tml.h:394-395`，其 `TML_ERROR` 默认是空宏，所以没有任何原因输出）。
+- **本机复现**（`/tmp/alias_sim.c`，系统 gcc-13；vitasdk 的 gcc 是 ARM 交叉编译器，本机跑不了）：29139 字节、4096 分块，
+  现状写法 → 8 块、长度 29139、**不以 MThd 开头**，开头 467 字节恰等于最后一块；"KNI 暂存 + 独立累加缓冲"写法 → 与原文件完全一致。
+
+**为什么很卡（机制确定，耗时是估算）**
+- 解析失败 → `vita_midi_play` 返回 -1 → 播放线程仍发 END_OF_MEDIA（`vita_audio_javacall.c:799`，只看 `stop_flag`/`g_midi_seq`）→ 游戏立刻重播 → 无限重试。
+- 每轮约 10 次同步 `sceIoWrite`（`alog` 每行一次写，`vita_audio_javacall.c:52-77`）+ 1 次 stderr 写。VM 线程自己的 audio_debug 写 2757 次
+  （get_time 1231 + get_duration 607 + start/set_volume/set_time 919）。
+- 本设备单次写实测 12–22 ms（log110 预载 `io_write n=5 us=60294` ≈ 12 ms；log105 为 21.7 ms）。按此估算 VM 线程被日志阻塞约 33–60 s / 133 s。
+  **游戏阶段的单次写延迟没测过，这是估算。** 308 轮 / 133 s ≈ 0.43 s/轮，与"每轮 ~10 次写 × 数十 ms"同量级，循环本身可能就是被日志 I/O 限速的。
+
+**修复方案（未实施）**
+1. `vita_player` 加独立累加缓冲（如 `midi_acc` + 容量），`get_buffer_address` 继续返回固定的 `jts_data` 作 KNI 暂存；MIDI 分支追加到 `midi_acc`；
+   `vita_midi_play(pl->midi_acc, ...)`；`close/destroy` 释放。
+2. 同样的写法也在 **WAV 分支**（`memcpy(pl->jts_data + pl->wav_buf_len, buffer, take)`，`buffer == jts_data`）。< 4096 字节的单块 WAV 不受影响，
+   更长的会被破坏。**归档的 12 份真机日志里没有任何一份出现过 `wav buffered` / `wav parse FAILED`**，所以没有真机证据说明长 WAV 曾经能用；
+   这是同一缺陷，是否一并修由你定。
+3. `wav_ensure_cap` 里的 `javacall_realloc` 可能移动 `jts_data`，而 `buffer` 还指向旧块（已释放）→ 读已释放内存。独立暂存缓冲后此问题随之消失。
+4. 热路径日志：`get_time`/`get_duration`/`set_volume` 每次一行同步写，建议去掉或按次数限流。
+5. 失败保护：解析失败后记 `pl->midi_bad`，后续 `start` 不再重复解析/打印；`tml.h` 的 `TML_ERROR` 在 `vita_midi.c` 里接到 stderr，失败原因才可见。
+6. 修好后 `[MIDI] play: N ch ... N ms` 应出现，且 END_OF_MEDIA 只在曲终发一次。声音能否真的出来还没验证（解析之后的渲染、`sceAudioOut` 写入都没跑过）。
+
+### 2. UC：输入法"弹不出来 + 卡死"
+
+**事实**
+- 顺序：`[GXM] initialized (display queue)` → `[IME] show: Init rc=0x00000000` → `[IME] poll: first status=1`（RUNNING）→ `[CD] map fb base=0x61400000 bytes=4194304 rc=0x0`。
+  之后**没有** `dismissed / committed / abort`。GXM/映射都成功，没有失败日志。
+- **VM 没有冻结**：UC 启动之后 watchdog 再无 `[WD-STALL]`；心跳 CE 一路增长到 12289（约 94 次/秒，与平常一致）。这与 log106（VM 冻结）不同。
+  所以用户看到的"卡死"是**键盘不可见 + 画面不更新/输入无响应**，不是 VM 挂起。最后的操作是触摸一次、再按 PS 键（`buttons=0x10000`），之后 10 s 心跳仍在走。
+
+**候选原因（读代码得出，日志无法证实）**：`sceCommonDialogUpdate` 只在 `flip_to_display()` 里被调用（`vita_display.c`，`vita_ime_is_active()` 分支 →
+`vita_gxm_dialog_frame`），而 `flip_to_display` 只在 Java 请求重绘或切前台时才跑（`vita_display.c:321/356/383`）。CommonDialog 需要**每帧**更新；
+UC 弹出键盘后若画面静止、不再重绘，就不会再有 Update/Submit，对话框一直是 RUNNING 却永远画不出来——和上面的事实吻合。
+**这是假设。** 日志里没有 `sceCommonDialogUpdate` / `sceGxmPadHeartbeat` / `sceGxmDisplayQueueAddEntry` 的调用次数和返回值，这是最大的可观测性缺口。
+
+**最小验证**：在 `vita_gxm_dialog_frame` 里记录调用次数和三个返回值（前几次 + 每 N 次）；并在 IME 激活期间让事件泵（`vita_checkevents`，约 94 Hz）
+重复提交当前画面，观察键盘是否出现。
+
+### 3. 游戏里"频繁弹出输入法"：这份日志里没有证据
+
+- 整份 log110 只有 **1 次** `[IME] show`，在 UC；封神榜会话没有任何 `[IME]` 行。`vita_ime_show()` 在已激活时静默返回，但激活本身要先走过一次带日志的 Init。
+  所以"游戏里频繁弹出"没有在这次运行里发生，或走了不打印的路径。
+- 代码里有两个触发源（见 v02.51 / v02.52 记录）：① `TextField`/`TextBox` 获焦自动弹（`TextFieldLFImpl.enableInput()`）；② **SELECT 键**
+  直接 `vita_ime_show()`（`vita_input.c:167-171`，v02.51 起不再发 '#'）。很多 J2ME 游戏把 '#' / SELECT 当功能键，按一次就会弹键盘——
+  这是个合理的猜测，**没有日志证实**。
+- 要定案需要：游戏里复现一次，带着当次 `midp_stderr.log`（看 `[IME] show` 出现的次数/时机）和 `input_debug.log`（看是否有 SELECT `0x1`）。
+
+### 4. 其它观察
+
+- `exit_probe`：`land=14 shadow_in=14 th_start=13 th_finish=9 trip_rep=0`——封神榜退出正常，v02.58 的 pad 修复在这个应用上也成立（`trip_rep=0`）。
+- 白屏：封神榜 `round_begin→first_content_flip` ≈ 10.5 s（预载 7.0–7.5 s，`io_read n=4168 us≈6.1–6.7 s`）；UC 10.7 s（`jar[0]` 4.46 s + `jar[1]` 1.07 s）。
+  `io_read` 仍是预载的主要成本（85–90%），这是下一步优化目标。
+
+
+---
+
+## v02.64：log110 的修复（MIDI 缓冲别名 / SELECT / IME 刷新）
+
+> 上一节（log110 分析）的结论落地。这些文件之前就有别的会话的未提交改动，本次只在其上做最小补丁，**未提交**。
+> 用户确认：游戏里弹输入法是因为按了 SELECT。
+
+### 改动
+
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_audio_javacall.c` | `vita_player` 加 `midi_acc / midi_cap / midi_bad`；新增 `midi_acc_ensure()`（64 KB 起、倍增、上限 4 MB）；`do_buffering` 的 MIDI 分支改为追加到 `midi_acc`（不再写 `jts_data`）；`realize` 置 `midi_len=0, midi_bad=0`；`close` 释放 `midi_acc`；播放线程用 `midi_acc`，失败后置 `midi_bad` 并**限速约 1 s（可被 stop/新请求打断）再发 END_OF_MEDIA**；`get_time / get_duration / set_volume` 的日志改为每 64 次一条（`ALOG_HOT`） |
+| `vita-port/src/vita_midi.c` | `TML_ERROR/TML_WARN` 接到 stderr；解析失败日志追加文件前 8 字节 |
+| `vita-port/src/vita_ime.c/.h` | 新增 `vita_ime_set_text_wanted()/vita_ime_text_wanted()`；状态日志改为"每次变化一条"（`[IME] status -> N`） |
+| `phoneme-midp/.../lfj_native_input_mode.c` | `showNativeKeyboard` 先 `set_text_wanted(1)` 再 `vita_ime_show()`；`hideNativeKeyboard` 先 `set_text_wanted(0)` 再 `vita_ime_abort()` |
+| `vita-port/src/vita_input.c` | SELECT 只在 `vita_ime_text_wanted()` 为真时开键盘，否则落到 `key_map` 的 `#`；事件泵里调 `vita_display_ime_tick()` |
+| `vita-port/src/vita_display.c` | 记录上次提交时间；新增 `vita_display_ime_tick()`：IME 激活且距上次提交 ≥16 ms 时重新 `flip_to_display()` |
+| `vita-port/src/vita_gxm.c` | `vita_gxm_dialog_frame` 记录 `sceCommonDialogUpdate / PadHeartbeat / DisplayQueueAddEntry` 的返回值（每个会话前 4 帧 + 每 300 帧） |
+| `vita-port/src/vita_main.c` | 每轮 `runMidlet` 返回后 `set_text_wanted(0)` + `vita_ime_abort()`，避免标志/键盘残留到下一个应用 |
+| `vita-port/CMakeLists.txt` | 版本 02.64 + 说明 |
+
+### 验证状态
+
+- 构建：`midp_vita_v02.64.vpk` 9323547 B（含 6 MB 音色库，条目数与 02.63 同为 192），编译/链接错误 0，`vita-port` 自己的文件无新警告。
+  midp 侧重编了 `lfj_native_input_mode.o` → `libobj.a`（旧 `.o` 早于源文件）。`/tmp/build_vita_ws.sh` 末尾报
+  `No rule to make target .../vita_stubs.o`，是 midp 目标 `vita_stubs` 与本次改动无关的既有现象。
+- 反汇编核对：`vita_ime_set_text_wanted` 的调用点为 `showNativeKeyboard`(r0=1)、`hideNativeKeyboard`(r0=0) 和 `vita_main`(0)；
+  `vita_ime_text_wanted` 在 `vita_input` 里被调用；`vita_display_ime_tick` 在事件泵里被调用。
+- MIDI 别名：本机模拟（`/tmp/alias_sim.c`）旧写法 8 块后不以 MThd 开头，新写法与原文件逐字节一致。
+- **未在真机验证**：① MIDI 解析之后是否真的出声（渲染、`sceAudioOut` 都没跑过）；② 16 ms 重复提交能否让键盘出现——这是对 log110 的**假设**的修复，
+  验证标准见下。
+
+### 下一轮真机怎么看
+
+1. **封神榜**：`midp_stderr.log` 应出现 `[MIDI] play: N ch ... N ms`，不再有 `parse FAILED`；`audio_debug.log` 的 `start` 次数应从 308 降到个位数，
+   `END_OF_MEDIA` 只在曲终出现。若仍 `parse FAILED`，现在日志会带 `head=` 前 8 字节和 `[MIDI] tml error: ...` 原因。
+2. **游戏里按 SELECT**：不应再弹键盘；`#` 键事件恢复（如游戏用 `#` 做功能键应生效）。
+3. **UC 输入框**：`[IME] show` → `[IME] status -> 1` → 若修复有效应出现键盘；`[GXM] dialog frame #1..#4 update=… pad=… queue=…` 给出三个返回码。
+   键盘仍不出现时，这三个返回码就是下一步的线索（`update` 非 0 = CommonDialog 拒绝；`queue` 非 0 = 显示队列提交失败）。
+4. **WAV 同样的别名写法未改**（`wav_buf_len`/`jts_data`），长于 4096 字节的 WAV 会同样被破坏；没有真机日志证明长 WAV 曾经可用。需要时再按 MIDI 的做法拆出累加缓冲。
+
+
+---
+
+## v02.65：log111 的修复（键盘卡死/重叠、MIDI 渲染开销）
+
+> 在 v02.64 之上继续，同样未提交。`midp_vita_v02.65.vpk` 9325341 B，`vita-port/build.sh` 退出码 0，本次改的 5 个文件无警告。**以下根因都是从日志和 SDK 示例推出来的，未上机验证。**
+
+### log111 实测事实
+
+- v02.64 的 MIDI 修复生效：`[MIDI] play: 11 ch, 9 prog, 3638 notes, 109227 ms`，三个播放器各 `start` 一次，无重启风暴，音频能出声。
+- 事件泵速率游戏阶段：log110（无音频）中位数 835 ms/64 CE，log111（有音频）774。**没有变慢**，所以“掉帧”不能由这个指标证实；渲染耗时当时没有任何记录。
+- UC 阶段：CE 9473 启动后到 CE 10369 之间 **没有任何按键/触摸**，键盘就出现了（输入框默认获焦、`showNativeKeyboard` 自动触发）。
+  stderr 只有 `[IME] status -> 1`、`dialog frame #1..#4`（返回码全 0）、然后 `[IME] abort`，**始终没有 `status -> 2`**。之后 71 s 内只有一次触摸（CE 10369）和一次 PS 键。
+
+### 根因（推断）
+
+1. `hideNativeKeyboard`（UC 输入框失焦）→ `vita_ime_abort()` 对 **RUNNING** 的对话框直接 `sceImeDialogTerm()` 并清 `g_ime_active`。
+   SDK 示例 `samples/ime` 只在 `FINISHED` 后 Term。对话框因此留在系统里，但没人再调 `sceCommonDialogUpdate` → 键盘冻在屏幕上、吞输入。
+2. 整屏键盘画进 render target，而 `flip_to_display` 的 blit 只写缩放后的 MIDlet 矩形，**两侧黑边从不重写** → 键盘在黑边里的像素永久残留 = “和 UC 重叠”。
+3. 键盘激活期间触摸/按键仍被转发给 MIDlet（穿透到 UC）。
+
+### 改动
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/vita_ime.c` | `abort` 只发 `sceImeDialogAbort()` 并置 `g_ime_aborting`；`poll` 在 `FINISHED` 后才 `Term`，abort 路径不产生文本事件；3 s 兜底强制 Term；关闭期间的 `show()` 事后补发；日志带 Abort/Term 返回码和“距 show 多少 ms” |
+| `src/vita_input.c` | IME 激活时手柄只跟踪 `prev_buttons`、触摸不转发（先补一个 RELEASED）；对话框期间 app 仍读到触摸则记 `[IME] touch visible to the app ...`（每次最多 3 条） |
+| `src/vita_display.c` | 新增 `clear_letterbox()`：对话框每帧前清黑边；对话框结束后再清 2 帧（两块 CDRAM），`vita_display_ime_tick` 这 2 帧也运行 |
+| `src/vita_midi.c` | `tsf_set_max_voices(32)`；每首曲开始/结束 `tsf_reset`；每块渲染耗时统计，曲终/停止时打印一行 `[MIDI] ended|stopped: N chunks, render avg/max us (budget 10666 us, K over), voices avg/max (cap 32)` |
+| `src/vita_audio_javacall.c` | `midi_out_cb`：`mute` 时不再满速空转（原先跳过了唯一的节拍 `sceAudioOutOutput`），改为睡一块时长；`cur_time_ms` 播放中随帧数推进（原先整首为 0） |
+| `CMakeLists.txt` | 版本 02.65 及说明 |
+
+渲染统计在播放期间**不写 stderr**（一次写 12–22 ms，大于 10.7 ms 的块预算，会自己造成欠载）。
+
+### 下一轮真机怎么看
+
+1. **UC**：`midp_stderr.log` 期望 `[IME] abort requested after N ms: Abort rc=0x...` 之后出现 `[IME] status -> 2` 和 `[IME] finished: ... Term rc=0x00000000 [after abort]`。
+   - 若 `Abort rc` 非 0，或 3 s 后出现 `abort not finished ... forced Term`，说明“Update 持续驱动 + Abort”的假设不成立，要看 `status` 序列。
+   - 若出现 `[IME] touch visible to the app while the dialog is up`，说明对话框不独占触摸，需要自己把键盘区域的点击分流。
+   - 黑边：关闭键盘后两侧不应再有键盘残影。
+2. **游戏**：`[MIDI] ended: ... render avg X us max Y us (budget 10666 us, K over), voices avg V max M`。
+   - `avg` 接近预算或 `over` 很多 → 合成器单核吃不消，是掉帧的直接证据，下一步降复音上限或降采样率。
+   - `avg` 很小但仍掉帧 → 不是渲染，要查线程调度（tone 线程与 VM 同优先级 0x10000100、亲和性全核）或 `sceAudioOutOutput` 的阻塞。
+3. 复音上限 32 是经验值，没有实测依据；`voices max` 若远小于 32，说明上限没起作用，不是掉帧原因。
+
+
+---
+
+## v02.66：两个音频缺陷（代码审查发现，非日志发现）
+
+> 在 v02.64/v02.65 之上继续，未提交。`midp_vita_v02.66.vpk` 9325733 B，`make` 退出码 0，
+> `vita_audio_javacall.c` / `vita_midi.c` 无新警告。log111 是 v02.64 产物，对这两个缺陷**没有任何证据**；
+> 根因来自读代码 + KNI 约定（与 v02.64 的 MIDI 同一类）。
+
+### 1. `start` → `pause`/`stop` 竞态（BGM 停不下来）
+
+log111 的 `audio_debug.log` 三个 player 全是 `start` 紧跟 `pause`，但原实现里：
+
+- `javacall_media_start()` 只递增 `g_midi_seq` / `g_wav_seq`，**`pl->playing = 1` 是播放线程自己设的**；
+- `javacall_media_pause()` / `javacall_media_stop()` 写成 `if (pl->playing) pl->stop_flag = 1;`
+  → pause 若在该线程被调度前到达（`playing == 0`），`stop_flag` 根本没置位；
+- 更糟的是播放线程进入分支时会 `pl->stop_flag = 0;`，即使无条件置 1 也会被它清掉。
+
+结论：Java 认为已暂停，MIDI 却继续播完整首（log111 那首 109227 ms）。
+
+修复：
+- `javacall_media_start()` 在 `pl->state = 3;` 之前清 `pl->stop_flag = 0`（VM 线程、请求入队前）；
+- 三个播放线程分支（JTS / WAV / MIDI）删掉进入时的 `pl->stop_flag = 0;`；
+- `pause()` / `stop()` 改为无条件 `pl->stop_flag = 1`。
+
+自然结束/被抢占后末尾的 `pl->stop_flag = 0` 复位保留（此时已不在播放，无副作用）。
+
+### 2. WAV 累加缓冲（与 v02.64 的 MIDI 同一别名缺陷 + use-after-free）
+
+WAV 走的是和 MIDI 完全一样的 KNI 约定：`get_buffer_address()` 交出 `pl->jts_data`，
+KNI 把每个 Java 窗口拷到**该缓冲起点**，再以 `buffer == jts_data` 调 `do_buffering`。而 WAV 分支是：
+
+```c
+memcpy(pl->jts_data + pl->wav_buf_len, buffer, take);   /* buffer == jts_data */
+```
+
+→ 从第 2 个 4 KB 窗口起，新块先**覆盖**已累积的数据（RIFF 头也没了）。
+并且 `wav_ensure_cap()` 里 `javacall_realloc(pl->jts_data, ...)` 可能**移动** `jts_data`，
+`buffer` 仍指向已释放的旧块 → **use-after-free**。
+
+修复（与 MIDI 的 `midi_acc` 完全对称）：
+- `vita_player` 新增 `wav_acc` / `wav_acap`，删除不再需要的 `wav_cap`（`jts_data` 固定 32 KB 作 KNI 暂存）；
+- `wav_ensure_cap` → `wav_acc_ensure`（`WAV_INIT_CAP` 64 KB 起、倍增、`WAV_MAX_BUFFER` 32 MB 上限）；
+- `do_buffering` 的 WAV 分支追加到 `wav_acc`；结束标记处的 `vita_wav_parse_header` 读 `wav_acc`；
+- `wav_sample_at()` 的 PCM 基址改 `wav_acc + data_off`；
+- `close()` 释放 `wav_acc`；解析失败时释放它（不再替换 `jts_data`）；
+- `realize()` 的 WAV 分支额外清 `wav_buf_len / data_off / data_len`（与 MIDI 的 `midi_len` 复位对齐），
+  否则重新下载会追加到旧数据、或残留 `data_off` 导致跳过结束时的头解析。
+
+### 3. CMakeLists 版本号
+
+`set(VITA_VERSION "02.64")` 之前被 02.65 覆盖掉了（源码无法重建 log111 的 02.64）。已补回该 set 行，
+02.64 的详细说明仍在原处；当前生效版本为 02.66。
+
+### 验证状态
+
+- 编译：`midp_vita_v02.66.vpk` 9325733 B，`APP_VER "02.66"`，错误 0，`vita_audio_javacall.c` 无警告。
+- **未在真机验证**。两个判据：
+  1. 暂停/停止 BGM 后必须真的静音（原缺陷下会继续播到曲终）；
+  2. >4 KB 的 WAV 应能正常播放（原缺陷下从第 2 窗口起数据被覆盖，且可能踩已释放内存）。
+- 当前无 >4 KB WAV 的用例可直接回归；`wav buffered:` 日志行从未在任何已归档日志里出现过。
+
+---
+
+## v02.67：log112 的分析（键盘只显示一次）
+
+> `midp_vita_v02.67.vpk` 9326903 B，`vita-port/build.sh` 退出码 0，`vita_ime.c`/`vita_display.c` 无警告。日志是 v02.66 的。**根因未知，本版是实验。**
+
+### log112 实测事实
+
+- **音频已解决**：`[MIDI] ended/stopped: render avg 2.9–4.3 ms，预算 10.7 ms，0 over；voices avg 26–30、max 32`。渲染占预算约 40%，复音触顶 32（上限确实在起作用）。用户反馈不卡顿、感知不到掉帧。
+- **v02.65 的关闭流程被验证**：`Abort rc=0` → `status -> 2 (+3900 ms)` → `Term rc=0x0 [after abort]`。
+- UC 在 show 后 **3146 ms 自己撤掉**键盘；这段时间没有用户输入（UC 启动约 CE 24427，第一次触摸在 CE 30593，约 65 s 后）。
+- 之后 **13 次 `sceImeDialogInit` 全部 `0x8002047f`**（`SCE_COMMON_DIALOG_ERROR_UNEXPECTED_FATAL`），一次都没成功。→ 用户看到“显示一次后不再显示”。
+- 12 份归档日志里 `[IME] committed` / `dismissed` 全是 0：**系统键盘的“输入文字并回填”从未在真机上完整跑通过**。
+
+### “触屏机怎么弹输入法”能不能参考
+
+- 仓库里没有叫“触屏机”的东西；真实触屏手机/模拟器上的行为我**无法**从这里验证，不能凭印象写。
+- 能读到的 phoneME 触屏路径：`TextFieldLFImpl.uCallPointerReleased` 只移动光标，**不弹键盘**；触屏键盘是 Java 自绘的 `VirtualKeyboardLayer`（vkjava，点键→注入 key 事件）；vkplatform 则把键盘绑在 **InputMode 会话**（`beginInput` → `showNativeKeyboard`，`endInput` → `hideNativeKeyboard`）。当前构建用 vkdefault（`isSupportJavaKeyboard()==false`），我们手工把 show/hide 绑在 **`TextBoxLFImpl.uCallShowNotify/HideNotify`**。
+- 可借鉴的是**生命周期绑定到用户意图**，而不是 UC 的 show/hide 通知：UC 在无用户输入时就把 TextBox 显示又撤掉。但“第二次起 Init 全失败”与触发方式无关，先解决它。
+
+### 本版改动（vita_ime.c / vita_ime.h / vita_display.c）
+
+两个猜测同时放进去，靠日志区分：
+
+1. **Term 之后继续跑几帧 `sceCommonDialogUpdate`**（SDK 示例每帧都调，Term 之后也调；我们 Term 后立刻停了）：`IME_POST_FRAMES=6` 帧走对话框路径。
+2. **Init 失败不丢请求**：每 100 ms 重试，最多 30 次（3 s），`hide` 取消。
+
+日志：`[IME] show: Init rc=.. (status before=N, M ms since last Term, attempt K, t=.. ms)`；`[IME] Init succeeded on retry K` / `giving up`；`[IME] text_wanted -> 0|1 (t=.. ms)`（Java 侧 show/hide 节奏，之前看不到）。
+
+### 下一轮怎么读
+
+- 第 1 次 attempt 就成功 → 是“Term 后没 Update”。
+- 第 K 次重试成功 → 是时序，约 K×100 ms。
+- 30 次仍失败 → 两个猜测都不对，下一条线索是 Init 前的状态（`status before`）和参数（`initialText` 我们是 NULL，SDK 示例设了）。
+- 键盘出现后再确认能否输入、按确认是否出现 `[IME] committed N chars`——这条链路从没跑通过。
+
+
+---
+
+## v02.68：log113 的分析（文字没回填 + 键盘仍只显示一次）
+
+> `midp_vita_v02.68.vpk` 9327268 B，`build.sh` 退出码 0，`vita_ime.c`/`vita_gxm.c` 无警告。日志是 v02.67 的。**两个问题都没有确定根因，本版是“修已知缺陷 + 加观测”。**
+
+### log113 实测事实
+
+- 第一次对话框存续 **18.4 s**，窗口内没有任何输入转发给应用，也没有 `touch visible` 行 → 对话框确实独占了触摸/按键，用户的输入由它处理。
+- 结束：`status -> 2`，`finished: button=0`，`dismissed (button=0)`，**文字被丢弃**。没有我们的 Abort（`g_ime_aborting=0`），UC 在对话框结束 4.2 s 后才 hide。
+- SDK 枚举：`NONE=0 / CLOSE=1 / ENTER=2`。**显式取消是 CLOSE，不是 NONE**，所以 `button=0` 不能解释成“用户取消”。
+- 之后所有 Init 都是 `0x8002047f`，`status before=0`，距上次 Term 16 s～84 s 都失败 → **“收尾时序”猜测被否定**。重试窗口因此 30 次 → 3 次。
+- “Term 后继续跑 Update”的猜测**没被验证也没被否定**：没有计数器能证明那几帧跑了。
+- 帧率偏低：`frame #300` 打印了、`#600` 没有，18 s 内 300–599 帧，< 32 fps。
+
+### 代码里确认的缺陷（与 Init 失败无关）
+
+`vita_ime_poll`：`SceImeDialogResult result;` 未清零，`sceImeDialogGetResult` 的返回值没看，只在 `button == ENTER` 时提交。GetResult 失败或系统报 NONE 都会表现为“输入被丢弃”。
+
+### 本版改动
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/vita_ime.c` | 结果结构 `memset`；检查 GetResult 返回值；`finished:` 行输出 `result / button / 缓冲区字符数 / 首字符 / 时长 / 帧数 / fps`；提交条件改为 **ENTER，或 NONE 且缓冲区非空**（CLOSE 与 NONE+空仍丢弃）；Init 行增加 `free user/cdram/phycont` 和 “Term 之后跑了多少个对话框帧”；重试 30 → 3 |
+| `src/vita_gxm.c/.h` | `vita_gxm_frame_count()`：累计对话框帧数 |
+
+“NONE 且有文字就提交”是**行为假设**：依据是用户确实输入了、而缓冲区是否有字还没看到。若下一份日志 `text=0 chars`，说明文字根本没进缓冲区，这条改动就没用，问题在别处。
+
+### 下一轮怎么读
+
+1. `[IME] finished: GetResult rc=.. result=.. button=.. text=N chars first=U+....`
+   - `GetResult rc` 非 0 → 之前就是读取失败，button 是垃圾值。
+   - `text=0` 且你确实输入了 → 缓冲区没拿到文字（`inputTextBuffer`/`initialText` 的用法要对照 SDK 示例）。
+   - `text>0` 且出现 `button=NONE but N chars typed - committing` → 回填链路通了，再看 UC 里是否显示。
+2. 第二次 `Init` 行：`status before`、`free user/cdram/phycont`、`dialog frames since Term`。
+   - frames since Term ≥ 6 → post-Term Update 确实跑了，该猜测可以否定。
+   - 内存很低 → UNEXPECTED_FATAL 可能是分配失败。
+3. fps 明显低于 60 → 键盘手感差的原因，另行处理（每帧整屏 RGB565→ABGR 转换 + 清黑边）。
+
+
+---
+
+## v02.69：log113 之后的实施（sysmodule/AppUtil、每缓冲 surface、队列深度、fps）
+
+> `midp_vita_v02.69.vpk` 9327224 B，`cmake`/`make` 退出码 0，`vita_ime.c` / `vita_gxm.c` /
+> `vita_display.c` 无新警告，`APP_VER "02.69"`。**未上机验证。**
+
+log113 是 v02.67 的产物。它把两条猜测否掉了（`status before=0`；Term 之后 16/17/18/84 s
+仍然 `0x8002047f`，跨 MIDlet 也失败），剩下与官方 `samples/ime` 的差异只有 4 条，本版按风险
+从低到高全部落地。
+
+### 改动
+
+| 文件 | 改动 | 对应的 sample 差异 |
+| --- | --- | --- |
+| `vita_ime.c` | 一次性配置里加 `sceSysmoduleLoadModule(SCE_SYSMODULE_IME)` + `sceAppUtilInit()`（在 `sceCommonDialogSetConfigParam` 之前），两条 rc 都打日志 | ①IME 系统模块从未加载（`ime_dialog.h` usage 行要求）；②从未 `sceAppUtilInit` |
+| `vita_gxm.c` | `displayQueueMaxPendingCount` 2 → 1；`g_surf` 改为 `g_surf[2]` + `g_surf_fb[2]`，每个 CDRAM 缓冲一个 surface、只 init 一次；`PadHeartbeat` 用该缓冲自己的 surface | ③sample 是 `dbuf[].surf` 各一份；④`DISPLAY_MAX_PENDING_SWAPS = 1` |
+| `vita_display.c` | IME 分支在 `vita_gxm_dialog_frame` 之后 `sceDisplayWaitVblankStart()`（原来注释明确说"不要等"）；`clear_letterbox()` 改 `memset` 分段清，不再逐像素 | ④sample 每帧 swap 后都等 vblank；log113 实测 16–32 fps |
+| `CMakeLists.txt` | 链接 `SceAppUtil_stub`；版本 02.69 + 说明 | — |
+
+### 为什么这四条值得试
+
+- **sysmodule 那条与观测形状最吻合**：第一次 Init 成功说明模块当时在位；若系统是"按需自动
+  加载、Term 时释放"，第二次起就会永久 `UNEXPECTED_FATAL`。而 `status before=0` 说明不是
+  "旧对话框没关"，跨度 84 s 也排除时序。
+- **surface 每帧重写**在 GPU 可能仍在读旧描述时改写了它；sample 的写法是把 surface 与缓冲
+  固定绑定、只 init 一次。
+- **pending=1 + 等 vblank**：既解释 `AddEntry` 可能阻塞 VM 线程，也把对话帧率从 16–32 fps
+  拉回 60 fps 上限。
+
+### 下一轮真机怎么读
+
+1. 新增 `[IME] sysmodule IME load rc=0x........, apputil init rc=0x........`
+   - 非 0 → 模块加载/AppUtil 初始化本身失败，直接看错误码（`0x8002xxxx`）。
+   - 全 0 且第二次 `Init rc=0x00000000` → 就是这两条之一，问题关闭。
+2. 第二个 `[IME] show:` 行仍 `0x8002047f` → 四条都不是原因，下一步只剩"全程走 GXM 队列"
+   （把软件 `sceDisplaySetFrameBuf` 也换成 display queue），属于改动主渲染路径的版本。
+3. `[IME] finished: ... text=N chars first=U+....`
+   - `text>0` 且随后 UC 输入框出现文字 → 回填链路通了。
+   - `text=0` 而确实输入了 → 文字没进 `inputTextBuffer`，要对照 sample 试 `initialText`
+     与 `sceImeDialogParamInit` 的字段（`option` / `type` 目前是 `SCE_IME_TYPE_DEFAULT`，
+     sample 用 `SCE_IME_DIALOG_TEXTBOX_MODE_DEFAULT`）。
+4. `[GXM] dialog frame #300/#600` 的间隔 → 直接读 fps 是否回到 ~60。
+
+
+---
+
+## v02.70：白屏优化 —— jar 整包读入内存
+
+> `midp_vita_v02.70.vpk` 9331926 B，`rebuild_vm.sh` 重编 `OsFile_vita.o` 并入库，`vita-port/build.sh` 退出码 0，`APP_VER "02.70"`。**未上机验证。**
+
+### 依据（log113，v02.67，第 0 轮 WebClient）
+
+- `round_begin → first_content_flip` = 10.0 s（第 1、2 轮 8.9 s / 6.8 s；FileManager 6.8 s 与 v02.58 的 6.83 s 持平，之后没再变短）。
+- preload `total_us=5.59 s`：`open 2.07 + iter 1.57 + read 0.26 + resolve 1.57`；VM 线程 `io_read n=3892 us=4,492,493`（1.15 ms/次）。
+- 真正加载的类约 494 个（`entries=1000 skipped=506`），折合约 8 次 `sceIoRead`/类。
+- 机理：`BufferedFile::BUFFERSIZE=256`；`find_entry`（jar 尾部中央目录）与 `open_entry`/`read`（jar 前部本地头+数据）交替访问同一 FILE，缓冲区几乎每次都失效。
+- `midp_system.jar` 1.28 MB（932 个类，全 deflate，压缩后 894 KB）。第 1/2 轮的 open/read 计数是跨轮累计，只有 `total_us` 是单轮值，故只用第 0 轮拆分。
+
+### 改动
+
+| 文件 | 改动 |
+| --- | --- |
+| `phoneme-cldc/src/vm/os/vita/OsFile_vita.cpp` | `OsFile_open(*.jar, "rb")` 把整个文件读入 malloc 内存；`OsFile_read/seek/length/eof/close/flush/write` 对内存句柄走内存路径，其余照旧 fopen/stdio。`+266` 行，全部在该 Vita 专属文件内（`#if defined(VITA)`），未碰 `JarFileParser`/`BufferedFile`/共享文件 |
+| `vita-port/CMakeLists.txt` | 版本 02.70 + 说明（`set` 位于 02.69 之后） |
+
+设计要点：
+
+- 内存句柄 = `g_jar_h[]` 槽位地址，真 `FILE*` 不可能落在该数组内，靠地址区间区分。
+- 镜像按路径引用计数（`JarFileParser` 会重复打开同一个 jar），最后一个句柄关闭时 `free`。
+- 上限：单 jar 4 MB、合计 8 MB、8 个镜像；超限 / malloc 失败 / 读失败 → 回退原 fopen 路径，行为与 02.69 一致。
+- 开关：`ux0:/data/J2ME00001/jar_mem.cfg` 首字符 `0`/`n`/`N` 关闭，用于真机 A/B。
+- 没有用 `fmemopen`：libc.a 里有这个符号，但 `fseek(SEEK_END)`/`ftell` 行为没验证过，而 `OsFile_length` 依赖它们；自管理镜像语义完全可控。
+- 无锁：jar 的 `OsFile_*` 只在 VM 线程上调用（类加载、`ResourceInputStream`）。**这是读代码得到的判断，没有逐条调用点验证。**
+- 内存：newlib 池 64 MB（`_newlib_heap_size_user`），Java 堆 32 MB；增加 ≤ 约 1.3 MB + 应用 jar 大小。
+
+### 验证
+
+- 符号级：最终 ELF 含 `g_jar_h / g_jar_img / g_jar_total / g_jar_enabled`，含 5 条 `[jarmem]` 格式串和 `jar_mem.cfg` 路径，版本串 `J2ME Player v02.70 b329 (1e8533d)`。
+- `rebuild_vm.sh` 末尾的 `loopgen` 链接错误是脚本注明的"预期失败"（crt0），`34 ARM objects OK`，库 21 成员，退出码 0。
+- `OsFile_vita.o` 是独立对象，不在 `_MergedSrc*` 里，不会重演 v02.37 的"MergedSrc 依赖断裂"。
+- **没有做的**：没有在 Vita3K / 真机上运行，也没有做内存路径与 stdio 路径的字节级对拍。
+
+### 下一轮真机怎么读
+
+1. `vm_boot.log`：`[jarmem] enabled=1`，以及 `[jarmem] loaded <路径> size=.. us=.. total=..`（应出现 midp_system.jar 与应用 jar 各一次；第 2 轮起同路径应重新加载，因为上一轮已 close）。出现 `skip` / `malloc failed` / `short read` 说明走了回退。
+2. `[preload] sys(VM thread, delta)`：`io_read n` 应从约 3900 降到个位数；`[preload] done total_us` 应从约 5.6 s 向 resolve 的 1.6–2 s 靠拢。
+3. `boot_timing.log`：`round_begin → first_content_flip`，第 0 轮对比 10.0 s。
+4. **回归判据**：MIDlet 能正常启动、能读 jar 内资源（图片/音频）、退出后再启动一轮不崩。若异常，先写 `jar_mem.cfg=0` 复跑确认是不是本版引起。
+5. 若 `io_read` 没降：说明读放大不在 `OsFile_*` 这一层（例如有路径绕过 `OsFile_open` 直接 `fopen`），回到 `JarFileParser.cpp:236` 附近查。
+
+### 仍未做（按性价比）
+
+- 启动期 stderr 合并（`vita_main.c:379-380` 的 `_IONBF`；log108 估约 0.7 s，log113 的 `runMidlet_enter → JVM_Start` 为 0.42 s）。
+- `vita_display.c:flip_to_display` 的逐像素 RGB565→ABGR 最近邻缩放，先加耗时计数再决定是否优化。
+- 把 midp_system.jar 里未进 ROM 的约 426 个类并入 ROM：改 MIDP ROM 配置，风险高，长期选项。
+
+---
+
+
+
+### 关键文件修改记录（按键映射）
+- `vita-port/src/vita_input.c`：`key_map[]` 改为可变；新增 `vita_keymap_*` API，配置存 `ux0:/data/J2ME00001/keymap.cfg`（`索引=KEYMAP码`，索引顺序同 key_map，映射为 0 表示不发送）。
+- `vita-port/src/vita_menu.c`：设置页新增"按键映射"项（`SET_KEYMAP`）及子页面（左右/X 切换功能机键，恢复默认，O 保存返回）。
+- 验证：`vita-port/build.sh` 构建通过；未在真机/Vita3K 实测。
+
+---
+
+## v02.71：log114 的分析（键盘变白边 + 第二个 MIDlet 里 GPU 崩溃）
+
+> `midp_vita_v02.71.vpk` 9332542 B，`build.sh` 退出码 0，`vita_display.c` 无警告。日志是 v02.70 的（02.69/02.70 来自别的会话）。**两个根因都有硬证据，但修复未上真机。**
+
+### log114 实测事实
+
+- **键盘已经好了**（v02.69 的改动生效）：11 次 `Init` 全部 `rc=0`，输入文字回填成功（`button=2 ENTER, text=2 chars` → `committed 2 chars`），19 fps。每条 `finished:` 的 button 都是 2 或 1，**v02.68 的“NONE 且有字也提交”从未触发**，可以视为多余。
+- 日志里没有 `touch visible to the app`，对话框期间触摸确实由它独占。
+
+### 问题 1：空白处变白 —— 根因确定
+
+`vita_display.c` 的 `clear_letterbox()` 在 v02.69 被改成 `memset(row, 0xFF, ...)`。`memset` 把同一个字节写进 4 个通道，`0xFF` → `0xFFFFFFFF` = 不透明**白**。改回 `0x00`（黑；`lfjport_ui_init` 也是 0；官方示例 `memset(data, 0xff000000, ...)` 里 int 被截成字节 0x00，实际也是 0）。我 v02.65 写的是逐像素 `0xFF000000`，是黑；被“提速”改坏的是后来那次。
+
+### 问题 2：GPU 崩溃 —— 根因有硬证据
+
+- 崩溃的是最后一次触发：第 1 轮（FileManager）的第一次 show。日志停在 `dialog frame #4 ... fb=0x62800000`。
+- 每轮 MIDlet 都新分配一块 CDRAM 帧缓冲：第 0 轮 `0x61400000`，第 1 轮 `0x62800000`。
+- GXM 映射用的是布尔 `vita_fb_gxm_mapped`，**全代码没有任何地方清零**。整份日志 `[CD] map fb` 只有 1 行（第 0 轮）→ 第 1 轮的新块**从未 `sceGxmMapMemory`**，对话框直接往未映射内存渲染。
+- dump 佐证（`/tmp/gpuscan114.py`）：`GPU_INFO` 里有 `0x62b2a024`（落在第 1 轮块内），`MEM_BLK_INFO` 列出 `0x62800000` 块；`GPU_INFO` 里第 0 轮范围只有 1 个命中。ELF 就是 v02.70，符号化可信。
+- 之前没暴露：旧版本 Init 第二次起就失败，键盘根本到不了第二轮。键盘修好才露出来。
+- 观察（未深究）：第 1 轮 Init 时 `free cdram` 比第 0 轮少 4 MB（90112K → 86016K），像是第 0 轮那块没被释放或菜单占了一块。
+
+### 改动（`vita_display.c`）
+
+- 记录**被映射的基址**，不是布尔；块变了就重新映射。
+- 映射新块前、`lfjport_ui_finalize` 释放块前：`sceGxmDisplayQueueFinish()` + `sceGxmUnmapMemory()`。
+- `clear_letterbox` 填 `0x00`。
+
+### 下一轮怎么看
+
+- 日志应有 `[CD] unmap fb base=0x61400000 rc=0x00000000`（第 0 轮结束），第 1 轮首次对话框前有 `[CD] map fb base=0x62...`。
+- `sceGxmUnmapMemory` 返回非 0 或卡在 `DisplayQueueFinish` 要立刻看；这是第一次在 finalize 路径里调 GXM。
+- 黑边：键盘出现、消失后两侧应保持黑色。
+
+
+---
+
+## v02.72：log114 里“少了 4 MB 显存”的分析
+
+> `midp_vita_v02.72.vpk` 9333104 B，`build.sh` 退出码 0。**本版只加观测，没有新的修复。** 4 MB 的去向只有强线索，未证实。
+
+### 实测事实
+
+- IME `Init` 行里的 `free cdram`：第 0 轮 **10 次全是 90112K**（一次键盘不耗显存），第 1 轮是 **86016K**。差 4096K = 恰好一个帧缓冲块（960×544×4 字节×2 缓冲 = 约 4.0 MB，向上取整到 256 KB 粒度 = 4 MB）。
+- 崩溃 dump 的 `MEM_BLK_INFO`（`/tmp/memblk114b.py` 解析）CDRAM 窗口布局：
+
+  | 区间 | 大小 | 内容 |
+  | --- | --- | --- |
+  | `61000000-61400000` | 4 MB | 菜单帧缓冲 `j2me_fb`（uid 40010161，`crumb.log` 的 `menu: fb=0x61000000` 对得上，进程内一直持有） |
+  | `61400000-61800000` | **4 MB 空洞** | 第 0 轮 MIDlet 的帧缓冲（已释放，不在块列表里） |
+  | `61800000-62800000` | 16 MB | `SceGxmParamBuffer` |
+  | `62800000-62C00000` | 4 MB | 第 1 轮 MIDlet 帧缓冲 `j2me_fb`（uid 401202cf） |
+
+- 所以**句柄确实释放了**（没有第二个 `j2me_fb` 残留），但新块**没有落进那个正好 4 MB 的空洞**，而且空闲量少了 4096K。
+  如果只是“分配器不爱用空洞”，空闲量不会变；变了，说明这 4 MB 被什么东西占着。
+
+### 候选原因（按证据强弱）
+
+1. **第 0 轮 `sceGxmMapMemory` 之后从没 `sceGxmUnmapMemory` 就把块释放了。** 整个代码库没有 unmap（v02.71 之前）。这是唯一已知碰过这段地址的东西。
+2. 显示队列还引用着旧帧缓冲（`gxm_display_cb` 里 `sceDisplaySetFrameBuf(旧 fb)`）。
+3. 其他我不知道的持有者。
+
+v02.71 已经做了 `sceGxmDisplayQueueFinish()` + `sceGxmUnmapMemory()`，同时覆盖 1 和 2，但**效果未验证**。
+
+### 副作用评估
+
+每个用过键盘的 MIDlet 轮次会漏 4 MB CDRAM；总空闲约 90 MB，大约 20 轮后会分配不到帧缓冲（黑屏）。没用过键盘的轮次没有 map，不漏（推断，无数据）。
+
+### 本版改动（`vita_display.c`）
+
+每轮打印 CDRAM 读数：`[fb] alloc | finalize begin | after unmap | after release  base=..  cdram free=..K`。
+
+### 下一轮怎么读
+
+- `after release` 比 `after unmap` 多回 4096K，且下一轮 `alloc` 的 `base` 又是 `0x61400000`、free 与第 0 轮相同 → 02.71 的 unmap 修好了漏。
+- `after unmap` 之后仍不回 → unmap 不是原因，看 `[CD] unmap fb ... rc`；rc 非 0 说明 unmap 本身失败。
+- `after release` 也不回 → 释放本身没生效，持有者是别的（显示控制器、队列），需要进一步查。
+- 没用键盘的轮次也掉 4 MB → 与 GXM 映射无关。
+
+
+---
+
+## v02.73：log115 的分析（CDRAM 泄漏已消失）+ 清除键
+
+> `midp_vita_v02.73.vpk` 9333389 B，`build.sh` 退出码 0，`vita_input.c` 无警告。日志是 v02.72 的。**清除键未上真机。**
+
+### 1. CDRAM 泄漏：已不存在
+
+`[fb]` 行（UC 轮 + FileManager 轮）：
+
+| 步骤 | 第 0 轮 | 第 1 轮 |
+| --- | --- | --- |
+| alloc（块在 `0x61400000`） | 106496K | 90112K（**复用了 `0x61400000`**） |
+| finalize begin | 90112K | 90112K |
+| after unmap（`rc=0x0`） | 90112K | 90112K |
+| after release | **94208K**（+4096K 回来了） | **94208K** |
+
+- 第 1 轮 alloc 前是 94208K，等于第 0 轮 release 后 → 每轮净零。log114 里那个 4 MB 空洞现在被复用。
+- 两轮 `[CD] unmap fb rc=0x00000000`，`sceGxmDisplayQueueFinish` 没卡；没有 GPU 崩溃，也没有 psp2dmp；第 1 轮对话框正常（`map fb 0x61400000` → `committed 3 chars`）。
+- 106496K → 94208K 的 12288K：16 MB 是 `SceGxmParamBuffer`（第一次对话框时 `sceGxmInitialize` 建的，进程级一次，**设计内，不是泄漏**），再回 4 MB 是帧缓冲。
+- **仍未能分开**：02.71 同时做了 unmap 和 `DisplayQueueFinish`，不知道是哪一个起的作用。样本只有 2 轮（外加每轮多次对话框），“多轮后仍不漏”只能靠下一份多轮日志。
+- v02.72 的 `[fb]` 日志可以保留，每轮 4 行代价很小。
+
+### 2. 没有键可以删除已输入的文本
+
+- 事实：`key_map` 的 12 个手柄键 + 8 个摇杆方向里**没有任何一个**映射到 `KEYMAP_KEY_CLEAR`(-8)（"设置 > 按键映射"页能手动选"清除"，但默认没有）。
+- phoneME 已经会处理它：`TextFieldLFImpl.handleClearKey` —— 短按删光标前一个字符；同一个键在释放前**第二次进入** `uCallKeyPressed`（即 `KEYMAP_STATE_REPEATED`）= 长按 = 清空整个文本框。
+- 提交语义：`Display.handleInputMethodEvent` 对 TextBox 是 `insert(inputText, caretPosition)`，**追加不覆盖**；而系统键盘每次都以空串打开（`initialText=NULL`），所以已有内容既看不到也删不掉，多次输入只会越攒越多。这就是“没有键删除”的实际代价。
+
+### 改动（`vita_input.c`）
+
+TRIANGLE 在**文本框获焦 + 键盘没弹**时发 Clear：按下 PRESSED（删 1 个字符），按住 0.7 s 发一次 REPEATED（清空），松开 RELEASED（释放永远与按下的发送方式一致）。条件与 SELECT 相同（`vita_ime_text_wanted()`），游戏里不变（仍是 GAME_A）。以下情况不启用：任何键已映射到"清除"，或 TRIANGLE 在按键映射页被改过。日志 `[IME] Clear key held -> long press (empty field)`。
+
+### 已知局限（要在真机确认）
+
+1. `text_wanted` 只在整屏 `TextBox` 里置位（v02.62 去掉了 Form `TextField` 的），所以 Form 里的 TextField 没有清除键，SELECT 也同样打不开键盘。
+2. 字段是否真的清空，取决于 `BasicInputMode.processKey` 对 Clear 返回 `KEYCODE_NONE`（标准路径，这里没跑过）。
+3. 最理想的体验是**打开键盘时把现有文本作为 `initialText` 传进去**，在系统键盘里直接增删，提交时替换。这需要 Java 把当前文本传给 native + 改成替换语义 + 重生成 ROM，没做。
+
+### 下一轮怎么看
+
+- 在 UC 的输入框里提交文字后，键盘关闭状态下：短按 TRIANGLE 应删掉 1 个字符；按住 ≥0.7 s 应出现 `Clear key held` 并清空。
+- 如果按键有日志 `[INPUT] buttons=0x00001000` 但文本不变 → Java 侧没处理，要查 `processKey` 的返回值。
+- 如果没有 `0x1000` 的 INPUT 行 → 按键没进来。
+
+
+---
+
+## v02.74：系统键盘带入现有文本，提交时整体替换（TextBox）
+
+> `midp_vita_v02.74.vpk` 9333769 B，`build.sh midp` 退出码 0。改动文件无警告（日志里 7 条警告全是测试 MIDlet 的 -source 1.3 / CanvasTest 编码，与本次无关）。新符号 `Java_..._setNativeKeyboardText`、`vita_ime_set_initial_text` 已在最终二进制里。**未上真机。**
+
+### 背景
+- v02.73 的清除键只是绕路：键盘每次以空文本打开，提交走 `TextBox.insert(text, caret)`，已有内容既看不到也改不了。
+- 官方 `samples/ime` 的 `param.initialText` 就是为此设计的，我们一直传 NULL。
+
+### 设计
+键盘既可由 Java 的 `showNativeKeyboard()` 打开，也可由 SELECT 在原生侧直接打开（`vita_input.c` -> `vita_ime_show()`，不经过 Java）。所以原生侧必须有一份文本缓存，由 Java 在文本变化时推送。
+
+链路：`TextBoxLFImpl`（`lSetChars/lInsert/lDelete/lSetMaxSize` + `uCallShowNotify`）-> `VirtualKeyboardInputMode.setNativeKeyboardText(text, capacity)`（新 KNI）-> `vita_ime_set_initial_text()` 写 `g_ime_pending` -> `ime_try_init()` 在 Init 前拷到 `g_ime_initial` -> `param.initialText`，`maxTextLength = min(容量, 系统上限)`。结果 -> IME 事件 -> `Display.handleInputMethodEvent` -> `TextBox.setString(result)`。
+
+### 改动文件
+| 文件 | 改动 |
+|---|---|
+| `vita-port/src/vita_ime.c/.h` | `g_ime_pending/g_ime_initial/g_ime_max_len`；`vita_ime_set_initial_text(text,len,max)`；Init 带 `initialText`、容量限制；**空结果也投递**（= 用户清空）；转换 OOM 时丢弃事件而不是发空串（替换语义下空串会抹掉文本）；Init 日志加 `initial=N chars` |
+| `lfj_native_input_mode.c` | 新 KNI `setNativeKeyboardText`（`#ifdef VITA`），读 Java String 转 UTF-16 |
+| `vkdefault/.../VirtualKeyboardInputMode.java` | 声明 `static native void setNativeKeyboardText(String,int)` |
+| `TextBoxLFImpl.java` | `nativeKbShown` 标志（show 置位 / hide 清除）；`syncNativeKeyboardText()` 在 4 个 L 回调和 show 时推送；hide 时推 `(null,0)` 清缓存 |
+| `Display.jpp` | TextBox 分支 `insert(...)` 改 `setString(...)`，捕获 `IllegalArgumentException` 保留旧文本 |
+
+### 刻意的取舍
+- **只接了整屏 TextBox**。Form 里的 `TextField` 仍是追加（`TextFieldLFImpl.commit`）；而且 v02.62 起 `text_wanted` 对它不置位，SELECT 也打不开。若把 TextField 也接成替换，需要先让它也推送文本，否则会用空缓存覆盖。
+- 只有正在显示的 TextBox 才推送（`nativeKbShown`），避免后台 TextBox 的变化覆盖前台的缓存。
+- hide 时清缓存，避免残留文本泄漏进别的键盘（别的键盘走追加语义，会重复）。
+
+### 已知风险（真机确认）
+1. 容量小于现有文本长度时 `maxTextLength` 比 `initialText` 短，系统行为未知。NUL 结尾已保证，长度已截断到 `SCE_IME_DIALOG_MAX_TEXT_LENGTH`。
+2. `setString` 在约束不符（如 NUMERIC 里输入了字母）时抛异常，被吞掉，表现为"提交了但没变化"。
+3. v02.73 的 TRIANGLE 清除键保留，两者不冲突。
+
+### 下一轮怎么看
+- `[IME] show: Init rc=0x... initial=N chars`：N 应等于 TextBox 当前长度。第一次为 0，第二次起应 > 0。
+- 键盘里应能看到并修改原文本；确认后 `[IME] committed N chars`，UC 里文字被**替换**而不是追加。
+- 在键盘里删光再确认：应出现 `committed 0 chars (empty: clears the text)`，文本框清空。
+- 若 `initial=0` 但 TextBox 里有字：Java 推送没生效，检查 `nativeKbShown` / KNI 是否被调用。
+

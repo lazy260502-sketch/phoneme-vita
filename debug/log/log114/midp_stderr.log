@@ -1,0 +1,219 @@
+vita-port J2ME launcher
+vm cpu: unpinned (mask=0, kernel default 3-core)
+kubridge precheck: ABSENT
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+version: J2ME Player v02.70 b329 (1e8533d)
+[ANI] thread pool initialized
+[media] tone player thread created
+menu jar: games/app/game.jar
+menu class: cn.uc.application.app.WebClient
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_1A35
+classpath: midp_system.jar:games/app/game.jar
+starting MIDlet: cn.uc.application.app.WebClient
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='cn.uc.application.app.WebClient'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=36 additionalPathLength=34
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFcoreA.db flags=0x2 size=5056
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFG2.db flags=0x2 size=51344
+[NET] gethostbyname('uc.ucweb.com') = 111.13.216.139
+[NET] socket_open ip=111.13.216.139 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)
+[NET] connect DONE fd=11
+[IME] text_wanted -> 1 (t=36687 ms)
+[IME] sysmodule IME load rc=0x00000000, apputil init rc=0x00000000
+[GXM] initialized (display queue)
+[IME] show: Init rc=0x00000000 (status before=0, -1 ms since last Term, 0 dialog frames since Term, attempt 1, t=36709 ms, free user=182272K cdram=90112K phycont=26624K)
+[CD] map fb base=0x61400000 bytes=4194304 rc=0x00000000
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 1 (+66 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 2 (+10694 ms)
+[IME] finished: GetResult rc=0x00000000 result=0 button=2 (0=NONE 1=CLOSE 2=ENTER) text=2 chars first=U+767E Term rc=0x00000000 (+10717 ms, 210 dialog frames = 19 fps)
+[IME] committed 2 chars
+[IME] text_wanted -> 0 (t=56876 ms)
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=12 rc=0 errno=0
+[NET] connect EINPROGRESS fd=12 (thread will block)
+[NET] connect DONE fd=12
+[NET] gethostbyname('kwurl.ucweb.com') = 120.241.3.226
+[NET] socket_open ip=120.241.3.226 port=80
+[NET] set_nbio fd=12 rc=0 errno=0
+[NET] connect EINPROGRESS fd=12 (thread will block)
+[NET] connect DONE fd=12
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFP.db flags=0x2 size=168
+[IME] text_wanted -> 1 (t=71493 ms)
+[IME] show: Init rc=0x00000000 (status before=0, 23890 ms since last Term, 6 dialog frames since Term, attempt 1, t=71515 ms, free user=182272K cdram=90112K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 1 (+47 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #300 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 2 (+19199 ms)
+[IME] finished: GetResult rc=0x00000000 result=0 button=2 (0=NONE 1=CLOSE 2=ENTER) text=6 chars first=U+0067 Term rc=0x00000000 (+19224 ms, 377 dialog frames = 19 fps)
+[IME] committed 6 chars
+[IME] text_wanted -> 0 (t=96983 ms)
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)
+[NET] connect DONE fd=11
+[NET] gethostbyname('safe.ucweb.com') = 14.116.143.163
+[NET] socket_open ip=14.116.143.163 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFB.db flags=0x2 size=64
+[IME] text_wanted -> 1 (t=106739 ms)
+[IME] show: Init rc=0x00000000 (status before=0, 15974 ms since last Term, 6 dialog frames since Term, attempt 1, t=106760 ms, free user=182272K cdram=90112K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 1 (+39 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 2 (+4944 ms)
+[IME] finished: GetResult rc=0x00000000 result=1 button=0 (0=NONE 1=CLOSE 2=ENTER) text=0 chars first=U+0000 Term rc=0x00000000 (+4966 ms, 96 dialog frames = 19 fps)
+[IME] dismissed (button=0, 0 chars dropped)
+[IME] text_wanted -> 0 (t=115821 ms)
+[IME] text_wanted -> 1 (t=117381 ms)
+[IME] show: Init rc=0x00000000 (status before=0, 5633 ms since last Term, 6 dialog frames since Term, attempt 1, t=117402 ms, free user=182272K cdram=90112K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 1 (+42 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 2 (+2944 ms)
+[IME] finished: GetResult rc=0x00000000 result=1 button=0 (0=NONE 1=CLOSE 2=ENTER) text=0 chars first=U+0000 Term rc=0x00000000 (+2966 ms, 57 dialog frames = 19 fps)
+[IME] dismissed (button=0, 0 chars dropped)
+[IME] show: Init rc=0x00000000 (status before=0, 8052 ms since last Term, 6 dialog frames since Term, attempt 1, t=128462 ms, free user=182272K cdram=90112K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 1 (+42 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 2 (+7733 ms)
+[IME] finished: GetResult rc=0x00000000 result=0 button=2 (0=NONE 1=CLOSE 2=ENTER) text=4 chars first=U+0064 Term rc=0x00000000 (+7754 ms, 151 dialog frames = 19 fps)
+[IME] committed 4 chars
+[IME] text_wanted -> 0 (t=144812 ms)
+[IME] text_wanted -> 1 (t=149261 ms)
+[IME] show: Init rc=0x00000000 (status before=0, 13022 ms since last Term, 6 dialog frames since Term, attempt 1, t=149282 ms, free user=182272K cdram=90112K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 1 (+43 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 2 (+3096 ms)
+[IME] finished: GetResult rc=0x00000000 result=1 button=0 (0=NONE 1=CLOSE 2=ENTER) text=0 chars first=U+0000 Term rc=0x00000000 (+3118 ms, 60 dialog frames = 19 fps)
+[IME] dismissed (button=0, 0 chars dropped)
+[IME] show: Init rc=0x00000000 (status before=0, 19524 ms since last Term, 6 dialog frames since Term, attempt 1, t=171967 ms, free user=182272K cdram=90112K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 1 (+47 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[NET] connect FAILED fd=11 SO_ERROR=60
+[NET] gethostbyname('safe.ucweb.com') = 14.116.143.163
+[NET] socket_open ip=14.116.143.163 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)
+[IME] status -> 2 (+7004 ms)
+[IME] finished: GetResult rc=0x00000000 result=0 button=1 (0=NONE 1=CLOSE 2=ENTER) text=2 chars first=U+0028 Term rc=0x00000000 (+7026 ms, 132 dialog frames = 18 fps)
+[IME] dismissed (button=1, 2 chars dropped)
+[IME] text_wanted -> 0 (t=179740 ms)
+[IME] text_wanted -> 1 (t=180344 ms)
+[IME] show: Init rc=0x00000000 (status before=0, 1329 ms since last Term, 6 dialog frames since Term, attempt 1, t=180365 ms, free user=182272K cdram=90112K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 1 (+41 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 2 (+4396 ms)
+[IME] finished: GetResult rc=0x00000000 result=1 button=0 (0=NONE 1=CLOSE 2=ENTER) text=0 chars first=U+0000 Term rc=0x00000000 (+4417 ms, 86 dialog frames = 19 fps)
+[IME] dismissed (button=0, 0 chars dropped)
+[IME] show: Init rc=0x00000000 (status before=0, 14257 ms since last Term, 6 dialog frames since Term, attempt 1, t=199082 ms, free user=182272K cdram=90112K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 1 (+42 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 2 (+4480 ms)
+[IME] finished: GetResult rc=0x00000000 result=0 button=2 (0=NONE 1=CLOSE 2=ENTER) text=4 chars first=U+0076 Term rc=0x00000000 (+4504 ms, 86 dialog frames = 19 fps)
+[IME] committed 4 chars
+[IME] text_wanted -> 0 (t=208434 ms)
+[IME] text_wanted -> 1 (t=209095 ms)
+[IME] show: Init rc=0x00000000 (status before=0, 5489 ms since last Term, 6 dialog frames since Term, attempt 1, t=209119 ms, free user=182272K cdram=90112K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[IME] status -> 1 (+45 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x61400000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x615fe000
+[IME] status -> 2 (+3315 ms)
+[IME] finished: GetResult rc=0x00000000 result=0 button=1 (0=NONE 1=CLOSE 2=ENTER) text=0 chars first=U+0000 Term rc=0x00000000 (+3336 ms, 63 dialog frames = 18 fps)
+[IME] dismissed (button=1, 0 chars dropped)
+[IME] text_wanted -> 0 (t=213278 ms)
+  midpRunVm returned vmStatus=2001 (MAIN_EXIT=2001)
+  classPath freed
+*** runMidlet: midp_run_midlet_with_args_cp returned status=0
+runMidlet returned 0 - back to menu
+menu jar: games/app (1)/game.jar
+menu class: com.app.filemanager.FileManagerMIDlet
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_6B15
+classpath: midp_system.jar:games/app (1)/game.jar
+starting MIDlet: com.app.filemanager.FileManagerMIDlet
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app (1)/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='com.app.filemanager.FileManagerMIDlet'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app (1)/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app (1)/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app (1)/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=40 additionalPathLength=38
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app (1)/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+[IME] text_wanted -> 1 (t=246147 ms)
+[IME] show: Init rc=0x00000000 (status before=0, 33665 ms since last Term, 6 dialog frames since Term, attempt 1, t=246168 ms, free user=182272K cdram=86016K phycont=26624K)
+[GXM] dialog frame #1 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x629fe000
+[IME] status -> 1 (+54 ms)
+[GXM] dialog frame #2 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x62800000
+[GXM] dialog frame #3 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x629fe000
+[GXM] dialog frame #4 update=0x00000000 pad=0x00000000 queue=0x00000000 fb=0x62800000

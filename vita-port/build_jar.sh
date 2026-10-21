@@ -5,18 +5,19 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../build_env.sh"
 SRC_DIR="$SCRIPT_DIR/midlets"
 BUILD_DIR="$SCRIPT_DIR/build/midlet"
 
 # J2ME class library
-CLDC_ZIP="/home/zyb/vitasdk/samples/j2me/phoneme-cldc/build/vita_arm/dist/lib/cldc_classes.zip"
-MIDP_ZIP="/home/zyb/vitasdk/samples/j2me/phoneme-midp/build/vita_arm/classes.zip"
+CLDC_ZIP="$J2ME_ROOT/phoneme-cldc/build/vita_arm/dist/lib/cldc_classes.zip"
+MIDP_ZIP="$J2ME_ROOT/phoneme-midp/build/vita_arm/classes.zip"
 BOOTCP="$CLDC_ZIP:$MIDP_ZIP"
 
 mkdir -p "$BUILD_DIR/classes" "$BUILD_DIR/preverified" "$BUILD_DIR/jar"
 
 # CLDC preverify tool (32-bit x86 host binary bundled with phoneME)
-PREVERIFY="/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/cldc/build/share/bin/linux_i386/preverify"
+PREVERIFY="$J2ME_ROOT/phoneme_source/phoneME/cldc/build/share/bin/linux_i386/preverify"
 
 echo "Compiling test MIDlets..."
 javac -source 1.3 -target 1.3 \

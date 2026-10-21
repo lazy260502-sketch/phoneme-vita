@@ -36,6 +36,20 @@
 #include <sipapi.h>
 #endif
 
+#ifdef VITA
+/* v02.52: system-keyboard bridge lives in the vita-port layer (vita_ime.c),
+ * compiled into the midp_vita executable. These are resolved at final link
+ * (libobj.a is linked with --whole-archive before vita_ime.o). */
+extern void vita_ime_show(void);
+extern void vita_ime_abort(void);
+/* v02.64: focus flag read by the SELECT key handler (vita_input.c). */
+extern void vita_ime_set_text_wanted(int on);
+/* v02.74: current TextBox content, opened as the dialog's initial text. */
+extern void vita_ime_set_initial_text(const unsigned short *text, int len,
+                                      int max_len);
+#include <midpMalloc.h>
+#endif
+
 #define numElems(x) sizeof(x)/sizeof(x[0])
 
 #ifdef __cplusplus
@@ -403,22 +417,67 @@ KNIDECL(com_sun_midp_chameleon_input_InputModeFactory_getInputModeIds) {
     KNI_EndHandlesAndReturnObject(idListObj);
 }
 
-#ifdef WINCE
+#if defined(WINCE) || defined(VITA)
 KNIEXPORT KNI_RETURNTYPE_VOID
 KNIDECL(com_sun_midp_chameleon_input_VirtualKeyboardInputMode_showNativeKeyboard) {
+#ifdef WINCE
     bVirtualModeEnabled = KNI_TRUE;
     midpPaintAllowed = 0;
     SipShowIM(SIPF_ON);
+#else
+    vita_ime_set_text_wanted(1);
+    vita_ime_show();
+#endif
     KNI_ReturnVoid();
 }
 
 KNIEXPORT KNI_RETURNTYPE_VOID
 KNIDECL(com_sun_midp_chameleon_input_VirtualKeyboardInputMode_hideNativeKeyboard) {
+#ifdef WINCE
     bVirtualModeEnabled = KNI_FALSE;
     midpPaintAllowed = 0;
     SipShowIM(SIPF_OFF);
+#else
+    vita_ime_set_text_wanted(0);
+    vita_ime_abort();
+#endif
     KNI_ReturnVoid();
 }
+
+#ifdef VITA
+/* v02.74: static native void setNativeKeyboardText(String text, int maxSize);
+ * Java pushes the focused TextBox's content whenever it changes, so the
+ * system keyboard (also opened natively by SELECT) starts with it. */
+KNIEXPORT KNI_RETURNTYPE_VOID
+KNIDECL(com_sun_midp_chameleon_input_VirtualKeyboardInputMode_setNativeKeyboardText) {
+    jint maxSize = KNI_GetParameterAsInt(2);
+    jint len;
+    jchar *buf = NULL;
+
+    KNI_StartHandles(1);
+    KNI_DeclareHandle(strHandle);
+    KNI_GetParameterAsObject(1, strHandle);
+
+    len = KNI_IsNullHandle(strHandle) ? 0 : KNI_GetStringLength(strHandle);
+    if (len > 0) {
+        buf = (jchar *)midpMalloc((size_t)len * sizeof(jchar));
+        if (buf == NULL) {
+            len = 0;                      /* OOM: open empty rather than stale */
+        } else {
+            KNI_GetStringRegion(strHandle, 0, len, buf);
+        }
+    } else {
+        len = 0;
+    }
+    vita_ime_set_initial_text((const unsigned short *)buf, (int)len,
+                              (int)maxSize);
+    if (buf != NULL) {
+        midpFree(buf);
+    }
+    KNI_EndHandles();
+    KNI_ReturnVoid();
+}
+#endif
 #endif
 
 #ifdef __cplusplus

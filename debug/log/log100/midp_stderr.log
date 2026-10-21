@@ -1,0 +1,613 @@
+vita-port J2ME launcher
+vm cpu: unpinned (mask=0, kernel default 3-core)
+kubridge precheck: ABSENT
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+version: J2ME Player v02.49 b329 (1e8533d)
+[ANI] thread pool initialized
+[media] tone player thread created
+menu jar: games/app (1)/game.jar
+menu class: com.app.filemanager.FileManagerMIDlet
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_6B15
+classpath: midp_system.jar:games/app (1)/game.jar
+starting MIDlet: com.app.filemanager.FileManagerMIDlet
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app (1)/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='com.app.filemanager.FileManagerMIDlet'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app (1)/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app (1)/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app (1)/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=40 additionalPathLength=38
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app (1)/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+BEFORE_NATIVES: heap_top=0x8389d580
+AFTER_NATIVES_CALL: heap_top=0x8389d580
+  midpRunVm returned vmStatus=2001 (MAIN_EXIT=2001)
+  classPath freed
+*** runMidlet: midp_run_midlet_with_args_cp returned status=0
+runMidlet returned 0 - back to menu
+menu jar: games/app (2)/game.jar
+menu class: MiniXplorer
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_38D6
+classpath: midp_system.jar:games/app (2)/game.jar
+starting MIDlet: MiniXplorer
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app (2)/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='MiniXplorer'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app (2)/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app (2)/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app (2)/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=40 additionalPathLength=38
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app (2)/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+  midpRunVm returned vmStatus=2001 (MAIN_EXIT=2001)
+  classPath freed
+*** runMidlet: midp_run_midlet_with_args_cp returned status=0
+runMidlet returned 0 - back to menu
+menu jar: games/app/game.jar
+menu class: cn.uc.application.app.WebClient
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_1A35
+classpath: midp_system.jar:games/app/game.jar
+starting MIDlet: cn.uc.application.app.WebClient
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='cn.uc.application.app.WebClient'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=36 additionalPathLength=34
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+BEFORE_NATIVES: heap_top=0x838be780
+AFTER_NATIVES_CALL: heap_top=0x838be780
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFcoreA.db flags=0x2 size=11824
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFG2.db flags=0x2 size=39424
+[NET] gethostbyname('uc.ucweb.com') = 111.13.216.166
+[NET] socket_open ip=111.13.216.166 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=17 rc=0 errno=0
+[NET] connect EINPROGRESS fd=17 (thread will block)
+[NET] connect DONE fd=17
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFP.db flags=0x2 size=168
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=17 rc=0 errno=0
+[NET] connect EINPROGRESS fd=17 (thread will block)
+[NET] connect DONE fd=17
+[NET] gethostbyname('sina.cn') = 106.63.15.221
+[NET] socket_open ip=106.63.15.221 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('n.sinaimg.cn') = 120.233.177.3
+[NET] socket_open ip=120.233.177.3 port=80
+[NET] set_nbio fd=19 rc=0 errno=0
+[NET] connect EINPROGRESS fd=19 (thread will block)
+[NET] connect DONE fd=19
+[NET] gethostbyname('ent.sina.cn') = 49.7.37.230
+[NET] socket_open ip=49.7.37.230 port=80
+[NET] set_nbio fd=20 rc=0 errno=0
+[NET] connect EINPROGRESS fd=20 (thread will block)
+[NET] connect DONE fd=20
+[NET] gethostbyname('news.sina.cn') = 120.233.177.5
+[NET] socket_open ip=120.233.177.5 port=80
+[NET] set_nbio fd=21 rc=0 errno=0
+[NET] connect EINPROGRESS fd=21 (thread will block)
+[NET] connect DONE fd=21
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=17 rc=0 errno=0
+[NET] connect EINPROGRESS fd=17 (thread will block)
+[NET] connect DONE fd=17
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('ucus.ucweb.com') = 120.241.3.246
+[NET] socket_open ip=120.241.3.246 port=80
+[NET] set_nbio fd=17 rc=0 errno=0
+[NET] connect EINPROGRESS fd=17 (thread will block)
+[NET] connect DONE fd=17
+[NET] gethostbyname('puds.ucweb.com') = 123.180.156.135
+[NET] socket_open ip=123.180.156.135 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('m.baidu.com') = 183.2.172.116
+[NET] socket_open ip=183.2.172.116 port=80
+[NET] set_nbio fd=19 rc=0 errno=0
+[NET] connect EINPROGRESS fd=19 (thread will block)
+[NET] connect DONE fd=19
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=19 rc=0 errno=0
+[NET] connect EINPROGRESS fd=19 (thread will block)
+[NET] connect DONE fd=19
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=19 rc=0 errno=0
+[NET] connect EINPROGRESS fd=19 (thread will block)
+[NET] connect DONE fd=19
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=19 rc=0 errno=0
+[NET] connect EINPROGRESS fd=19 (thread will block)
+[NET] connect DONE fd=19
+[NET] gethostbyname('m.baidu.com') = 183.2.172.116
+[NET] socket_open ip=183.2.172.116 port=80
+[NET] set_nbio fd=19 rc=0 errno=0
+[NET] connect EINPROGRESS fd=19 (thread will block)
+[NET] connect DONE fd=19
+[NET] gethostbyname('ms.bdstatic.com') = 120.240.138.36
+[NET] socket_open ip=120.240.138.36 port=80
+[NET] set_nbio fd=20 rc=0 errno=0
+[NET] connect EINPROGRESS fd=20 (thread will block)
+[NET] connect DONE fd=20
+[NET] gethostbyname('m.baidu.com') = 183.2.172.116
+[NET] socket_open ip=183.2.172.116 port=80
+[NET] set_nbio fd=23 rc=0 errno=0
+[NET] connect EINPROGRESS fd=23 (thread will block)
+[NET] connect DONE fd=23
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=17 rc=0 errno=0
+[NET] connect EINPROGRESS fd=17 (thread will block)
+[NET] connect DONE fd=17
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('m.baidu.com') = 183.2.172.116
+[NET] socket_open ip=183.2.172.116 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('m.baidu.com') = 183.2.172.116
+[NET] socket_open ip=183.2.172.116 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('m.baidu.com') = 183.2.172.116
+[NET] socket_open ip=183.2.172.116 port=80
+[NET] set_nbio fd=23 rc=0 errno=0
+[NET] connect EINPROGRESS fd=23 (thread will block)
+[NET] connect DONE fd=23
+[NET] gethostbyname('m.baidu.com') = 183.2.172.116
+[NET] socket_open ip=183.2.172.116 port=80
+[NET] set_nbio fd=23 rc=0 errno=0
+[NET] connect EINPROGRESS fd=23 (thread will block)
+[NET] connect DONE fd=23
+[NET] gethostbyname('m.baidu.com') = 183.2.172.116
+[NET] socket_open ip=183.2.172.116 port=80
+[NET] set_nbio fd=23 rc=0 errno=0
+[NET] connect EINPROGRESS fd=23 (thread will block)
+[NET] connect DONE fd=23
+[NET] gethostbyname('ucsec.ucweb.com') = 120.241.3.130
+[NET] socket_open ip=120.241.3.130 port=8020
+[NET] set_nbio fd=23 rc=0 errno=0
+[NET] connect EINPROGRESS fd=23 (thread will block)
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=18 rc=0 errno=0
+[NET] connect EINPROGRESS fd=18 (thread will block)
+[NET] connect DONE fd=18
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=20 rc=0 errno=0
+[NET] connect EINPROGRESS fd=20 (thread will block)
+[NET] connect DONE fd=20
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=20 rc=0 errno=0
+[NET] connect EINPROGRESS fd=20 (thread will block)
+[NET] connect DONE fd=20
+[NET] gethostbyname('wap.tiexue.net') = 183.60.163.119
+[NET] socket_open ip=183.60.163.119 port=80
+[NET] set_nbio fd=25 rc=0 errno=0
+[NET] connect EINPROGRESS fd=25 (thread will block)
+[NET] connect DONE fd=25
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=25 rc=0 errno=0
+[NET] connect EINPROGRESS fd=25 (thread will block)
+[NET] connect DONE fd=25
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[NET] connect FAILED fd=23 SO_ERROR=60
+[NET] gethostbyname('ucsec.ucweb.com') = 120.241.3.130
+[NET] socket_open ip=120.241.3.130 port=8020
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=23 rc=0 errno=0
+[NET] connect EINPROGRESS fd=23 (thread will block)
+[NET] connect DONE fd=23
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFB.db flags=0x42 size=-1
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=26 rc=0 errno=0
+[NET] connect EINPROGRESS fd=26 (thread will block)
+[NET] connect DONE fd=26
+[NET] gethostbyname('u.uc.cn') FAILED h_errno/errno=-2143223322
+[NET] gethostbyname('u.uc.cn') FAILED h_errno/errno=-2143223322
+[NET] gethostbyname('u.uc.cn') FAILED h_errno/errno=-2143223322
+[NET] connect FAILED fd=16 SO_ERROR=60
+[NET] gethostbyname('ucsec.ucweb.com') = 120.241.3.130
+[NET] socket_open ip=120.241.3.130 port=8020
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=20 rc=0 errno=0
+[NET] connect EINPROGRESS fd=20 (thread will block)
+[NET] connect DONE fd=20
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=20 rc=0 errno=0
+[NET] connect EINPROGRESS fd=20 (thread will block)
+[NET] connect DONE fd=20
+[NET] gethostbyname('dh.uc.cn') = 120.241.3.133
+[NET] socket_open ip=120.241.3.133 port=80
+[NET] set_nbio fd=20 rc=0 errno=0
+[NET] connect EINPROGRESS fd=20 (thread will block)
+[NET] connect DONE fd=20
+[NET] gethostbyname('wap.ifeng.com') = 140.143.220.197
+[NET] socket_open ip=140.143.220.197 port=80
+[NET] set_nbio fd=26 rc=0 errno=0
+[NET] connect EINPROGRESS fd=26 (thread will block)
+[NET] connect DONE fd=26
+[NET] gethostbyname('wap.ifeng.com') = 140.143.220.197
+[NET] socket_open ip=140.143.220.197 port=80
+[NET] set_nbio fd=26 rc=0 errno=0
+[NET] connect EINPROGRESS fd=26 (thread will block)
+[NET] connect DONE fd=26
+[NET] gethostbyname('wap.ifeng.com') = 140.143.220.197
+[NET] socket_open ip=140.143.220.197 port=80
+[NET] set_nbio fd=26 rc=0 errno=0
+[NET] connect EINPROGRESS fd=26 (thread will block)
+[NET] connect DONE fd=26
+[NET] gethostbyname('wap.ifeng.com') = 140.143.220.197
+[NET] socket_open ip=140.143.220.197 port=80
+[NET] set_nbio fd=26 rc=0 errno=0
+[NET] connect EINPROGRESS fd=26 (thread will block)
+[NET] connect DONE fd=26
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=26 rc=0 errno=0
+[NET] connect EINPROGRESS fd=26 (thread will block)
+[NET] connect DONE fd=26
+  midpRunVm returned vmStatus=2001 (MAIN_EXIT=2001)
+  classPath freed
+*** runMidlet: midp_run_midlet_with_args_cp returned status=0
+runMidlet returned 0 - back to menu

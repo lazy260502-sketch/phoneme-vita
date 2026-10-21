@@ -9,8 +9,10 @@
 # Usage: build_extra_o.sh <src.cpp> <out.o>
 set -eo pipefail
 
-GEN=/home/zyb/vitasdk/samples/j2me/phoneme-cldc/build/vita_arm/loopgen/generated
-SRC=/home/zyb/vitasdk/samples/j2me/phoneme-cldc/src
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../build_env.sh"
+GEN="$J2ME_ROOT/phoneme-cldc/build/vita_arm/loopgen/generated"
+SRC="$J2ME_ROOT/phoneme-cldc/src"
 IN="$1"; OUT="$2"
 [ -f "$IN" ] || { echo "no such source: $IN" >&2; exit 1; }
 
@@ -23,7 +25,7 @@ HDR=$(mktemp /tmp/extrawrap_XXXX.cpp)
 } > "$HDR"
 
 cd $GEN
-/home/zyb/.local/vitasdk/bin/g++ -O2 -Wuninitialized \
+"$VITASDK/bin/arm-vita-eabi-g++" -O2 -Wuninitialized \
   -DPRODUCT -DROMIZING=1 -DARM -DVITA -D__PSP2__ \
   -Wno-narrowing -fpermissive \
   -marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3 \

@@ -1,0 +1,25 @@
+[WD] alive tid=1073807709 start rc=0x00000000
+[WD] STORM ce=0 clinit=0 gc=0 preload=90 (pump starved but progressing)
+[WD] alive tid=1073807709 start rc=0x00000000
+[WD] STORM ce=0 clinit=0 gc=0 preload=86 (pump starved but progressing)
+[WD-STALL] recovered ce 0 -> 4, 4 polls frozen (~1000 ms), 4 samples kept
+[WD-STALL] #0 t=10244170 phase=0(none/interp) age_ms=0 vm=WAITING wait=event dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #0 sys found=1 lastop=io_write arg=4001010f(ux0:/data/J2ME00001/midp_stderr.log) inside=1 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #1 t=10494438 phase=0(none/interp) age_ms=0 vm=WAITING wait=event dclk_us=34974 sw+0 site+0 jsmp+0
+[WD-STALL] #1 sys found=1 lastop=io_write arg=400101c5(ux0:/data/midp_debug.log) inside=1 since_ms=0 | calls+168 rd+0 lseek+5 lseek32+7 lwmutex+66 sema+0
+[WD-STALL] #2 t=10744808 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=9334 sw+0 site+0 jsmp+0
+[WD-STALL] #2 sys found=1 lastop=io_write arg=400101cb(?) inside=1 since_ms=0 | calls+92 rd+0 lseek+3 lseek32+4 lwmutex+36 sema+0
+[WD-STALL] #3 t=10994980 phase=0(none/interp) age_ms=0 vm=WAITING wait=event dclk_us=29423 sw+0 site+0 jsmp+0
+[WD-STALL] #3 sys found=1 lastop=io_close arg=400101dd(?) inside=1 since_ms=7280 | calls+384 rd+0 lseek+9 lseek32+18 lwmutex+156 sema+0
+[WD] STORM ce=9826 clinit=96 gc=7 preload=1025 (pump starved but progressing)
+[WD-STALL] recovered ce 9826 -> 9827, 5 polls frozen (~1250 ms), 5 samples kept
+[WD-STALL] #0 t=158804824 phase=0(none/interp) age_ms=0 vm=WAITING wait=event dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #0 sys found=1 lastop=io_write arg=400101bb(ux0:/data/runmidlet_debug.log) inside=1 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #1 t=159055113 phase=0(none/interp) age_ms=0 vm=WAITING wait=event dclk_us=19081 sw+0 site+0 jsmp+0
+[WD-STALL] #1 sys found=1 lastop=lwmutex_unlock arg=815da648(-) inside=0 since_ms=0 | calls+741 rd+2 lseek+13 lseek32+5 lwmutex+352 sema+0
+[WD-STALL] #2 t=159305243 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=29883 sw+0 site+0 jsmp+0
+[WD-STALL] #2 sys found=1 lastop=io_write arg=4001010f(ux0:/data/J2ME00001/midp_stderr.log) inside=1 since_ms=0 | calls+81 rd+0 lseek+3 lseek32+3 lwmutex+31 sema+0
+[WD-STALL] #3 t=159555427 phase=0(none/interp) age_ms=0 vm=WAITING wait=event dclk_us=15239 sw+0 site+0 jsmp+0
+[WD-STALL] #3 sys found=1 lastop=io_write arg=400701ab(?) inside=1 since_ms=0 | calls+166 rd+0 lseek+5 lseek32+8 lwmutex+66 sema+0
+[WD-STALL] #4 t=159805731 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=29790 sw+0 site+0 jsmp+0
+[WD-STALL] #4 sys found=1 lastop=lwmutex_unlock arg=815da648(-) inside=0 since_ms=5800 | calls+352 rd+0 lseek+8 lseek32+16 lwmutex+143 sema+0

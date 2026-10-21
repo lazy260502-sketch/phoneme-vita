@@ -84,6 +84,7 @@ class TextBoxLFImpl extends TextFieldLFImpl implements TextFieldLF {
      * Notifies L&F of a content change in the corresponding TextBox.
      */
     public void lSetChars() {
+        syncNativeKeyboardText();
         cursor.index = tf.buffer.length(); // cursor at the end
         cursor.option = Text.PAINT_USE_CURSOR_INDEX;
 
@@ -91,6 +92,27 @@ class TextBoxLFImpl extends TextFieldLFImpl implements TextFieldLF {
         updateTextInfo();
     }
 
+
+    /**
+     * v02.74: true while this TextBox is the one on screen (set in
+     * uCallShowNotify / cleared in uCallHideNotify). Only then may its content
+     * be pushed to the native system keyboard - a TextBox that is not showing
+     * must not overwrite the text of the one that is.
+     */
+    private boolean nativeKbShown;
+
+    /**
+     * v02.74: push the current content and capacity to the native side, so the
+     * system keyboard (also opened natively by SELECT, without passing through
+     * Java) starts with the text that is already there. Called with
+     * LCDUILock held, right after tf.buffer changed.
+     */
+    private void syncNativeKeyboardText() {
+        if (nativeKbShown) {
+            VirtualKeyboardInputMode.setNativeKeyboardText(
+                tf.buffer.toString(), tf.buffer.capacity());
+        }
+    }
 
     /**
      * Update text info if required
@@ -156,6 +178,7 @@ class TextBoxLFImpl extends TextFieldLFImpl implements TextFieldLF {
      * @param position the position at which insertion occurred
      */
     public void lInsert(char data[], int offset, int length, int position) {
+        syncNativeKeyboardText();
         if (data != null) {
             if (editable) {
                 if (position <= cursor.index) {
@@ -181,6 +204,7 @@ class TextBoxLFImpl extends TextFieldLFImpl implements TextFieldLF {
      * specify a valid range within the contents of the <code>TextField</code>
      */
     public void lDelete(int offset, int length) {
+        syncNativeKeyboardText();
         if (editable) {
             if (cursor.index >= offset) {
                 int diff = cursor.index - offset;
@@ -198,6 +222,7 @@ class TextBoxLFImpl extends TextFieldLFImpl implements TextFieldLF {
      * @param maxSize - the new maximum size
      */
     public void lSetMaxSize(int maxSize) {
+        syncNativeKeyboardText();
         if (editable) {
             if (cursor.index >= maxSize) {
                 cursor.index = maxSize;
@@ -667,6 +692,13 @@ class TextBoxLFImpl extends TextFieldLFImpl implements TextFieldLF {
                 // IMPL_NOTE: problem with synchronization on layers and LCDUILock
                 showIMPopup = false;
                 disableLayers();
+                // v02.61: dismiss the system keyboard when the TextBox is
+                // hidden (mirrors uCallShowNotify). On Vita this forwards
+                // to vita_ime_abort(); no-op elsewhere.
+                nativeKbShown = false;
+                // forget our text so it cannot leak into another keyboard
+                VirtualKeyboardInputMode.setNativeKeyboardText(null, 0);
+                VirtualKeyboardInputMode.hideNativeKeyboard();
             }
         }
     }
@@ -792,6 +824,13 @@ class TextBoxLFImpl extends TextFieldLFImpl implements TextFieldLF {
                 // IMPL_NOTE: problem with synchronization on layers and LCDUILock
                 showIMPopup = true;
                 enableLayers();
+                // v02.61: auto-pop the system keyboard only for a whole-screen
+                // TextBox (this class), not for Form TextFields - see
+                // TextFieldLFImpl.enableInput(). On Vita this forwards to
+                // vita_ime_show(); it is a no-op elsewhere.
+                nativeKbShown = true;
+                syncNativeKeyboardText();   // v02.74: open with current text
+                VirtualKeyboardInputMode.showNativeKeyboard();
             }
         }
     }

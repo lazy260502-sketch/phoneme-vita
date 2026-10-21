@@ -1,0 +1,277 @@
+site seq=178480 frozen=yes self=0x810b178c mark=0x810b1764
+  [ 0] 0x810e6784
+  [ 1] 0x810e40bc
+  [ 2] 0x810e6784
+  [ 3] 0x810e6784
+  [ 4] 0x810e6784
+  [ 5] 0x810e6784
+  [ 6] 0x810e6784
+  [ 7] 0x810e6784
+  [ 8] 0x810e6784
+  [ 9] 0x810e6784
+  [10] 0x810e6784
+  [11] 0x810e6784
+  [12] 0x810e6784
+  [13] 0x810e6784
+  [14] 0x810e6784
+  [15] 0x810e6784
+verify class=(none) method=(none)
+clinit class=com/app/filemanager/UI
+clinit stats count=35 depth=0 max=3 gc=0 preload=868
+clinit [ 0] com/app/filemanager/UI
+clinit [ 1] .unknown.
+clinit [ 2] com/app/filemanager/MenuCanvas
+clinit [ 3] .unknown.
+clinit [ 4] .unknown.
+clinit [ 5] .unknown.
+clinit [ 6] .unknown.
+clinit [ 7] .unknown.
+clinit [ 8] com/app/filemanager/FileManagerMIDlet
+clinit [ 9] javax/microedition/midlet/MIDlet
+clinit [10] com/sun/midp/content/CHManager
+clinit [11] com/sun/midp/i18n/Resource
+clinit [12] com/sun/cldc/i18n/j2me/UTF_8_Reader
+clinit [13] com/sun/midp/main/MIDletProxyList
+clinit [14] com/sun/midp/midlet/MIDletStateHandler
+clinit [15] java/util/Timer
+java site=.unknown...unknown.
+java samples=345
+
+===== v02.18 sample 1 =====
+wd_snapshot cur_cell=0x81401d00 cur_thread=0x81d29860
+  status=0x00000000 pending=0x00000000 jsp=0x81d2a80c
+  active_count=5 async_count=1 VerifyOnly=0
+  timer_ticked=1 ev_readiness=0
+  rt_ticks=286 ttk=345 jsmp=345
+  ttk_stage=7 hits 1..7=345/345/345/345/345/345/345
+  lanes fast=379 slow=0 pump=405 switch=177527 sf=0/0/0 gnrt=0/0
+dispatch ring (last 16, newest first):
+  [ 0] id=3 pri=5 st=00000000 pe=0
+  [ 1] id=3 pri=5 st=00000000 pe=0
+  [ 2] id=3 pri=5 st=00000000 pe=0
+  [ 3] id=3 pri=5 st=00000000 pe=0
+  [ 4] id=3 pri=5 st=00000000 pe=0
+  [ 5] id=3 pri=5 st=00000000 pe=0
+  [ 6] id=3 pri=5 st=00000000 pe=0
+  [ 7] id=3 pri=5 st=00000000 pe=0
+  [ 8] id=3 pri=5 st=00000000 pe=0
+  [ 9] id=3 pri=5 st=00000000 pe=0
+  [10] id=3 pri=5 st=00000000 pe=0
+  [11] id=3 pri=5 st=00000000 pe=0
+  [12] id=3 pri=5 st=00000000 pe=0
+  [13] id=3 pri=5 st=00000000 pe=0
+  [14] id=3 pri=5 st=00000000 pe=0
+  [15] id=3 pri=5 st=00000000 pe=0
+[rd1 dispatch ok]
+java-stack-top (current):
+  stack_pointer()=0x81d2a80c stack_limit()=0x81d29dd8
+  [jsp+00] 0x81d2786c
+  [jsp+04] 0x811201d8
+  [jsp+08] 0x812514f7
+  [jsp+12] 0x81d2a838
+  [jsp+16] 0x811fdbb0
+  [jsp+20] 0x812514c0
+  [jsp+24] 0x81d2a850
+  [jsp+28] 0x81d2a810
+  [jsp+32] 0x81d2a850
+  [jsp+36] 0x81d2c658
+  [jsp+40] 0x81d2786c
+  [jsp+44] 0x81cf84b8
+  [jsp+48] 0x81120348
+  [jsp+52] 0x81289b61
+  [jsp+56] 0x81d2a85c
+  [jsp+60] 0x811fdbb0
+[rd2 stacktop ok]
+  nrt cell=0x815d6818 obj=0x81d29860
+  nrt obj=0x81d29860 id=4 st=00000000 jsp=0x81d2a80c wait=0x00000000 pe=0x00000000 tobj=0x81d297a8
+[rd3 nrt ok]
+  ticker loops=1284 tick_count=1283 last_ms=22487 ago_ms=7 cpu_cfg=-1 tickgate=0 tick_compile=1
+[rd4 ticker ok]
+  boot run=1 sched_start=5 th_start=4 th_finish=0 lw_exit=0 start0=4 justborn=0 birth_delay=0
+  v230 swjb_seen=0 swjb_clear=0 pe_enter=0 ts_enter=0 ts_gadget=0 born_dsp=4
+  v231 finish=0 force=0 setcur=91 term=0 term_listed=0 exit_seq=0
+  v240 land=15966556 fp=00000000 lr=810f8040 pad=810f8040
+  v241 rec[0] land=1 r4=815d7460 r5=814018f4 r6=818b57bc r7=811790cc r8=811790a4 r9=00000000 r10=81680d64 r11=00000000 r12=00000001 sp=8167fd00 lr=810f8040
+  v241 rec[0] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=818a5858 cur.sp=818b57b4 cur.st=00000000 cur.pe=818b4768
+  v241 rec[0] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[1] land=2 r4=81d10a98 r5=814018f4 r6=81d03c68 r7=818b5294 r8=811fdbb0 r9=81d10abc r10=818b5274 r11=00000000 r12=81d03178 sp=8167fd00 lr=810f8040
+  v241 rec[1] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d02c00 cur.sp=81d03c60 cur.st=00000000 cur.pe=81d03c88
+  v241 rec[1] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[2] land=3 r4=81d03c88 r5=814018f4 r6=81d04d84 r7=81d03c1c r8=811fdbb0 r9=81d03ca4 r10=81d03c00 r11=00000000 r12=81d04294 sp=8167fd00 lr=810f8040
+  v241 rec[2] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d03d1c cur.sp=81d04d7c cur.st=00000000 cur.pe=81d04da4
+  v241 rec[2] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[3] land=4 r4=81d29448 r5=814018f4 r6=81d28c00 r7=818b55b8 r8=811fdbb0 r9=81d2946c r10=818b5598 r11=00000000 r12=81d28110 sp=8167fd00 lr=810f8040
+  v241 rec[3] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d27b98 cur.sp=81d28bf8 cur.st=00000000 cur.pe=81d28c20
+  v241 rec[3] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[4] land=5 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[4] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a8c0 cur.st=00000000 cur.pe=81d2a8e8
+  v241 rec[4] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[5] land=6 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[5] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[5] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[6] land=7 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[6] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[6] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[7] land=8 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[7] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[7] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[8] land=1000000 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[8] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[8] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[9] land=1000001 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[9] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[9] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[10] land=1000002 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[10] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[10] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[11] land=1000003 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[11] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[11] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[12] land=1000004 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[12] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[12] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[13] land=1000005 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[13] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[13] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[14] land=1000006 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[14] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[14] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[15] land=1000007 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[15] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[15] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v242 st=0/0/0/0/0/0/0/0/0/0 r6=00000000 lr=00000000 pendexc=00000000
+  v243 rep=17513805 trip_rep=0 trip_land=0 last_cur=81d29860 last_r6=81d2a8c8
+  last 8 java threads created:
+    [0] java/lang/Thread.run
+    [1] java/lang/Thread.run
+    [2] java/lang/Thread.run
+    [3] java/lang/Thread.run
+[rd5 threads ok]
+threads(active-list):
+  t0x81d29860 id=4 st=00000000 wait=0x00000000 timed
+  t0x81d27b98 id=3 st=00000000 wait=0x00000000 no-timeout
+  t0x81d03d1c id=2 st=00000000 wait=0x81d02ad8 no-timeout
+  t0x81d02c00 id=1 st=00000000 wait=0x81d02ad8 no-timeout
+  t0x818a5858 id=0 st=00000000 wait=0x81d258ac no-timeout
+threads(priority-queues):
+  q5: t0x81d29860(id=4,st=00000000) t0x81d27b98(id=3,st=00000000) CYCLE(2)
+[rd6 dumpthreads ok]
+===== v02.18 sample 2 (+400ms) =====
+wd_snapshot cur_cell=0x81401d00 cur_thread=0x81d29860
+  status=0x00000000 pending=0x00000000 jsp=0x81d2a80c
+  active_count=5 async_count=1 VerifyOnly=0
+  timer_ticked=1 ev_readiness=0
+  rt_ticks=371 ttk=345 jsmp=345
+  ttk_stage=7 hits 1..7=345/345/345/345/345/345/345
+  lanes fast=379 slow=0 pump=405 switch=177527 sf=0/0/0 gnrt=0/0
+dispatch ring (last 16, newest first):
+  [ 0] id=3 pri=5 st=00000000 pe=0
+  [ 1] id=3 pri=5 st=00000000 pe=0
+  [ 2] id=3 pri=5 st=00000000 pe=0
+  [ 3] id=3 pri=5 st=00000000 pe=0
+  [ 4] id=3 pri=5 st=00000000 pe=0
+  [ 5] id=3 pri=5 st=00000000 pe=0
+  [ 6] id=3 pri=5 st=00000000 pe=0
+  [ 7] id=3 pri=5 st=00000000 pe=0
+  [ 8] id=3 pri=5 st=00000000 pe=0
+  [ 9] id=3 pri=5 st=00000000 pe=0
+  [10] id=3 pri=5 st=00000000 pe=0
+  [11] id=3 pri=5 st=00000000 pe=0
+  [12] id=3 pri=5 st=00000000 pe=0
+  [13] id=3 pri=5 st=00000000 pe=0
+  [14] id=3 pri=5 st=00000000 pe=0
+  [15] id=3 pri=5 st=00000000 pe=0
+[rd1 dispatch ok]
+java-stack-top (current):
+  stack_pointer()=0x81d2a80c stack_limit()=0x81d29dd8
+  [jsp+00] 0x81d2786c
+  [jsp+04] 0x811201d8
+  [jsp+08] 0x812514f7
+  [jsp+12] 0x81d2a838
+  [jsp+16] 0x811fdbb0
+  [jsp+20] 0x812514c0
+  [jsp+24] 0x81d2a850
+  [jsp+28] 0x81d2a810
+  [jsp+32] 0x81d2a850
+  [jsp+36] 0x81d2c658
+  [jsp+40] 0x81d2786c
+  [jsp+44] 0x81cf84b8
+  [jsp+48] 0x81120348
+  [jsp+52] 0x81289b61
+  [jsp+56] 0x81d2a85c
+  [jsp+60] 0x811fdbb0
+[rd2 stacktop ok]
+  nrt cell=0x815d6818 obj=0x81d29860
+  nrt obj=0x81d29860 id=4 st=00000000 jsp=0x81d2a80c wait=0x00000000 pe=0x00000000 tobj=0x81d297a8
+[rd3 nrt ok]
+  ticker loops=1371 tick_count=1370 last_ms=23372 ago_ms=4 cpu_cfg=-1 tickgate=0 tick_compile=1
+[rd4 ticker ok]
+  boot run=1 sched_start=5 th_start=4 th_finish=0 lw_exit=0 start0=4 justborn=0 birth_delay=0
+  v230 swjb_seen=0 swjb_clear=0 pe_enter=0 ts_enter=0 ts_gadget=0 born_dsp=4
+  v231 finish=0 force=0 setcur=91 term=0 term_listed=0 exit_seq=0
+  v240 land=20653300 fp=00000000 lr=810f8040 pad=810f8040
+  v241 rec[0] land=1 r4=815d7460 r5=814018f4 r6=818b57bc r7=811790cc r8=811790a4 r9=00000000 r10=81680d64 r11=00000000 r12=00000001 sp=8167fd00 lr=810f8040
+  v241 rec[0] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=818a5858 cur.sp=818b57b4 cur.st=00000000 cur.pe=818b4768
+  v241 rec[0] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[1] land=2 r4=81d10a98 r5=814018f4 r6=81d03c68 r7=818b5294 r8=811fdbb0 r9=81d10abc r10=818b5274 r11=00000000 r12=81d03178 sp=8167fd00 lr=810f8040
+  v241 rec[1] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d02c00 cur.sp=81d03c60 cur.st=00000000 cur.pe=81d03c88
+  v241 rec[1] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[2] land=3 r4=81d03c88 r5=814018f4 r6=81d04d84 r7=81d03c1c r8=811fdbb0 r9=81d03ca4 r10=81d03c00 r11=00000000 r12=81d04294 sp=8167fd00 lr=810f8040
+  v241 rec[2] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d03d1c cur.sp=81d04d7c cur.st=00000000 cur.pe=81d04da4
+  v241 rec[2] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[3] land=4 r4=81d29448 r5=814018f4 r6=81d28c00 r7=818b55b8 r8=811fdbb0 r9=81d2946c r10=818b5598 r11=00000000 r12=81d28110 sp=8167fd00 lr=810f8040
+  v241 rec[3] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d27b98 cur.sp=81d28bf8 cur.st=00000000 cur.pe=81d28c20
+  v241 rec[3] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[4] land=5 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[4] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a8c0 cur.st=00000000 cur.pe=81d2a8e8
+  v241 rec[4] pendexc[gp+1040]=00000000 [cur.sp]=00000000 [cur.sp+4]=810f8040
+  v241 rec[5] land=6 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[5] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[5] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[6] land=7 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[6] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[6] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[7] land=8 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[7] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[7] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[8] land=1000000 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[8] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[8] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[9] land=1000001 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[9] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[9] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[10] land=1000002 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[10] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[10] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[11] land=1000003 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[11] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[11] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[12] land=1000004 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[12] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[12] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[13] land=1000005 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[13] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[13] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[14] land=1000006 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[14] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[14] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v241 rec[15] land=1000007 r4=00000001 r5=814018f4 r6=81d2a8c8 r7=818b5570 r8=811fdbb0 r9=811dd464 r10=818b5528 r11=00000000 r12=81d29dd8 sp=8167fd00 lr=810f8040
+  v241 rec[15] x[r6+0/4/8/12/16]=810f9e80 810f8360 810f82a0 810f8260 00000000 cur=81d29860 cur.sp=81d2a80c cur.st=00000000 cur.pe=00000000
+  v241 rec[15] pendexc[gp+1040]=00000000 [cur.sp]=81d2786c [cur.sp+4]=811201d8
+  v242 st=0/0/0/0/0/0/0/0/0/0 r6=00000000 lr=00000000 pendexc=00000000
+  v243 rep=22086438 trip_rep=0 trip_land=0 last_cur=81d29860 last_r6=81d2a8c8
+  last 8 java threads created:
+    [0] java/lang/Thread.run
+    [1] java/lang/Thread.run
+    [2] java/lang/Thread.run
+    [3] java/lang/Thread.run
+[rd5 threads ok]
+threads(active-list):
+  t0x81d29860 id=4 st=00000000 wait=0x00000000 timed
+  t0x81d27b98 id=3 st=00000000 wait=0x00000000 no-timeout
+  t0x81d03d1c id=2 st=00000000 wait=0x81d02ad8 no-timeout
+  t0x81d02c00 id=1 st=00000000 wait=0x81d02ad8 no-timeout
+  t0x818a5858 id=0 st=00000000 wait=0x81d258ac no-timeout
+threads(priority-queues):
+  q5: t0x81d29860(id=4,st=00000000) t0x81d27b98(id=3,st=00000000) CYCLE(2)
+[rd6 dumpthreads ok]

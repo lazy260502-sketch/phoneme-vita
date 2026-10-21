@@ -1,0 +1,41 @@
+[MIDLET] startSuite: main.MainMidlet
+[MIDLET] creating main.MainMidlet
+[rms] open name='NEZHA_DOWN' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[rms] open name='NEZHASMS' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[MIDLET] created+registered OK: main.MainMidlet
+javax.microedition.media.MediaException: unable to realize: Tone sequence check failed at offset 0: missing version information
+ - com.sun.mmedia.DirectTone..unknown.(), bci=153
+ - com.sun.mmedia.HighLevelPlayer.realize(), bci=375
+ - com.sun.mmedia.HighLevelPlayer.prefetch(), bci=18
+ - b.b.b(), bci=89
+ - b.b.run(), bci=41
+ - java.lang.Thread.run(), bci=5
+[rms] open name='NEZHA' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[rms] open name='NEZHA' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[MIDLET] startSuite: main.MainMidlet
+[MIDLET] creating main.MainMidlet
+[rms] open name='NEZHA_DOWN' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[rms] open name='NEZHASMS' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[MIDLET] created+registered OK: main.MainMidlet
+javax.microedition.media.MediaException: unable to realize: Tone sequence check failed at offset 0: missing version information
+ - com.sun.mmedia.DirectTone..unknown.(), bci=153
+ - com.sun.mmedia.HighLevelPlayer.realize(), bci=375
+ - com.sun.mmedia.HighLevelPlayer.prefetch(), bci=18
+ - b.b.b(), bci=89
+ - b.b.run(), bci=41
+ - java.lang.Thread.run(), bci=5
+[rms] open name='NEZHA' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+javax.microedition.media.MediaException: unable to realize: Tone sequence check failed at offset 0: missing version information
+ - com.sun.mmedia.DirectTone..unknown.(), bci=153
+ - com.sun.mmedia.HighLevelPlayer.realize(), bci=375
+ - com.sun.mmedia.HighLevelPlayer.prefetch(), bci=18
+ - b.b.b(), bci=89
+ - b.b.run(), bci=41
+ - java.lang.Thread.run(), bci=5
+[MIDLET] startSuite: cn.uc.application.app.WebClient
+[MIDLET] creating cn.uc.application.app.WebClient
+[MIDLET] created+registered OK: cn.uc.application.app.WebClient
+[rms] open name='coreA' suite=-1 exists=1 next=2 live=1 ver=39 data=4976 free=0
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0
+[rms] open name='coreA' suite=-1 exists=1 next=2 live=1 ver=39 data=4976 free=0
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0

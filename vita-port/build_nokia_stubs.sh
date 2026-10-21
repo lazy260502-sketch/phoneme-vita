@@ -4,12 +4,14 @@
 # preverified like app classes (CLDC VM requires it for jar/dir classes).
 set -e
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nokia_src"
-OUT_CLASSES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nokia_classes"
-CLS=/home/zyb/vitasdk/samples/j2me/phoneme-midp/build/vita_arm/classes
-CLDC_ZIP=/home/zyb/vitasdk/samples/j2me/phoneme-cldc/build/vita_arm/dist/lib/cldc_classes.zip
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../build_env.sh"
+SRC_DIR="$SCRIPT_DIR/nokia_src"
+OUT_CLASSES="$SCRIPT_DIR/nokia_classes"
+CLS="$J2ME_ROOT/phoneme-midp/build/vita_arm/classes"
+CLDC_ZIP="$J2ME_ROOT/phoneme-cldc/build/vita_arm/dist/lib/cldc_classes.zip"
 MIDP_ZIP=$CLS.zip
-PREVERIFY=/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/cldc/build/share/bin/linux_i386/preverify
+PREVERIFY="$J2ME_ROOT/phoneme_source/phoneME/cldc/build/share/bin/linux_i386/preverify"
 
 mkdir -p "$SRC_DIR" "$OUT_CLASSES"
 ls "$SRC_DIR"/*.java > /dev/null

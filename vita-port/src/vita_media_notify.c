@@ -25,6 +25,7 @@
  *   MM_EVT_STATUS = status
  */
 
+#include <stdint.h>       /* intptr_t */
 #include <midpEvents.h>
 #include <midpServices.h>
 #include <javacall_defs.h>

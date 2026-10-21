@@ -47,6 +47,9 @@ ReturnOop FileDecoder::allocate(OsFile_Handle handle, int pos, int size,
 }
 
 ReturnOop FileDecoder::read_completely(JVM_SINGLE_ARG_TRAPS) {
+#if defined(VITA)
+  VitaPhaseScope vps3(3); /* v02.47 stall phase marker */
+#endif
   // try ...
   ReturnOop result = read_completely0(JVM_SINGLE_ARG_NO_CHECK);
 

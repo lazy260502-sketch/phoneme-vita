@@ -3394,17 +3394,39 @@ public class Display {
         // Handle keyboard event only if in Keyboard Input mode
         public void handleInputMethodEvent(String inputText) {
             TextBox textBoxCopy = null;
+            Item curItem = null;
 
             synchronized (LCDUILock) {
-                if (current instanceof TextBox) {
-                    textBoxCopy = (TextBox) current;
+                // v02.52: `current` is a DisplayableLF, so the old
+                // `current instanceof TextBox` never matched (TextBox is a
+                // Displayable). Resolve the API object via lGetDisplayable().
+                Displayable d = current.lGetDisplayable();
+                if (d instanceof TextBox) {
+                    textBoxCopy = (TextBox) d;
+                } else if (current instanceof FormLF) {
+                    // Focused item in a Form: commit to a TextField.
+                    curItem = ((FormLF) current).lGetCurrentItem();
                 }
             }
 
             // SYNC NOTE: TextBox.insert() does its own locking so we
             // move the call outside of our lock using a local variable
             if (textBoxCopy != null) {
-                textBoxCopy.insert(inputText, textBoxCopy.getCaretPosition());
+                // v02.74: the system keyboard opens with the TextBox's
+                // current content (initialText), so its result is the WHOLE
+                // new content: replace, do not insert. A null/empty result
+                // means the user cleared the text.
+                try {
+                    textBoxCopy.setString(inputText);
+                } catch (IllegalArgumentException e) {
+                    // not valid for the constraints / over capacity: keep old
+                }
+            } else if (curItem instanceof TextField) {
+                // v02.52: route the typed text into the focused TextField.
+                ItemLF lf = ((TextField) curItem).getLF();
+                if (lf instanceof TextFieldLFImpl) {
+                    ((TextFieldLFImpl) lf).commit(inputText);
+                }
             }
         } // handleInputMethodEvent
 

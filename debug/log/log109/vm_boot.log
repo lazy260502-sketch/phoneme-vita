@@ -1,0 +1,52 @@
+[+5173680 us] [JVM_Start] classpath=midp_system.jar:games/fengshenbang/game.jar main=com.sun.midp.main.MIDletSuiteLoader argc=0
+[+5182047 us] [JVM_Start] set_arguments done, calling JVM::start
+[+5188218 us] [JVM_Start] JVM::start() loop 0 enter
+[+5195285 us] [vita] vm_cpu=off aff=0x70000
+[+5201455 us] [v257] tramp@0x811007f8 w0-3=e59f5078 e595040c e5901068 e3a02000 w4-7=e3110101 15802024 0affff42 e5960010
+[+5207569 us] [v257] tramp w8-11=e5951410 e3500000 1a00000c e3510000 w12-15=15960004 1bffff48 e5960008 ebffff46
+[+5217353 us] [v257] ipe@0x81100520 w0-3=e59f0028 e5900000 e5901024 e3510000
+[+5224438 us] [v257] bleq(w6)=0affff42 L=0 cond=0 | blne(w13)=1bffff48 L=1 cond=1 | bl(w15)=ebffff46 L=1 cond=e
+[+5231556 us] [v258] shared_entry+0x358 blne=1bffff28 L=1 cond=1
+[+5238769 us] [v258] shared_entry+0x488 blne=1bfffedc L=1 cond=1
+[+5245973 us] [v258] shared_entry+0x5a4 blne=1bfffe95 L=1 cond=1
+[+5333815 us] [preload] begin load_all_in_classpath
+[+9789757 us] [preload] jar[0] entries=932 defined=859 fast=3 us=4448427
+[+12552235 us] [preload] jar[1] entries=73 defined=73 fast=0 us=2752707
+[+12561710 us] [preload] done defined=932 entries=1005 fast=3 total_us=7227911 open_us=1972565 read_us=168813 resolve_us=1902936
+[+12570205 us] [preload] phases2 sym_us=12481 verify_us=0 iter_us=3095144 skipped=511
+[+12578844 us] [preload] sys(VM thread, delta): io_open n=9 us=7093 io_close n=9 us=15548 io_read n=4168 us=6367916 io_write n=5 us=19406 io_lseek n=5 us=499 io_getstat n=15 us=6701 lwmutex_lock n=11229 us=34959 lwmutex_unlock n=11229 us=33069 io_lseek32 n=1378 us=170930 io_getstat_byfd n=17 us=2133
+[+7435169 us] [JVM_Start] classpath=midp_system.jar:games/fengshenbang/game.jar main=com.sun.midp.main.MIDletSuiteLoader argc=0
+[+7445440 us] [JVM_Start] set_arguments done, calling JVM::start
+[+7455394 us] [JVM_Start] JVM::start() loop 0 enter
+[+7467958 us] [vita] vm_cpu=off aff=0x70000
+[+7477862 us] [v257] tramp@0x811277f8 w0-3=e59f5078 e595040c e5901068 e3a02000 w4-7=e3110101 15802024 0affff42 e5960010
+[+7487782 us] [v257] tramp w8-11=e5951410 e3500000 1a00000c e3510000 w12-15=15960004 1bffff48 e5960008 ebffff46
+[+7497650 us] [v257] ipe@0x81127520 w0-3=e59f0028 e5900000 e5901024 e3510000
+[+7508014 us] [v257] bleq(w6)=0affff42 L=0 cond=0 | blne(w13)=1bffff48 L=1 cond=1 | bl(w15)=ebffff46 L=1 cond=e
+[+7518272 us] [v258] shared_entry+0x358 blne=1bffff28 L=1 cond=1
+[+7528573 us] [v258] shared_entry+0x488 blne=1bfffedc L=1 cond=1
+[+7538956 us] [v258] shared_entry+0x5a4 blne=1bfffe95 L=1 cond=1
+[+7629724 us] [preload] begin load_all_in_classpath
+[+12016861 us] [preload] jar[0] entries=932 defined=859 fast=3 us=4376496
+[+14583663 us] [preload] jar[1] entries=73 defined=73 fast=0 us=2554614
+[+14595066 us] [preload] done defined=932 entries=1005 fast=3 total_us=6965531 open_us=1947879 read_us=168500 resolve_us=1857188
+[+14605757 us] [preload] phases2 sym_us=12516 verify_us=0 iter_us=2898489 skipped=511
+[+14616458 us] [preload] sys(VM thread, delta): io_open n=9 us=6770 io_close n=9 us=21881 io_read n=4168 us=6112264 io_write n=5 us=25080 io_lseek n=5 us=497 io_getstat n=15 us=6770 lwmutex_lock n=11229 us=34634 lwmutex_unlock n=11229 us=32806 io_lseek32 n=1378 us=157325 io_getstat_byfd n=17 us=2202
+[+75669508 us] [JVM_Start] JVM::start() loop 0 returned 2001
+[+80786955 us] [JVM_Start] classpath=midp_system.jar:games/app/game.jar main=com.sun.midp.main.MIDletSuiteLoader argc=0
+[+80797988 us] [JVM_Start] set_arguments done, calling JVM::start
+[+80809029 us] [JVM_Start] JVM::start() loop 0 enter
+[+80823064 us] [vita] vm_cpu=off aff=0x70000
+[+80834132 us] [v257] tramp@0x811277f8 w0-3=e59f5078 e595040c e5901068 e3a02000 w4-7=e3110101 15802024 0affff42 e5960010
+[+80845240 us] [v257] tramp w8-11=e5951410 e3500000 1a00000c e3510000 w12-15=15960004 1bffff48 e5960008 ebffff46
+[+80856645 us] [v257] ipe@0x81127520 w0-3=e59f0028 e5900000 e5901024 e3510000
+[+80868066 us] [v257] bleq(w6)=0affff42 L=0 cond=0 | blne(w13)=1bffff48 L=1 cond=1 | bl(w15)=ebffff46 L=1 cond=e
+[+80879558 us] [v258] shared_entry+0x358 blne=1bffff28 L=1 cond=1
+[+80890938 us] [v258] shared_entry+0x488 blne=1bfffedc L=1 cond=1
+[+80902452 us] [v258] shared_entry+0x5a4 blne=1bfffe95 L=1 cond=1
+[+80994499 us] [preload] begin load_all_in_classpath
+[+85474607 us] [preload] jar[0] entries=932 defined=859 fast=3 us=4467567
+[+86555527 us] [preload] jar[1] entries=68 defined=67 fast=0 us=1067800
+[+86568631 us] [preload] done defined=1858 entries=2005 fast=6 total_us=5574220 open_us=4032584 read_us=430111 resolve_us=3422429
+[+86580430 us] [preload] phases2 sym_us=25080 verify_us=0 iter_us=4480189 skipped=1017
+[+86592457 us] [preload] sys(VM thread, delta): io_open n=9 us=6841 io_close n=9 us=21993 io_read n=3892 us=4515532 io_write n=5 us=31819 io_lseek n=5 us=502 io_getstat n=15 us=6643 lwmutex_lock n=10633 us=32738 lwmutex_unlock n=10633 us=31072 io_lseek32 n=1356 us=164351 io_getstat_byfd n=17 us=2153

@@ -1,0 +1,23 @@
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+[NET] gethostbyname('uc.ucweb.com') = 219.133.46.238
+[NET] socket_open ip=219.133.46.238 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)
+[NET] connect DONE fd=11
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=12 rc=0 errno=0
+[NET] connect EINPROGRESS fd=12 (thread will block)
+[NET] connect DONE fd=12
+[NET] gethostbyname('ucus.ucweb.com') = 219.133.46.246
+[NET] socket_open ip=219.133.46.246 port=80
+[NET] set_nbio fd=12 rc=0 errno=0
+[NET] connect EINPROGRESS fd=12 (thread will block)
+[NET] connect DONE fd=12
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)
+[NET] connect DONE fd=11

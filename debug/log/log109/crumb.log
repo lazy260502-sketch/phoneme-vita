@@ -1,0 +1,98 @@
+
+==== launcher start ====
+version: J2ME Player v02.60 b329 (1e8533d)
+vm cpu: unpinned (mask=0)
+kubridge ABSENT
+
+==== net early init done ====
+
+==== ANI_Initialize enter ====
+[pte] sem create init=0 handle=0x81700278 -> 0x4001013f rc=0 from 0x81103da7
+[pte] sem create init=0 handle=0x81700270 -> 0x40010141 rc=0 from 0x81105547
+[pte] sem create init=0 handle=0x817002a0 -> 0x40010143 rc=0 from 0x81103da7
+[pte] sem create init=0 handle=0x81700298 -> 0x40010145 rc=0 from 0x81105547
+[pte] sem create init=0 handle=0x817002b8 -> 0x40010147 rc=0 from 0x81103da7
+[pte] sem create init=0 handle=0x817002d0 -> 0x40010149 rc=0 from 0x81103da7
+[pte] sem create init=0 handle=0x81700330 -> 0x4001014b rc=0 from 0x81103da7
+[pte] sem create init=0 handle=0x81700328 -> 0x4001014d rc=0 from 0x81105547
+[pte] sem create init=0 handle=0x81700358 -> 0x4001014f rc=0 from 0x81103da7
+[pte] sem create init=0 handle=0x81700350 -> 0x40010151 rc=0 from 0x81105547
+[pte] sem create init=0 handle=0x81700370 -> 0x40010153 rc=0 from 0x81103da7
+[pte] sem create init=0 handle=0x81700388 -> 0x40010155 rc=0 from 0x81103da7
+
+==== ANI_Initialize done ====
+
+==== media init enter ====
+
+==== media init done ====
+round 0: jit cfg=0 -> policy=0
+menu: fb=0x61000000/0x611fe000 block=0x40010161
+menu hb: flips=1 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=59 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+
+==== menu exit ====
+menu exit: have_sel=1 games=5 sen0=c0de0000
+
+==== round begin ====
+launch: games/fengshenbang/game.jar / main.MainMidlet
+
+==== runMidlet enter ====
+vm UseCompiler(pre)=1 (jit policy=0)
+
+==== launcher start ====
+version: J2ME Player v02.60 b329 (1e8533d)
+vm cpu: unpinned (mask=0)
+kubridge ABSENT
+
+==== net early init done ====
+
+==== ANI_Initialize enter ====
+[pte] sem create init=0 handle=0x81700278 -> 0x4001013f rc=0 from 0x8112ada7
+[pte] sem create init=0 handle=0x81700270 -> 0x40010141 rc=0 from 0x8112c547
+[pte] sem create init=0 handle=0x817002a0 -> 0x40010143 rc=0 from 0x8112ada7
+[pte] sem create init=0 handle=0x81700298 -> 0x40010145 rc=0 from 0x8112c547
+[pte] sem create init=0 handle=0x817002b8 -> 0x40010147 rc=0 from 0x8112ada7
+[pte] sem create init=0 handle=0x817002d0 -> 0x40010149 rc=0 from 0x8112ada7
+[pte] sem create init=0 handle=0x81700330 -> 0x4001014b rc=0 from 0x8112ada7
+[pte] sem create init=0 handle=0x81700328 -> 0x4001014d rc=0 from 0x8112c547
+[pte] sem create init=0 handle=0x81700358 -> 0x4001014f rc=0 from 0x8112ada7
+[pte] sem create init=0 handle=0x81700350 -> 0x40010151 rc=0 from 0x8112c547
+[pte] sem create init=0 handle=0x81700370 -> 0x40010153 rc=0 from 0x8112ada7
+[pte] sem create init=0 handle=0x81700388 -> 0x40010155 rc=0 from 0x8112ada7
+
+==== ANI_Initialize done ====
+
+==== media init enter ====
+
+==== media init done ====
+round 0: jit cfg=0 -> policy=0
+menu: fb=0x61000000/0x611fe000 block=0x40010161
+menu hb: flips=0 rc=0x7fffffff games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=47 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=105 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+
+==== menu exit ====
+menu exit: have_sel=1 games=5 sen0=c0de0000
+
+==== round begin ====
+launch: games/fengshenbang/game.jar / main.MainMidlet
+
+==== runMidlet enter ====
+vm UseCompiler(pre)=1 (jit policy=0)
+vm UseCompiler(post)=0 <- actual round mode
+runMidlet returned 0
+
+==== runMidlet exit ====
+round 1: jit cfg=0 -> policy=0
+menu: fb=0x611fe000/0x61000000 block=0x40010161
+menu hb: flips=143 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=202 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+
+==== menu exit ====
+menu exit: have_sel=1 games=5 sen0=c0de0000
+
+==== round begin ====
+launch: games/app/game.jar / cn.uc.application.app.WebClient
+
+==== runMidlet enter ====
+vm UseCompiler(pre)=0 (jit policy=0)

@@ -1,0 +1,11 @@
+[+7446483 us] round=0 round_begin main.MainMidlet
+[+7470594 us] round=0 runMidlet_enter
+[+7738919 us] round=0 first_flip
+[+14975478 us] round=0 first_check_events
+[+17014858 us] round=0 first_content_flip flip#=3
+[+295265426 us] round=0 runMidlet_exit status=0
+[+299794208 us] round=1 round_begin cn.uc.application.app.WebClient
+[+299888090 us] round=1 runMidlet_enter
+[+300281175 us] round=1 first_flip
+[+306401184 us] round=1 first_check_events
+[+309740628 us] round=1 first_content_flip flip#=3

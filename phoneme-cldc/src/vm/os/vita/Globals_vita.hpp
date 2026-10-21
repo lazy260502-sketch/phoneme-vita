@@ -85,6 +85,39 @@ extern "C" {
      * and Universe::load_jar_entry) - advanced once per successfully
      * defined jar class during the boot-time define sweep. */
     extern volatile unsigned int vita_preload_count;
+    /* v02.44: boot-timing instrumentation (definitions and meaning in
+     * OS_vita.cpp). vita_now_us() = us since process start. */
+    unsigned long long vita_now_us(void);
+    extern volatile unsigned int vita_preload_entries;
+    extern volatile unsigned int vita_preload_fast;
+    extern volatile unsigned long long vita_preload_us_open;
+    extern volatile unsigned long long vita_preload_us_read;
+    extern volatile unsigned long long vita_preload_us_resolve;
+    /* resolve() faster than this is counted as a probable cache hit */
+    #define VITA_PRELOAD_FAST_US 50
+    /* v02.47: the other preload phases that were NOT timed in v02.44
+     * (they are the suspects for the 34-41% "unaccounted" share):
+     *   sym     SymbolTable::symbol_for in load_jar_entry
+     *   verify  InstanceClass::verify  (UseVerifier defaults to true)
+     *   iter    JarFileParser::filtered_do_next_entries: find_entry +
+     *           entry-name read, i.e. the central-directory walk */
+    extern volatile unsigned long long vita_preload_us_sym;
+    extern volatile unsigned long long vita_preload_us_verify;
+    extern volatile unsigned long long vita_preload_us_iter;
+
+    /* v02.47: "what is the VM doing" phase marker, read by the watchdog
+     * during a stall (OS_vita.cpp has the id table). vita_phase_id is the
+     * innermost active VitaPhaseScope, vita_phase_us when it was entered. */
+    extern volatile unsigned int vita_phase_id;
+    extern volatile unsigned long long vita_phase_us;
+    extern volatile unsigned int vita_preload_skipped;
+    /* syscall baseline / delta report around the preload (OS_vita.cpp) */
+    void vita_trace_preload_mark(void);
+    void vita_trace_preload_report(void);
+    /* 1 = developer asked for "run the REAL trampoline, never divert to the
+     * shadow" (pad_nodivert.cfg, set by the launcher). See
+     * InterpreterRuntime_arm.cpp. */
+    extern volatile int vita_v247_nodivert;
 
     /*=====================================================================
      * v02.17 one-shot forensics.
@@ -148,5 +181,36 @@ extern "C" {
     /* The resolved mode (0/1/2) for the watchdog dump. */
     int vita_tickgate_mode(void);
 }
+
+/* v02.47: RAII phase marker. Put one at the top of a function worth naming
+ * in a stall report; every return path (JVM_CHECK included) restores the
+ * enclosing phase, so the marker always names the INNERMOST phase still
+ * open. Plain integer stores only - no oops, no syscalls beyond the clock.
+ *   id  meaning
+ *    1  JarFileParser::find_entry       (central directory walk)
+ *    2  JarFileParser::open_entry       (seek + LOC header)
+ *    3  FileDecoder::read_completely    (read + inflate)
+ *    4  preload: SystemDictionary::resolve (parse + define)
+ *    5  preload: InstanceClass::verify
+ *    6  SystemDictionary::fetch_buffer  (lazy class load at run time)
+ *    7  ObjectHeap::collect             (GC)
+ *    8  ResourceInputStream.open        (getResourceAsStream)
+ *    9  InstanceClass::clinit           (static initializer)
+ * 0 = none open: the VM is in the interpreter or in native code that has
+ * no marker (that itself is information during a stall). */
+class VitaPhaseScope {
+  unsigned int _prev_id;
+  unsigned long long _prev_us;
+ public:
+  explicit VitaPhaseScope(unsigned int id)
+      : _prev_id(vita_phase_id), _prev_us(vita_phase_us) {
+    vita_phase_us = vita_now_us();
+    vita_phase_id = id;
+  }
+  ~VitaPhaseScope() {
+    vita_phase_id = _prev_id;
+    vita_phase_us = _prev_us;
+  }
+};
 
 #endif // GLOBALS_VITA_HPP

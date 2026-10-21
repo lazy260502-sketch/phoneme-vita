@@ -98,4 +98,31 @@ void vita_trace_enter(unsigned int op, unsigned int arg);
 void vita_trace_exit(void);
 void vita_trace_dump(const char *path);
 
+/* v02.47: VM-thread syscall accounting + zero-I/O peek for the watchdog's
+ * early stall sampling. Only the VM thread (vita_wd_vm_tid) is accounted,
+ * so the counters have a single writer. */
+unsigned int vita_trace_op_count(void);              /* TRACE_OP_N         */
+const char  *vita_trace_op_name(unsigned int op);
+/* cumulative calls and microseconds spent INSIDE op, VM thread only */
+void vita_trace_op_stats(unsigned int op, unsigned int *cnt,
+                         unsigned long long *us);
+
+/* v02.50: where do the VM thread's sceIoWrite calls go? fd -> path tail
+ * (recorded at sceIoOpen) and per-fd call count / time, VM thread only. */
+const char *vita_trace_fd_path(int fd);
+int vita_trace_fdw_get(unsigned int idx, int *fd, unsigned int *cnt,
+                       unsigned long long *us, unsigned long long *bytes);
+
+typedef struct {
+    unsigned int arg;       /* v02.50: arg of the last op (fd for I/O)   */
+    unsigned int found;     /* 0 = tid not registered in the tracer      */
+    unsigned int op;        /* last traced op entered (0xFF = none)      */
+    unsigned int inside;    /* 1 = that call has not returned yet        */
+    unsigned int ts_lo;     /* sceKernelGetSystemTimeWide low 32 bits    */
+    unsigned int total;     /* all traced calls by this thread so far    */
+    unsigned int rd, lseek, lseek32, lwmutex, sema;
+} vita_trace_peek_t;
+/* Read-only copy of one thread's slot and a few op counters. */
+void vita_trace_peek(unsigned int tid, vita_trace_peek_t *out);
+
 #endif /* VITA_TRACE_H */

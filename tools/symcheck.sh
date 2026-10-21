@@ -3,11 +3,13 @@
 # undefined symbol is satisfied by another member or by known external
 # (sce*, GCC runtime, vita-port side provides the rest at final link).
 set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../build_env.sh"
 LIB="$1"
 DIR=$(mktemp -d)
 cd "$DIR"
-/home/zyb/.local/vitasdk/bin/arm-vita-eabi-ar x "$LIB" || { echo "ar x failed"; exit 1; }
-arm-vita-eabi-nm *.o 2>/dev/null > all.nm
+"$VITASDK/bin/arm-vita-eabi-ar" x "$LIB" || { echo "ar x failed"; exit 1; }
+"$VITASDK/bin/arm-vita-eabi-nm" *.o 2>/dev/null > all.nm
 grep " U " all.nm | awk '{print $2}' | sort -u > undef.txt
 grep -E "^[0-9a-f]+ [A-Za-z]" all.nm | awk '{print $3}' | sort -u > def.txt
 # leak = undefined minus defined, minus compiler/runtime/sce externals

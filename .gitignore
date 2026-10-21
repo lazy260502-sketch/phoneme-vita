@@ -35,3 +35,7 @@ vita-port/nokia_classes/
 /docker/
 /midp-vita/
 .nested-git-backups/
+
+# Python 缓存
+__pycache__/
+*.pyc

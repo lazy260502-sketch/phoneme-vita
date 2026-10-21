@@ -1,0 +1,7 @@
+[midp_run] ENTRY #1, suiteId=-1, classPathExt=midp_system.jar:games/app (1)/game.jar, caller=0x8106201c
+[midp_run] midpInitCallback OK
+[getClassPathPlus] start suiteId=-1 classPathExt='midp_system.jar:games/app (1)/game.jar'
+[getClassPathPlus] INTERNAL_SUITE_ID branch
+[midp_run] classPath built OK, status=0
+[midp_run] before midpRunVm, classPath set
+[midp_run] after midpRunVm, vmStatus=2001 (MAIN_EXIT=2001)

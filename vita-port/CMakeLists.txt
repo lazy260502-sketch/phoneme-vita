@@ -1221,6 +1221,636 @@ set(VITA_VERSION  "02.40")
 #   Sentinel-template diagnostics updated (OS_vita rd2 stacktop,
 #   vita_sched_dump_stack): the never-executed template now shows the
 #   pad address as its 6th word, not the trampoline's.
+set(VITA_VERSION  "02.41")
+# 02.41 (2026-10-16): landing-pad register/exit-table recorder (probe only,
+#   NO behaviour change). log85 (v02.40) disproved the "kernel froze the
+#   core" reading of log61..66: vita_v240_land climbed 317,984,101 ->
+#   323,798,186 in ~550 ms (~10-14M/s) while switch/ttk/site_seq stayed
+#   constant and the VMPROG verdict was "ticker RUNS, VM NOT EXECUTING".
+#   The VM thread is spinning in userland asm through vita_landing_pad
+#   (coredump pc=pad+0x18, lr=pad entry, fp=0). Every earlier "dead pc"
+#   was a random sample of the same loop. The pad now snapshots r4-r12,
+#   sp, lr, the exit-table words [r6+0..16] and the current thread's
+#   stack_pointer/status/pending_entries for land=1..8 (healthy handoffs)
+#   and land=1000000..1000007 (inside the loop). Watchdog prints them as
+#   "v241 rec[i]" lines. Reading: loop records identical => fixed cycle;
+#   compare r6 / [r6+16] / cur.sp against the healthy set to find which
+#   link of the run()-return unwind is wrong.
+set(VITA_VERSION  "02.42")
+# 02.42 (2026-10-16): shadow trampoline. log86 (v02.41) showed the loop is
+#   a fixed cycle (8 records at land=1000000.. byte-identical) with a
+#   HEALTHY exit table ([r6+0..16] = lw_exit/uncaught/finish/force_term/0),
+#   cur.st=0, cur.pe=0 - by the real trampoline's own code that state must
+#   call Thread::finish, yet finish=0 after 2.6e8 laps. The trampoline is
+#   inside the loopgen-frozen Interpreter_arm.o (no probes possible), so
+#   once land>=1000000 the pad now diverts to vita_tramp_shadow, a
+#   hand-written instruction-for-instruction copy with a counter before
+#   each stage. Every probe sits BEFORE the step it describes (the real
+#   call_on_primordial_stack resumes via the CURRENT thread's saved
+#   stack_pointer, so it only fails to return to its caller when the
+#   target switched threads - wording corrected in 02.43). Watchdog prints "v242 st=..." (see
+#   OS_vita.cpp): the first st[i] below st[0] marks where laps leave the
+#   trampoline body. Healthy threads (land<1000000) still use the real one.
+set(VITA_VERSION  "02.45")
+# 02.45 (2026-10-17): FIX "network test hangs, never connects" (log94, real
+#   hw). log94 proved the 02.44 NBIO fix worked ("set_nbio fd=15 rc=0") and
+#   connect() now returns EINPROGRESS correctly, BUT the completion is never
+#   reported: 158 s of event-pump polling (14942 JVMSPI_CheckEvents rounds,
+#   each calling vita_net_poll -> select -> sceNetEpollWait) produced ZERO
+#   EPOLLOUT, while `curl` connects the SAME host (219.133.46.205:80) in
+#   2.7 ms and log88's blocking connect returned "immediate OK". The
+#   official net_http_bsd sample uses a blocking connect too. Conclusion:
+#   Vita's non-blocking connect + sceNetEpoll completion detection is
+#   unreliable. Fix in pcsl_socket_open_start(): connect BLOCKING (fast when
+#   the host is reachable), then vita_set_nbio() only AFTER connect so the
+#   subsequent read/write stay non-blocking for the event-pump model.
+#   open_start now never returns WOULDBLOCK (socket is blocking during
+#   connect), so pcsl_socket_open_finish is dead code (kept for safety).
+#   Trade-off: an unreachable host blocks connect ~27 s (the pre-v02.44
+#   "27s freeze" behaviour) instead of hanging forever - acceptable and
+#   recoverable; can be improved later with a connect-timeout scheme.
+set(VITA_VERSION  "02.48")
+# 02.48 (2026-10-17): fixes from log95..log99 (real hardware).
+#   - log97/98 "audio toggle freezes for seconds": core pc=sceIoWrite r2=1,
+#     chain JVMStream::print -> print_raw -> crumb_append. MediaException.
+#     printStackTrace() wrote ONE BYTE per sceIoWrite (~13 ms each on ux0:)
+#     and every byte TWICE (vm_output.log + vm_stderr.log are byte-identical).
+#     JVMSPI_PrintRaw (midp_run.c) is now line-buffered: one write per sink
+#     per line. Output bytes/files/order unchanged.
+#   - log95 white screen: the preload spends 85-87% of its time in sceIoRead
+#     (4338 reads, 1.77 ms each), and 502 of 932 midp_system.jar entries are
+#     classes the dictionary already holds. load_jar_entry now skips those
+#     BEFORE open_entry/read (find_class_or_null, no allocation).
+#     "[preload] phases2 ... skipped=N" reports how many.
+#   - log96 UC freeze while operating: VM thread blocked in sceNetConnect to
+#     safe.ucweb.com (sockaddr verified in the core). Blocking connect now
+#     carries SO_SNDTIMEO=5 s and logs "ms=" for every attempt; whether
+#     sceNet honours it for connect() is unverified (the log will say).
+#   - watchdog forensic mode (wd_early_dump.cfg) skipped site_ring/trace_ring
+#     (log98/99 came back without them); it now writes them before aborting.
+set(VITA_VERSION  "02.50")
+# 02.50 (2026-10-18): probes from log100/log101 (probes only, no behaviour
+#   change).
+#   - log101 (pad_nodivert + wd_early_dump) finally returned site_ring.log
+#     with the landing-pad records. The loop is a FIXED POINT: from land=6
+#     (the 2nd pad entry of one thread, cur.pe=0, cur.sp=r6-0xbc) every
+#     field of every record is identical, the exit table is healthy
+#     (lightweight_thread_exit / uncaught_exception / Thread::finish /
+#     force_terminated / 0), th_finish=0. The trampoline's static model says
+#     it must call Thread::finish (and call_on_primordial_stack would then
+#     rewrite cur.sp to r6-8) - neither happens. Pad records gain the one
+#     trampoline input they lacked, [gp+1040] pending exception, plus
+#     [cur.sp] and [cur.sp+4] (the slot call_on_primordial_stack's tail
+#     returns through): "v241 rec[i] pendexc[gp+1040]=.. [cur.sp]=..".
+#   - log100: a constant 63 sceIoWrite calls cost 1.25 s per start (0.24 s
+#     in log95) and one sceIoWrite blocked the VM for >3 s. "[preload]
+#     io_write fd=N (path) n= us=" splits the sweep's writes per file, and
+#     "[WD-STALL] ... lastop=io_write arg=fd(path)" names the file of the
+#     call a stall sits in.
+set(VITA_VERSION  "02.51")
+# 02.51 (2026-10-18): system IME (sceImeDialog) bridge - first text input for
+#   MIDlets. The Vita port maps only physical buttons (no 0-9 digit keys), so
+#   phoneME's multi-tap InputMode chain can never produce a character: that
+#   is why J2ME programs had no input method. New vita_ime.c owns the
+#   sceImeDialog lifecycle (show -> sceImeDialogInit, poll -> GetStatus/
+#   GetResult/Term), and SELECT opens the keyboard (MVP trigger; auto-pop on
+#   TextField focus is a follow-up). The finished UTF-16 text is fed back
+#   through phoneME's built-in IME event (MIDP_KEY_EVENT, ACTION=IME=4,
+#   stringParam1) which DisplayEventListener routes to
+#   handleInputMethodEvent -> TextBox.insert(). TextBox covered; TextField
+#   needs the same event routed in the Java layer (follow-up). vita_ime_poll
+#   delivers straight into pNewMidpEvent (not the SPSC ring) because
+#   stringParam1 ownership transfers to the MIDP event queue. Links
+#   SceCommonDialog_stub (sceImeDialog* lives there, not in SceIme_stub).
+set(VITA_VERSION  "02.52")
+# 02.52 (2026-10-18): TextField support + auto-pop system keyboard. Two parts,
+#   both in phoneme-midp (midp classes load from midp_system.jar, NOT the ROM
+#   image, so these Java changes only need a midp rebuild + repack - no romize).
+#   (1) Fix handleInputMethodEvent (Display.jpp): the old `current instanceof
+#       TextBox` never matched because `current` is a DisplayableLF and TextBox
+#       is a Displayable - so the v02.51 TextBox path was actually DEAD code.
+#       Now resolves via current.lGetDisplayable(), and additionally routes the
+#       typed text into the focused TextField of a Form (current instanceof
+#       FormLF -> lGetCurrentItem() -> TextFieldLFImpl.commit()).
+#   (2) Auto-pop: TextFieldLFImpl.enableInput() (gained focus) calls
+#       VirtualKeyboardInputMode.showNativeKeyboard(), disableLayers() (lost
+#       focus) calls hideNativeKeyboard(). Because TextBoxLFImpl extends
+#       TextFieldLFImpl and also calls enableInput() from uCallShowNotify, both
+#       TextBox and TextField now auto-pop. vkdefault's VirtualKeyboardInputMode
+#       gained the two public static natives; lfj_native_input_mode.c implements
+#       them under VITA to forward to vita_ime_show()/vita_ime_abort(). The
+#       SELECT-key manual trigger in vita_input.c stays as a fallback.
+set(VITA_VERSION  "02.53")
+# 02.53 (2026-10-18): make the system IME actually render. log103 (real hw)
+#   showed the keyboard never appeared - only phoneME's built-in soft keyboard.
+#   Root cause: sceImeDialog is built on the CommonDialog framework, which the
+#   port never wired up. vita_ime.c called sceImeDialogInit/GetStatus/GetResult
+#   /Term but missed the three CommonDialog prerequisites:
+#     1. sceCommonDialogSetConfigParam (one-time; else Init can fail
+#        0x80020407 NOT_CONFIGURED)
+#     2. sceGxmInitialize (else 0x80020436 GXM_IS_UNINITIALIZED) - the port
+#        draws with sceDisplaySetFrameBuf, so GXM was never started
+#     3. sceCommonDialogUpdate every frame with renderTarget = back buffer
+#   Fix: vita_ime.c now calls SetConfigParam (MAX_VALUE = system defaults) and
+#   logs Init rc / first poll status; vita_display.c lazily sceGxmInitialize's
+#   (NULL vsync callback - the port keeps submitting via SetFrameBuf) and calls
+#   sceCommonDialogUpdate in flip_to_display() after the blit, only while
+#   vita_ime_is_active(). Diagnostic logs go to stderr -> midp_stderr.log.
+set(VITA_VERSION  "02.54")
+# 02.54 (2026-10-18): probes only, no behaviour change.
+#   - log102 (v02.52, pad_nodivert + wd_early_dump): the FileManager loop
+#     reproduced identically (thread id 4 = 5th pad entry: birth at land=5,
+#     first death-type entry at land=6, then a fixed point). The v02.50
+#     fields RULED OUT two hypotheses: pendexc[gp+1040]==0 in every record
+#     (not the uncaught_exception branch) and [cur.sp+4] is an interpreter
+#     return point (L318+0x8), not the pad sentinel (not a
+#     call_on_primordial_stack tail "return" to the sentinel). All three
+#     dumps (log99/101/102) have the VM thread's pc INSIDE vita_landing_pad.
+#     New: in nodivert mode the pad plants sentinels in r5 (0xdead0505) and
+#     r12 (0xdead0c12) before jumping to the real trampoline; the next
+#     rec[i] r5/r12 say how far the trampoline got (see the asm comment).
+#   - log102 vm_boot: 58 of the sweep's 63 sceIoWrite calls (1.31 s, ~22 ms
+#     each) go to ONE fd that the fd->path table reported as "?" - the 16
+#     slot round-robin table was overwritten by short-lived fds. Slots are
+#     now freed at sceIoClose (32 slots) and "[preload] io_write" also
+#     prints bytes= so call count vs volume can be told apart.
+set(VITA_VERSION  "02.55")
+# 02.55 (2026-10-18): fix the GXM chicken-and-egg deadlock in the system IME.
+#   log104 (real hw) showed Init rc=0x80020436 (GXM_IS_UNINITIALIZED) on every
+#   show. The v02.53 GXM init lived inside the per-frame CommonDialog update
+#   path, which only runs while vita_ime_is_active() - but active is set only
+#   after sceImeDialogInit succeeds, which needs GXM up: Init can never
+#   succeed, so GXM can never start. Fix: extract the idempotent GXM init
+#   into shared vita_gxm.c/vita_gxm.h and call vita_gxm_ensure_init() from
+#   vita_ime_show() BEFORE sceImeDialogInit. vita_display's update path still
+#   calls it (a no-op after first success) for safety.
+set(VITA_VERSION  "02.56")
+# 02.56 (2026-10-18): drop the BEFORE/AFTER_NATIVES stderr lines (VITA only).
+#   log105 (v02.54): the 58 preload sceIoWrite calls (1.26 s) were exactly
+#   those two fprintf lines x 29 classes with natives -> midp_stderr.log,
+#   2204 bytes total, ~38 B/call, ~22 ms/call (latency, not volume).
+#   Expected: preload ~5.8 s -> ~4.5 s. Same ClassFileParser.cpp family as
+#   the v01.92 PRE/POST_NATIVES removal. No behaviour change otherwise.
+set(VITA_VERSION  "02.57")
+# 02.57 (2026-10-18): probe only - does the loaded trampoline's "bleq" link?
+#   log105 (v02.54 sentinel run): VM thread pc = invoke_pending_entries+0x8
+#   with lr = landing pad (should be trampoline+0x1c if the bleq linked),
+#   r12 still the sentinel, r5 = gp, th_finish = 0. Of the three callers of
+#   invoke_pending_entries only the trampoline's CONDITIONAL "bleq" can
+#   produce lr=pad if its L bit is lost at load time (R_ARM_JUMP24, code 29;
+#   the image has just 5 conditional BLs, all of this type; every other
+#   caller, incl. the shadow's bne+bl, uses unconditional bl = R_ARM_CALL).
+#   vm_boot.log now carries "[v257] bleq(w6)=.. L=.. cond=.." read back from
+#   the loaded code (file image: 0bffff42, L=1). L=0 -> confirmed.
+set(VITA_VERSION  "02.58")
+# 02.58 (2026-10-18): FILEMANAGER EXIT-LOOP ROOT CAUSE FIXED (needs hw check).
+#   log107 (v02.57 read-back): the trampoline's "bleq invoke_pending_entries"
+#   is 0x0affff42 in memory vs 0x0bffff42 in the file - the loader dropped
+#   the L bit of that one instruction (SCE reloc code 29 / R_ARM_JUMP24; the
+#   sibling blne 0x1bffff48 and the unconditional bl 0xebffff46 are intact).
+#   Without the link, lr stays = the landing pad, invoke_pending_entries'
+#   "moveq pc,lr" returns to the pad, the pad re-enters the trampoline:
+#   an endless pad<->trampoline loop, Thread::finish never reached.
+#   Fix: vita_landing_pad always runs vita_tramp_shadow (bne + unconditional
+#   bl, immune). The real trampoline remains reachable via pad_nodivert.cfg.
+#   Expected on hardware: exit_probe.log "v243 trip_rep=0" (the detector no
+#   longer has anything to catch) and land == shadow_in (log108: 5 == 5;
+#   th_finish < th_start is normal, threads still alive at exit); no FileManager
+#   exit loop even with pad_nodivert.cfg absent. Also reads back the three
+#   "blne shared_entry" words ([v258] lines in vm_boot.log).
+set(VITA_VERSION  "02.59")
+# 02.59 (2026-10-19): system IME renders (方案1). log106 (v02.57): Init rc=0 /
+#   poll first status=1 - the dialog logically came up (v02.55 fixed the GXM
+#   chicken-and-egg) - but nothing appeared on screen and the frame froze
+#   (watchdog #3 vm=RUNNING sw+0 site+0 jsmp+0 since_ms=6081). CommonDialog
+#   renders THROUGH GXM, which still lacked two resources:
+#     1. sceGxmMapMemory on the CDRAM framebuffer: GXM cannot touch CPU
+#        memory it was never given, so the render was invisible.
+#     2. a valid SceGxmSyncObject in displaySyncObject (was NULL): nothing
+#        for the render to signal, and the no-sync render/submit race stalls.
+#   Fix: vita_display.c gains vita_cd_ensure_resources() - after
+#   vita_gxm_ensure_init() it sceGxmMapMemory's the double-buffer CDRAM block
+#   (READ|WRITE) once and sceGxmSyncObjectCreate's once, then
+#   vita_common_dialog_update() passes vita_cd_sync every frame. Diagnostics
+#   to stderr: "[CD] map fb base=.. bytes=.. rc=.." / "[CD] sync create rc=..".
+set(VITA_VERSION  "02.60")
+# 02.60 (2026-10-19): software MIDI (SMF) playback - first sound in MIDI-BGM
+#   games. log97 (fengshenbang): the BGM is a .mid file, but the port declared
+#   only tone + WAV caps, so Manager.createPlayer threw "Player cannot be
+#   created for audio/midi" and the game stayed silent. phoneME open-source
+#   ships NO MIDI renderer (SUN's was proprietary). This adds a software GM
+#   synthesizer:
+#     - TinySoundFont (src/tsf.h, MIT)   : SF2 synthesizer
+#     - TinyMidiLoader (src/tml.h, ZLIB) : SMF Format 0/1/2 parser
+#     - TimGM6mb.sf2 (assets/, GPL-2)    : 5.7 MB GM sound bank (bundled)
+#   New vita_midi.c/.h owns the synth (loads the bank from ux0: then app0:,
+#   renders 48 kHz stereo via vita_midi_play). vita_audio_javacall.c adds the
+#   "audio/midi" cap, a midi discriminator in realize(), byte accumulation in
+#   do_buffering() (like WAV), a g_midi_req/seq handshake in start(), and a
+#   MIDI branch in tone_player_thread that calls vita_midi_play with output/
+#   stop callbacks. The bank ships in the VPK at data/J2ME00001/TimGM6mb.sf2
+#   (+5.7 MB VPK) and is loaded read-only from app0:.
+set(VITA_VERSION  "02.61")
+# 02.61 (2026-10-19): fix MIDI routing - log109 (fengshenbang) still silent.
+#   v02.60 added the "audio/midi" cap and the synth, but get_player_controls()
+#   returned TONE|VOLUME for EVERY player. HighLevelPlayer.getPlayerFromType()
+#   is an else-if over nIsToneControlSupported -> nIsMIDIControlSupported, so a
+#   MIDI player was routed to DirectTone (the JTS player), whose checkSequence()
+#   validator rejects SMF bytes with "Tone sequence check failed at offset 0:
+#   missing version information" (log109 vm_output). Fix: get_player_controls
+#   now returns MIDI|VOLUME for a MIDI player (pl->midi) so getPlayerFromType
+#   lands in DirectMIDI, which inherits DirectPlayer's javacall-backed
+#   doBuffering/start (our MIDI branch). TONE|VOLUME unchanged for tone/JTS.
+set(VITA_VERSION  "02.62")
+# 02.62 (2026-10-19): auto-pop the system IME only for TextBox, not TextField.
+#   log109 problem 2: the in-game Form navigation flashed the system keyboard
+#   repeatedly. Root cause: v02.52 put show/hideNativeKeyboard in the SHARED
+#   TextFieldLFImpl.enableInput()/disableLayers(), and a Form's TextField
+#   re-enters those every time navigation crosses it (firstTimeInTraverse
+#   toggles on traverse-out). Fix: move the auto-pop to
+#   TextBoxLFImpl.uCallShowNotify()/uCallHideNotify() (whole-screen editor
+#   only); TextFieldLFImpl no longer calls the native keyboard. TextField input
+#   still works via the SELECT-key manual trigger. MIDP Java change => romize
+#   (classes.zip -> ROMImage -> libobj.a rebuilt).
+set(VITA_VERSION  "02.63")
+# 02.63 (2026-10-19): system IME rendering - give CommonDialog a real GXM
+#   display queue (log109 problem 3, the freeze). v02.59/02.60 mapped the
+#   framebuffer and created a sync object but left the GXM display-queue
+#   callback NULL and still submitted via sceDisplaySetFrameBuf. CommonDialog
+#   renders THROUGH GXM, whose output only reaches the screen via the display
+#   queue (sceGxmPadHeartbeat + sceGxmDisplayQueueAddEntry + a vsync callback
+#   that does the real sceDisplaySetFrameBuf); with the callback NULL the
+#   dialog's render had nowhere to go and the VM stalled in the render path.
+#   Fix: vita_gxm.c now initializes GXM with a display-queue callback (2 sync
+#   objects, double-buffered) and exposes vita_gxm_dialog_frame() which paints
+#   the dialog (sceCommonDialogUpdate) then submits through the display queue.
+#   vita_display.c's flip_to_display() branches: while the IME is active it
+#   calls vita_gxm_dialog_frame(vita_fb) instead of sceDisplaySetFrameBuf, so
+#   the two submit paths never mix. Software path unchanged when IME is idle.
+set(VITA_VERSION  "02.64")
+# 02.64's full description is below (after 02.65); this set line is kept so the
+# 02.64 VPK that produced log111 can still be rebuilt from this tree.
+set(VITA_VERSION  "02.65")
+# 02.65 (2026-10-19): log111 fixes - keyboard stuck/overlapping, MIDI cost.
+#   log111 confirmed v02.64: MIDI parses (11 ch / 3638 notes / 109 s) and plays,
+#   one start per player, no restart storm; the keyboard now appears.
+#   - IME close protocol. UC's field takes focus by itself at start-up (no
+#     input between CE 9473 and 10369), then loses it within seconds ->
+#     hideNativeKeyboard -> vita_ime_abort() called sceImeDialogTerm() on a
+#     RUNNING dialog and dropped g_ime_active. Term is only legal after
+#     FINISHED (the SDK sample never does otherwise), so the dialog stayed
+#     alive in the system with nobody calling sceCommonDialogUpdate: frozen
+#     keyboard, input swallowed ("cannot type / cannot close"; log111 shows
+#     "[IME] abort" and never "status -> 2"). abort now sends
+#     sceImeDialogAbort() and the poll Terms after FINISHED while the display
+#     tick keeps driving Update; 3 s safety net; a show() during the close is
+#     replayed afterwards. NOT verified on hardware (inference from the log
+#     and the SDK sample; Abort/Term return codes are logged to confirm).
+#   - Input isolation: pad and touch are not forwarded to the MIDlet while the
+#     keyboard is up (a tap meant for the dialog also hit UC). A touch that is
+#     still visible to the app during the dialog is logged (max 3 per show).
+#   - Letterbox: the blit only writes the scaled MIDlet rectangle; the bars
+#     keep whatever the full-width keyboard painted there -> permanent
+#     "overlap". Bars are cleared every dialog frame and in the 2 frames
+#     after it closes (one per CDRAM buffer; the tick also runs for those).
+#   - MIDI cost: tsf_set_max_voices(32) (TSF grew the pool unbounded; kills
+#     the oldest released voice first), tsf_reset at song start/stop (cut
+#     songs left voices ringing), muted player no longer renders flat out
+#     (it skipped sceAudioOutOutput, the only pacing), cur_time_ms advances
+#     during playback (was 0 until the end). One "[MIDI] ended/stopped: ...
+#     render avg/max us, voices" line per song, printed after playback (a
+#     stderr write costs 12-22 ms > the 10.7 ms chunk budget).
+#     Whether this removes the frame drops is NOT verified: no render timing
+#     existed before; the new line gives it. The heartbeat rate in the game
+#     phase was unchanged vs log110 (774 vs 835 ms / 64 CE).
+# 02.64 (2026-10-19): log110 fixes - MIDI silence/lag, SELECT popping the IME,
+#   IME not drawing.
+#   - MIDI: KNI copies every Java window to the START of the buffer we hand
+#     out (pl->jts_data) and then calls do_buffering with buffer == jts_data;
+#     the port appended to jts_data + midi_len, so from the 2nd 4 KB chunk on
+#     it overwrote the bytes already collected (MThd header included). The
+#     size stayed right (29139) but tml_load_memory failed 198 times. The SMF
+#     now accumulates in its own block (midi_acc). Reproduced on the host
+#     (/tmp/alias_sim.c): old = no MThd, new = byte-identical.
+#   - A failed play is paced (~1 s, interruptible) and remembered (midi_bad)
+#     instead of END_OF_MEDIA at once -> the game's loop-restart storm (308
+#     rounds / 133 s, each ~10 synchronous log writes) is gone. get_time /
+#     get_duration / set_volume log every 64th call. TML_ERROR/TML_WARN now
+#     print, and a parse failure prints the first 8 bytes.
+#   - SELECT opened the system keyboard unconditionally (v02.50), so pressing
+#     it in a game popped the IME (confirmed by the tester). It now does so
+#     only while a TextField/TextBox has focus (flag set by
+#     show/hideNativeKeyboard); otherwise it is '#' again (key_map).
+#   - IME: sceCommonDialogUpdate only ran from flip_to_display (Java repaint);
+#     an idle screen never drove the dialog (log110: Init rc=0, status=1, VM
+#     alive, no keyboard). vita_display_ime_tick() resubmits every 16 ms from
+#     the event pump while the IME is up. [GXM] dialog frame lines now log the
+#     three return codes; [IME] status -> N logs every status change.
+#     NOT verified on hardware: whether this makes the keyboard appear.
+set(VITA_VERSION  "02.66")
+# 02.66 (2026-10-20): two audio defects found while reviewing v02.64/02.65
+#   (neither came from the logs - log111 only shows start -> pause on every
+#   player).
+#   1. start -> pause/stop race. javacall_media_start() queued the request but
+#      the player thread was the one that set pl->playing = 1, while
+#      pause()/stop() were written as "if (pl->playing) pl->stop_flag = 1".
+#      A pause that arrived before the thread ran therefore did nothing, and
+#      even an unconditional set was wiped by the thread's own
+#      "pl->stop_flag = 0" at branch entry: the MIDI song kept playing for
+#      up to its full length (109 s in log111) while Java believed it was
+#      paused. stop_flag is now cleared in javacall_media_start() (VM thread,
+#      before the request is queued) and cleared nowhere in the player
+#      threads; pause()/stop() set it unconditionally.
+#   2. WAV accumulator. The WAV path had exactly the MIDI aliasing bug fixed
+#      in v02.64 for MIDI: KNI copies each Java window to the START of
+#      jts_data (returned by get_buffer_address) and then calls do_buffering
+#      with buffer == jts_data, so appending to jts_data + wav_buf_len
+#      overwrote the bytes already collected from the 2nd 4 KB window on.
+#      Worse, wav_ensure_cap() realloc'd jts_data, which could MOVE it while
+#      `buffer` still pointed at the freed block (use-after-free). WAV now
+#      accumulates in its own block (wav_acc, 64 KB start, WAV_MAX_BUFFER
+#      ceiling) like MIDI; jts_data stays a fixed 32 KB KNI staging buffer.
+#      No archived log has a "wav buffered" line, so long WAV was never
+#      proven working. realize() also resets wav_buf_len/data_off so a
+#      re-download cannot append to (or skip parsing) a previous copy.
+#   NOTE: this is a code-review fix; log111 was v02.64 and says nothing about
+#   either defect. Verify on hardware: a paused BGM must go silent, and a
+#   >4 KB WAV must still play.
+set(VITA_VERSION  "02.67")
+# 02.67 (2026-10-20): log112 (v02.66) - the keyboard shows once and never again.
+#   log112 confirms: MIDI render avg 2.9-4.3 ms per 10.7 ms chunk, 0 over, voices
+#   avg 26-30 max 32 (the cap is hit), no frame drops felt -> audio load fixed.
+#   v02.65's close protocol works: Abort rc=0 -> status 2 -> Term rc=0 (+3.9 s;
+#   UC took the keyboard away 3.1 s after showing it, no user input in between:
+#   first touch is 65 s later). Then 13 x sceImeDialogInit = 0x8002047f
+#   (UNEXPECTED_FATAL), no success. Nothing in any archived log shows a typed
+#   text ever being committed ("committed" count is 0 in all of them).
+#   CAUSE NOT KNOWN. This build is an experiment that separates two guesses:
+#   - the SDK sample calls sceCommonDialogUpdate every frame, also right after
+#     Term; we stopped at once -> 6 more dialog-path frames after Term.
+#   - Init fails only while the system is still tearing down -> a failed Init
+#     is retried every 100 ms for 3 s from the event pump (cancelled by hide).
+#   New log: "[IME] show: Init rc=.. (status before=N, M ms since last Term,
+#   attempt K, t=..)", "[IME] Init succeeded on retry K" / "giving up", and
+#   "[IME] text_wanted -> 0|1 (t=..ms)" = the Java side's show/hide rhythm.
+#   Read: success on attempt 1 -> post-Term Update was it; success on retry K
+#   -> timing, K*100 ms; still failing after 30 -> neither, next lead is the
+#   state before Init / the parameters.
+set(VITA_VERSION  "02.68")
+# 02.68 (2026-10-20): log113 (v02.67) - typed text never reaches the app, and
+#   the keyboard still shows once only.
+#   log113 facts: first dialog ran 18.4 s (user typing; no input reached the
+#   app, no "touch visible" line -> the dialog owns the panel), then
+#   status 2, "finished: button=0", "dismissed (button=0)". SDK enum:
+#   0=NONE 1=CLOSE 2=ENTER; CLOSE is the explicit cancel, so NONE is not "the
+#   user cancelled". Every later Init: 0x8002047f with status before=0, up to
+#   84 s after Term -> the timing guess is dead (retries cut 30 -> 3).
+#   Whether the post-Term Update frames ran is unproven (no counter).
+#   - Result handling: the SceImeDialogResult was never cleared and the return
+#     of sceImeDialogGetResult never checked; the code only committed on
+#     button==ENTER. Now: memset, check rc, log result/button/text length/first
+#     char, and ENTER *or* (NONE with text in the buffer) commits; CLOSE and
+#     NONE-with-empty-buffer still drop. Whether the buffer really holds the
+#     typed text is exactly what the new "finished:" line will show.
+#   - New observability for the Init failure: free user/cdram/phycont memory
+#     and the number of dialog frames since Term on the Init line, and the
+#     dialog's frame rate in the "finished:" line (log113 printed #300 but not
+#     #600 over 18 s, i.e. < 32 fps).
+#   NOT a fix for the Init failure: its cause is still unknown.
+set(VITA_VERSION  "02.69")
+# 02.69 (2026-10-21): log113 follow-up - the four remaining differences from
+#   samples/ime, in ascending order of risk. log113 is v02.67: the first
+#   dialog worked (18.4 s, status 2, button=0, text dropped) and every later
+#   sceImeDialogInit returned 0x8002047f = SCE_COMMON_DIALOG_ERROR_UNEXPECTED_
+#   FATAL (status before=0, still failing 84 s after Term, across MIDlets).
+#   1. sceSysmoduleLoadModule(SCE_SYSMODULE_IME) - ime_dialog.h names the
+#      module in its usage line and it was never loaded here. If the system
+#      auto-loads it for the first dialog and drops it on Term, the second
+#      Init fails forever - the exact observed shape. Logged with its rc.
+#   2. sceAppUtilInit, called before sceCommonDialogSetConfigParam like the
+#      sample (CommonDialog reads app info). Logged with its rc.
+#   3. One SceGxmColorSurface PER framebuffer, initialised once (the sample's
+#      dbuf[].surf) instead of re-running sceGxmColorSurfaceInit on a single
+#      shared surface every frame - that rewrote a description the GPU may
+#      still have been reading.
+#   4. displayQueueMaxPendingCount 2 -> 1 (DISPLAY_MAX_PENDING_SWAPS in the
+#      sample) and sceDisplayWaitVblankStart() after each dialog submit, so
+#      AddEntry cannot block the VM thread and the dialog is paced at 60 fps
+#      (log113 printed frame #300 but not #600 over 18 s = 16-32 fps).
+#   Also clear_letterbox() now memsets each run instead of looping per pixel
+#   (it ran up to 62x/s on the VM thread while the keyboard was up).
+#   NOT verified on hardware. Expected next-run markers: the new
+#   "[IME] sysmodule IME load rc=.., apputil init rc=..", a second
+#   "[IME] show: Init rc=0x00000000" after the first dialog closed, and
+#   "[IME] finished: ... text=N chars ..." telling whether the buffer holds
+#   the typed text.
+set(VITA_VERSION  "02.70")
+# 02.70 (2026-10-21): boot white-screen - read the jar once into RAM.
+#   log113 (v02.67), round 0: round_begin -> first_content_flip = 10.0 s, of
+#   which the boot preload (load_all_in_classpath) is 5.59 s and 4.49 s of that
+#   is io_read: n=3892 at 1.15 ms each, ~8 reads per class actually loaded.
+#   BufferedFile::BUFFERSIZE is 256 B and find_entry (central directory at the
+#   end of the jar) alternates with open_entry/read (local header + data) on
+#   one FILE, so nearly every refill is a real sceIoRead.
+#   FIX phoneme-cldc OsFile_vita.cpp: OsFile_open(<x>.jar, "rb") reads the
+#   whole file with a few large reads into malloc'd RAM and serves
+#   OsFile_read/seek/length/eof/close from memory. Caps: 4 MB per jar, 8 MB
+#   total, 8 images; over a cap / malloc or read failure => the original
+#   fopen path. Images are refcounted per path (JarFileParser reopens).
+#   Other files, and any non-"rb" open, are untouched. A/B switch: put '0' in
+#   ux0:/data/J2ME00001/jar_mem.cfg to disable.
+#   NOT verified on hardware. Expected in vm_boot.log: "[jarmem] enabled=1",
+#   "[jarmem] loaded <jar> size=.. us=.." for midp_system.jar and the app jar,
+#   and in "[preload] sys(VM thread, delta)": io_read n collapsing from ~3900
+#   to a handful, total_us from ~5.6 s towards the resolve-only ~1.6-2 s.
+
+
+set(VITA_VERSION  "02.71")
+# 02.71 (2026-10-21): log114 (v02.70) - GPU crash on the keyboard in the 2nd
+#   MIDlet, and the letterbox bars turning white while the keyboard is up.
+#   log114 confirms v02.69 fixed the keyboard: Init rc=0 on all 11 shows
+#   (sysmodule IME + sceAppUtilInit), typed text commits ("button=2 ENTER,
+#   text=2 chars", "committed 2 chars"), 19 fps -> the 02.68 NONE-with-text
+#   workaround was never needed (button is 2 or 1 in every finished line).
+#   1. GPU crash. psp2core-...-GPUCRASH.psp2dmp, last show = first show of
+#      round 1 (FileManager), log stops after "dialog frame #4 fb=0x62800000".
+#      Every MIDlet round allocates a fresh CDRAM framebuffer block (round 0
+#      0x61400000, round 1 0x62800000). The block was GXM-mapped through a
+#      boolean (vita_fb_gxm_mapped) that nothing ever cleared, so "[CD] map
+#      fb" is printed ONCE in the whole log and the round-1 block was never
+#      sceGxmMapMemory'd. The dialog then rendered into unmapped memory.
+#      Evidence in the dump: GPU_INFO contains 0x62b2a024 (inside the round-1
+#      block); MEM_BLK_INFO lists the block at 0x62800000. Fix: remember the
+#      mapped BASE; remap whenever the block changes; sceGxmDisplayQueueFinish
+#      + sceGxmUnmapMemory before the block is freed (lfjport_ui_finalize) and
+#      before mapping a different one.
+#   2. White bars. v02.69 rewrote clear_letterbox() with memset(..., 0xFF, ...)
+#      "to be faster"; memset repeats the byte in all four channels, so the
+#      bars became 0xFFFFFFFF = white. Now 0x00 (black; what ui_init uses and
+#      what the SDK sample's memset(data, 0xff000000, ..) actually writes).
+#   NOT verified on hardware. Expect "[CD] unmap fb ... rc=0" at the end of
+#   round 0, "[CD] map fb base=0x62..." before the first dialog of round 1.
+set(VITA_VERSION  "02.72")
+# 02.72 (2026-10-21): log114 follow-up - where did 4 MB of CDRAM go?
+#   Facts (log114 + crash dump MEM_BLK_INFO): free CDRAM at IME Init is 90112K
+#   in all 10 round-0 dialogs (so a dialog itself costs nothing) and 86016K in
+#   round 1 (-4096K = one framebuffer block). CDRAM layout at the crash:
+#   menu fb 0x61000000-0x61400000, a 4096 KB HOLE 0x61400000-0x61800000 (round
+#   0's freed MIDlet block), SceGxmParamBuffer 16 MB, round-1 fb 0x62800000.
+#   The new block was not placed in the hole although it is exactly 4 MB; the
+#   -4096K says the hole is not free, it is held by something. The only thing
+#   known to have touched that range is the sceGxmMapMemory made in round 0
+#   (never unmapped before the block was freed, fixed in 02.71); a display-queue
+#   reference to the old framebuffer is the second candidate. Not proven.
+#   This build only ADDS observation: "[fb] alloc|finalize begin|after unmap|
+#   after release base=.. cdram free=..K" at every round. Read: if "after
+#   release" is 4096K above "after unmap"'s predecessor and the next "alloc"
+#   reuses 0x61400000 with the same free number as round 0, the 02.71 unmap
+#   fixed the leak; if free stays 4096K low, something else holds the block.
+set(VITA_VERSION  "02.74")
+# 02.74 (2026-10-21): the system keyboard opens with the TextBox's current text and
+#   its result REPLACES it (was: always opened empty, result inserted at the caret,
+#   so earlier input could be neither seen nor edited; v02.73 only added a Clear key
+#   to work around that). Chain: TextBoxLFImpl (lSetChars/lInsert/lDelete/lSetMaxSize
+#   and show) -> VirtualKeyboardInputMode.setNativeKeyboardText(text, capacity) KNI
+#   -> vita_ime_set_initial_text() (a cache, because SELECT opens the dialog from
+#   native code without passing through Java) -> sceImeDialogParam.initialText +
+#   maxTextLength = capacity. Result -> IME event -> Display.handleInputMethodEvent
+#   -> TextBox.setString(result); an empty result is delivered (= user cleared it).
+#   The cache is dropped when the TextBox is hidden, so it cannot leak into another
+#   keyboard. Only the whole-screen TextBox is wired; a Form TextField still inserts.
+#   Needs a MIDP rebuild (Java + KNI table -> ROM). NOT verified on hardware.
+# 02.73 (2026-10-21): log115 (v02.72) - CDRAM leak confirmed gone; add a Clear key.
+#   CDRAM (the "[fb]" lines, two rounds): alloc 106496K -> (GXM param buffer 16 MB
+#   appears at the first dialog) -> finalize begin 90112K -> after unmap 90112K ->
+#   after release 94208K; round 1: alloc base=0x61400000 (the hole is REUSED),
+#   free 90112K -> release 94208K again. "[CD] unmap fb rc=0x00000000" both
+#   rounds, no hang in sceGxmDisplayQueueFinish, no GPU crash, and round 1's
+#   dialog works (map fb 0x61400000, committed 3 chars). So the 4 MB per round is
+#   returned: the 02.71 unmap (+ display-queue finish) fixed it. The two causes
+#   were fixed together, so which of the two it was is not separable. The
+#   remaining 16 MB vs the first alloc is the GXM param buffer, created once per
+#   process (sceGxmInitialize), by design - not a leak.
+#   Clear key. After the system keyboard committed text there was no way to
+#   delete it: no button maps to KEYMAP_KEY_CLEAR (-8), though phoneME handles it
+#   (TextFieldLFImpl.handleClearKey: short press = delete the char before the
+#   cursor; a second event for the same key before its release = long press =
+#   empty the field). TRIANGLE now sends Clear while a TextBox/TextField has
+#   focus and the keyboard is down (same context test as SELECT, vita_ime_
+#   text_wanted); held 0.7 s it sends one KEYMAP_STATE_REPEATED = empty field.
+#   Games are unaffected (no text focus -> still GAME_A). It stands down if any
+#   button is already mapped to Clear or TRIANGLE was remapped in 设置 > 按键映射.
+#   Limits: text_wanted is only set for a whole-screen TextBox (v02.62 removed it
+#   for Form TextFields), so a Form TextField gets no Clear key; and whether the
+#   field really empties depends on BasicInputMode.processKey returning
+#   KEYCODE_NONE for Clear - phoneME's standard path, not exercised here.
+#   NOT verified on hardware.
+
+
+
+
+# 02.49 (2026-10-18): restore non-blocking connect. The v02.45 "epoll never
+#   reports EPOLLOUT" attribution was wrong: log94 ALSO had the
+#   wait-descriptor bug (vita_net_poll signalled the bare fd while MIDP
+#   waits on the NetHandle pointer), fixed in v02.45, so the 158 s hang is
+#   fully explained by the descriptor mismatch and EPOLLOUT was likely
+#   reported all along. The blocking connect v02.45 introduced then caused
+#   log96: UC connecting to the unreachable safe.ucweb.com froze the single
+#   VM thread (and the whole UI) for the full connect timeout. Revert to
+#   non-blocking connect (NBIO before connect, EINPROGRESS => WOULDBLOCK =>
+#   event-pump completes it via vita_net_poll), which never blocks the VM.
+#   Added select()/epoll probes (vita_net_poll_calls/ready/writable/lastn,
+#   printed as "[WD] net poll" at a HANG) to settle it on the next run:
+#   poll_writable>0 while a connect stalls => descriptor bug (log94), else
+#   EPOLLOUT really is not reported and connect completion needs
+#   sceNetGetSockInfo. Removed the now-dead SO_SNDTIMEO connect-bound code.
+# 02.47 (2026-10-17): watchdog + boot-timing probes, one bug fix.
+#   FIX vita_watchdog.c: the "if (!moved)" opened at KICK0 was closed AFTER
+#   the "KICK RECOVERED / re-arm / continue" block, so a pump that recovered
+#   during KICK0's own 4 polls skipped recovery and fell into the coredump
+#   abort (log93: CE kept advancing after the HANG line, yet the process was
+#   killed by its own watchdog). The brace now closes before that block.
+#   PROBES:
+#   - watchdog early stall sampling: one in-memory sample per frozen poll
+#     (VM thread state/CPU clock, interpreter counters, vita_phase_id,
+#     VM-thread syscall activity). Written out as "[WD-STALL]" lines when
+#     the pump recovers after >= 1 s, or at the start of a HANG report.
+#   - ux0:/data/J2ME00001/wd_early_dump.cfg (opt-in, KILLS the process):
+#     coredump ~2 s into a stall, so PC/LR describe the stall.
+#   - ux0:/data/J2ME00001/pad_nodivert.cfg (opt-in): loop detector off, the
+#     real trampoline always runs - reproduces the FileManager exit loop.
+#   - preload: sym/verify/iter timers + VM-thread syscall delta
+#     ("[preload] phases2" and "[preload] sys(...)" in vm_boot.log).
+#   - VitaPhaseScope markers (jar find/open, read, resolve, verify, lazy
+#     class load, GC, resource open, clinit setup).
+# 02.46 (2026-10-17): FIX the wake-up descriptor in vita_net_poll(). MIDP
+#   parks a Java thread with midp_thread_wait(NETWORK_*_SIGNAL,
+#   (int)pcslHandle, ...) where pcslHandle is the NetHandle pointer our
+#   pcsl_socket_*_start() returned, and midp_thread_signal_list() matches
+#   descriptors by equality. vita_net_poll() signalled the bare newlib fd
+#   (15, 16, ...), so no WOULDBLOCK waiter was ever woken - the real reason
+#   behind log94 "stuck in the network test" (select/epoll was never shown
+#   to be at fault: nothing logged its result). 02.45's blocking connect
+#   only moves the stall: the first recv() -> EWOULDBLOCK parks the thread
+#   on the same never-signalled handle. vita_net_poll() now signals
+#   (int)&g_handles[i]; the 02.45 connect change is kept as is.
+#   Also in 02.46: nothing else changed vs 02.44/02.45 (timing probes stay).
+# 02.44 (2026-10-17): root-cause FIX - NBIO was never enabled. log91 (real
+#   hw, three networked launches) printed "[NET] set_nbio fd=15/16
+#   rc=0x80410109" = SCE_NET_ERROR_EBADF on every socket: vita_set_nbio()
+#   passed the newlib user-space fd straight to sceNetSetsockopt(), but
+#   newlib's socket() returns a small fd while the raw sceNetSocket id is
+#   kept in __vita_fdmap[fd] (verified in libc.a socket.o/setsockopt.o
+#   disasm). So SCE_NET_SO_NBIO never took effect, sockets stayed blocking,
+#   and recv(MSG_PEEK) (pcsl_socket_available) blocked in-kernel - watchdog
+#   log91 "avail enter=6 exit=5 inside=1" + "VM stuck in a kernel wait".
+#   Fix: call newlib setsockopt() which translates fd->id internally. This
+#   is the network-path hang only; the shared_entry switch race (FileManager
+#   landing-pad self-loop) is a SEPARATE bug, still open.
+#   02.44 also carries two untested additions (same version on purpose -
+#   nothing of 02.44 has been run on hardware yet):
+#   - vita_set_nbio records errno (newlib setsockopt returns -1 and puts the
+#     reason in errno): "[NET] set_nbio fd= rc= errno=" and the watchdog
+#     "[WD] net nbio ... lastrc= errno=" line.
+#   - landing-pad loop detector (InterpreterRuntime_arm.cpp): the 3rd
+#     consecutive pad entry with an unchanged (current thread, r6) diverts to
+#     the shadow trampoline immediately instead of after land>=1e6. DEBUG
+#     EXPERIMENT: if the shadow breaks the loop on its first lap, land stays
+#     tiny and exit_probe.log shows "v243 trip_rep>0 trip_land~7"; if the
+#     loop persists on the shadow, trip_rep/land grow and the earlier
+#     "rescued after 1e6 laps" was not a code difference. The old land
+#     threshold remains as a fallback.
+#   - launch-timing instrumentation (probes only) for the "every app shows
+#     a white screen for seconds" report, suspected to be the v01.91 eager
+#     preload (load_all_in_classpath: every .class of midp_system.jar +
+#     the app jar is read, inflated and resolved before the first byte
+#     runs, each round). One clock, sceKernelGetProcessTimeWide() us:
+#       boot_timing.log  round_begin / runMidlet_enter / first_check_events /
+#                        first_flip / first_content_flip(first non-white
+#                        frame) / runMidlet_exit        (vita_main.c,
+#                        vita_display.c, vita_checkevents.c)
+#       vm_boot.log      every line prefixed "[+N us]"; "[preload] jar[i]
+#                        entries= defined= fast= us=" per jar (i=0 is
+#                        midp_system.jar) and "[preload] done ... open_us
+#                        read_us resolve_us" (Universe.cpp, JVM.cpp).
+# 02.43 (2026-10-17): probes only, NO behaviour change. Answers the two
+#   questions log87..log89 left open:
+#   (a) exit probe (vita_exit_probe, OS_vita.cpp, called from vita_main.c
+#       after runMidlet returns): writes land / v242 st / thread counters
+#       to exit_probe.log on a NORMAL exit. log88 round 0 (FileManager)
+#       already shows rec[8] (land=1000000) on the same loop thread as
+#       rec[5..7] (land=6..8): the loop forms in FileManager and the shadow
+#       trampoline breaks it after ~1e6 laps. Prediction: every normal
+#       FileManager exit shows land >= 1000000 and shadow_in > 0. If land
+#       stays in the tens, the loop never forms and the "shadow rescues
+#       it" reading is wrong (timing/layout luck instead).
+#   (b) network probe (vita_net.c + vita_watchdog.c): log88/log89#2 froze
+#       the VM thread in recv(MSG_PEEK) <- pcsl_socket_available while all
+#       four connect() calls returned "immediate OK" (never EINPROGRESS).
+#       vita_set_nbio now records sceNetSetsockopt(NBIO)'s return value
+#       and the watchdog prints "[WD] net nbio ok/fail/lastrc | avail
+#       enter/exit/inside/fd/lastn/lasterr".
+
 # 02.37 (2026-10-02): v02.36 was NEVER BUILT - a make dependency gap:
 #   _MergedSrc002.cpp is a 76-byte shell #including __MergedSrc002.cpp.incl
 #   which #includes Scheduler.cpp by ABSOLUTE PATH; make only watches the
@@ -1874,7 +2504,10 @@ add_executable(${PROJECT_NAME}
     src/vita_storage.c
     src/vita_audio_javacall.c
     src/vita_wav.c
+    src/vita_midi.c
     src/vita_media_notify.c
+    src/vita_ime.c
+    src/vita_gxm.c
     src/vita_sms_javacall.c
     src/vita_checkevents.c
     src/vita_watchdog.c
@@ -2086,6 +2719,15 @@ target_link_libraries(${PROJECT_NAME}
     SceAppMgr_stub
     SceGxm_stub
     SceAudio_stub
+    # v02.51: sceImeDialogInit/GetStatus/GetResult/Term for the system
+    # keyboard (vita_ime.c). These live in the CommonDialog stub, not the
+    # SceIme stub (which only has the low-level sceImeOpen/Close/SetText).
+    SceCommonDialog_stub
+    # v02.69: sceAppUtilInit (CommonDialog reads app info; samples/ime calls
+    # it before sceCommonDialogSetConfigParam) and sceSysmoduleLoadModule
+    # (SCE_SYSMODULE_IME) - the two omissions that plausibly explain log113's
+    # permanent 0x8002047f (UNEXPECTED_FATAL) after the first dialog.
+    SceAppUtil_stub
     # v01.67: sceKernelAllocMemBlock/GetMemBlockBase for the CDRAM
     # framebuffers (vita_fbmem.h)
     SceSysmem_stub
@@ -2189,6 +2831,10 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
     FILE     ${MIDP_SYSTEM_JAR}                  data/J2ME00001/midp_system.jar
     FILE     ${PORT_DIR}/config/fontbitmap.bin    data/J2ME00001/fontbitmap.bin
     FILE     ${MIDLET_JAR}                       data/J2ME00001/Hello.jar
+    # v02.60: General-MIDI sound bank for the software MIDI synthesizer
+    # (vita_midi.c). Read-only; loaded straight from app0: (never copied
+    # to ux0:). 5.7 MB. GPL-2, see assets/TimGM6mb.COPYING.txt.
+    FILE     ${PORT_DIR}/assets/TimGM6mb.sf2     data/J2ME00001/TimGM6mb.sf2
     # v02.18: kubridge plugin bundled for one-stop install - copy to
     # ux0:tai/kubridge.skprx and add "kubridge.skprx" under *KERNEL in
     # ux0:tai/config.txt (see ab/README.md). Bundling it here does NOT

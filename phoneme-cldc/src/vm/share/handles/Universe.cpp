@@ -1095,14 +1095,71 @@ void Universe::create_main_thread_mirror(JVM_SINGLE_ARG_TRAPS) {
 void Universe::load_jar_entry(char* name, int length, JarFileParser* jf_parser
                               JVM_TRAPS) {
   const int post_length = STATIC_STRLEN(".class");
+#if defined(VITA)
+  /* v02.44: per-phase timing of the eager preload (see OS_vita.cpp).
+   * Plain integers, no oops - safe between handle-using statements. */
+  unsigned long long vt0 = vita_now_us();
+  vita_preload_entries++;
+  {
+    /* v02.48: skip classes the dictionary already holds. log95: 502 of the
+     * 932 midp_system.jar entries resolve in < 50 us, i.e. they are
+     * already in the ROM image, yet each one was still seeked to,
+     * inflated and read (~4.6 sceIoRead x ~1.8 ms each) only for
+     * SystemDictionary::resolve() to return the existing class and drop
+     * the buffer. find_class_or_null() does not allocate and ignores
+     * fake (placeholder) classes, so a hit is exactly the case in which
+     * resolve() would have returned without using the data. The counter
+     * still advances (watchdog progress, defined= in the summary);
+     * verify() on such a class is a no-op (log95 verify_us=0). */
+    Symbol pre_name = SymbolTable::symbol_for(name, length - post_length
+                                              JVM_CHECK);
+    InstanceClass::Raw pre_hit =
+        SystemDictionary::find_class_or_null(&pre_name);
+    vita_preload_us_sym += vita_now_us() - vt0;
+    if (pre_hit.not_null()) {
+      vita_preload_count++;
+      vita_preload_skipped++;
+      return;
+    }
+    vt0 = vita_now_us();   /* the open timer must not include the lookup */
+  }
+#endif
   FileDecoder fd = jf_parser->open_entry(0 JVM_CHECK);
+#if defined(VITA)
+  vita_preload_us_open += vita_now_us() - vt0;
+#endif
   if (fd.not_null()) {
+#if defined(VITA)
+    unsigned long long vt1 = vita_now_us();
+#endif
     Buffer b = fd.read_completely(JVM_SINGLE_ARG_CHECK);
+#if defined(VITA)
+    vita_preload_us_read += vita_now_us() - vt1;
+#endif
     if (b.not_null()) {
+#if defined(VITA)
+      unsigned long long vs0 = vita_now_us();   /* v02.47 */
+#endif
       Symbol class_name = SymbolTable::symbol_for(name, length - post_length
                                                   JVM_CHECK);
+#if defined(VITA)
+      vita_preload_us_sym += vita_now_us() - vs0;
+      unsigned long long vt2 = vita_now_us();
+      /* v02.47: phase 4 stays open to the end of the function; the verify
+       * call below opens its own inner phase 5. */
+      VitaPhaseScope vps4(4);
+#endif
       InstanceClass instance_class =
         SystemDictionary::resolve(&class_name, ErrorOnFailure, &b JVM_NO_CHECK);
+#if defined(VITA)
+      {
+        unsigned long long vd = vita_now_us() - vt2;
+        vita_preload_us_resolve += vd;
+        if (vd < VITA_PRELOAD_FAST_US) {
+          vita_preload_fast++;
+        }
+      }
+#endif
       if (CURRENT_HAS_PENDING_EXCEPTION) {
         if (VerifyOnly) {
           return;
@@ -1138,7 +1195,16 @@ void Universe::load_jar_entry(char* name, int length, JarFileParser* jf_parser
       vita_preload_count++;
 #endif
       if (UseVerifier || VerifyOnly) {
+#if defined(VITA)
+        /* v02.47: UseVerifier defaults to true, so every preloaded class
+         * is verified here - never timed before this version. */
+        unsigned long long vv0 = vita_now_us();
+        VitaPhaseScope vps5(5);
+#endif
         instance_class.verify(JVM_SINGLE_ARG_NO_CHECK_AT_BOTTOM);
+#if defined(VITA)
+        vita_preload_us_verify += vita_now_us() - vv0;
+#endif
       }
       return;
     }
@@ -1180,7 +1246,25 @@ void Universe::load_all_in_classpath(JVM_SINGLE_ARG_TRAPS) {
   int index = 0;
   for (; index < classpath().length(); index++) {
     FilePath path = classpath().obj_at(index);
+#if defined(VITA)
+    /* v02.44: per-jar subtotal. classpath order is fixed
+     * (midp_system.jar first, then the app jar), so jar[0] vs jar[1]
+     * separates the shared system jar from the application. */
+    unsigned long long jt0 = vita_now_us();
+    unsigned int je0 = vita_preload_entries;
+    unsigned int jc0 = vita_preload_count;
+    unsigned int jf0 = vita_preload_fast;
+#endif
     load_all_in_classpath_segment(&path JVM_CHECK);
+#if defined(VITA)
+    {
+      extern void vita_boot_log(const char *fmt, ...);
+      vita_boot_log("[preload] jar[%d] entries=%u defined=%u fast=%u us=%llu",
+                    index, vita_preload_entries - je0,
+                    vita_preload_count - jc0, vita_preload_fast - jf0,
+                    vita_now_us() - jt0);
+    }
+#endif
   }
   
   GUARANTEE(Task::current()->sys_classpath() == NULL ||

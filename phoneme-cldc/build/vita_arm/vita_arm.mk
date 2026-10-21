@@ -11,12 +11,17 @@ LD := $(CROSS_COMPILE)ld
 AR := $(CROSS_COMPILE)ar
 STRIP := $(CROSS_COMPILE)strip
 
+# Vita SDK root (exported by build_env.sh); falls back to standard location.
+ifndef VITASDK
+VITASDK := /usr/local/vitasdk
+endif
+
 # Vita SDK includes
-VITASDK_INCLUDES := -I/home/zyb/.local/vitasdk/arm-vita-eabi/include
-VITASDK_INCLUDES += -I/home/zyb/.local/vitasdk/arm-vita-eabi/include/c++
+VITASDK_INCLUDES := -I$(VITASDK)/arm-vita-eabi/include
+VITASDK_INCLUDES += -I$(VITASDK)/arm-vita-eabi/include/c++
 
 # Vita SDK libraries
-VITASDK_LIBS := -L/home/zyb/.local/vitasdk/arm-vita-eabi/lib
+VITASDK_LIBS := -L$(VITASDK)/arm-vita-eabi/lib
 VITASDK_LIBS += -lvita2d -lSceDisplay_stub -lSceCtrl_stub -lSceGxm_stub
 VITASDK_LIBS += -lSceAudioOut_stub -lSceKernel_stub -lSceSysmodule_stub
 VITASDK_LIBS += -lSceCommonDialog_stub -lSceAppMgr_stub -lSceIo_stub

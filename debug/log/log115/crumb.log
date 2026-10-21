@@ -1,0 +1,307 @@
+
+==== launcher start ====
+version: J2ME Player v02.72 b329 (1e8533d)
+vm cpu: unpinned (mask=0)
+kubridge ABSENT
+
+==== net early init done ====
+
+==== ANI_Initialize enter ====
+[pte] sem create init=0 handle=0x81700278 -> 0x4001013f rc=0 from 0x81144747
+[pte] sem create init=0 handle=0x81700270 -> 0x40010141 rc=0 from 0x81145ee7
+[pte] sem create init=0 handle=0x817002a0 -> 0x40010143 rc=0 from 0x81144747
+[pte] sem create init=0 handle=0x81700298 -> 0x40010145 rc=0 from 0x81145ee7
+[pte] sem create init=0 handle=0x817002b8 -> 0x40010147 rc=0 from 0x81144747
+[pte] sem create init=0 handle=0x817002d0 -> 0x40010149 rc=0 from 0x81144747
+[pte] sem create init=0 handle=0x81700330 -> 0x4001014b rc=0 from 0x81144747
+[pte] sem create init=0 handle=0x81700328 -> 0x4001014d rc=0 from 0x81145ee7
+[pte] sem create init=0 handle=0x81700358 -> 0x4001014f rc=0 from 0x81144747
+[pte] sem create init=0 handle=0x81700350 -> 0x40010151 rc=0 from 0x81145ee7
+[pte] sem create init=0 handle=0x81700370 -> 0x40010153 rc=0 from 0x81144747
+[pte] sem create init=0 handle=0x81700388 -> 0x40010155 rc=0 from 0x81144747
+
+==== ANI_Initialize done ====
+
+==== media init enter ====
+
+==== media init done ====
+round 0: jit cfg=0 -> policy=0
+menu: fb=0x61000000/0x611fe000 block=0x40010161
+menu hb: flips=0 rc=0x7fffffff games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=48 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=106 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=164 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=222 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=280 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=337 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=395 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=453 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=511 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=569 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=627 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=685 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=743 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=801 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=859 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=917 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=975 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1033 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1091 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1149 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1207 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1265 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1323 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1381 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1439 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1497 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1555 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1613 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1671 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1729 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1787 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1845 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1903 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=1961 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2019 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2077 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2135 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2193 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2251 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2309 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2367 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2425 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2483 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2541 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2599 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2657 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2715 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2773 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2831 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2889 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=2947 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3005 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3063 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3121 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3179 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3237 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3295 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3353 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3411 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3469 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3527 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3585 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3643 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3701 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3759 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3817 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3875 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3933 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=3991 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4049 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4107 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4165 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4223 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4281 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4339 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4397 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4455 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4513 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4571 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4629 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4687 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4745 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4803 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4861 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4919 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=4977 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5035 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5093 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5151 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5209 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5267 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5325 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5383 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5441 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5499 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5557 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5615 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5673 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5731 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5789 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5847 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5905 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=5963 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6021 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6079 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6137 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6195 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6253 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6311 rc=0x00000000 games=5 btn=0x40 tab=0 focus=0 view=l
+menu hb: flips=6369 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+
+==== menu exit ====
+menu exit: have_sel=1 games=5 sen0=c0de0000
+
+==== round begin ====
+launch: games/app/game.jar / cn.uc.application.app.WebClient
+
+==== runMidlet enter ====
+vm UseCompiler(pre)=1 (jit policy=0)
+vm UseCompiler(post)=0 <- actual round mode
+runMidlet returned 0
+
+==== runMidlet exit ====
+round 1: jit cfg=0 -> policy=0
+menu: fb=0x61000000/0x611fe000 block=0x40010161
+menu hb: flips=6372 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6431 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+
+==== menu exit ====
+menu exit: have_sel=1 games=5 sen0=c0de0000
+
+==== round begin ====
+launch: games/app (1)/game.jar / com.app.filemanager.FileManagerMIDlet
+
+==== runMidlet enter ====
+vm UseCompiler(pre)=0 (jit policy=0)
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+[jsr75] listOpen enter
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listNext loop #1
+[jsr75] listClose slot=0
+vm UseCompiler(post)=0 <- actual round mode
+runMidlet returned 0
+
+==== runMidlet exit ====
+round 2: jit cfg=0 -> policy=0
+menu: fb=0x611fe000/0x61000000 block=0x40010161
+menu hb: flips=6447 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6506 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6564 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6622 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l
+menu hb: flips=6680 rc=0x00000000 games=5 btn=0x0 tab=0 focus=0 view=l

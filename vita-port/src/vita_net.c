@@ -28,6 +28,8 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h> /* v02.45: intptr_t for the poll wait descriptor */
 #include <stdarg.h>
 #include <errno.h>
 #include <unistd.h>
@@ -43,6 +45,7 @@
 #include <psp2/net/netctl.h>
 
 #include <pcsl_network.h>
+#include <midp_thread.h>  /* midp_thread_signal() */
 #include <pcsl_socket.h>
 #include <pcsl_serversocket.h>
 #include <pcsl_datagram.h>
@@ -83,6 +86,45 @@ static char g_net_mem[VITA_NET_MEM_SIZE];
 
 /* FIONREAD is not exposed by newlib's sys/ioctl.h on Vita; available()
  * is implemented with a 1-byte MSG_PEEK recv + socket buffer query. */
+/* v02.43: network-block probes, read by the watchdog at a HANG (no I/O in
+ * the hot path, so they cannot change timing much or block themselves).
+ * log88/log89#2 froze the VM thread in recv() <- pcsl_socket_available
+ * with every connect() having returned "immediate OK" (never EINPROGRESS),
+ * which suggests SCE_NET_SO_NBIO did not take effect. These answer it:
+ *   nbio_ok/nbio_fail/nbio_lastrc  sceNetSetsockopt(NBIO) results
+ *   avail_enter > avail_exit       the VM is INSIDE the peek recv right now
+ *   avail_fd/lastn/lasterr         the last peek: fd, return, errno */
+volatile unsigned int vita_net_nbio_ok = 0;
+volatile unsigned int vita_net_nbio_fail = 0;
+volatile int vita_net_nbio_lastrc = 0;
+volatile int vita_net_nbio_lasterrno = 0;
+volatile unsigned int vita_net_avail_enter = 0;
+volatile unsigned int vita_net_avail_exit = 0;
+volatile int vita_net_avail_fd = -1;
+volatile int vita_net_avail_lastn = 0;
+volatile int vita_net_avail_lasterr = 0;
+
+/* v02.49: select()/epoll probe for the non-blocking connect question.
+ * log94 (real hw) hung after a non-blocking connect returned EINPROGRESS,
+ * and v02.45 blamed "sceNetEpoll never reports EPOLLOUT" and switched to a
+ * blocking connect. But that same log also had the wait-descriptor bug
+ * (signalling the bare fd while MIDP waits on the handle), fixed in
+ * v02.45, so EPOLLOUT may have been reported all along and just never woke
+ * the right thread. These counters settle it without guessing:
+ *   poll_calls      number of select() calls in vita_net_poll()
+ *   poll_ready      number of those that returned n>0 (something ready)
+ *   poll_writable   number of polls where at least one fd was writeable
+ *                   (the signal that would complete a non-blocking connect)
+ *   poll_lastn      the last select() return value
+ * If, with non-blocking connect restored, a connect stalls AND
+ * poll_writable>0, the descriptor bug was the log94 cause. If
+ * poll_ready==0 or poll_writable==0 the whole time, EPOLLOUT really is
+ * not reported and connect completion needs sceNetGetSockInfo. */
+volatile unsigned int vita_net_poll_calls = 0;
+volatile unsigned int vita_net_poll_ready = 0;
+volatile unsigned int vita_net_poll_writable = 0;
+volatile int vita_net_poll_lastn = 0;
+
 static int vita_socket_available(int fd, int *pBytesAvailable) {
     /* Peek one byte non-blocking; if a byte exists data is pending. The
      * exact count is not obtainable cheaply on Vita; available() is a hint
@@ -90,7 +132,14 @@ static int vita_socket_available(int fd, int *pBytesAvailable) {
      * The socket is already NBIO (vita_set_nbio at open time), so the
      * MSG_PEEK recv cannot block. */
     unsigned char probe;
-    int n = recv(fd, (char *)&probe, 1, MSG_PEEK);
+    int n;
+
+    vita_net_avail_fd = fd;
+    vita_net_avail_enter++;
+    n = recv(fd, (char *)&probe, 1, MSG_PEEK);
+    vita_net_avail_lastn = n;
+    vita_net_avail_lasterr = (n < 0) ? errno : 0;
+    vita_net_avail_exit++;
 
     if (n < 0) {
         return (errno == EWOULDBLOCK || errno == EAGAIN) ? 0 : -1;
@@ -126,8 +175,33 @@ static int g_net_up = 0;
  * before connect()/accept()/recv() on every socket we create. */
 static void vita_set_nbio(int fd) {
     int on = 1;
-    sceNetSetsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
-                     &on, sizeof(on));
+    /* v02.44 (root-cause fix): NBIO must go through newlib setsockopt(),
+     * NOT sceNetSetsockopt(). newlib's socket() returns a small user-space
+     * fd (15,16,...) while the raw sceNetSocket id is kept in
+     * __vita_fdmap[fd] (verified in libc.a socket.o/setsockopt.o disasm).
+     * Passing that fd straight to sceNetSetsockopt() yields
+     * SCE_NET_ERROR_EBADF (0x80410109, log91 "[NET] set_nbio fd=15/16
+     * rc=0x80410109") on every socket, so NBIO was silently NEVER enabled,
+     * sockets stayed blocking, and recv(MSG_PEEK) (pcsl_socket_available)
+     * blocked in-kernel: watchdog log91 "avail enter=6 exit=5 inside=1" +
+     * "VM stuck in a kernel wait". newlib setsockopt() translates fd ->
+     * sceNetSocket id internally. */
+    int rc = setsockopt(fd, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                        &on, sizeof(on));
+    /* newlib setsockopt() reports failure as -1 with the reason in errno
+     * (already translated from the sceNet code), so capture errno BEFORE
+     * vnet_log() runs - its fopen/fprintf may clobber it. */
+    int err = (rc < 0) ? errno : 0;
+    /* v02.43: the return value was ignored, so a silent failure was
+     * indistinguishable from success (see the probe block above). */
+    vita_net_nbio_lastrc = rc;
+    vita_net_nbio_lasterrno = err;
+    if (rc < 0) {
+        vita_net_nbio_fail++;
+    } else {
+        vita_net_nbio_ok++;
+    }
+    vnet_log("[NET] set_nbio fd=%d rc=%d errno=%d\n", fd, rc, err);
 }
 
 int pcsl_lastNetworkError = 0; /* mirrors upstream `lastError` */
@@ -212,8 +286,26 @@ void vita_net_poll(void) {
 
     memset(&tv, 0, sizeof(tv)); /* pure poll, never block */
     n = select(maxfd + 1, &rfds, &wfds, &efds, &tv);
+    /* v02.49: record whether the poll found anything, and whether any fd
+     * was writeable (the non-blocking-connect completion signal). */
+    vita_net_poll_calls++;
+    vita_net_poll_lastn = n;
     if (n <= 0) {
         return; /* nothing ready (or select missing on Vita3K; harmless) */
+    }
+    vita_net_poll_ready++;
+    {
+        int wseen = 0;
+        for (i = 0; i < VITA_NET_MAX_FDS; i++) {
+            int cfd = g_handles[i].fd;
+            if (cfd >= 0 && cfd < FD_SETSIZE && FD_ISSET(cfd, &wfds)) {
+                wseen = 1;
+                break;
+            }
+        }
+        if (wseen) {
+            vita_net_poll_writable++;
+        }
     }
 
     /* Ready fds: the *_finish() calls happen back in Java threads; here we
@@ -226,17 +318,26 @@ void vita_net_poll(void) {
      * and a thread waiting on the other direction will just re-block. */
     for (i = 0; i < VITA_NET_MAX_FDS; i++) {
         int fd = g_handles[i].fd;
+        /* v02.45: the wait descriptor is the HANDLE, not the fd. MIDP
+         * (socketProtocol.c / datagramProtocol.c) registers waiters with
+         * midp_thread_wait(NETWORK_*_SIGNAL, (int)pcslHandle, ...) and
+         * pcslHandle is the NetHandle pointer na_create() returned.
+         * midp_thread_signal_list() matches descriptors by equality, so
+         * signalling the bare fd (15, 16, ...) never woke anybody: every
+         * WOULDBLOCK (connect, and later recv/send) parked its Java thread
+         * forever while the event pump kept polling (log94). */
+        int desc = (int)(intptr_t)&g_handles[i];
         if (fd < 0 || fd >= FD_SETSIZE) {
             continue;
         }
         if (FD_ISSET(fd, &rfds)) {
-            midp_thread_signal(NETWORK_READ_SIGNAL, fd, PCSL_NET_SUCCESS);
+            midp_thread_signal(NETWORK_READ_SIGNAL, desc, PCSL_NET_SUCCESS);
         }
         if (FD_ISSET(fd, &wfds)) {
-            midp_thread_signal(NETWORK_WRITE_SIGNAL, fd, PCSL_NET_SUCCESS);
+            midp_thread_signal(NETWORK_WRITE_SIGNAL, desc, PCSL_NET_SUCCESS);
         }
         if (FD_ISSET(fd, &efds)) {
-            midp_thread_signal(NETWORK_EXCEPTION_SIGNAL, fd,
+            midp_thread_signal(NETWORK_EXCEPTION_SIGNAL, desc,
                                PCSL_NET_IOERROR);
         }
     }
@@ -268,6 +369,15 @@ int pcsl_socket_open_start(unsigned char *ipBytes, int port,
 
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* v02.49: restore NON-BLOCKING connect. v02.45 dropped it and went
+     * blocking, but that attribution was wrong (see vita_net_poll's probe
+     * comment): log94 also had the wait-descriptor bug (signal fd while
+     * MIDP waits on handle), fixed in v02.45, so the 158 s hang was the
+     * descriptor mismatch, not "epoll never reports EPOLLOUT". The
+     * blocking connect then caused log96 (real hw): UC connecting to the
+     * unreachable safe.ucweb.com froze the whole single-VM-thread UI for
+     * ~27 s. Non-blocking connect never blocks the VM thread: it returns
+     * EINPROGRESS and the event pump completes it via vita_net_poll. */
     vita_set_nbio(fd); /* non-blocking connect: EINPROGRESS => wait on WRITE */
 
     memset(&addr, 0, sizeof(addr));
@@ -276,14 +386,19 @@ int pcsl_socket_open_start(unsigned char *ipBytes, int port,
     memcpy(&addr.sin_addr.s_addr, ipBytes, 4);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        /* Immediate success (host on the same subnet / already connected). */
         h = na_create(fd);
         if (h == NULL) { close(fd); return PCSL_NET_IOERROR; }
         *pHandle = h;
-        vnet_log("[NET] connect immediate OK fd=%d\n", fd);
+        vnet_log("[NET] connect OK fd=%d\n", fd);
         return PCSL_NET_SUCCESS;
     }
 
     if (errno == EINPROGRESS || errno == EALREADY) {
+        /* Non-blocking connect in flight: park the Java thread on
+         * NETWORK_WRITE_SIGNAL with the HANDLE as descriptor. The event
+         * pump (vita_net_poll) completes it when the socket becomes
+         * writeable. */
         h = na_create(fd);
         if (h == NULL) { close(fd); return PCSL_NET_IOERROR; }
         *pHandle = h;

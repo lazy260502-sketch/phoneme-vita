@@ -289,6 +289,16 @@ jlong Os::elapsed_frequency() {
  * Initialization and cleanup
  *=======================================================================*/
 
+#if defined(VITA)
+/* v02.57: raw code addresses of the two asm stubs probed in Os::initialize
+ * below. File scope + extern "C": a block-scope linkage declaration is not
+ * allowed, and the labels are plain asm symbols (no C++ mangling). */
+extern "C" char vita_v257_tramp[] __asm__("start_lightweight_thread_asm");
+extern "C" char vita_v257_ipe[] __asm__("invoke_pending_entries");
+extern "C" char vita_v258_se[] __asm__("shared_entry");
+#endif
+
+
 void Os::initialize() {
 #if NEED_CLOCK_TICKS
     init_clock_ticks();
@@ -323,6 +333,61 @@ void Os::initialize() {
                           pin, aff, mask, rc);
         } else {
             vita_boot_log("[vita] vm_cpu=off aff=0x%x", aff);
+        }
+    }
+    /* v02.57: read the REAL trampoline's code back from memory, as loaded.
+     * log105 (v02.54 sentinel run): the looping VM thread sits at
+     * invoke_pending_entries+0x8 with lr = the landing pad, not the
+     * trampoline's return point (trampoline+0x1c). The only caller that
+     * could give lr=pad is the trampoline's "bleq invoke_pending_entries"
+     * (the other two callers are unconditional bl; the shadow's callers
+     * never run in nodivert mode). That fits "the conditional BL does not
+     * link at run time": pe==0 -> moveq pc,lr -> back to the pad -> forever,
+     * r12 never reaches call_on_primordial_stack, Thread::finish never runs,
+     * while the shadow (bne + UNCONDITIONAL bl) is immune. The file image
+     * has the L bit set (0x0bffff42) and its relocation is R_ARM_JUMP24
+     * (code 29) - the only 5 conditional BLs in the image all use that
+     * type - so the question is what the loader left in memory. Probe only:
+     * the words are logged, nothing is patched.
+     *   w[6]  (+0x18) bleq invoke_pending_entries  file: 0bffff42
+     *   w[13] (+0x34) blne call_on_primordial_stack file: 1bffff48
+     *   w[15] (+0x3c) bl call_on_primordial_stack  (unconditional control)
+     * L bit = bit 24; 0b -> linked, 0a -> plain beq (L lost). */
+    {
+        extern void vita_boot_log(const char *fmt, ...);
+        const volatile unsigned int *t = (const volatile unsigned int *)vita_v257_tramp;
+        const volatile unsigned int *p = (const volatile unsigned int *)vita_v257_ipe;
+        vita_boot_log("[v257] tramp@%p w0-3=%08x %08x %08x %08x w4-7=%08x %08x %08x %08x",
+                      (const void *)t, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+        vita_boot_log("[v257] tramp w8-11=%08x %08x %08x %08x w12-15=%08x %08x %08x %08x",
+                      t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
+        vita_boot_log("[v257] ipe@%p w0-3=%08x %08x %08x %08x",
+                      (const void *)p, p[0], p[1], p[2], p[3]);
+        vita_boot_log("[v257] bleq(w6)=%08x L=%u cond=%x | blne(w13)=%08x L=%u cond=%x"
+                      " | bl(w15)=%08x L=%u cond=%x",
+                      t[6], (t[6] >> 24) & 1, t[6] >> 28,
+                      t[13], (t[13] >> 24) & 1, t[13] >> 28,
+                      t[15], (t[15] >> 24) & 1, t[15] >> 28);
+        /* v02.58: log107 answered the question above - the bleq lost its L
+         * bit at load time (0affff42 vs file 0bffff42), the other two were
+         * intact. The three "blne shared_entry" sites are the only other
+         * conditional BLs in the image; same SCE reloc code. Read them back
+         * too (file words 1bffff28 / 1bfffedc / 1bfffe95; offsets are
+         * v02.57-specific and only checked when the word looks like a BL,
+         * so a rebuild that moves them just prints "n/a"). */
+        {
+            const volatile unsigned int *se = (const volatile unsigned int *)vita_v258_se;
+            static const unsigned int off[3] = { 0x358, 0x488, 0x5a4 };
+            int i;
+            for (i = 0; i < 3; i++) {
+                unsigned int w = se[off[i] / 4];
+                if (((w >> 24) & 0xe) == 0xa) {   /* B/BL, any cond */
+                    vita_boot_log("[v258] shared_entry+0x%x blne=%08x L=%u cond=%x",
+                                  off[i], w, (w >> 24) & 1, w >> 28);
+                } else {
+                    vita_boot_log("[v258] shared_entry+0x%x n/a word=%08x", off[i], w);
+                }
+            }
         }
     }
 #endif
@@ -545,6 +610,19 @@ extern volatile unsigned int vita_v240_land;
 extern volatile unsigned int vita_v240_fp;
 extern volatile unsigned int vita_v240_lr;
 extern void vita_landing_pad(void);
+/* v02.41: register/exit-table records written by the pad (definition in
+ * InterpreterRuntime_arm.cpp, layout documented there). */
+extern volatile unsigned int vita_v241_rec[16][24];
+/* v02.42: shadow-trampoline stage counters (definition and word index in
+ * InterpreterRuntime_arm.cpp). */
+extern volatile unsigned int vita_v242_stage[16];
+/* v02.44: loop-detector state (definitions and meaning in
+ * InterpreterRuntime_arm.cpp). */
+extern volatile unsigned int vita_v243_last_cur;
+extern volatile unsigned int vita_v243_last_r6;
+extern volatile unsigned int vita_v243_rep;
+extern volatile unsigned int vita_v243_trip_rep;
+extern volatile unsigned int vita_v243_trip_land;
 }
 #define VITA_V231_EXIT_RING 8
 volatile unsigned int vita_v231_exit_ring[VITA_V231_EXIT_RING][4];
@@ -756,6 +834,151 @@ volatile unsigned int vita_gc_count = 0;
  * it so the boot-time define sweep - which freezes the CE pump by
  * design - is not mistaken for a hang. */
 volatile unsigned int vita_preload_count = 0;
+
+/* v02.44: boot-timing instrumentation for the white-screen question
+ * ("every app shows a white screen for seconds after launch" - is it the
+ * eager preload above?). All microsecond figures use ONE clock,
+ * sceKernelGetProcessTimeWide() (us since process start), so launcher
+ * marks (vita_main.c -> boot_timing.log), vm_boot.log prefixes and the
+ * display's first-content mark are directly comparable.
+ * The counters are single-writer (VM thread, during the sweep) and read
+ * only after the sweep, from the same thread.
+ *   entries   every .class entry visited (defined + failed)
+ *   us_open   JarFileParser::open_entry
+ *   us_read   FileDecoder::read_completely  (read + inflate)
+ *   us_resolve SystemDictionary::resolve    (parse + define, or a hit)
+ *   fast      resolve calls faster than VITA_PRELOAD_FAST_US - HEURISTIC
+ *             for "class already known" (ROM/dictionary hit); a fresh
+ *             define of a real class takes far longer. */
+extern "C" unsigned long long vita_now_us(void) {
+    return (unsigned long long)sceKernelGetProcessTimeWide();
+}
+/* v02.47: further preload phases (see Globals_vita.hpp) and the stall
+ * phase marker read by the watchdog. */
+volatile unsigned long long vita_preload_us_sym = 0;
+volatile unsigned long long vita_preload_us_verify = 0;
+volatile unsigned long long vita_preload_us_iter = 0;
+volatile unsigned int vita_phase_id = 0;
+volatile unsigned long long vita_phase_us = 0;
+/* v02.48: preload entries skipped because the class was already known */
+volatile unsigned int vita_preload_skipped = 0;
+/* Set by the launcher from ux0:/data/J2ME00001/pad_nodivert.cfg; read by
+ * the landing pad (InterpreterRuntime_arm.cpp). Default 0 = shipping
+ * behaviour (loop detector active). */
+volatile int vita_v247_nodivert = 0;
+
+/* v02.47: syscall-level view of the preload sweep. vita_trace.c (launcher
+ * side) accounts calls and microseconds spent inside each traced syscall
+ * for the VM thread; the sweep's share is the difference between a baseline
+ * taken at "[preload] begin" and the figures at "[preload] done". Weak
+ * references: the VM library must still link without the launcher.
+ * Question this answers: are the unaccounted 34-41% of the sweep many tiny
+ * seek+read round trips (io_read / io_lseek counts huge, us/call small) or
+ * something else entirely (counts small, time elsewhere)? */
+extern "C" {
+void vita_trace_op_stats(unsigned int op, unsigned int *cnt,
+                         unsigned long long *us) __attribute__((weak));
+unsigned int vita_trace_op_count(void) __attribute__((weak));
+const char *vita_trace_op_name(unsigned int op) __attribute__((weak));
+/* v02.50: per-fd split of the VM thread's sceIoWrite calls (vita_trace.c) */
+int vita_trace_fdw_get(unsigned int idx, int *fd, unsigned int *cnt,
+                       unsigned long long *us,
+                       unsigned long long *bytes) __attribute__((weak));
+const char *vita_trace_fd_path(int fd) __attribute__((weak));
+}
+#define VITA_PRELOAD_OPS 64
+static unsigned int s_pre_cnt0[VITA_PRELOAD_OPS];
+static unsigned long long s_pre_us0[VITA_PRELOAD_OPS];
+#define VITA_PRELOAD_FDW 8
+static int s_pre_fdw_fd0[VITA_PRELOAD_FDW];
+static unsigned int s_pre_fdw_cnt0[VITA_PRELOAD_FDW];
+static unsigned long long s_pre_fdw_us0[VITA_PRELOAD_FDW];
+static unsigned long long s_pre_fdw_by0[VITA_PRELOAD_FDW];
+
+extern "C" void vita_trace_preload_mark(void) {
+    unsigned int op, n;
+    if (vita_trace_op_stats == NULL || vita_trace_op_count == NULL) return;
+    n = vita_trace_op_count();
+    if (n > VITA_PRELOAD_OPS) n = VITA_PRELOAD_OPS;
+    for (op = 0; op < n; op++) {
+        vita_trace_op_stats(op, &s_pre_cnt0[op], &s_pre_us0[op]);
+    }
+    if (vita_trace_fdw_get != NULL) {
+        unsigned int k;
+        for (k = 0; k < VITA_PRELOAD_FDW; k++) {
+            if (!vita_trace_fdw_get(k, &s_pre_fdw_fd0[k], &s_pre_fdw_cnt0[k],
+                                    &s_pre_fdw_us0[k], &s_pre_fdw_by0[k])) {
+                s_pre_fdw_fd0[k] = -1;
+                s_pre_fdw_cnt0[k] = 0;
+                s_pre_fdw_us0[k] = 0;
+                s_pre_fdw_by0[k] = 0;
+            }
+        }
+    }
+}
+
+extern "C" void vita_trace_preload_report(void) {
+    /* vita_boot_log has C++ linkage (JVM_vita.cpp); declared inside the
+     * function like the other callers, because a file-scope declaration
+     * here clashes with the one at line ~315 under extern "C". */
+    extern void vita_boot_log(const char *fmt, ...);
+    char buf[600];
+    int pos = 0;
+    unsigned int op, n;
+    if (vita_trace_op_stats == NULL || vita_trace_op_count == NULL ||
+        vita_trace_op_name == NULL) {
+        return;
+    }
+    n = vita_trace_op_count();
+    if (n > VITA_PRELOAD_OPS) n = VITA_PRELOAD_OPS;
+    pos = snprintf(buf, sizeof(buf), "[preload] sys(VM thread, delta):");
+    for (op = 0; op < n; op++) {
+        unsigned int c;
+        unsigned long long u;
+        vita_trace_op_stats(op, &c, &u);
+        c -= s_pre_cnt0[op];
+        u -= s_pre_us0[op];
+        if (c == 0) continue;
+        if (pos < (int)sizeof(buf) - 60) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " %s n=%u us=%llu",
+                            vita_trace_op_name(op), c, u);
+        }
+    }
+    vita_boot_log("%s", buf);
+    /* v02.50: which files take the sweep's sceIoWrite calls? log100: a
+     * constant 63 writes cost 1.25-1.27 s per start (0.24 s in log95), i.e.
+     * ~20 ms each, and nothing says whose they are. One line per fd that
+     * took part (delta vs the baseline taken at "[preload] begin"). */
+    if (vita_trace_fdw_get != NULL && vita_trace_fd_path != NULL) {
+        unsigned int k, j;
+        for (k = 0; k < VITA_PRELOAD_FDW; k++) {
+            int fdn;
+            unsigned int cn;
+            unsigned long long un, bn;
+            if (!vita_trace_fdw_get(k, &fdn, &cn, &un, &bn)) continue;
+            for (j = 0; j < VITA_PRELOAD_FDW; j++) {
+                if (s_pre_fdw_fd0[j] == fdn && s_pre_fdw_cnt0[j] != 0) {
+                    cn -= s_pre_fdw_cnt0[j];
+                    un -= s_pre_fdw_us0[j];
+                    bn -= s_pre_fdw_by0[j];
+                    break;
+                }
+            }
+            if (cn == 0) continue;
+            /* bytes/n is the point: ~22 ms per call is a latency problem,
+             * not a volume one, if the average call is a few dozen bytes. */
+            vita_boot_log("[preload] io_write fd=0x%x (%s) n=%u us=%llu "
+                          "bytes=%llu",
+                          fdn, vita_trace_fd_path(fdn), cn, un, bn);
+        }
+    }
+}
+
+volatile unsigned int vita_preload_entries = 0;
+volatile unsigned int vita_preload_fast = 0;
+volatile unsigned long long vita_preload_us_open = 0;
+volatile unsigned long long vita_preload_us_read = 0;
+volatile unsigned long long vita_preload_us_resolve = 0;
 
 /* Called at the top of InstanceClass::clinit per class. Same explicit
  * length copy as the verifier hooks (Symbols are length-prefixed). */
@@ -1257,6 +1480,64 @@ static void vita_wd_snapshot_one(SceUID fd) {
                  vita_v240_land, vita_v240_fp, vita_v240_lr,
                  (unsigned int)&vita_landing_pad);
     sceIoWrite(fd, buf, n);
+
+    /* v02.41: pad records. rec[0..7] = land 1..8 (healthy handoffs),
+     * rec[8..15] = land 1000000..1000007 (inside the log85 loop).
+     * Empty slots (land==0) are skipped. Two lines per record: general
+     * registers, then exit-table words + current-thread fields.
+     * Compare the two sets: identical loop records => fixed cycle;
+     * r6 / [r6+16] / cur->stack_pointer differing from the healthy
+     * set names the corrupted link. */
+    {
+        unsigned int i;
+        for (i = 0; i < 16; i++) {
+            const volatile unsigned int *r = vita_v241_rec[i];
+            if (r[0] == 0) continue;
+            n = snprintf(buf, sizeof(buf),
+                         "  v241 rec[%u] land=%u r4=%08x r5=%08x r6=%08x"
+                         " r7=%08x r8=%08x r9=%08x r10=%08x r11=%08x"
+                         " r12=%08x sp=%08x lr=%08x\n",
+                         i, r[0], r[1], r[2], r[3], r[4], r[5], r[6],
+                         r[7], r[8], r[9], r[10], r[11]);
+            sceIoWrite(fd, buf, n);
+            n = snprintf(buf, sizeof(buf),
+                         "  v241 rec[%u] x[r6+0/4/8/12/16]=%08x %08x %08x"
+                         " %08x %08x cur=%08x cur.sp=%08x cur.st=%08x"
+                         " cur.pe=%08x\n",
+                         i, r[12], r[13], r[14], r[15], r[16], r[17],
+                         r[18], r[19], r[20]);
+            sceIoWrite(fd, buf, n);
+            /* v02.50: the trampoline inputs v02.41 did not record */
+            n = snprintf(buf, sizeof(buf),
+                         "  v241 rec[%u] pendexc[gp+1040]=%08x"
+                         " [cur.sp]=%08x [cur.sp+4]=%08x\n",
+                         i, r[21], r[22], r[23]);
+            sceIoWrite(fd, buf, n);
+        }
+    }
+    /* v02.42: shadow-trampoline stage counters. Laps with land>=1000000
+     * run the instrumented copy of the trampoline; st[0] is the number of
+     * entries, every other st[i] counts laps that reached stage i (all
+     * probes sit BEFORE their step, see InterpreterRuntime_arm.cpp). The
+     * first st[i] below st[0] marks where laps leave the trampoline. */
+    n = snprintf(buf, sizeof(buf),
+                 "  v242 st=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u"
+                 " r6=%08x lr=%08x pendexc=%08x\n",
+                 vita_v242_stage[0], vita_v242_stage[1], vita_v242_stage[2],
+                 vita_v242_stage[3], vita_v242_stage[4], vita_v242_stage[5],
+                 vita_v242_stage[6], vita_v242_stage[7], vita_v242_stage[8],
+                 vita_v242_stage[9], vita_v242_stage[10], vita_v242_stage[11],
+                 vita_v242_stage[13]);
+    sceIoWrite(fd, buf, n);
+    /* v02.44: loop detector. trip_rep = diverts to the shadow caused by
+     * "3rd consecutive entry with the same (cur, r6)"; trip_land = land at
+     * the first such divert; rep = the current run length. */
+    n = snprintf(buf, sizeof(buf),
+                 "  v243 rep=%u trip_rep=%u trip_land=%u last_cur=%08x"
+                 " last_r6=%08x\n",
+                 vita_v243_rep, vita_v243_trip_rep, vita_v243_trip_land,
+                 vita_v243_last_cur, vita_v243_last_r6);
+    sceIoWrite(fd, buf, n);
     {
         unsigned int c = vita_v231_exit_seq;
         unsigned int start = (c >= VITA_V231_EXIT_RING)
@@ -1307,6 +1588,46 @@ static void vita_wd_snapshot_one(SceUID fd) {
             sceIoWrite(fd, thread_dump, len);
         vita_wd_puts(fd, "[rd6 dumpthreads ok]\n");
     }
+}
+
+/* v02.43: exit probe - the same landing-pad / shadow-trampoline counters
+ * the watchdog prints at a HANG, but written when a MIDlet round ENDS
+ * NORMALLY (called from vita_main.c right after runMidlet returns).
+ * log87 (no hang) carried no land/v242 data, so "does the loop form and
+ * get broken by the shadow on every run, or did the timing change make it
+ * disappear?" could not be answered. Prediction to falsify: if the shadow
+ * rescues FileManager on every run, land >= 1000000 and v242 st[0] > 0 at
+ * its normal exit; if the loop never forms, land stays small (tens) and
+ * st[0] == 0. Counters are process-lifetime (not reset per round). */
+extern "C" void vita_exit_probe(int round, int status) {
+    SceUID fd = sceIoOpen("ux0:/data/J2ME00001/exit_probe.log",
+                          SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    char buf[320];
+    int n;
+    if (fd < 0) return;
+    n = snprintf(buf, sizeof(buf),
+                 "exit round=%d status=%d land=%u shadow_in=%u"
+                 " th_start=%u th_finish=%u lw_exit=%u setcur=%u\n",
+                 round, status, vita_v240_land, vita_v242_stage[0],
+                 vita_thread_start_count, vita_thread_finish_count,
+                 vita_lw_exit_count, vita_v231_setcur);
+    sceIoWrite(fd, buf, n);
+    n = snprintf(buf, sizeof(buf),
+                 "  v242 st=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u"
+                 " rec8.land=%u rec15.land=%u\n",
+                 vita_v242_stage[0], vita_v242_stage[1], vita_v242_stage[2],
+                 vita_v242_stage[3], vita_v242_stage[4], vita_v242_stage[5],
+                 vita_v242_stage[6], vita_v242_stage[7], vita_v242_stage[8],
+                 vita_v242_stage[9], vita_v241_rec[8][0], vita_v241_rec[15][0]);
+    sceIoWrite(fd, buf, n);
+    /* v02.44: with the loop detector the shadow is entered on the 3rd
+     * repeat, so land stays small and rec8.land stays 0 - read trip_rep /
+     * trip_land to see whether the detector fired and how early. */
+    n = snprintf(buf, sizeof(buf),
+                 "  v243 trip_rep=%u trip_land=%u rep=%u\n",
+                 vita_v243_trip_rep, vita_v243_trip_land, vita_v243_rep);
+    sceIoWrite(fd, buf, n);
+    sceIoClose(fd);
 }
 
 void vita_wd_snapshot(const char *path) {

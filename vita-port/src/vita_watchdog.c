@@ -29,6 +29,7 @@
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/stat.h>   /* v02.47: wd_early_dump.cfg probe */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -265,6 +266,171 @@ static void wd_dump_vm_progress(void) {
     wd_log(buf, n);
 }
 
+/* v02.48: pending half-line of VM output (midp_run.c line buffer). Weak, so
+ * a build without it still links. Called before a deliberate abort so the
+ * last partial line is not lost with the process. */
+extern void vita_printraw_flush(void) __attribute__((weak));
+static void wd_printraw_flush(void) {
+    if (vita_printraw_flush != NULL) {
+        vita_printraw_flush();
+    }
+}
+
+/* ====================================================================
+ * v02.47 EARLY STALL SAMPLING
+ *
+ * Why: log93 showed the old flow is too late. The pump froze for ~8.8 s,
+ * the HANG report (12 polls = 3 s) then spent another ~20 s on census
+ * probes, KICKs and dumps, and the coredump (and site_ring/trace_ring)
+ * were taken AFTER the VM had already recovered - so they described a
+ * healthy VM, not the stall.
+ *
+ * What: from the 1st poll in which CE AND the clinit/GC/preload counters
+ * are all frozen, take one cheap sample per poll (no file I/O, no foreign
+ * register reads) into memory: the VM thread's kernel state and CPU
+ * clock, the interpreter progress counters, the VM-side phase marker
+ * (vita_phase_id, Globals_vita.hpp) and the VM thread's syscall activity
+ * (vita_trace_peek). The series is written out in one go when the pump
+ * recovers (a stall of >= WD_EARLY_MIN polls - the old code never
+ * reported one shorter than 12) or at the start of a HANG report.
+ * Reading it: deltas of calls/rd/lseek say whether the VM thread is in a
+ * storm of small file I/O; dclk_us vs 250000 says how much CPU it burns;
+ * phase names the innermost marked VM function.
+ *
+ * PC/LR: user mode has no safe way to read another thread's registers
+ * (kubridge is not installed - see kernel_forensics.log; the *ForVM
+ * thread-context exports have no header and sceKernelSuspendThreadForVM
+ * already returns 0x80020008 here; GetThreadRunStatus killed the caller
+ * in log33/34). The one faithful source of PC/LR is a coredump taken
+ * DURING the stall, so FORENSIC MODE aborts early: create
+ * ux0:/data/J2ME00001/wd_early_dump.cfg and the watchdog flushes the
+ * series and takes the data-abort dump after WD_EARLY_DUMP_POLLS frozen
+ * polls (~2 s) instead of ~25 s. That kills the process, hence opt-in.
+ * ==================================================================== */
+extern volatile unsigned int vita_phase_id;
+extern volatile unsigned long long vita_phase_us;
+
+#define WD_EARLY_N          24  /* samples kept: 24 x 250 ms = 6 s        */
+#define WD_EARLY_MIN         4  /* ~1 s frozen before a stall is reported  */
+#define WD_EARLY_DUMP_POLLS  8  /* forensic mode: coredump after ~2 s      */
+#define WD_EARLY_CFG "ux0:/data/J2ME00001/wd_early_dump.cfg"
+
+typedef struct {
+    unsigned long long t_us;        /* process time of the sample          */
+    unsigned long long phase_us;    /* when the innermost phase was entered */
+    unsigned long long run_clocks;  /* VM thread CPU clock (us)            */
+    unsigned int phase_id;
+    unsigned int status, wait_type; /* VM thread kernel state              */
+    unsigned int sw, sf, site, jsmp;/* interpreter progress counters       */
+    vita_trace_peek_t pk;
+} wd_early_t;
+
+static wd_early_t g_early[WD_EARLY_N];
+
+static const char *wd_phase_name(unsigned int id) {
+    switch (id) {
+        case 0: return "none/interp";
+        case 1: return "jar_find_entry";
+        case 2: return "jar_open_entry";
+        case 3: return "read_completely";
+        case 4: return "preload_resolve";
+        case 5: return "preload_verify";
+        case 6: return "lazy_class_load";
+        case 7: return "gc";
+        case 8: return "resource_open";
+        case 9: return "clinit_setup";
+        default: return "?";
+    }
+}
+
+/* Sample number n_total (0-based). Once the buffer is full the LAST slot
+ * keeps rolling, so the report always ends with the freshest sample. */
+static void wd_early_sample(int n_total) {
+    wd_early_t *e = &g_early[n_total < WD_EARLY_N ? n_total : WD_EARLY_N - 1];
+    SceKernelThreadInfo info;
+
+    e->t_us = (unsigned long long)sceKernelGetProcessTimeWide();
+    e->phase_id = vita_phase_id;
+    e->phase_us = vita_phase_us;
+    memset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    if (vita_wd_vm_tid >= 0 &&
+        sceKernelGetThreadInfo(vita_wd_vm_tid, &info) >= 0) {
+        e->status = info.status;
+        e->wait_type = info.waitType;
+        e->run_clocks = info.runClocks;
+    } else {
+        e->status = 0;
+        e->wait_type = 0;
+        e->run_clocks = 0;
+    }
+    e->sw = vita_sched_switch_count();
+    e->sf = vita_sched_yield_fast();
+    e->site = vita_site_seq;
+    e->jsmp = vita_java_sample_count;
+    vita_trace_peek((unsigned int)vita_wd_vm_tid, &e->pk);
+}
+
+/* v02.50: for fd-based ops, which file was the last call on? (hint only -
+ * vita_trace.c records fd -> path tail at sceIoOpen). Other ops: "-". */
+static const char *wd_op_fdpath(const vita_trace_peek_t *pk) {
+    switch (pk->op) {
+        case TRACE_OP_IO_READ:
+        case TRACE_OP_IO_WRITE:
+        case TRACE_OP_IO_PWRITE:
+        case TRACE_OP_IO_LSEEK:
+        case TRACE_OP_IO_LSEEK32:
+        case TRACE_OP_IO_CLOSE:
+            return vita_trace_fd_path((int)pk->arg);
+        default:
+            return "-";
+    }
+}
+
+static void wd_early_flush(int n_total, const char *tag,
+                           unsigned int ce_a, unsigned int ce_b) {
+    char buf[360];
+    int n, i;
+    int cnt = n_total < WD_EARLY_N ? n_total : WD_EARLY_N;
+    unsigned int now_lo = (unsigned int)sceKernelGetSystemTimeWide();
+
+    n = snprintf(buf, sizeof(buf),
+                 "[WD-STALL] %s ce %u -> %u, %d polls frozen (~%d ms), "
+                 "%d samples kept\n",
+                 tag, ce_a, ce_b, n_total, n_total * WD_POLL_MS, cnt);
+    wd_log(buf, n);
+    for (i = 0; i < cnt; i++) {
+        const wd_early_t *e = &g_early[i];
+        const wd_early_t *p = i ? &g_early[i - 1] : e;
+        long long age = (e->phase_id && e->t_us >= e->phase_us)
+                          ? (long long)(e->t_us - e->phase_us) : 0;
+        n = snprintf(buf, sizeof(buf),
+                     "[WD-STALL] #%d t=%llu phase=%u(%s) age_ms=%lld "
+                     "vm=%s wait=%s dclk_us=%lld sw+%u site+%u jsmp+%u\n",
+                     i, e->t_us, e->phase_id, wd_phase_name(e->phase_id),
+                     age / 1000, wd_status_name(e->status),
+                     wd_wait_type_name(e->wait_type),
+                     (long long)(e->run_clocks - p->run_clocks),
+                     e->sw - p->sw, e->site - p->site, e->jsmp - p->jsmp);
+        wd_log(buf, n);
+        n = snprintf(buf, sizeof(buf),
+                     "[WD-STALL] #%d sys found=%u lastop=%s arg=%08x(%s) "
+                     "inside=%u since_ms=%u | calls+%u rd+%u lseek+%u "
+                     "lseek32+%u lwmutex+%u sema+%u\n",
+                     i, e->pk.found, vita_trace_op_name(e->pk.op),
+                     e->pk.arg, wd_op_fdpath(&e->pk),
+                     e->pk.inside,
+                     (i == cnt - 1)
+                       ? (now_lo - e->pk.ts_lo) / 1000u : 0u,
+                     e->pk.total - p->pk.total, e->pk.rd - p->pk.rd,
+                     e->pk.lseek - p->pk.lseek,
+                     e->pk.lseek32 - p->pk.lseek32,
+                     e->pk.lwmutex - p->pk.lwmutex,
+                     e->pk.sema - p->pk.sema);
+        wd_log(buf, n);
+    }
+}
+
 /* v01.90: VM-side progress counters (OS_vita.cpp). A class-load storm
  * (log14..16) or a GC cycle advances these while the CE pump is starved:
  * that is "pathologically slow", not "dead" - the watchdog must not
@@ -288,6 +454,23 @@ static int wd_thread_routine(SceSize args, void *argp) {
     int storm_noted = 0;
     int preload_extensions = 0;   /* v01.92: bounded grace for the sweep */
     int kick_recoveries = 0;      /* v02.06: KICK-RECOVERED count */
+    /* v02.47 early stall sampling (see wd_early_sample) */
+    int early_n = 0;              /* frozen polls sampled so far */
+    int early_flushed = 0;        /* series already written out */
+    int early_dump = 0;           /* forensic mode: wd_early_dump.cfg */
+    {
+        SceIoStat st;
+        memset(&st, 0, sizeof(st));
+        early_dump = (sceIoGetstat(WD_EARLY_CFG, &st) >= 0);
+        if (early_dump) {
+            char eb[96];
+            int en = snprintf(eb, sizeof(eb),
+                              "[WD] forensic mode ON (%s): coredump after "
+                              "%d frozen polls\n", WD_EARLY_CFG,
+                              WD_EARLY_DUMP_POLLS);
+            wd_log(eb, en);
+        }
+    }
 
     for (;;) {
         sceKernelDelayThread(WD_POLL_MS * 1000);
@@ -302,10 +485,20 @@ static int wd_thread_routine(SceSize args, void *argp) {
             reported = 0;
             storm_noted = 0;
             preload_extensions = 0;
+            early_n = 0;
+            early_flushed = 0;
             continue;
         }
 
         if (vita_ce_count != last_ce) {
+            /* v02.47: the pump moved. If it had been frozen long enough
+             * to matter, write the series now (the stall has just ended,
+             * so the samples still describe it). */
+            if (early_n >= WD_EARLY_MIN && !early_flushed) {
+                wd_early_flush(early_n, "recovered", last_ce, vita_ce_count);
+            }
+            early_n = 0;
+            early_flushed = 0;
             last_ce = vita_ce_count;
             last_clinit = vita_clinit_count;
             last_gc = vita_gc_count;
@@ -376,11 +569,46 @@ static int wd_thread_routine(SceSize args, void *argp) {
              * effectively dead); fall through to the HANG report. */
         }
 
+        /* v02.47: CE and every progress counter are frozen in this poll:
+         * take one in-memory sample (no I/O). Forensic mode takes the
+         * coredump here, ~2 s into the stall, so its PC/LR describe the
+         * stall instead of the aftermath. */
+        wd_early_sample(early_n);
+        early_n++;
+        if (early_dump && early_n >= WD_EARLY_DUMP_POLLS && !reported) {
+            char eb[96];
+            int en;
+            wd_early_flush(early_n, "EARLY-DUMP", last_ce, vita_ce_count);
+            /* v02.48: log98/log99 were taken in this mode and came back
+             * WITHOUT site_ring.log / trace_ring.log - the HANG path writes
+             * them but this shortcut skipped them, losing the landing-pad
+             * records (v241/v242/v243), the interpreter snapshot and the
+             * syscall slots, i.e. exactly the state the FileManager loop
+             * question needs. Same read-only calls as the HANG path. */
+            vita_site_dump("ux0:/data/J2ME00001/site_ring.log");
+            vita_site_dump_verify("ux0:/data/J2ME00001/site_ring.log");
+            vita_site_dump_clinit("ux0:/data/J2ME00001/site_ring.log");
+            vita_site_dump_java("ux0:/data/J2ME00001/site_ring.log");
+            vita_wd_snapshot("ux0:/data/J2ME00001/site_ring.log");
+            vita_trace_dump("ux0:/data/J2ME00001/trace_ring.log");
+            wd_printraw_flush();
+            en = snprintf(eb, sizeof(eb),
+                          "[WD] forensic mode: requesting coredump after %d "
+                          "frozen polls\n", early_n);
+            wd_log(eb, en);
+            sceKernelDelayThread(200 * 1000);
+            *(volatile int *)0x81000000 = 0x53455244; /* read-only .text */
+        }
+
         /* counter frozen; require WD_STALL_POLLS consecutive frozen
          * polls before declaring a hang (iteration count, NOT clock -
          * a frozen gettimeofday must not blind the watchdog). */
         if (++stalled_polls < WD_STALL_POLLS) continue;
         if (reported) continue;  /* one report per hang */
+        if (!early_flushed) {
+            wd_early_flush(early_n, "HANG", last_ce, vita_ce_count);
+            early_flushed = 1;
+        }
 
         /* ---- hang detected: forensic snapshot ----
          * clock liveness: two readings 100 ms apart must differ.
@@ -620,6 +848,16 @@ static int wd_thread_routine(SceSize args, void *argp) {
                     if (vita_ce_count != ce_before) { moved = 1; break; }
                 }
             }
+            /* v02.47 BUGFIX: the "!moved" guard opened at KICK0 used to be
+             * closed AFTER the recovery block below, so when KICK0 alone
+             * (or the first 4 polls after it) saw the pump move, the
+             * "KICK RECOVERED / re-arm / continue" code was skipped and
+             * control fell straight through to the coredump abort. log93:
+             * CE kept advancing 4376 -> 5138 and input kept being served
+             * after the HANG line, yet watchdog.log ends with only
+             * "KICK0 signal" + "requesting coredump" - a recoverable
+             * stall was escalated into a self-inflicted crash. */
+            } /* end KICK0 !moved guard (KICK1..KICK5) */
             n = snprintf(buf, sizeof(buf),
                          "[WD] KICK %s (ce %u -> %u)\n",
                          moved ? "RECOVERED" : "no effect",
@@ -629,6 +867,8 @@ static int wd_thread_routine(SceSize args, void *argp) {
                 /* recovered: keep the process alive, re-arm for the
                  * next hang so we learn whether one kick is enough
                  * or the loss recurs (recurrence count matters). */
+                early_n = 0;           /* v02.47: series already written */
+                early_flushed = 0;
                 reported = 0;
                 stalled_polls = 0;
                 storm_noted = 0;
@@ -649,7 +889,6 @@ static int wd_thread_routine(SceSize args, void *argp) {
                     wd_log(buf, m);
                 }
             }
-            } /* end KICK0 !moved guard (KICK1..KICK5) */
         }
 
         /* v01.84: dump the VM's site ring BEFORE the coredump request.
@@ -728,6 +967,57 @@ static int wd_thread_routine(SceSize args, void *argp) {
             }
         }
 
+        /* v02.43: network-block probe (vita_net.c). avail_enter>avail_exit
+         * means the VM thread is INSIDE the MSG_PEEK recv right now (log88
+         * /log89#2 stack: recv <- pcsl_socket_available). nbio_fail>0 or a
+         * negative nbio_lastrc proves SCE_NET_SO_NBIO did not take; ok>0
+         * with the VM still blocked in recv means NBIO is set but the peek
+         * recv ignores it. */
+        {
+            extern volatile unsigned int vita_net_nbio_ok;
+            extern volatile unsigned int vita_net_nbio_fail;
+            extern volatile int vita_net_nbio_lastrc;
+            extern volatile int vita_net_nbio_lasterrno;
+            extern volatile unsigned int vita_net_avail_enter;
+            extern volatile unsigned int vita_net_avail_exit;
+            extern volatile int vita_net_avail_fd;
+            extern volatile int vita_net_avail_lastn;
+            extern volatile int vita_net_avail_lasterr;
+            char nbuf[200];
+            int nn = snprintf(nbuf, sizeof(nbuf),
+                              "[WD] net nbio ok=%u fail=%u lastrc=%d"
+                              " errno=%d | avail enter=%u exit=%u inside=%d"
+                              " fd=%d lastn=%d lasterr=%d\n",
+                              vita_net_nbio_ok, vita_net_nbio_fail,
+                              vita_net_nbio_lastrc,
+                              vita_net_nbio_lasterrno,
+                              vita_net_avail_enter, vita_net_avail_exit,
+                              (vita_net_avail_enter != vita_net_avail_exit),
+                              vita_net_avail_fd, vita_net_avail_lastn,
+                              vita_net_avail_lasterr);
+            wd_log(nbuf, nn);
+        }
+
+        /* v02.49: select()/epoll probe for the non-blocking connect
+         * question (vita_net.c). poll_writable>0 while a connect stalls
+         * => the log94 hang was the wait-descriptor bug (now fixed), not
+         * "epoll never reports EPOLLOUT". poll_ready==0/poll_writable==0
+         * => EPOLLOUT really is not reported and connect completion needs
+         * sceNetGetSockInfo instead. */
+        {
+            extern volatile unsigned int vita_net_poll_calls;
+            extern volatile unsigned int vita_net_poll_ready;
+            extern volatile unsigned int vita_net_poll_writable;
+            extern volatile int vita_net_poll_lastn;
+            char pbuf[160];
+            int pn = snprintf(pbuf, sizeof(pbuf),
+                              "[WD] net poll calls=%u ready=%u writable=%u"
+                              " lastn=%d\n",
+                              vita_net_poll_calls, vita_net_poll_ready,
+                              vita_net_poll_writable, vita_net_poll_lastn);
+            wd_log(pbuf, pn);
+        }
+
         /* v02.18: kernel-side forensics via kubridge. The sysinfo block
          * above can NAME the stalled core but says nothing about WHY it
          * stopped; the coredump's SYSTEM_INFO2 is hashed so the kernel
@@ -753,8 +1043,10 @@ static int wd_thread_routine(SceSize args, void *argp) {
          * the dump is worth more than a frozen process. */
         {
             char buf[128];
-            int n = snprintf(buf, sizeof(buf),
-                             "[WD] requesting coredump via data abort\n");
+            int n;
+            wd_printraw_flush(); /* v02.48: keep the last partial VM line */
+            n = snprintf(buf, sizeof(buf),
+                         "[WD] requesting coredump via data abort\n");
             wd_log(buf, n);
             /* give the log write a moment to hit the disk */
             sceKernelDelayThread(200 * 1000);

@@ -1,0 +1,20 @@
+[MIDLET] startSuite: main.MainMidlet
+[MIDLET] creating main.MainMidlet
+[rms] open name='NEZHA_DOWN' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[rms] open name='NEZHASMS' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[MIDLET] created+registered OK: main.MainMidlet
+[rms] open name='NEZHA' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[MIDLET] startSuite: main.MainMidlet
+[MIDLET] creating main.MainMidlet
+[rms] open name='NEZHA_DOWN' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[rms] open name='NEZHASMS' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[MIDLET] created+registered OK: main.MainMidlet
+[rms] open name='NEZHA' suite=-1 exists=1 next=1 live=0 ver=0 data=0 free=0
+[MIDLET] startSuite: cn.uc.application.app.WebClient
+[MIDLET] creating cn.uc.application.app.WebClient
+[MIDLET] created+registered OK: cn.uc.application.app.WebClient
+[rms] open name='coreA' suite=-1 exists=1 next=2 live=1 ver=40 data=4976 free=0
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0
+[rms] open name='coreA' suite=-1 exists=1 next=2 live=1 ver=40 data=4976 free=0
+[rms] open name='B' suite=-1 exists=1 next=2 live=1 ver=1 data=24 free=0
+[rms] open name='G2' suite=-1 exists=1 next=23 live=22 ver=22 data=51304 free=0

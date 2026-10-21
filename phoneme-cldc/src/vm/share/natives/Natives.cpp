@@ -1460,6 +1460,9 @@ void Java_java_lang_Throwable_printStackTrace() {
 
 // static native Object open(String name);
 ReturnOop Java_com_sun_cldc_io_ResourceInputStream_open(JVM_SINGLE_ARG_TRAPS) {
+#if defined(VITA)
+  VitaPhaseScope vps8(8); /* v02.47 stall phase marker (getResourceAsStream) */
+#endif
   UsingFastOops fast_oops;
   String::Fast j_filename = GET_PARAMETER_AS_OOP(1);
   Symbol::Fast c_filename = SymbolTable::symbol_for(&j_filename JVM_CHECK_0);

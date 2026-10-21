@@ -220,6 +220,10 @@ void InstanceClass::initialize_internal(Thread *thread, Oop *m JVM_TRAPS) {
 void InstanceClass::clinit(JVM_SINGLE_ARG_TRAPS) {
   UsingFastOops fast_oops;
 #if defined(VITA)
+  /* v02.47 stall phase marker. Note: clinit() only SCHEDULES the Java
+   * <clinit> (pending entry), so this phase covers the setup, not the
+   * Java body - that runs in the interpreter (phase 0). */
+  VitaPhaseScope vps9(9);
   {
     /* v01.88: log14 froze with the verifier off after 345 frames of
      * normal play; the spin moved into clinit execution. Record the

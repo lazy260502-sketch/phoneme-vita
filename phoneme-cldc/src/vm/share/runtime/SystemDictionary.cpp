@@ -130,6 +130,9 @@ ReturnOop SystemDictionary::find_class_or_null(Symbol *class_name) {
 }
 
 ReturnOop SystemDictionary::fetch_buffer(LoaderContext *loader_ctx JVM_TRAPS) {
+#if defined(VITA)
+  VitaPhaseScope vps6(6); /* v02.47 stall phase marker (lazy class load) */
+#endif
   UsingFastOops fast_oops;
   FileDecoder::Fast fd = 
     ClassPathAccess::open_entry(loader_ctx->class_name(), true JVM_CHECK_0);

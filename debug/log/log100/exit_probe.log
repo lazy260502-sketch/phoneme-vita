@@ -1,0 +1,9 @@
+exit round=0 status=0 land=10 shadow_in=2 th_start=4 th_finish=2 lw_exit=2 setcur=284
+  v242 st=2/2/2/0/2/2/2/2/2/2 rec8.land=0 rec15.land=0
+  v243 trip_rep=2 trip_land=7 rep=2
+exit round=1 status=0 land=36 shadow_in=9 th_start=13 th_finish=9 lw_exit=9 setcur=588
+  v242 st=9/9/9/0/9/9/9/9/9/9 rec8.land=0 rec15.land=0
+  v243 trip_rep=9 trip_land=7 rep=2
+exit round=2 status=0 land=891 shadow_in=276 th_start=285 th_finish=276 lw_exit=276 setcur=10547
+  v242 st=276/276/276/0/276/276/276/276/276/276 rec8.land=0 rec15.land=0
+  v243 trip_rep=276 trip_land=7 rep=2

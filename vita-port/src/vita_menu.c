@@ -33,6 +33,7 @@
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h> /* v02.x: sceKernelGetProcessTimeWide (VitaSDK 15+) */
 #include <psp2/rtc.h>
 #include <psp2/touch.h>
 #include <psp2/appmgr.h>
@@ -1508,7 +1509,20 @@ static const char *fe_devices[] = {
 /* ---- settings (menu.cfg + launch.cfg line 4) ---- */
 #define MENU_CFG DATA_ROOT "/menu.cfg"
 #define LAUNCH_CFG DATA_ROOT "/launch.cfg"
-enum { SET_VIEW = 0, SET_JIT, SET_N };
+enum { SET_VIEW = 0, SET_JIT, SET_KEYMAP, SET_N };
+
+/* vita_input.c: user key remapping (keymap.cfg) */
+int vita_keymap_count(void);
+const char *vita_keymap_btn_name(int i);
+int vita_keymap_get(int i);
+const char *vita_keymap_key_name(int key);
+void vita_keymap_cycle(int i, int dir);
+void vita_keymap_reset(void);
+void vita_keymap_save(void);
+static int km_page = 0;            /* 1 = key-mapping sub page open */
+static int km_sel = 0;             /* row; == count is the "reset" row */
+static int km_top = 0;             /* first visible row */
+#define KM_LINES 13
 static int set_list_grid = 0;      /* 0 = list, 1 = grid */
 static int set_jit = 0;            /* 0/1/2, mirrors launch.cfg "jit=" */
 
@@ -1610,6 +1624,10 @@ static void settings_toggle(int item, char *msg, size_t msg_sz) {
         settings_save();
         write_jit_to_launch_cfg(set_jit);
         snprintf(msg, msg_sz, "JIT: %s", jit_name(set_jit));
+    } else if (item == SET_KEYMAP) {
+        km_page = 1;
+        km_sel = 0;
+        km_top = 0;
     }
 }
 
@@ -1971,6 +1989,51 @@ int vita_menu_run(VitaGameSel *out) {
                 }
                 crumb_flush();
             }
+        }
+
+        /* key-mapping sub page owns the input while open */
+        if (km_page) {
+            const int kn = vita_keymap_count();
+            int leave = 0;
+            if (btn & SCE_CTRL_UP) {
+                if (km_sel > 0) km_sel--;
+            }
+            if (btn & SCE_CTRL_DOWN) {
+                if (km_sel < kn) km_sel++;
+            }
+            if (km_sel < kn) {
+                if (btn & SCE_CTRL_LEFT) vita_keymap_cycle(km_sel, -1);
+                if (btn & (SCE_CTRL_RIGHT | SCE_CTRL_CROSS)) {
+                    vita_keymap_cycle(km_sel, 1);
+                }
+            } else if (btn & SCE_CTRL_CROSS) {
+                vita_keymap_reset();
+                snprintf(msg, sizeof(msg), "已恢复默认映射");
+                msg_us = sceKernelGetProcessTimeWide();
+            }
+            if (km_sel < km_top) km_top = km_sel;
+            if (km_sel >= km_top + KM_LINES) km_top = km_sel - KM_LINES + 1;
+            if (tapped && tap_x >= TABBAR_W && tap_y >= 64) {
+                int row = (tap_y - 64) / row_h + km_top;
+                if (row >= 0 && row < kn) {
+                    km_sel = row;
+                    vita_keymap_cycle(row, 1);
+                } else if (row == kn) {
+                    km_sel = kn;
+                    vita_keymap_reset();
+                }
+                tapped = 0;
+            }
+            if (btn & SCE_CTRL_CIRCLE) leave = 1;
+            if (tapped && tap_x < TABBAR_W) leave = 1; /* tab tap passes on */
+            if (leave) {
+                km_page = 0;
+                vita_keymap_save();
+                snprintf(msg, sizeof(msg), "按键映射已保存");
+                msg_us = sceKernelGetProcessTimeWide();
+            }
+            btn = 0; /* nothing leaks into the tab/list logic */
+            if (km_page) tapped = 0;
         }
 
         /* ---- tab switching: L/R, dpad left/right, or tap the column ----
@@ -2424,6 +2487,30 @@ int vita_menu_run(VitaGameSel *out) {
                     shown++;
                 }
             }
+        } else if (tab == 3 && km_page) {
+            const int kn = vita_keymap_count();
+            y = 64;
+            for (i = km_top; i < kn && i < km_top + KM_LINES; i++) {
+                if (i == km_sel) {
+                    fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
+                              row_h, C_SEL);
+                }
+                draw_text(TABBAR_W + 20, y, vita_keymap_btn_name(i), 2, C_FG);
+                draw_text(TABBAR_W + 260, y,
+                          vita_keymap_key_name(vita_keymap_get(i)), 2,
+                          C_TITLE);
+                y += row_h;
+            }
+            if (km_top + KM_LINES > kn) {
+                if (km_sel == kn) {
+                    fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
+                              row_h, C_SEL);
+                }
+                draw_text(TABBAR_W + 20, y, "恢复默认", 2, C_FG);
+                y += row_h;
+            }
+            draw_text(TABBAR_W + 20, 64 + KM_LINES * row_h + 4,
+                      "左右/X 切换功能机按键  O 保存并返回", 1, C_HINT);
         } else if (tab == 3) {
             uint64_t maxb = 0, freeb = 0;
             /* option rows: UP/DOWN move setsel, X cycles the value */
@@ -2431,13 +2518,15 @@ int vita_menu_run(VitaGameSel *out) {
             for (i = 0; i < SET_N; i++) {
                 const char *val = (i == SET_VIEW)
                                       ? (set_list_grid ? "网格" : "列表")
+                                  : (i == SET_KEYMAP) ? "进入 >"
                                       : jit_name(set_jit);
                 if (i == setsel) {
                     fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
                               row_h, (focus == 1) ? C_PANEL2 : C_SEL);
                 }
                 draw_text(TABBAR_W + 20, y,
-                          (i == SET_VIEW) ? "游戏视图" : "JIT 编译", 2,
+                          (i == SET_VIEW) ? "游戏视图" :
+                          (i == SET_KEYMAP) ? "按键映射" : "JIT 编译", 2,
                           C_FG);
                 draw_text(TABBAR_W + 260, y, val, 2, C_TITLE);
                 y += row_h;

@@ -1,0 +1,32 @@
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+[NET] gethostbyname('uc.ucweb.com') = 111.13.216.139
+[NET] socket_open ip=111.13.216.139 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)
+[NET] connect DONE fd=11
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=12 rc=0 errno=0
+[NET] connect EINPROGRESS fd=12 (thread will block)
+[NET] connect DONE fd=12
+[NET] gethostbyname('kwurl.ucweb.com') = 120.241.3.226
+[NET] socket_open ip=120.241.3.226 port=80
+[NET] set_nbio fd=12 rc=0 errno=0
+[NET] connect EINPROGRESS fd=12 (thread will block)
+[NET] connect DONE fd=12
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)
+[NET] connect DONE fd=11
+[NET] gethostbyname('safe.ucweb.com') = 14.116.143.163
+[NET] socket_open ip=14.116.143.163 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)
+[NET] connect FAILED fd=11 SO_ERROR=60
+[NET] gethostbyname('safe.ucweb.com') = 14.116.143.163
+[NET] socket_open ip=14.116.143.163 port=80
+[NET] set_nbio fd=11 rc=0 errno=0
+[NET] connect EINPROGRESS fd=11 (thread will block)

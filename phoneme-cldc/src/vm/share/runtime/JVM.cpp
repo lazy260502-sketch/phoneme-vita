@@ -216,9 +216,29 @@ inline bool JVM::load_main_class(JVM_SINGLE_ARG_TRAPS) {
    * syscall per constant-pool entry; removed in v01.92). */
   {
     extern void vita_boot_log(const char *fmt, ...);
+    unsigned long long pt0 = vita_now_us();
+    vita_trace_preload_mark(); /* v02.47: syscall baseline (OS_vita.cpp) */
     vita_boot_log("[preload] begin load_all_in_classpath");
     Universe::load_all_in_classpath(JVM_SINGLE_ARG_CHECK_0);
-    vita_boot_log("[preload] done (see site_ring stats for count)");
+    /* v02.44: summary with the per-phase split (OS_vita.cpp). open/read/
+     * resolve do not add up to total: the rest is directory iteration and
+     * symbol-table work. fast = resolve calls under VITA_PRELOAD_FAST_US
+     * (heuristic for "already known class"). */
+    vita_boot_log("[preload] done defined=%u entries=%u fast=%u total_us=%llu"
+                  " open_us=%llu read_us=%llu resolve_us=%llu",
+                  vita_preload_count, vita_preload_entries,
+                  vita_preload_fast, vita_now_us() - pt0,
+                  vita_preload_us_open, vita_preload_us_read,
+                  vita_preload_us_resolve);
+    /* v02.47: the phases v02.44 did not cover. verify is a sub-interval of
+     * the per-entry work after resolve; sym is part of load_jar_entry;
+     * iter is the central-directory walk outside load_jar_entry. Together
+     * with open/read/resolve they should now account for ~all of total. */
+    vita_boot_log("[preload] phases2 sym_us=%llu verify_us=%llu iter_us=%llu"
+                  " skipped=%u",
+                  vita_preload_us_sym, vita_preload_us_verify,
+                  vita_preload_us_iter, vita_preload_skipped);
+    vita_trace_preload_report(); /* OS_vita.cpp: syscall delta of the sweep */
   }
 #endif
   InstanceClass::Fast klass = JVM::resolve_class(_main_class JVM_CHECK_0);

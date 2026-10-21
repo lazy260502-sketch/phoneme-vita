@@ -1,0 +1,92 @@
+vita-port J2ME launcher
+vm cpu: unpinned (mask=0, kernel default 3-core)
+kubridge precheck: ABSENT
+[NET] sysmodule load: 0x00000000
+[NET] sceNetInit: 0x00000000
+[NET] sceNetCtlInit: 0x00000000
+version: J2ME Player v02.57 b329 (1e8533d)
+[ANI] thread pool initialized
+[media] tone player thread created
+menu jar: games/app (1)/game.jar
+menu class: com.app.filemanager.FileManagerMIDlet
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_6B15
+classpath: midp_system.jar:games/app (1)/game.jar
+starting MIDlet: com.app.filemanager.FileManagerMIDlet
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app (1)/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='com.app.filemanager.FileManagerMIDlet'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app (1)/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app (1)/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app (1)/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=40 additionalPathLength=38
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app (1)/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+  midpRunVm returned vmStatus=2001 (MAIN_EXIT=2001)
+  classPath freed
+*** runMidlet: midp_run_midlet_with_args_cp returned status=0
+runMidlet returned 0 - back to menu
+menu jar: games/app/game.jar
+menu class: cn.uc.application.app.WebClient
+menu orientation: portrait
+[RMS] appdb: ux0:/data/J2ME00001/rms/appdb_1A35
+classpath: midp_system.jar:games/app/game.jar
+starting MIDlet: cn.uc.application.app.WebClient
+runtime Hello.jar size=9203 (expected 9203)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='cn.uc.application.app.WebClient'
+*** runMidlet: using INTERNAL_SUITE_ID, argv[1]='internal'
+*** runMidlet: about to call midp_run_midlet_with_args_cp
+*** runMidlet: calling midp_run_midlet_with_args_cp(suiteId=-1, additionalPath=midp_system.jar:games/app/game.jar)
+===== midp_run_midlet_with_args_cp ENTRY =====
+  suiteId=-1
+  classPathExt='midp_system.jar:games/app/game.jar'
+[getClassPathPlus] start
+  suiteId=-1 classPathExt='midp_system.jar:games/app/game.jar'
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY
+  getClassPathPlus: jarPathLen=0 allocSize=36 additionalPathLength=34
+  INFO: INTERNAL_SUITE_ID, jarPath=EMPTY, parsing additionalPath
+  additionalPath contains multiple paths, will parse
+  [getClassPathPlus] parsed classPath='midp_system.jar:games/app/game.jar'
+  [getClassPathPlus] OK returning (parsed multi-path)
+  OK: classPath built
+  Calling midpRunVm
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFcoreA.db flags=0x2 size=5016
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFG2.db flags=0x2 size=51344
+[NET] gethostbyname('uc.ucweb.com') = 219.133.46.181
+[NET] socket_open ip=219.133.46.181 port=80
+[NET] set_nbio fd=16 rc=0 errno=0
+[NET] connect EINPROGRESS fd=16 (thread will block)
+[NET] connect DONE fd=16
+[GXM] initialized
+[IME] show: Init rc=0x00000000
+[IME] poll: first status=1
+[pcsl] open path=ux0:/data/J2ME00001/rms/appdb_1A35/FFFFFFFFP.db flags=0x2 size=168
+[NET] gethostbyname('vs1.szcm.u2.ucweb.com') = 120.241.3.228
+[NET] socket_open ip=120.241.3.228 port=80
+[NET] set_nbio fd=17 rc=0 errno=0
+[NET] connect EINPROGRESS fd=17 (thread will block)
+[NET] connect DONE fd=17
+[NET] gethostbyname('kwurl.ucweb.com') = 120.241.3.226
+[NET] socket_open ip=120.241.3.226 port=80
+[NET] set_nbio fd=17 rc=0 errno=0
+[NET] connect EINPROGRESS fd=17 (thread will block)
+[NET] connect DONE fd=17

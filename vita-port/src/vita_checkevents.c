@@ -86,6 +86,17 @@ void JVMSPI_CheckEvents(JVMSPI_BlockedThreadInfo *blocked_threads,
                         jlong timeout) {
     vita_ce_count++;
 
+    /* v02.44: first time this round's VM reaches the event pump (flag is
+     * armed by the launcher at round begin; see vita_main.c). */
+    {
+        extern volatile int vita_timing_want_first_ce;
+        extern void vita_timing_markf(const char *fmt, ...);
+        if (vita_timing_want_first_ce) {
+            vita_timing_want_first_ce = 0;
+            vita_timing_markf("first_check_events");
+        }
+    }
+
     /* 0. Network readiness scan: wake any protocol thread blocked on a
      * socket before this cycle's MIDP pump runs, so a read that became
      * possible last cycle is not delayed by input/media work. */

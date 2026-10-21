@@ -1,0 +1,18 @@
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='cn.uc.application.app.WebClient'
+*** runMidlet: midpInitialize OK
+*** runMidlet: calling midp_run_midlet_with_args_cp now
+*** runMidlet: midp_run_midlet_with_args_cp RETURNED status=0
+*** runMidlet: status=0 (default)
+*** runMidlet: ENTRY argc=6
+*** runMidlet: argv[0]='runMidlet'
+*** runMidlet: argv[1]='-classpathext'
+*** runMidlet: argv[2]='midp_system.jar:games/app (1)/game.jar'
+*** runMidlet: argv[3]='internal'
+*** runMidlet: argv[4]='com.app.filemanager.FileManagerMIDlet'
+*** runMidlet: midpInitialize OK
+*** runMidlet: calling midp_run_midlet_with_args_cp now

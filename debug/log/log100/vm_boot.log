@@ -1,0 +1,33 @@
+[+6102222 us] [JVM_Start] classpath=midp_system.jar:games/app (1)/game.jar main=com.sun.midp.main.MIDletSuiteLoader argc=0
+[+6111540 us] [JVM_Start] set_arguments done, calling JVM::start
+[+6118171 us] [JVM_Start] JVM::start() loop 0 enter
+[+6125622 us] [vita] vm_cpu=off aff=0x70000
+[+6212465 us] [preload] begin load_all_in_classpath
+[+11944307 us] [preload] jar[0] entries=932 defined=859 fast=2 us=5724811
+[+12020790 us] [preload] jar[1] entries=9 defined=9 fast=0 us=59665
+[+12030031 us] [preload] done defined=868 entries=941 fast=2 total_us=5817750 open_us=1790900 read_us=149770 resolve_us=2221474
+[+12042401 us] [preload] phases2 sym_us=11900 verify_us=0 iter_us=1563117 skipped=500
+[+12051033 us] [preload] sys(VM thread, delta): io_open n=8 us=6145 io_close n=8 us=33641 io_read n=2594 us=3879060 io_write n=63 us=1268021 io_lseek n=5 us=504 io_getstat n=13 us=5747 lwmutex_lock n=7856 us=24306 lwmutex_unlock n=7856 us=22594 io_lseek32 n=1216 us=137052 io_getstat_byfd n=14 us=1770
+[+23962585 us] [JVM_Start] JVM::start() loop 0 returned 2001
+[+28953917 us] [JVM_Start] classpath=midp_system.jar:games/app (2)/game.jar main=com.sun.midp.main.MIDletSuiteLoader argc=0
+[+28962181 us] [JVM_Start] set_arguments done, calling JVM::start
+[+28972073 us] [JVM_Start] JVM::start() loop 0 enter
+[+28985201 us] [vita] vm_cpu=off aff=0x70000
+[+29075025 us] [preload] begin load_all_in_classpath
+[+34712024 us] [preload] jar[0] entries=932 defined=859 fast=2 us=5626715
+[+36336808 us] [preload] jar[1] entries=67 defined=63 fast=0 us=1608254
+[+36345547 us] [preload] done defined=1790 entries=1940 fast=4 total_us=7270689 open_us=3720967 read_us=313623 resolve_us=4816899
+[+36353998 us] [preload] phases2 sym_us=24877 verify_us=0 iter_us=4048601 skipped=1001
+[+36362477 us] [preload] sys(VM thread, delta): io_open n=9 us=6836 io_close n=9 us=15341 io_read n=3402 us=5261299 io_write n=63 us=1248376 io_lseek n=5 us=499 io_getstat n=15 us=6642 lwmutex_lock n=9792 us=29985 lwmutex_unlock n=9792 us=28296 io_lseek32 n=1367 us=154107 io_getstat_byfd n=17 us=2170
+[+50227329 us] [JVM_Start] JVM::start() loop 0 returned 2001
+[+55766089 us] [JVM_Start] classpath=midp_system.jar:games/app/game.jar main=com.sun.midp.main.MIDletSuiteLoader argc=0
+[+55773907 us] [JVM_Start] set_arguments done, calling JVM::start
+[+55782901 us] [JVM_Start] JVM::start() loop 0 enter
+[+55795009 us] [vita] vm_cpu=off aff=0x70000
+[+55884142 us] [preload] begin load_all_in_classpath
+[+61681466 us] [preload] jar[0] entries=932 defined=859 fast=3 us=5787984
+[+62814364 us] [preload] jar[1] entries=68 defined=67 fast=0 us=1114274
+[+62825333 us] [preload] done defined=2716 entries=2940 fast=7 total_us=6941347 open_us=5854263 read_us=576087 resolve_us=7663996
+[+62835787 us] [preload] phases2 sym_us=37693 verify_us=0 iter_us=5664810 skipped=1507
+[+62846395 us] [preload] sys(VM thread, delta): io_open n=9 us=6741 io_close n=9 us=16690 io_read n=3885 us=4669133 io_write n=63 us=1256337 io_lseek n=5 us=500 io_getstat n=15 us=6618 lwmutex_lock n=10739 us=32987 lwmutex_unlock n=10739 us=30879 io_lseek32 n=1358 us=153857 io_getstat_byfd n=17 us=2130
+[+396695512 us] [JVM_Start] JVM::start() loop 0 returned 2001

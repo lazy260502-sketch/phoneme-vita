@@ -1,0 +1,30 @@
+[WD] alive tid=1073807709 start rc=0x00000000
+[WD] forensic mode ON (ux0:/data/J2ME00001/wd_early_dump.cfg): coredump after 8 frozen polls
+[WD] STORM ce=0 clinit=0 gc=0 preload=97 (pump starved but progressing)
+[WD-STALL] recovered ce 0 -> 4, 4 polls frozen (~1000 ms), 4 samples kept
+[WD-STALL] #0 t=8677408 phase=0(none/interp) age_ms=0 vm=WAITING wait=event dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #0 sys found=1 lastop=io_write arg=4001010f(?) inside=1 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #1 t=8927939 phase=0(none/interp) age_ms=0 vm=WAITING wait=event dclk_us=22618 sw+0 site+0 jsmp+0
+[WD-STALL] #1 sys found=1 lastop=io_write arg=4001010f(?) inside=1 since_ms=0 | calls+827 rd+2 lseek+15 lseek32+10 lwmutex+386 sema+0
+[WD-STALL] #2 t=9178138 phase=0(none/interp) age_ms=0 vm=WAITING wait=event dclk_us=35005 sw+0 site+0 jsmp+0
+[WD-STALL] #2 sys found=1 lastop=io_write arg=4001010f(?) inside=1 since_ms=0 | calls+133 rd+0 lseek+4 lseek32+5 lwmutex+52 sema+0
+[WD-STALL] #3 t=9428454 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=100859 sw+0 site+1 jsmp+0
+[WD-STALL] #3 sys found=1 lastop=io_getstat arg=839bf5f0(-) inside=1 since_ms=6049 | calls+279 rd+0 lseek+7 lseek32+12 lwmutex+112 sema+0
+[WD-STALL] EARLY-DUMP ce 405 -> 405, 8 polls frozen (~2000 ms), 8 samples kept
+[WD-STALL] #0 t=19935796 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #0 sys found=1 lastop=io_pwrite arg=400101f3(?) inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #1 t=20186073 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #1 sys found=1 lastop=io_pwrite arg=400101f3(?) inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #2 t=20436389 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #2 sys found=1 lastop=io_pwrite arg=400101f3(?) inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #3 t=20686522 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #3 sys found=1 lastop=io_pwrite arg=400101f3(?) inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #4 t=20936761 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #4 sys found=1 lastop=io_pwrite arg=400101f3(?) inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #5 t=21187054 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #5 sys found=1 lastop=io_pwrite arg=400101f3(?) inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #6 t=21437268 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #6 sys found=1 lastop=io_pwrite arg=400101f3(?) inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #7 t=21687525 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #7 sys found=1 lastop=io_pwrite arg=400101f3(?) inside=0 since_ms=2161 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD] forensic mode: requesting coredump after 8 frozen polls

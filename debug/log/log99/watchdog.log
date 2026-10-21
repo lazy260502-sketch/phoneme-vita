@@ -1,0 +1,21 @@
+[WD] alive tid=1073807709 start rc=0x00000000
+[WD] forensic mode ON (ux0:/data/J2ME00001/wd_early_dump.cfg): coredump after 8 frozen polls
+[WD] STORM ce=0 clinit=0 gc=0 preload=6 (pump starved but progressing)
+[WD-STALL] EARLY-DUMP ce 414 -> 414, 8 polls frozen (~2000 ms), 8 samples kept
+[WD-STALL] #0 t=19773548 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #0 sys found=1 lastop=io_pwrite inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #1 t=20023835 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #1 sys found=1 lastop=io_pwrite inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #2 t=20274088 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #2 sys found=1 lastop=io_pwrite inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #3 t=20524195 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #3 sys found=1 lastop=io_pwrite inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #4 t=20774340 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #4 sys found=1 lastop=io_pwrite inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #5 t=21024524 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #5 sys found=1 lastop=io_pwrite inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #6 t=21274745 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #6 sys found=1 lastop=io_pwrite inside=0 since_ms=0 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD-STALL] #7 t=21525109 phase=0(none/interp) age_ms=0 vm=RUNNING wait=none dclk_us=0 sw+0 site+0 jsmp+0
+[WD-STALL] #7 sys found=1 lastop=io_pwrite inside=0 since_ms=2196 | calls+0 rd+0 lseek+0 lseek32+0 lwmutex+0 sema+0
+[WD] forensic mode: requesting coredump after 8 frozen polls

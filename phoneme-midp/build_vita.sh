@@ -1,16 +1,30 @@
 #!/bin/bash
-# Build MIDP for PS Vita with all boolean options set to false
+# Build MIDP for PS Vita with all boolean options set to false.
+# Paths come from build_env.sh (J2ME_ROOT / JDK_DIR / VITASDK), all
+# configurable via environment variables.
 
-cd /home/zyb/vitasdk/samples/j2me/phoneme-midp
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # phoneme-midp
+. "$SCRIPT_DIR/../build_env.sh"
+
+TOOLS_DIR="$J2ME_ROOT/phoneme_source/phoneME/tools"
+CLDC_DIST_DIR="$J2ME_ROOT/phoneme-cldc/build/vita_arm/dist"
+GNU_TOOLS_BINDIR="$VITASDK/bin/arm-vita-eabi-"
+JSR_135_DIR="$J2ME_ROOT/phoneme_source/phoneME/jsr135"
+JSR_120_DIR="$J2ME_ROOT/phoneme_source/phoneME/jsr120"
+JSR_75_DIR="$J2ME_ROOT/jsr75"
+ABSTRACTIONS_DIR="$SCRIPT_DIR/src/abstractions"
+OVERLAY_MK="$SCRIPT_DIR/build/vita_arm/vita_overlay.mk"
+
+cd "$SCRIPT_DIR"
 
 # Build the command
 CMD="make -f GNUmakefile \
-  JDK_DIR=/home/zyb/tools/jdk8u502-b07 \
-  TOOLS_DIR=/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/tools \
+  JDK_DIR=$JDK_DIR \
+  TOOLS_DIR=$TOOLS_DIR \
   PROJECT_TOOLS_DIR=$(pwd)/src/tool \
   PCSL_OUTPUT_DIR=$(pwd)/build/vita_arm/pcsl \
-  CLDC_DIST_DIR=/home/zyb/vitasdk/samples/j2me/phoneme-cldc/build/vita_arm/dist \
-  GNU_TOOLS_BINDIR=/home/zyb/.local/vitasdk/bin/arm-vita-eabi- \
+  CLDC_DIST_DIR=$CLDC_DIST_DIR \
+  GNU_TOOLS_BINDIR=$GNU_TOOLS_BINDIR \
   g= \
   USE_CLDC_RELEASE=true \
   USE_NATIVE_APP_MANAGER=false \
@@ -45,13 +59,13 @@ CMD="make -f GNUmakefile \
   USE_VERBOSE_MAKE=false \
   USE_MIDP_MALLOC=false \
   USE_JSR_135=true \
-  JSR_135_DIR=/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/jsr135 \
-  PROJECT_JSR_135_DIR=/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/jsr135 \
+  JSR_135_DIR=$JSR_135_DIR \
+  PROJECT_JSR_135_DIR=$JSR_135_DIR \
   USE_ABSTRACTIONS=true \
-  ABSTRACTIONS_DIR=/home/zyb/vitasdk/samples/j2me/phoneme-midp/src/abstractions \
+  ABSTRACTIONS_DIR=$ABSTRACTIONS_DIR \
   USE_JSR_75=true \
-  JSR_75_DIR=/home/zyb/vitasdk/samples/j2me/jsr75 \
-  PROJECT_JSR_75_DIR=/home/zyb/vitasdk/samples/j2me/jsr75 \
+  JSR_75_DIR=$JSR_75_DIR \
+  PROJECT_JSR_75_DIR=$JSR_75_DIR \
   USE_JSR_177=false \
   USE_JSR_179=false \
   USE_JSR_180=false \
@@ -87,12 +101,12 @@ CMD="make -f GNUmakefile \
   USE_MIDP_ABB=false \
   USE_JSR_177=false \
   USE_JSR_75=true \
-  JSR_75_DIR=/home/zyb/vitasdk/samples/j2me/jsr75 \
-  PROJECT_JSR_75_DIR=/home/zyb/vitasdk/samples/j2me/jsr75 \
+  JSR_75_DIR=$JSR_75_DIR \
+  PROJECT_JSR_75_DIR=$JSR_75_DIR \
   USE_JSR_82=false \
   USE_JSR_120=true \
-  JSR_120_DIR=/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/jsr120 \
-  PROJECT_JSR_120_DIR=/home/zyb/vitasdk/samples/j2me/phoneme_source/phoneME/jsr120 \
+  JSR_120_DIR=$JSR_120_DIR \
+  PROJECT_JSR_120_DIR=$JSR_120_DIR \
   USE_JSR_172=false \
   USE_JSR_226=false \
   USE_PISCES=false \
@@ -138,5 +152,5 @@ CMD="make -f GNUmakefile \
 echo "Running build..."
 # Inject Vita overlay (extra vpath + vita_sms_javacall.c for JSR 120 WMA).
 # MAKEFILES is read by GNU make before GNUmakefile; the overlay only appends.
-export MAKEFILES=/home/zyb/vitasdk/samples/j2me/phoneme-midp/build/vita_arm/vita_overlay.mk
+export MAKEFILES="$OVERLAY_MK"
 eval $CMD 2>&1 | grep -v "gawk: cmd" | tee /tmp/midp_build.log | tail -30

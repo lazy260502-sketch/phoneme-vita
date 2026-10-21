@@ -1,0 +1,25 @@
+[MIDLET] startSuite: com.app.filemanager.FileManagerMIDlet
+[MIDLET] creating com.app.filemanager.FileManagerMIDlet
+[MIDLET] created+registered OK: com.app.filemanager.FileManagerMIDlet
+[MIDLET] startSuite: MiniXplorer
+[MIDLET] creating MiniXplorer
+[MIDLET] created+registered OK: MiniXplorer
+[MIDLET] startSuite: cn.uc.application.app.WebClient
+[MIDLET] creating cn.uc.application.app.WebClient
+[MIDLET] created+registered OK: cn.uc.application.app.WebClient
+[rms] open name='coreA' suite=-1 exists=1 next=2 live=1 ver=17 data=11784 free=8512
+[rms] open name='G2' suite=-1 exists=1 next=20 live=19 ver=19 data=39384 free=0
+[rms] open name='coreA' suite=-1 exists=1 next=2 live=1 ver=17 data=3272 free=0
+[rms] open name='G2' suite=-1 exists=1 next=20 live=19 ver=19 data=39384 free=0
+[rms] open name='P' suite=-1 exists=1 next=2 live=1 ver=1 data=128 free=0
+[rms] open name='G2' suite=-1 exists=1 next=20 live=19 ver=19 data=39384 free=0
+[rms] open name='G2' suite=-1 exists=1 next=20 live=19 ver=19 data=39384 free=0
+[rms] open name='P' suite=-1 exists=1 next=2 live=1 ver=1 data=128 free=0
+[rms] open name='P' suite=-1 exists=0 (new store)
+[rms] open name='G2' suite=-1 exists=1 next=20 live=19 ver=19 data=39384 free=0
+[rms] open name='G2' suite=-1 exists=0 (new store)
+[rms] open name='G2' suite=-1 exists=1 next=21 live=20 ver=20 data=40200 free=0
+[rms] open name='B' suite=-1 exists=0 (new store)
+[rms] open name='B' suite=-1 exists=0 (new store)
+[rms] open name='B' suite=-1 exists=1 next=2 live=1 ver=1 data=24 free=0
+[rms] open name='G2' suite=-1 exists=1 next=21 live=20 ver=20 data=40200 free=0

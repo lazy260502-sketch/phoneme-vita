@@ -17,6 +17,8 @@
 #include <psp2/display.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/processmgr.h>
+#include <psp2/gxm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,8 @@
 #include <lfjport_export.h>
 
 #include "vita_fbmem.h"
+#include "vita_ime.h"
+#include "vita_gxm.h"
 
 /* ------------------------------------------------------------------ */
 /* Virtual phone screen (what MIDP games see) vs Vita physical screen.
@@ -86,6 +90,16 @@ static VitaFbMem vita_fb_blk = { -1, NULL };
 static uint32_t *vita_fb_front = NULL;
 static uint32_t *vita_fb_back = NULL;
 static int display_ready = 0;
+/* v02.64: time of the last submitted frame (see vita_display_ime_tick). */
+static unsigned long long g_last_flip_us = 0;
+/* v02.65: letterbox hygiene around the system keyboard. The blit only writes
+ * the scaled MIDlet rectangle; the bars around it were never touched. The
+ * keyboard is full-screen wide, so whatever it painted into the bars stayed
+ * there for good ("overlaps the UC screen", log111). g_was_ime = the last
+ * frame went through the dialog path; g_post_ime_clear = number of normal
+ * frames that still have to wipe the bars (one per CDRAM buffer). */
+static int g_was_ime = 0;
+static int g_post_ime_clear = 0;
 
 /* Computed scaling: virtual screen scaled to fit physical, centered. */
 static int dst_w, dst_h, dst_x, dst_y;
@@ -141,6 +155,140 @@ int vita_display_map_touch(int px, int py, int *vx, int *vy) {
     return 0;
 }
 
+/* v02.44: white-screen measurement (marks go to boot_timing.log via
+ * vita_timing_markf in vita_main.c). The FIRST flip can itself be the white
+ * screen's beginning (an app may submit a blank frame before painting), so
+ * "first_flip" alone cannot say when the white screen ends. frame_has_
+ * content() samples ~2048 pixels of the virtual screen and reports whether
+ * at least 8 differ from pure white (0xFFFF in RGB565); "first_content_flip"
+ * is the first such frame. A black or coloured frame counts as content, as
+ * it is not a white screen. Only the first 900 flips of a round are
+ * checked, so a white-background app costs nothing afterwards. */
+extern void vita_timing_markf(const char *fmt, ...);
+static int g_flip_n = 0;
+static int g_content_found = 0;
+
+void vita_display_timing_reset(void) {
+    g_flip_n = 0;
+    g_content_found = 0;
+}
+
+static int frame_has_content(void) {
+    int total = virt_w * virt_h;
+    int step = total / 2048;
+    int i, diff = 0;
+
+    if (step < 1) {
+        step = 1;
+    }
+    for (i = 0; i < total; i += step) {
+        if (vita_screen_pixels[i] != 0xFFFF && ++diff >= 8) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- v02.53: GXM + CommonDialog bridge for the system IME ----
+ * sceImeDialog is built on the CommonDialog framework, which renders
+ * through GXM into a render target the app supplies. This port draws with
+ * sceDisplaySetFrameBuf (software blit, no GXM), so GXM was never
+ * initialized. CommonDialog needs:
+ *   1. sceGxmInitialize (one-time; otherwise the dialog errors with
+ *      SCE_COMMON_DIALOG_ERROR_GXM_IS_UNINITIALIZED 0x80020436)
+ *   2. sceCommonDialogUpdate every frame with renderTarget = back buffer
+ * The vsync callback is NULL on purpose: the port keeps submitting with
+ * sceDisplaySetFrameBuf (a GXM display-queue callback would double-submit).
+ * CommonDialog only paints into the buffer; flip_to_display() submits it.
+ * GXM init lives in vita_gxm.c and is called from vita_ime_show() BEFORE
+ * sceImeDialogInit (v02.54: doing it here caused a chicken-and-egg deadlock
+ * - see log104, Init rc=0x80020436).
+ *
+ * v02.59 (log106): Init rc=0 / poll status=1 (the dialog logically came up)
+ * but the keyboard never rendered and the frame froze (watchdog #3
+ * vm=RUNNING sw+0 site+0 jsmp+0 since_ms=6081). CommonDialog renders
+ * THROUGH GXM, which needs two things the port never provided:
+ *   1. sceGxmMapMemory on the CDRAM framebuffer - GXM cannot touch CPU
+ *      memory it has not been given; without it the render is invisible.
+ *   2. a real SceGxmSyncObject in displaySyncObject - NULL gives the
+ *      dialog's render nothing to signal, and the render/submit race
+ *      (no GPU sync) stalls the VM thread.
+ * The official sample (samples/ime) calls sceGxmMapMemory right after the
+ * CDRAM alloc and passes a valid sync object every frame. */
+/* v02.71: remember WHICH block was mapped, not just "a block was mapped".
+ * log114: each MIDlet round allocates a fresh CDRAM block (round 0
+ * 0x61400000, round 1 0x62800000) but the old boolean was never cleared, so
+ * round 1 skipped sceGxmMapMemory and the dialog rendered into an unmapped
+ * block -> GPU crash (psp2core ...-GPUCRASH, GPU_INFO holds 0x62b2a024 inside
+ * the unmapped block; "[CD] map fb" appears once in the whole log). */
+static void *vita_fb_gxm_mapped_base = NULL;
+static unsigned int vita_fb_gxm_mapped_size = 0;
+
+static void vita_cd_unmap_fb(void) {
+    if (vita_fb_gxm_mapped_base != NULL) {
+        /* Let the display queue drop every reference first. */
+        sceGxmDisplayQueueFinish();
+        int rc = sceGxmUnmapMemory(vita_fb_gxm_mapped_base);
+        fprintf(stderr, "[CD] unmap fb base=%p rc=0x%08x\n",
+                vita_fb_gxm_mapped_base, rc);
+        vita_fb_gxm_mapped_base = NULL;
+        vita_fb_gxm_mapped_size = 0;
+    }
+}
+
+static void vita_cd_ensure_resources(void) {
+    /* v02.63: only the GXM memory mapping lives here now. The sync object
+     * and the CommonDialog render+submit moved into vita_gxm_dialog_frame()
+     * (vita_gxm.c), which needs a fully working GXM display queue. */
+    if (vita_fb_blk.base != NULL && vita_fb_blk.base != vita_fb_gxm_mapped_base) {
+        unsigned int bytes = VITA_PHYS_W * VITA_PHYS_H * sizeof(uint32_t) * 2;
+        unsigned int rounded = (bytes + 0x3FFFF) & ~0x3FFFF;
+        int rc;
+        /* A previous round's block (already freed, or about to be): drop
+         * its mapping before mapping the new one. */
+        vita_cd_unmap_fb();
+        rc = sceGxmMapMemory(vita_fb_blk.base, rounded,
+                             SCE_GXM_MEMORY_ATTRIB_READ |
+                             SCE_GXM_MEMORY_ATTRIB_WRITE);
+        fprintf(stderr, "[CD] map fb base=%p bytes=%u rc=0x%08x\n",
+                vita_fb_blk.base, rounded, rc);
+        if (rc >= 0) {
+            vita_fb_gxm_mapped_base = vita_fb_blk.base;
+            vita_fb_gxm_mapped_size = rounded;
+        }
+    }
+}
+
+/* v02.65: paint everything OUTSIDE the scaled MIDlet rectangle opaque black.
+ * Rows above/below the rectangle in full, left/right bars row by row.
+ * v02.69: memset per run instead of a pixel loop - this ran up to 62 times a
+ * second on the VM thread (log113: 16-32 fps while the keyboard was up). */
+static void clear_letterbox(uint32_t *fb) {
+    /* v02.71: the fill byte is 0x00. v02.69 turned the per-pixel loop into
+     * memset(..., 0xFF, ...), but memset writes the SAME byte into all four
+     * channels: 0xFF gives 0xFFFFFFFF = opaque WHITE, so the bars went white
+     * whenever the keyboard was up (log114). 0x00 is black, the same value
+     * lfjport_ui_init() uses for the bars, and what the SDK sample's
+     * memset(data, 0xff000000, ...) really writes (the int is truncated to
+     * the byte 0x00). The display ignores alpha. */
+    const size_t row_bytes = (size_t)VITA_PHYS_W * sizeof(uint32_t);
+    int y;
+    for (y = 0; y < VITA_PHYS_H; y++) {
+        uint32_t *row = &fb[y * VITA_PHYS_W];
+        if (y < dst_y || y >= dst_y + dst_h) {
+            memset(row, 0x00, row_bytes);
+        } else {
+            if (dst_x > 0) {
+                memset(row, 0x00, (size_t)dst_x * sizeof(uint32_t));
+            }
+            if (dst_x + dst_w < VITA_PHYS_W) {
+                memset(&row[dst_x + dst_w], 0x00,
+                       (size_t)(VITA_PHYS_W - dst_x - dst_w) * sizeof(uint32_t));
+            }
+        }
+    }
+}
+
 static void flip_to_display(void) {
     SceDisplayFrameBuf fb;
     int x, y;
@@ -164,45 +312,117 @@ static void flip_to_display(void) {
         }
     }
 
-    memset(&fb, 0, sizeof(fb));
-    fb.size = sizeof(SceDisplayFrameBuf);
-    fb.base = vita_fb;
-    fb.pitch = VITA_PHYS_W;
-    fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
-    fb.width = VITA_PHYS_W;
-    fb.height = VITA_PHYS_H;
-    /* v01.69: NEXTFRAME - IMMEDIATE returns INVALID_UPDATETIMING
-     * (0x80290006) on real fw 3.65 (see vita_menu.c menu_flip).
-     * v01.70: submit the just-blitted back buffer, then swap; the next
-     * blit goes into the old front while the display scans the new
-     * one out.
-     * v01.77: NEXTFRAME only takes effect at the NEXT vblank; until
-     * then scanout still reads the old front buffer. Without a wait
-     * here a fast repaint loop could finish blitting into the (just
-     * swapped) new back buffer before the flip lands and tear the
-     * frame - menu_flip() has always paired the submit with
-     * sceDisplayWaitVblankStart(), this side now does the same. It
-     * also caps the refresh rate at 60 Hz, which a software blit
-     * cannot exceed anyway. */
-    rc = sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
-    if (rc < 0) {
-        /* once per process: a persistent error would spam 60 lines/s */
-        static int reported = 0;
-        if (!reported) {
-            reported = 1;
-            fprintf(stderr, "vita_display: SetFrameBuf rc=0x%08x\n", rc);
+    /* v02.63: paint the system keyboard (if up) over the just-blitted back
+     * buffer, then submit it. When the IME is active, the CommonDialog render
+     * must go through the GXM display queue (vita_gxm_dialog_frame) rather
+     * than a raw sceDisplaySetFrameBuf - the two submit paths must not be
+     * mixed, or the GPU-rendered dialog never reaches the screen and the VM
+     * stalls in the render path (log109 problem 3). */
+    /* v02.67: also take the few frames right after Term through the dialog
+     * path (sceCommonDialogUpdate keeps running, as in the SDK sample). */
+    if (vita_ime_is_active() || vita_ime_take_post_frame()) {
+        g_was_ime = 1;
+        /* v02.65: the dialog composites onto whatever is in the target, so
+         * start every dialog frame from a clean bar area (the official IME
+         * sample clears the whole target each frame for the same reason). */
+        clear_letterbox(vita_fb);
+        vita_cd_ensure_resources();
+        vita_gxm_dialog_frame(vita_fb);
+        /* v02.69: pace the dialog at one frame per vblank, exactly like
+         * samples/ime (gxm_swap(); sceDisplayWaitVblankStart();). With
+         * displayQueueMaxPendingCount = 1 this is also what keeps
+         * sceGxmDisplayQueueAddEntry from blocking the VM thread, and it caps
+         * the dialog at 60 fps instead of the 16-32 fps log113 showed. */
+        sceDisplayWaitVblankStart();
+        tmp = vita_fb_front;
+        vita_fb_front = vita_fb;
+        vita_fb = tmp;
+    } else {
+        /* v02.65: the keyboard just went away - wipe the bars it left in
+         * each of the two CDRAM buffers (one normal frame per buffer). */
+        if (g_was_ime) {
+            g_was_ime = 0;
+            g_post_ime_clear = 2;
         }
-        return;
+        if (g_post_ime_clear > 0) {
+            clear_letterbox(vita_fb);
+            g_post_ime_clear--;
+        }
+        memset(&fb, 0, sizeof(fb));
+        fb.size = sizeof(SceDisplayFrameBuf);
+        fb.base = vita_fb;
+        fb.pitch = VITA_PHYS_W;
+        fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
+        fb.width = VITA_PHYS_W;
+        fb.height = VITA_PHYS_H;
+        /* v01.69: NEXTFRAME - IMMEDIATE returns INVALID_UPDATETIMING
+         * (0x80290006) on real fw 3.65 (see vita_menu.c menu_flip).
+         * v01.70: submit the just-blitted back buffer, then swap; the next
+         * blit goes into the old front while the display scans the new
+         * one out.
+         * v01.77: NEXTFRAME only takes effect at the NEXT vblank; until
+         * then scanout still reads the old front buffer. Without a wait
+         * here a fast repaint loop could finish blitting into the (just
+         * swapped) new back buffer before the flip lands and tear the
+         * frame - menu_flip() has always paired the submit with
+         * sceDisplayWaitVblankStart(), this side now does the same. It
+         * also caps the refresh rate at 60 Hz, which a software blit
+         * cannot exceed anyway. */
+        rc = sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
+        if (rc < 0) {
+            /* once per process: a persistent error would spam 60 lines/s */
+            static int reported = 0;
+            if (!reported) {
+                reported = 1;
+                fprintf(stderr, "vita_display: SetFrameBuf rc=0x%08x\n", rc);
+            }
+            return;
+        }
+        sceDisplayWaitVblankStart();
+        tmp = vita_fb_front;
+        vita_fb_front = vita_fb;
+        vita_fb = tmp;
     }
-    sceDisplayWaitVblankStart();
-    tmp = vita_fb_front;
-    vita_fb_front = vita_fb;
-    vita_fb = tmp;
+
+    /* v02.64: when the last frame was submitted (vita_display_ime_tick). */
+    g_last_flip_us = sceKernelGetProcessTimeWide();
+
+    /* v02.44: white-screen marks (see above) */
+    g_flip_n++;
+    if (g_flip_n == 1) {
+        vita_timing_markf("first_flip");
+    }
+    if (!g_content_found && g_flip_n <= 900 && frame_has_content()) {
+        g_content_found = 1;
+        vita_timing_markf("first_content_flip flip#=%d", g_flip_n);
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /* lfjport implementation                                             */
 /* ------------------------------------------------------------------ */
+
+/* v02.64: keep the system keyboard alive while the MIDlet is idle.
+ * sceCommonDialogUpdate() has to run EVERY frame (the dialog draws and reads
+ * its input inside it), but it only ran from flip_to_display(), i.e. when
+ * Java repainted. A TextField that just opened the keyboard is a static
+ * screen - no repaint, so the dialog stayed RUNNING and never drew (log110:
+ * Init rc=0, status=1, VM alive, nothing on screen). Called from the event
+ * pump (VM thread, ~94 Hz): while the IME is up and nothing was submitted
+ * for 16 ms, resubmit the current screen. No effect when the IME is idle. */
+void vita_display_ime_tick(void) {
+    /* v02.65: also runs for the two frames after the keyboard closed, so the
+     * bars get wiped even if the MIDlet does not repaint by itself. */
+    if (!display_ready ||
+        (!vita_ime_is_active() && !g_was_ime && g_post_ime_clear == 0 &&
+         !vita_ime_post_frames_pending())) {
+        return;
+    }
+    if (sceKernelGetProcessTimeWide() - g_last_flip_us < 16000ULL) {
+        return;
+    }
+    flip_to_display();
+}
 
 void lfjport_refresh(int hardwareId, int x, int y, int w, int h) {
     (void)hardwareId; (void)x; (void)y; (void)w; (void)h;
@@ -245,6 +465,21 @@ void lfjport_gained_foreground(int hardwareId) {
     flip_to_display();
 }
 
+/* v02.72: CDRAM bookkeeping per round. log114: the round-1 Init saw 86016K
+ * free CDRAM against 90112K in round 0 (-4096K = exactly one framebuffer
+ * block), and the crash dump shows a 4096 KB hole at 0x61400000 (round 0's
+ * freed block) that the round-1 block did NOT reuse (it went to 0x62800000).
+ * These lines give free CDRAM at every alloc / unmap / release so the next
+ * log says which step does or does not give the 4 MB back. */
+static void vita_fb_log_cdram(const char *what, void *base) {
+    SceKernelFreeMemorySizeInfo mi;
+    memset(&mi, 0, sizeof(mi));
+    mi.size = sizeof(mi);
+    sceKernelGetFreeMemorySize(&mi);
+    fprintf(stderr, "[fb] %s base=%p cdram free=%dK\n", what, base,
+            mi.size_cdram / 1024);
+}
+
 int lfjport_ui_init(void) {
     if (display_ready) {
         return 0;
@@ -257,6 +492,7 @@ int lfjport_ui_init(void) {
         vita_fb_front = (uint32_t *)vita_fb_blk.base;
         vita_fb = vita_fb_front + VITA_PHYS_W * VITA_PHYS_H;
         vita_fb_back = vita_fb;
+        vita_fb_log_cdram("alloc", vita_fb_blk.base);
     }
     if (vita_fb == NULL) {
         return -1;
@@ -285,7 +521,15 @@ void lfjport_ui_finalize(void) {
          * its fb allocated. Accepted here because finalize only runs
          * at VM shutdown, right before the menu reclaims the display,
          * so the worst case is a single garbage frame. */
-        vita_fbmem_release(&vita_fb_blk);
+        /* v02.71: unmap from GXM BEFORE the block goes back (log114). */
+        {
+            void *base = vita_fb_blk.base;
+            vita_fb_log_cdram("finalize begin", base);
+            vita_cd_unmap_fb();
+            vita_fb_log_cdram("after unmap", base);
+            vita_fbmem_release(&vita_fb_blk);
+            vita_fb_log_cdram("after release", base);
+        }
     }
 }
 

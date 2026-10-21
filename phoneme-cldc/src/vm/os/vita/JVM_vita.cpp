@@ -19,12 +19,18 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+extern "C" unsigned long long vita_now_us(void);   /* OS_vita.cpp */
+
 void vita_boot_log(const char *fmt, ...) {
   va_list ap;
   FILE *f = fopen("vm_boot.log", "a");
   if (f == NULL) {
     return;
   }
+  /* v02.44: timestamp every line (us since process start - the same
+   * clock as boot_timing.log) so the gaps between boot stages are
+   * readable straight from the log. */
+  fprintf(f, "[+%llu us] ", vita_now_us());
   va_start(ap, fmt);
   vfprintf(f, fmt, ap);
   va_end(ap);

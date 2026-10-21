@@ -2858,6 +2858,7 @@ void ObjectHeap::collect(size_t min_free_after_collection JVM_TRAPS) {
 #if defined(VITA)
   vita_site_mark(); /* v01.84: log10 - GC entry marker */
   vita_gc_count++;   /* v01.90: pass counter for HANG forensics */
+  VitaPhaseScope vps7(7); /* v02.47 stall phase marker (GC) */
 #endif
   min_free_after_collection = align_allocation_size(min_free_after_collection);
 

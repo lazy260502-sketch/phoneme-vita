@@ -14,6 +14,7 @@
  */
 
 #include <stdio.h>
+#include <stdarg.h> /* v02.44: vita_timing_markf */
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,6 +22,7 @@
 #include <pthread.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/dirent.h> /* v02.x: sceIoDopen/sceIoDclose (VitaSDK 15+) */
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h> /* v01.72: sceKernelGetThreadId */
@@ -159,6 +161,53 @@ static void dlog_str(const char *prefix, const char *s) {
     dlog(prefix);
     dlog(s);
     dlog("\n");
+}
+
+/* v02.44: launch-timing marks -> ux0:/data/J2ME00001/boot_timing.log
+ * (append, one open/write/close per line so a kill loses nothing).
+ * Clock = sceKernelGetProcessTimeWide() (us since process start), the same
+ * clock as the "[+N us]" prefix in vm_boot.log, so the launcher marks, the
+ * VM boot stages and the display marks (vita_display.c) line up on one
+ * timeline. Answers "how long is the white screen and where does it go":
+ *   round_begin        menu selection handed over to the launcher
+ *   runMidlet_enter    just before the VM starts
+ *   first_check_events first time the VM comes back to the event pump
+ *   first_flip         first MIDlet frame submitted (may itself be blank)
+ *   first_content_flip first frame that is NOT all white (vita_display.c)
+ *   runMidlet_exit     round over
+ * Rare (about 6 lines per round): no measurable cost. */
+volatile int vita_timing_round = 0;
+volatile int vita_timing_want_first_ce = 0;
+extern void vita_display_timing_reset(void);
+
+void vita_timing_markf(const char *fmt, ...) {
+    char buf[200];
+    int n;
+    va_list ap;
+    SceUID fd;
+
+    n = snprintf(buf, sizeof(buf), "[+%llu us] round=%d ",
+                 (unsigned long long)sceKernelGetProcessTimeWide(),
+                 (int)vita_timing_round);
+    if (n < 0 || n >= (int)sizeof(buf) - 2) {
+        return;
+    }
+    va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof(buf) - (size_t)n - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        return;
+    }
+    if (n > (int)sizeof(buf) - 2) {
+        n = (int)sizeof(buf) - 2;
+    }
+    buf[n++] = '\n';
+    fd = sceIoOpen(DATA_DIR "/boot_timing.log",
+                   SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, buf, (SceSize)n);
+        sceIoClose(fd);
+    }
 }
 
 /* Copy a file via sceIo (used to seed the writable data dir from app0:).
@@ -456,6 +505,21 @@ int main(int argc, char *argv[]) {
          * round (see vita_watchdog.c). Started once, runs forever. */
         vita_watchdog_start();
 
+        /* v02.47: pad_nodivert.cfg = run the REAL trampoline, never divert
+         * to the shadow (see vita_v247_nodivert in InterpreterRuntime_arm
+         * .cpp). Lets the original FileManager exit loop be reproduced on
+         * purpose; pair it with wd_early_dump.cfg so the watchdog takes a
+         * coredump ~2 s into the loop. Absent file = shipping behaviour. */
+        {
+            extern volatile int vita_v247_nodivert;
+            SceIoStat nst;
+            memset(&nst, 0, sizeof(nst));
+            if (sceIoGetstat(DATA_DIR "/pad_nodivert.cfg", &nst) >= 0) {
+                vita_v247_nodivert = 1;
+                crumb_printf("pad_nodivert.cfg present: loop detector OFF");
+            }
+        }
+
         /* Launcher main loop: menu -> run MIDlet -> back to menu.
          * The MIDlet exit only ends the VM round (runMidlet returns);
          * the PROCESS never exits. This is deliberate:
@@ -632,6 +696,11 @@ int main(int argc, char *argv[]) {
              * so a truncated crumb.log shows exactly which phase died. */
             crumb_marker("round begin");
             crumb_printf("launch: %s / %s", jar_path, class_name);
+            /* v02.44: start of the launch-timing timeline (see above) */
+            vita_timing_round = round;
+            vita_display_timing_reset();
+            vita_timing_want_first_ce = 1;
+            vita_timing_markf("round_begin %s", class_name);
 
             /* v01.72: mark the round active for the hang watchdog and
              * record the VM thread id (this thread becomes the VM's main
@@ -670,12 +739,36 @@ int main(int argc, char *argv[]) {
                 crumb_printf("vm UseCompiler(pre)=%d (jit policy=%d)",
                              (&UseCompiler == NULL) ? -1 : (int)UseCompiler,
                              vita_jit_policy);
+                vita_timing_markf("runMidlet_enter");
                 status = runMidlet(run_argc, run_argv);
+                vita_timing_markf("runMidlet_exit status=%d", status);
+                {
+                    /* v02.64: the "a text component has focus" flag and a
+                     * still-open system keyboard are process-wide statics;
+                     * a round that ends while a TextField is focused must
+                     * not leave SELECT acting as "open keyboard" in the next
+                     * application. */
+                    extern void vita_ime_set_text_wanted(int on);
+                    extern void vita_ime_abort(void);
+                    vita_ime_set_text_wanted(0);
+                    vita_ime_abort();
+                }
+                {
+                    /* v02.48: JVMSPI_PrintRaw is line-buffered now; drain a
+                     * trailing partial line before the round is torn down. */
+                    extern void vita_printraw_flush(void);
+                    vita_printraw_flush();
+                }
                 crumb_printf("vm UseCompiler(post)=%d <- actual round mode",
                              (&UseCompiler == NULL) ? -1 : (int)UseCompiler);
                 crumb_printf("runMidlet returned %d", status);
                 crumb_marker("runMidlet exit");
                 crumb_flush();
+                /* v02.43: normal-exit counters (OS_vita.cpp) -> exit_probe.log */
+                {
+                    extern void vita_exit_probe(int round, int status);
+                    vita_exit_probe(round, status);
+                }
 
                 vita_wd_round_active = 0; /* v01.72: round over, stand by */
 
