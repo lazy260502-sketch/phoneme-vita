@@ -42,3 +42,11 @@ __pycache__/
 
 # v04.54: fpmodel build product (armcal.py regenerates it from soft_ref.c)
 debug/tools/fpmodel/soft_ref.o
+
+# 本地调试产物：游戏包、运行日志、IDE 配置 —— 不入库。
+# 日志目录里此前已被跟踪的旧文件（log100..log179）在 v04.54 一次性删除，
+# 之后新增的 logXXX 不会再出现在 git status 里。
+debug/log/
+debug/game/
+debug/3d_game/
+.vscode/
