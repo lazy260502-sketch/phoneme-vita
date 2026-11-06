@@ -166,7 +166,7 @@ double ieee754_fmod(double x, double y) {
   }
   if (iy >= -1022) {  /* normalize output */
     hx = ((hx - 0x00100000) | ((iy + 1023) << 20));
-    x = jdouble_from_msw_lsw(hx | sx, lx);
+    x = jdouble_from_hi_lo_mem(hx | sx, lx);
   } else {    /* subnormal output */
     n = -1022 - iy;
     if (n <= 20) {
@@ -179,7 +179,7 @@ double ieee754_fmod(double x, double y) {
       lx = hx >> (n - 32);
       hx = sx;
     }
-    x = jdouble_from_msw_lsw(hx | sx, lx);
+    x = jdouble_from_hi_lo_mem(hx | sx, lx);
     x = jvm_dmul( x, one_fmod);   /* create necessary signal */
   }
   return x;   /* exact output */

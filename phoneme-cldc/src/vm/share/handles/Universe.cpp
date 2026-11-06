@@ -1100,6 +1100,12 @@ void Universe::load_jar_entry(char* name, int length, JarFileParser* jf_parser
    * Plain integers, no oops - safe between handle-using statements. */
   unsigned long long vt0 = vita_now_us();
   vita_preload_entries++;
+  /* v02.99: keep the startup splash counting. The counter is the only
+   * evidence of progress the user gets during the 5-7 s sweep, and the
+   * repaint behind it is throttled to ~4 Hz inside vita_splash_tick().
+   * Costs one compare per entry when nothing is armed. */
+  vita_splash_entries((int)vita_preload_entries);
+  vita_splash_tick();
   {
     /* v02.48: skip classes the dictionary already holds. log95: 502 of the
      * 932 midp_system.jar entries resolve in < 50 us, i.e. they are

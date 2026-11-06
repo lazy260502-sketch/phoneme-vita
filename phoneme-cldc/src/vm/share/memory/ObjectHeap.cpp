@@ -35,6 +35,9 @@
 #endif
 
 # include "incls/_precompiled.incl"
+#if defined(VITA)
+#include <malloc.h>      /* mallinfo() for the chunk-alloc failure report */
+#endif
 # include "incls/_ObjectHeap.cpp.incl"
 
 // Static variables
@@ -1481,6 +1484,27 @@ bool ObjectHeap::adjust_heap_size(size_t target_heap_size) {
     _bitv_chunk =
         (address)OsMemory_allocate_chunk(bitv_chunk_size, max_bitv, alignment);
     if (_heap_chunk == NULL || _bitv_chunk == NULL) {
+#if defined(VITA)
+      /* log120 (v02.94): the first jit=2 round died here with no numbers.
+       * Print what was asked for and what newlib's arena looks like, so
+       * the next log says whether it is size (too big), fragmentation
+       * (free total >> request) or a leaked chunk slot. */
+      {
+        struct mallinfo mi = mallinfo();
+        tty->print_cr("[heap] chunk alloc FAILED heap_chunk=%d(max %d) "
+                      "bitv_chunk=%d(max %d) heap=%d min=%d cap=%d "
+                      "UseCompiler=%d comp%%=%d",
+                      (int)heap_chunk_size, (int)max_heap,
+                      (int)bitv_chunk_size, (int)max_bitv,
+                      (int)target_heap_size, (int)_heap_min,
+                      (int)_heap_capacity, (int)UseCompiler,
+                      (int)CompilerAreaPercentage);
+        tty->print_cr("[heap]   got heap_chunk=%p bitv_chunk=%p | newlib "
+                      "arena=%d inuse=%d free=%d top=%d",
+                      _heap_chunk, _bitv_chunk, (int)mi.arena,
+                      (int)mi.uordblks, (int)mi.fordblks, (int)mi.keepcost);
+      }
+#endif
       return false;
     }
   } else {

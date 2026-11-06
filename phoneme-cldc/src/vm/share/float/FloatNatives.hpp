@@ -53,13 +53,9 @@
 // Macros used by the trigonometric functions
 // Note: never use those as LHS, as it leads to subtle 
 //       aliasing problems, use jdouble_from_msw_lsw instead
-#if MSW_FIRST_FOR_DOUBLE
-  #define __JHI(x) (((jdouble_accessor *)&x)->words[0])
-  #define __JLO(x) (((jdouble_accessor *)&x)->words[1])
-#else
-  #define __JHI(x) (((jdouble_accessor *)&x)->words[1])
-  #define __JLO(x) (((jdouble_accessor *)&x)->words[0])
-#endif
+// JDOUBLE_MEM_HI_WORD / JDOUBLE_MEM_LO_WORD (GlobalDefinitions.hpp) are the word order of a C double in memory.
+#define __JHI(x) (((jdouble_accessor *)&x)->words[JDOUBLE_MEM_HI_WORD])
+#define __JLO(x) (((jdouble_accessor *)&x)->words[JDOUBLE_MEM_LO_WORD])
 
 /*=========================================================================
  * Function prototypes for the internal library routines that we use

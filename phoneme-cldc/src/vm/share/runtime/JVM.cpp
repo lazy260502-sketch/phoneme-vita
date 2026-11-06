@@ -216,9 +216,21 @@ inline bool JVM::load_main_class(JVM_SINGLE_ARG_TRAPS) {
    * syscall per constant-pool entry; removed in v01.92). */
   {
     extern void vita_boot_log(const char *fmt, ...);
+    extern void vita_splash_stage(const char *stage);
+    extern void vita_splash_preload_done(void);
+    extern void vita_jarmem_report(const char *tag);
     unsigned long long pt0 = vita_now_us();
     vita_trace_preload_mark(); /* v02.47: syscall baseline (OS_vita.cpp) */
     vita_boot_log("[preload] begin load_all_in_classpath");
+    /* v03.01: jar-image state before and after the sweep. Two cumulative
+     * dumps per round; the difference is what this round did. A round whose
+     * delta is bypass/no_slot/no_img is reading its jar from disk on every
+     * class (~8 sceIoRead per class at 256 B per refill), which is the
+     * 4.8-6.4 s log120 spent in io_read. */
+    vita_jarmem_report("pre");
+    /* v02.99: tell the user what this 5-7 s is being spent on (the
+     * splash is already on screen since lfjport_ui_init). */
+    vita_splash_stage("解压游戏资源…");
     Universe::load_all_in_classpath(JVM_SINGLE_ARG_CHECK_0);
     /* v02.44: summary with the per-phase split (OS_vita.cpp). open/read/
      * resolve do not add up to total: the rest is directory iteration and
@@ -239,6 +251,15 @@ inline bool JVM::load_main_class(JVM_SINGLE_ARG_TRAPS) {
                   vita_preload_us_sym, vita_preload_us_verify,
                   vita_preload_us_iter, vita_preload_skipped);
     vita_trace_preload_report(); /* OS_vita.cpp: syscall delta of the sweep */
+    /* v03.01: what the sweep did to the jar images (see "pre" above). */
+    vita_jarmem_report("post");
+    /* v02.99: the sweep is done; the remaining wait is VM start-up and the
+     * MIDlet's own constructor, so say that instead of leaving "解压游戏
+     * 资源…" up while nothing is being decompressed. From this point on a
+     * frame the splash did not ask for is the MIDlet drawing, which ends
+     * the overlay (see vita_splash_on_foreign_flip). */
+    vita_splash_preload_done();
+    vita_splash_stage("初始化虚拟机…");
   }
 #endif
   InstanceClass::Fast klass = JVM::resolve_class(_main_class JVM_CHECK_0);

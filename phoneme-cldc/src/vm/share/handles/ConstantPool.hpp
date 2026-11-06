@@ -160,8 +160,26 @@ class ConstantPool: public Oop {
 
   jdouble double_at(int index) {
     GUARANTEE(tag_at(index).is_double(), "Corrupted constant pool");
+#if defined(VITA)
+    // Slot 0 holds the high word (interpreter ldc2_w and romgen order).
+    return jdouble_from_msw_lsw(int_field(offset_from_index(index)),
+        int_field(offset_from_index(index) + (int)sizeof(jint)));
+#else
     return double_field(offset_from_index(index));
+#endif
   }
+
+#if defined(VITA)
+  // The same constant as a C double in memory order, for the JIT. double_at() above stays as it is: it also feeds
+  // static final double initialisation, whose result the interpreter reads back in its own MSW-first layout.
+  jdouble double_at_native(int index) {
+    GUARANTEE(tag_at(index).is_double(), "Corrupted constant pool");
+    return jdouble_from_hi_lo_mem(int_field(offset_from_index(index)),
+        int_field(offset_from_index(index) + (int)sizeof(jint)));
+  }
+#else
+  jdouble double_at_native(int index) { return double_at(index); }
+#endif
 
   // Use this version instead of the one below only
   // in those cases that are not called by the ClassFileParser.
@@ -377,7 +395,12 @@ class ConstantPool: public Oop {
 
   void double_parts_at_put(int index, jint msw, jint lsw) {
     tag_at_put(index, JVM_CONSTANT_Double);
+#if defined(VITA)
+    // The interpreter reads slot 0 as the high word regardless of MSW_FIRST_FOR_DOUBLE.
+    if (true) {
+#else
     if (MSW_FIRST_FOR_DOUBLE) { 
+#endif
       int_field_put(offset_from_index(index), msw);
       int_field_put(offset_from_index(index) + (int)sizeof(jint), lsw);
     } else { 

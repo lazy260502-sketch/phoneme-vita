@@ -1306,7 +1306,7 @@ void Method::iterate_push_constant_2(int i, BytecodeClosure* blk JVM_TRAPS) {
   if (ConstantTag::is_long(tag)) {
     blk->push_long(c().long_at(i) JVM_NO_CHECK_AT_BOTTOM);
   } else if (ConstantTag::is_double(tag)) {
-    blk->push_double(c().double_at(i) JVM_NO_CHECK_AT_BOTTOM);
+    blk->push_double(c().double_at_native(i) JVM_NO_CHECK_AT_BOTTOM);
   } else {
     blk->illegal_code(JVM_SINGLE_ARG_NO_CHECK_AT_BOTTOM);
   }

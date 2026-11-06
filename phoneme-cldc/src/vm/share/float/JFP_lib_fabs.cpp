@@ -40,7 +40,7 @@ extern "C" {
 double jvm_fplib_fabs(double x) {
   jdouble_accessor acc;
   acc.double_value = x;
-  acc.words[WORD_FOR_MSW_IN_DOUBLE] &= 0x7fffffff;
+  acc.words[JDOUBLE_MEM_HI_WORD] &= 0x7fffffff;
   return acc.double_value;
 }
 

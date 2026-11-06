@@ -555,11 +555,17 @@ void CodeGenerator::double_constant_fold(Value& result, Value& op1,
             "Operand must be immediate to do constant folding");
   GUARANTEE(op == BytecodeClosure::una_neg || op == BytecodeClosure::una_abs,
             "Sanity");
+#if defined(VITA)
+  // as_raw_long() reads the C double's own memory order (sign in bit 63 on this little-endian target); the macro below
+  // is forced to 1 on VM objects for the link self check and says nothing about that.
+  const jlong flipper = ((jlong) 1) << 63;
+#else
   const jlong flipper = (MSW_FIRST_FOR_DOUBLE != MSW_FIRST_FOR_LONG)
          // Longs and doubles have opposite endianness
          ? ((jlong) 1) << 31
          // Longs and doubles have the same endianness
          : ((jlong) 1) << 63;
+#endif
   if (op == BytecodeClosure::una_neg) { 
     result.set_raw_long(op1.as_raw_long() ^ flipper);
   } else { 

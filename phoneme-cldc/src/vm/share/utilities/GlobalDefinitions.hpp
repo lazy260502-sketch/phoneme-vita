@@ -938,6 +938,28 @@ union jdouble_accessor {
 #define WORD_FOR_LSW_IN_DOUBLE 0
 #endif
 
+// Word order of a C `double` in MEMORY (what __JHI/__JLO, fabs, copysign and print_double touch).
+// WORD_FOR_*_IN_DOUBLE above follows MSW_FIRST_FOR_DOUBLE, which on VITA is forced to 1 on every VM object (rebuild_vm.sh)
+// so the link-time self check (_rom_linkcheck_mffd_true) matches the frozen interpreter's integer convention. That is a
+// statement about ROM/interpreter layout, not about the hardware; routing C double access through it made __JHI read the
+// LOW word and broke sqrt/floor/ceil/sin/cos/tan from v04.29 (log189 crash in remainder_pio2_kernel). So on VITA the
+// compiler's own __FLOAT_WORD_ORDER__ decides, and an unknown order is a build error rather than a guess.
+#if defined(VITA)
+  #if !defined(__FLOAT_WORD_ORDER__) || !defined(__ORDER_LITTLE_ENDIAN__)
+    #error "cannot tell the word order of a C double: refusing to guess"
+  #endif
+  #if __FLOAT_WORD_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    #define JDOUBLE_MEM_HI_WORD 1
+    #define JDOUBLE_MEM_LO_WORD 0
+  #else
+    #define JDOUBLE_MEM_HI_WORD 0
+    #define JDOUBLE_MEM_LO_WORD 1
+  #endif
+#else
+  #define JDOUBLE_MEM_HI_WORD WORD_FOR_MSW_IN_DOUBLE
+  #define JDOUBLE_MEM_LO_WORD WORD_FOR_LSW_IN_DOUBLE
+#endif
+
 #if MSW_FIRST_FOR_LONG
 #define WORD_FOR_MSW_IN_LONG 0
 #define WORD_FOR_LSW_IN_LONG 1
@@ -969,6 +991,16 @@ inline jdouble jdouble_from_msw_lsw(jint msw, jint lsw) {
 
   result.words[WORD_FOR_MSW_IN_DOUBLE] = msw;
   result.words[WORD_FOR_LSW_IN_DOUBLE] = lsw;
+  return result.double_value;
+}
+
+// A C double from its most/least significant word, by the memory order above (ROM/constant-pool layouts keep using
+// jdouble_from_msw_lsw).
+inline jdouble jdouble_from_hi_lo_mem(jint hi, jint lo) {
+  jdouble_accessor result;
+
+  result.words[JDOUBLE_MEM_HI_WORD] = hi;
+  result.words[JDOUBLE_MEM_LO_WORD] = lo;
   return result.double_value;
 }
 
@@ -2264,11 +2296,16 @@ static inline jint float_bits(jfloat f) {
 static inline jlong double_bits(jdouble d) {
   jdouble_accessor acc;
   acc.double_value = d;
+#if defined(VITA)
+  // memory order of the C double, not MSW_FIRST_FOR_DOUBLE (see JDOUBLE_MEM_HI_WORD)
+  return jlong_from_msw_lsw(acc.words[JDOUBLE_MEM_HI_WORD], acc.words[JDOUBLE_MEM_LO_WORD]);
+#else
   if (MSW_FIRST_FOR_DOUBLE == MSW_FIRST_FOR_LONG) {
     return jlong_from_low_high(acc.words[0], acc.words[1]);
   } else {
     return jlong_from_low_high(acc.words[1], acc.words[0]);
   }
+#endif
 }
 
 static inline jfloat float_from_bits(jint bits) {
@@ -2276,6 +2313,9 @@ static inline jfloat float_from_bits(jint bits) {
 }
 
 static inline jdouble double_from_bits(jlong bits) {
+#if defined(VITA)
+  return jdouble_from_hi_lo_mem(msw(bits), lsw(bits));
+#else
   jlong_accessor acc;
   acc.long_value = bits;
   if (MSW_FIRST_FOR_DOUBLE == MSW_FIRST_FOR_LONG) {
@@ -2283,6 +2323,7 @@ static inline jdouble double_from_bits(jlong bits) {
   } else {
     return jdouble_from_low_high(acc.words[1], acc.words[0]);
   }
+#endif
 }
 
 #else

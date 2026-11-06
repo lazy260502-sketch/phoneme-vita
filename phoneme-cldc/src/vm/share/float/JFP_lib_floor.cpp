@@ -99,7 +99,7 @@ double jvm_fplib_floor(double x) {
       i1 &= (~i);
     }
   }
-  return jdouble_from_msw_lsw(i0, i1);
+  return jdouble_from_hi_lo_mem(i0, i1);
 }
 
 #ifdef __cplusplus

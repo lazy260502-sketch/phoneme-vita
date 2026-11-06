@@ -209,6 +209,41 @@ bool FrameStream::skip() {
 }
 #endif
 
+#if defined(VITA)
+/* v02.82: declared here, OUTSIDE the extern "C" block below - inside it a
+ * plain declaration would get C linkage, but vita_boot_log is defined with
+ * C++ linkage in JVM_vita.cpp (_Z13vita_boot_logPKcz). */
+extern void vita_boot_log(const char *fmt, ...);
+
+/* v03.15: true for the resource kinds we want to see open successfully -
+ * the image-ish extensions involved in the log126 black screen
+ * (Image.createImage("/imgAct/last.png")), the CAPCOM texture set and the
+ * Mascot Capsule data files. Everything else stays silent so a game that
+ * opens thousands of class/resource entries cannot flood the boot log. */
+static int vita_res_name_is_image(const char *nm, int len) {
+  if (len <= 4) {
+    return 0;
+  }
+  const char *dot = nm + len - 4;
+  if (nm[len - 4] == '.') {
+    /* .png .bmp .mbc(.mbac handled below) */
+    if (dot[1] == 'p' && dot[2] == 'n' && dot[3] == 'g') return 1;
+    if (dot[1] == 'b' && dot[2] == 'm' && dot[3] == 'p') return 1;
+    if (dot[1] == 'm' && dot[2] == '3' && dot[3] == 'g') return 1;
+    if (dot[1] == 'j' && dot[2] == 'p' && dot[3] == 'g') return 1;
+  }
+  if (len > 5 && nm[len - 5] == '.' && nm[len - 4] == 'm' && nm[len - 3] == 'b'
+      && nm[len - 2] == 'a' && nm[len - 1] == 'c') {
+    return 1;
+  }
+  if (len > 5 && nm[len - 5] == '.' && nm[len - 4] == 'm' && nm[len - 3] == 't'
+      && nm[len - 2] == 'r' && nm[len - 1] == 'a') {
+    return 1;
+  }
+  return 0;
+}
+#endif
+
 extern "C" {
 
 #if ENABLE_DYNAMIC_NATIVE_METHODS
@@ -599,6 +634,62 @@ ReturnOop Java_java_lang_System_getProperty0(JVM_SINGLE_ARG_TRAPS) {
 
   char *name = (char *) cstring().base_address();
   const char *value = JVMSPI_GetSystemProperty(name);
+#if defined(VITA)
+  /* v03.69: which environment properties does a title ASK FOR, and what did it
+   * get? Nothing recorded this before, so a title that changes its layout or
+   * behaviour on a property could never be diagnosed: the call is silent and a
+   * null return is indistinguishable from "never asked".
+   *
+   * This matters right now for 极品飞车, whose IDIOMA screen is laid out at
+   * x=209..365 on a 240-pixel canvas (rows 2-6 entirely off-screen) while the
+   * same jar renders that screen correctly elsewhere. The layout comes out of
+   * the title's own packed data, so if the coordinates are purely data-driven
+   * they would be identical everywhere - meaning something ENVIRONMENTAL must
+   * steer it. microedition.platform, microedition.profiles and the
+   * device.* identity are the usual suspects for that.
+   *
+   * One line per DISTINCT name (16 names max), plus the value's length and a
+   * short prefix, so the next log answers the question without a bisect. */
+  {
+    static char seen_names[16][40];
+    static int  seen_values[16];
+    static int  seen_count = 0;
+    int i, known = -1;
+    int nlen = (int)jvm_strlen(name);
+    if (nlen > (int)sizeof(seen_names[0]) - 1) {
+      nlen = (int)sizeof(seen_names[0]) - 1;
+    }
+    for (i = 0; i < seen_count; i++) {
+      if (jvm_strncmp(seen_names[i], name, nlen) == 0
+          && seen_names[i][nlen] == '\0') {
+        known = i;
+        break;
+      }
+    }
+    if (known < 0 && seen_count < 16) {
+      known = seen_count++;
+      for (i = 0; i <= nlen; i++) {
+        seen_names[known][i] = (i < nlen) ? name[i] : '\0';
+      }
+      seen_values[known] = -99;
+    }
+    if (known >= 0) {
+      int vlen = (value == NULL) ? -1 : (int)jvm_strlen(value);
+      /* log the first answer, and any later answer that differs
+       * (a property can be added after the first probe) */
+      if (seen_values[known] != vlen) {
+        seen_values[known] = vlen;
+        if (vlen < 0) {
+          vita_boot_log("[prop] ask '%s' -> null", name);
+        } else if (vlen <= 12) {
+          vita_boot_log("[prop] ask '%s' -> '%s' (len=%d)", name, value, vlen);
+        } else {
+          vita_boot_log("[prop] ask '%s' -> len=%d", name, vlen);
+        }
+      }
+    }
+  }
+#endif
 
 #if ENABLE_PRODUCT_PRINT_STACK || !defined(PRODUCT)
   if (jvm_strcmp(name, "__debug.only.pss") == 0) {
@@ -1491,8 +1582,83 @@ ReturnOop Java_com_sun_cldc_io_ResourceInputStream_open(JVM_SINGLE_ARG_TRAPS) {
   }
 
   // Open resource from a file
+#if defined(VITA)
+  /* v02.82: getResourceAsStream returning null was the root of the Xiyangyang
+   * NPE (log118) but nothing recorded WHY. Log failed opens with the resource
+   * name. Success is not logged (a game may open thousands of resources) and
+   * at most VITA_RES_LOG_MAX failures are written, so a game that probes for
+   * missing optional resources in a loop cannot flood vm_boot.log. No Java
+   * heap allocation happens between open_entry() and the return, so the raw
+   * ReturnOop stays valid. */
+  {
+    static int vita_res_fail_logged = 0;
+    static int vita_res_ok_logged = 0;
+    /* v03.67: separate budget for non-image (data) resources - see below. */
+    static int vita_res_data_logged = 0;
+    const int VITA_RES_LOG_MAX = 64;
+    /* v03.15: log image-ish resources on SUCCESS too (bounded). log126 showed
+     * 生化危机 calling Image.createImage("/imgAct/last.png") and getting an
+     * IOException whose stack frame is createImageFromStream's `stream ==
+     * null` throw - i.e. getResourceAsStream returned null - yet no
+     * "[res] open FAILED" line was written for that name. Either the open
+     * actually succeeded (then the null came from somewhere else) or the
+     * failure happened without reaching this branch. Logging the successful
+     * image opens settles it in one run. */
+    const int VITA_RES_OK_MAX = 256;
+    /* v03.67: data resources (charmap, layout files) are few and small; 64
+     * lines is plenty and cannot flood the boot log. */
+    const int VITA_RES_DATA_MAX = 64;
+    ReturnOop r = ClassPathAccess::open_entry(&c_filename, false
+                                              JVM_NO_CHECK_AT_BOTTOM_0);
+    if (r == NULL) {
+      if (vita_res_fail_logged < VITA_RES_LOG_MAX) {
+        char nm[96];
+        /* string_copy(buf, size): copies at most size-1 chars and always
+         * NUL-terminates (Symbol.cpp), so a long name is truncated, not
+         * overrun. (GUARANTEE(length() < size) is compiled out in PRODUCT.) */
+        c_filename().string_copy(nm, (int)sizeof(nm));
+        vita_res_fail_logged++;
+        vita_boot_log("[res] open FAILED name='%s' len=%d (%d/%d logged)", nm,
+                      c_filename().length(), vita_res_fail_logged,
+                      VITA_RES_LOG_MAX);
+      }
+    } else {
+      /* v03.67: split the success budgets. Before this, reaching
+       * VITA_RES_OK_MAX stopped ALL success logging, so a data-only resource
+       * (charmap, the menu layout files) could never appear once a game had
+       * opened 256 images. Each class now has its own counter. */
+      char nm[96];
+      int n = c_filename().length();
+      c_filename().string_copy(nm, (int)sizeof(nm));
+      if (vita_res_name_is_image(nm, n)) {
+        if (vita_res_ok_logged < VITA_RES_OK_MAX) {
+          vita_res_ok_logged++;
+          vita_boot_log("[res] open OK name='%s' len=%d (%d/%d logged)", nm, n,
+                        vita_res_ok_logged, VITA_RES_OK_MAX);
+        }
+      } else if (vita_res_data_logged < VITA_RES_DATA_MAX) {
+        /* v03.67: DATA resources (no image extension) used to be invisible on
+         * success. log154's 极品飞车 investigation needed exactly this: u.a(byte)
+         * does
+         *   InputStream is = getClass().getResourceAsStream("/" + name + "charmap");
+         *   is.skip(off << 8);                    // 256-byte blocks
+         *   for (k = 0; k < 128; k++) d[k] = ...; // unpacking table
+         * and the layout coordinates are decoded through that table. charmap is
+         * 1024 bytes = exactly 4 blocks, so off >= 4 would skip past EOF and
+         * fill d[] with garbage - silently, because skip()'s return value is
+         * discarded. Whether that ever happens could not be answered from the
+         * log because data opens were never recorded. */
+        vita_res_data_logged++;
+        vita_boot_log("[res] open DATA name='%s' len=%d (%d/%d logged)", nm, n,
+                      vita_res_data_logged, VITA_RES_DATA_MAX);
+      }
+    }
+    return r;
+  }
+#else
   return ClassPathAccess::open_entry(&c_filename, false
                                      JVM_NO_CHECK_AT_BOTTOM_0);
+#endif
 }
 
 // static native int bytesRemain(Object fileDecoder);

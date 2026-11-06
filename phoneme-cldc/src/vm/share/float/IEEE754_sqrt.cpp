@@ -212,7 +212,7 @@ double ieee754_sqrt(double x) {
     ix1 |= sign;
   }
   ix0 += (m << 20);
-  return jdouble_from_msw_lsw(ix0, ix1);
+  return jdouble_from_hi_lo_mem(ix0, ix1);
 }
 
 #ifdef __cplusplus

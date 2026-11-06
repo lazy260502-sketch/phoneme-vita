@@ -49,6 +49,11 @@
 extern "C" {
     void vita_site_mark(void) __attribute__((noinline));
     void vita_site_dump(const char *path);
+    /* v04.18: unbuffered breadcrumb channel (crumb.log). Needed by
+     * OsMemory.cpp, which runs before/outside the VM's own trace streams and
+     * must report which backing store the Java heap got - a tty->print line
+     * would land in midp_stdout.log, which is empty in every recent log. */
+    void crumb_printf(const char *fmt, ...);
     /* v02.11: tick-driven JIT compile switch (defined in OS_vita.cpp).
      * Read once from ux0:/data/J2ME00001/tick_compile.cfg; absent or
      * unreadable = enabled (the b332 behaviour). Consulted by
@@ -114,6 +119,28 @@ extern "C" {
     /* syscall baseline / delta report around the preload (OS_vita.cpp) */
     void vita_trace_preload_mark(void);
     void vita_trace_preload_report(void);
+    /* v02.99: startup splash driver (vita-port/src/vita_splash.c). The
+     * preload loop calls these once per jar entry: the counter feeds the
+     * "已载入 N 个类" line and the tick repaints at ~4 Hz. Both are
+     * no-ops once the splash has ended, so a game that runs for an hour
+     * pays one compare per class load later in its life. */
+    void vita_splash_entries(int entries);
+    void vita_splash_tick(void);
+    void vita_splash_stage(const char *stage);
+    void vita_splash_preload_done(void);
+    /* v03.01: jar-image counters + live slot table (OsFile_vita.cpp).
+     * Declared here so the local redeclaration in JVM.cpp picks up C
+     * linkage; without this the call site mangles the name and the link
+     * fails with "undefined reference to vita_jarmem_report(char const*)". */
+    void vita_jarmem_report(const char *tag);
+    /* v04.18: did the Java heap chunk end up in VM-domain (executable) memory?
+     * Set by OsMemory_allocate_chunk when sceKernelAllocMemBlockForVM accepted
+     * the chunk and the block passed a write test at both ends. Read by
+     * vita_main.c before enabling the JIT: generated code can only run if the
+     * compiler area - which lives inside this chunk - is executable.
+     * A plain flag rather than an ObjectHeap query, because the launcher cannot
+     * see the VM's chunks and the answer cannot change after startup. */
+    int  vita_heap_executable(void);
     /* 1 = developer asked for "run the REAL trampoline, never divert to the
      * shadow" (pad_nodivert.cfg, set by the launcher). See
      * InterpreterRuntime_arm.cpp. */

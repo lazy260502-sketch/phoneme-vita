@@ -169,8 +169,43 @@ inline void JarFileParser::save_parser_in_cache(JVM_SINGLE_ARG_TRAPS) {
 
   dispose( found );
 
+#if defined(VITA)
+  /* v03.19 (Vita port): STRONG instead of WEAK reference.
+   *
+   * The cached parser owns the ONLY OsFile_Handle of its jar (get() opened it
+   * and set_file_pointer()/FileDescriptor took it; every FileDecoder handed
+   * out by open_entry() merely BORROWS that handle). With ObjectHeap::WEAK the
+   * parser is reclaimed as soon as no C stack references it, and then:
+   *   - the FileDescriptor object dies with it, so the only thing that could
+   *     close the handle is the Java finalizer
+   *     (Java_com_sun_cldchi_jvm_FileDescriptor_finalize -> dispose ->
+   *     OsFile_close), which in this port effectively never runs;
+   *   - dispose(i) above can no longer reach the parser, so eviction cannot
+   *     close it either. That is the leak: it leaves `get_global_ref_object`
+   *     returning NULL and the handle orphaned.
+   * Measured before this change (log127): 41 jar opens, only 9 closes,
+   * handles=32/32, no_slot=99 - after which every getResourceAsStream
+   * returned null. Now the parser stays alive, get_parser_from_cache() always
+   * hits, no second OsFile_open happens at all, and eviction (dispose(i))
+   * always sees a live parser and closes the handle properly.
+   *
+   * Cost is bounded by MAX_CACHED_PARSERS == 4 parser objects plus their
+   * entry caches (a few tens of KB), which is what the cache was sized for
+   * anyway. flush_caches() still closes every handle.
+   *
+   * Do NOT "fix" the leak by closing inside FileDecoder::read_completely or
+   * by making ResourceInputStream.close() close the decoder's handle: that
+   * handle belongs to the parser, and closing it kills the whole jar. v03.18
+   * did exactly that and log128 showed the result - the MIDlet's own class
+   * loaded, then every other class from the same jar failed with
+   * NoClassDefFoundError (e.g. "javay/microedition/lcdui/MIDhack", a class
+   * that really does exist in that jar). */
+  const int newref = ObjectHeap::register_global_ref_object(this,
+    ObjectHeap::STRONG JVM_MUST_SUCCEED);
+#else
   const int newref = ObjectHeap::register_global_ref_object(this,
     ObjectHeap::WEAK JVM_MUST_SUCCEED);
+#endif
   if( newref >= 0 ) {
     _cached_parsers[found] = newref;
   }
@@ -231,6 +266,13 @@ ReturnOop JarFileParser::get(const JvmPathChar* jar_file_name1,
   FileDescriptor::Fast desc = FileDescriptor::allocate(JVM_SINGLE_ARG_CHECK_0);
 
   OsFile_Handle fh = NULL;
+  /* v03.07: the two-pass retry used to be useless. It ran
+   *     pass0: open -> NULL
+   *     pass1: open -> NULL, THEN flush_caches()   <- too late, loop ends
+   * so the flush never had a chance to free a handle for the very call that
+   * noticed the shortage, and the caller got NULL (stdio fallback) even
+   * though flushing could have satisfied it. Now the flush happens between
+   * the attempts, which is the only order that can help. */
   for (int pass=0; pass<2; pass++) {
     if (jar_file_name1) {
       fh = OsFile_open(jar_file_name1, "rb");
@@ -241,10 +283,10 @@ ReturnOop JarFileParser::get(const JvmPathChar* jar_file_name1,
     if (fh != NULL) {
       break;
     }
-    if (pass == 1 && fh == NULL) {
+    if (pass == 0) {
       // The system is running low on OsFile_Handles. Make sure we flush
       // the cache, and free all currently cached OsFile_Handles that belong
-      // to other JAR files.
+      // to other JAR files - THEN try once more.
       flush_caches();
     }
   }

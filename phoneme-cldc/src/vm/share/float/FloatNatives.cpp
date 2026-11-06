@@ -85,7 +85,7 @@ JVM_SOFTFP_LINKAGE jlong jvm_doubleToLongBits(jdouble x) {
 }
 
 JVM_SOFTFP_LINKAGE jdouble jvm_double_from_msw_lsw(jint msw, jint lsw) {
-  return jdouble_from_msw_lsw(msw, lsw);
+  return jdouble_from_hi_lo_mem(msw, lsw);
 }
 
 JVM_SOFTFP_LINKAGE jint jvm_double_msw(jdouble d) {

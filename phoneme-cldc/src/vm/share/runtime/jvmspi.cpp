@@ -210,7 +210,25 @@ extern "C" {
   }
 
   jlong Java_com_sun_cldchi_jvm_JVM_monotonicTimeMillis(void) {
-    /* For standalone CLDC VM, return a monotonic-ish value */
+#if defined(VITA)
+    /* v04.00: `return 0` froze every repeating java.util.TimerTask after its
+     * first fire (nextExecutionTime = clock + period can never become <= a
+     * constant clock). See the full explanation in vita-port/src/vita_pcsl.c.
+     * sceKernelGetSystemTimeWide() is monotonic and returns microseconds; this
+     * method is milliseconds.
+     *
+     * v04.01: this file is NOT part of the shipping image. `nm` on both
+     * libcldc_vm.a and libobj.a shows no JVMSPI_* symbol coming from here
+     * (JVMSPI_PrintRaw and friends are in libobj.a's midp_run.o), so the live
+     * definition of JVM_monotonicTimeMillis is the one in
+     * vita-port/src/vita_pcsl.c. The fix is kept anyway: if jvmspi.o ever
+     * enters a link, it must not reintroduce `return 0` and win on link
+     * order. Same constant as vita_pcsl.c on purpose. */
+    extern long long sceKernelGetSystemTimeWide(void);
+    return (jlong)(sceKernelGetSystemTimeWide() / 1000);
+#else
+    /* Non-Vita builds keep the original stand-alone behaviour. */
     return (jlong)0;
+#endif
   }
 }

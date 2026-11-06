@@ -71,7 +71,7 @@ double jvm_fplib_scalbn (double x, int n) {
     return jvm_dmul(huge_number_sca, jvm_fplib_copysign(huge_number_sca,x)); /* overflow  */
   }
   if (k > 0) {             /* normal result */
-    x = jdouble_from_msw_lsw((hx & 0x800fffff) | (k << 20), lx);
+    x = jdouble_from_hi_lo_mem((hx & 0x800fffff) | (k << 20), lx);
     return x;
   }
   if (k <= -54) {
@@ -82,7 +82,7 @@ double jvm_fplib_scalbn (double x, int n) {
    }
   }
   k += 54;                /* subnormal result */
-  x = jdouble_from_msw_lsw((hx & 0x800fffff) | (k << 20), lx);
+  x = jdouble_from_hi_lo_mem((hx & 0x800fffff) | (k << 20), lx);
   return jvm_dmul(x, twom54);
 }
 

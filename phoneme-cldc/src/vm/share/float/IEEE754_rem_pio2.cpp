@@ -170,7 +170,7 @@ int ieee754_rem_pio2(double x, double *y) {
   }
   /* set z = scalbn(|x|,ilogb(x)-23) */
   e0  = (ix >> 20) - 1046;    /* e0 = ilogb(z)-23; */
-  z = jdouble_from_msw_lsw(ix - (e0 << 20), __JLO(x));
+  z = jdouble_from_hi_lo_mem(ix - (e0 << 20), __JLO(x));
   for (i = 0; i < 2; i++) {
     tx[i] = jvm_i2d(jvm_d2i(z));
     z     = jvm_dmul(jvm_dsub(z, tx[i]), two24_r);

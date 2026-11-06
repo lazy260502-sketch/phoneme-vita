@@ -171,6 +171,47 @@ public class ResourceInputStream extends InputStream {
         return readBytes(fileDecoder, b, off, len);
     }
 
+    /**
+     * v03.69: OBSERVATION ONLY - calls super.skip(), so behaviour is byte for
+     * byte what it was before. Exists because a SHORT skip is the one way this
+     * VM can silently corrupt a title's data:
+     *
+     * 极品飞车's text/layout helper u.a(byte) reads its unpacking table with
+     *     InputStream is = getResourceAsStream("/...charmap");
+     *     is.skip(off << 8);                    // 256-byte blocks
+     *     for (k = 0; k < 128; k++) d[k] = ...; // 128 shorts
+     * and then decodes every layout coordinate through d[]. charmap in that jar
+     * is 1024 bytes = exactly 4 blocks, so an off >= 4 skips past EOF; read()
+     * then returns -1, d[] becomes all -1, and EVERY coordinate decodes wrong -
+     * with no exception anywhere, because skip()'s return value is discarded by
+     * the title (javap shows pop2). Whether that happens could not be answered
+     * from any device log so far.
+     *
+     * Printing want/got/remain settles it: got < want proves the stream ran dry,
+     * and want >> 8 is exactly the block index the title asked for. Bounded, so
+     * a game that seeks around cannot flood the log.
+     */
+    private static int dbgSkipN = 0;
+
+    public long skip(long n) throws IOException {
+        long want = n;
+        long got = super.skip(n);
+        if (dbgSkipN < 40) {
+            dbgSkipN++;
+            int remain = -1;
+            try {
+                remain = available();
+            } catch (IOException e) {
+                remain = -2;
+            }
+            System.out.println("[res] skip want=" + want + " got=" + got
+                               + " remain=" + remain
+                               + " block=" + (want >> 8)
+                               + ((got != want) ? "  <<SHORT" : ""));
+        }
+        return got;
+    }
+
     public void close() throws IOException {
         fileDecoder = null;
     }

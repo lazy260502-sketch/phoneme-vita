@@ -48,9 +48,28 @@ const char *OsMisc_julong_format_specifier() {
 
 // Flush instruction cache after JIT code generation
 // On ARM, we need to flush both data and instruction cache
+//
+// v04.47: __builtin___clear_cache is EMPTY on this target. v03.71 established
+// it ("-O1 and above emit no code at all"), and the v04.47 disassembly of the
+// shipped ELF confirms it: OsMisc_flush_icache is two instructions long and the
+// next function starts immediately after. A hand-written `mcr p15, ...` is not
+// an option either - cache maintenance is PL1 on ARMv7-A and this code runs at
+// PL0.
+//
+// The one flush that works from user mode is sceKernelSyncVMDomain on the VM
+// block that backs the Java heap, which is where the JIT's compiler area lives
+// ([heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY). JVMCompiledMethod::flush_icache()
+// tail-calls this function once per compiled method, so the syscall cost is paid
+// per method, not per instruction.
+//
+// log187 is what the missing flush looked like: JIT enabled (heap_mb <= 15 kept
+// UseCompiler on), pc inside the heap block, runMidlet() never returned.
+extern "C" int vita_vm_flush_icache(void *start, int size);
+
 void OsMisc_flush_icache(address start, int size) {
-  // Use ARM barrier instructions to ensure cache coherence
-  // __builtin___clear_cache is available on GCC for ARM
+  if (vita_vm_flush_icache((void *)start, size)) {
+    return;
+  }
   __builtin___clear_cache(start, start + size);
 }
 

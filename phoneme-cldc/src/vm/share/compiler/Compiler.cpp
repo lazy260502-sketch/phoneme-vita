@@ -1064,6 +1064,20 @@ void Compiler::internal_compile_inlined( Method::Attributes& attributes
 }
 #endif  
 
+#if defined(VITA)
+/* v02.92 JIT probe (read by vita_jit.c). Counts how often the compiler was
+ * asked to compile and how often that produced code, so a jit=2 log can
+ * say whether the JIT really ran. log119: UseCompiler was stuck at 0 in
+ * every round after a "-int" one, so "no JIT exception" meant "no JIT". */
+extern "C" {
+  volatile unsigned int vita_jit_try_count = 0;     /* try_to_compile calls */
+  volatile unsigned int vita_jit_ok_count = 0;      /* ... that gave code   */
+  volatile unsigned int vita_jit_first_code = 0;    /* address of 1st code  */
+  int vita_jit_area_size(void) { return ObjectHeap::compiler_area_size(); }
+  int vita_jit_area_used(void) { return ObjectHeap::compiler_area_used(); }
+}
+#endif
+
 ReturnOop Compiler::try_to_compile(Method* method, const int active_bci,
                                    const int compiled_code_factor
                                    JVM_TRAPS) {
@@ -1078,6 +1092,15 @@ ReturnOop Compiler::try_to_compile(Method* method, const int active_bci,
     compiler.update_performance_counters(false, result);
     Thread::clear_current_pending_exception();
   }
+#if defined(VITA)
+  vita_jit_try_count++;
+  if (result != NULL) {
+    vita_jit_ok_count++;
+    if (vita_jit_first_code == 0) {
+      vita_jit_first_code = (unsigned int)result;
+    }
+  }
+#endif
 
   if (!is_suspended()) {
     // At this point, no handles and no heap objects should point to

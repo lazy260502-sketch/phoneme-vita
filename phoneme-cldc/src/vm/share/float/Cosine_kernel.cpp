@@ -94,7 +94,7 @@ double cosine_kernel(double x, double y) {
     if(ix > 0x3fe90000) {       /* x > 0.78125 */
       qx = 0.28125;
     } else {
-      qx = jdouble_from_msw_lsw(ix - 0x00200000 /* x/4 */, 0);
+      qx = jdouble_from_hi_lo_mem(ix - 0x00200000 /* x/4 */, 0);
     }
     hz = jvm_dsub(jvm_dmul(0.5, z), qx);
     a  = jvm_dsub(one_c, qx);
