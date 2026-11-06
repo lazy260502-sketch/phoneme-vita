@@ -2,6 +2,15 @@
 
 只列"改了什么就跑什么"和"已经踩过的坑"。原理和细节见 `VM_BUILD.md`、`BUILD.md`、`PROJECT_MEMORY.md`。
 
+> **首次 clone 之后先做这一步**：`git submodule update --init --recursive`
+>
+> 本仓库把 `phoneme_source/phoneME`（上游 phoneME Archive 参考树，**只读**，见 `AGENTS.md` 第 1 条）
+> 记成了子模块。不初始化它就是个空目录，而 `rebuild_vm.sh` 的 `TOOLS_DIR`、`preverify`
+> 和 `VM_BUILD.md` 里的宿主工具路径都指向那里 —— 表现是"工具找不到"而不是"子模块没拉"。
+> 平时编译 `vita-port`/`phoneme-midp` 不需要它深；只在重编 CLDC VM 或用 `romgen`/`loopgen` 时才需要。
+> 已初始化过的话 `git submodule update --init` 是幂等的，可以随时再跑。
+
+
 ## 1. 改了什么 → 跑什么
 
 | 你改了 | 命令(仓库根 `/workspace/psvita/phoneme-vita`) | 说明 |
