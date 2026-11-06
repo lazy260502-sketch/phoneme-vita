@@ -29,1622 +29,6 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 #==============================================================================
 set(VITA_APP_NAME "J2ME Player")
 set(VITA_TITLEID  "J2ME00001")
-# 01.01 = b152: touch support + input debug logging
-# 01.02 = b153: Scheduler.cpp VITA fix - event pump driven by timer tick even
-#         when no Java thread is blocked in async native (audio paths sync)
-# 01.11 = MEDIA_EVENT_SIGNAL routing enabled: midp_master_mode_events.o was
-#         built 08-28 without -DENABLE_JSR_135 (make doesn't track CFLAGS),
-#         so END_OF_MEDIA was dropped at the switch default case and the
-#         music toggle deadlocked the VM. Rebuilt with USE_JSR_135=true
-#         config; jump table slot 36 now routes to StoreMIDPEventInVmThread.
-# 01.30 = b170: real network stack restored (vita_net.c) + net_poll moved
-#         to JVMSPI_CheckEvents + per-call net logging (net_log.txt) +
-#         REAL-DEVICE INSTALL FIX: drop MEMSIZE 128 from vita_create_self
-#         - fself -m is a KiB budget where 0x1000-0x12800 is System-mode
-#         only and 0 is the only legal value for a normal app; 128 (0x80)
-#         produced an invalid SELF control info that Vita3K ignored but
-#         real hw rejects with 0x8010113D on install. Also raised the
-#         sceNetInit pool 64KB -> 1MB (DNS resolver lives in it; official
-#         net_http_bsd sample uses 1MB).
-# 01.32 = b171: LCDUI init hang fix chain -
-#         (a) pcsl_file_* app0-fallback built from the RAW path produced
-#             "app0:ux0:/..." (always ENOENT): skin PNGs in the VPK's
-#             data/J2ME00001/lib/ were unreachable, chameleon came up
-#             with ~30 missing images and UC WEB hung in init. The
-#             fallback now swaps the "ux0:/data/" prefix for "app0:/".
-#         (b) per-game appdb was set by the launcher but then silently
-#             discarded: runMidlet unconditionally re-ran
-#             midpSetAppDir(getApplicationDir()) = MIDP_HOME + "/appdb",
-#             so every suite shared the one appdb and the appdb_XXXX
-#             dirs stayed empty. runMidlet now keeps a launcher-provided
-#             dir (new midpGetAppDir query); storage moved under rms/
-#             (rms/appdb + rms/appdb_<TAG>) with a one-time rename
-#             migration of the old shared appdb.
-#
-# v01.33 (2026-09-08): two runtime fixes driven by the first v01.32 log
-#         capture:
-#         (a) sockets never became non-blocking: fcntl(O_NONBLOCK) is a
-#             NO-OP on sceNet descriptors (newlib's fd IS the sceNetSocket
-#             id), so connect() blocked in-syscall and froze the whole VM
-#             for 27s until ETIMEDOUT (net_log errno=116 + Vita3K
-#             sceNetConnect 0x8041013C at +27s). Non-blocking is now set
-#             with sceNetSetsockopt(SCE_NET_SO_NBIO) at socket creation
-#             (client + server), restoring the EINPROGRESS -> select() ->
-#             NETWORK_*_SIGNAL wake chain the port was designed around.
-#         (b) vm_output.log rendered one-char-per-line: CLDC's
-#             PrintStream.write(int) invokes JVMSPI_PrintRaw PER CHARACTER
-#             (length==1) and the debug hook appended '\n' per call.
-#             JVMSPI_PrintRaw now writes the bytes verbatim (fwrite).
-#         Note: the sceNetInit 0x80410110 (EBUSY) + sceNetResolverCreate
-#         stub warnings in Vita3K are benign: newlib's gethostbyname
-#         lazily re-inits the net stack on the second launch round; the
-#         first init in vita_net_early_init() already succeeded.
-#
-# v01.34 (2026-09-08): RMS directory enumeration was a NULL stub.
-#         RecordStore.listRecordStores() -> getNumberOfStores ->
-#         pcsl_file_openfilelist() returned NULL -> OUT_OF_MEM_LEN ->
-#         OutOfMemoryError raised from native inside UC's startup
-#         state restore (observed as ao.a() NPE one frame up). First
-#         launch worked (creates go through pcsl_file_open/exist,
-#         both real); every subsequent launch died - deleting the
-#         appdb dir "fixed" it because the listing then legitimately
-#         returned empty. Implemented openfilelist/getnextentry/
-#         closefilelist with sceIoDopen/Dread/Dclose following the
-#         reference POSIX contract (root + match-prefix split, full
-#         path results). This also un-breaks midp_remove_suite's file
-#         cleanup loop and rmsdb_remove_record_stores_for_suite,
-#         which iterate the same way.
-#
-# v01.35 (2026-09-08): silence the misleading "file in use" noise from
-#         midp_remove_suite's cleanup loop. Vita3K maps SCE errno onto
-#         the wrong Windows errno table when it logs io_error_impl, so a
-#         plain ENOENT (0x80010002 = 0x80010000 | 2, "file does not
-#         exist") shows up as "Error code: 32 (another program is using
-#         this file)". The cleanup loop unlinks every enumerated entry
-#         unconditionally, so a target that vanished (or is only a
-#         filename prefix of a store) legitimately returns ENOENT.
-#         pcsl_file_unlink now treats "already gone" as success (probed
-#         with sceIoGetstat, no hardcoded code), so storage_delete_file
-#         stops printing the noise and the loop no longer aborts early
-#         on a vanished entry.
-#
-#         (net) vita_net.c: g_handles[] was a BSS global (zero-filled),
-#         so na_create() never found an fd==-1 free slot and returned
-#         NULL for EVERY non-blocking (EINPROGRESS) connect - the
-#         "connect EINPROGRESS -> select -> NETWORK_*_SIGNAL" wake chain
-#         silently died and real connects to web servers never completed
-#         (net_log: socket_open OK but no connect result for reachable
-#         hosts; only unreachable WAP proxy 10.0.0.172 logged the
-#         immediate ETIMEDOUT errno=116). Explicitly initialised the
-#         table to fd=-1.
-#
-# v01.36 (2026-09-08): the v01.35 ENOENT-tolerance patch was NOT enough.
-#         Verified against the user's exact Vita3K build (v0.2.1
-#         496939b6, io.cpp remove_file): the "Error code: 32" line is
-#         Windows' ERROR_SHARING_VIOLATION message verbatim - a REAL
-#         sharing violation, not an errno mis-mapping. Vita3K's
-#         open_file() holds a FILE* (_wfopen, no FILE_SHARE_DELETE) for
-#         every open fd, so a remove fails with Error 32 whenever ANY
-#         handle in-process still refers to the file; Vita3K then
-#         returns 0x80010002 for BOTH "not exist" and "in use", which
-#         is what misled v01.35. POSIX allows unlinking open files
-#         (phoneME's cleanup loops rely on it), Windows does not. Fix:
-#         an open-handle registry in vita_pcsl.c - pcsl_file_open
-#         registers, pcsl_file_close unregisters, and pcsl_file_unlink,
-#         when the remove failed and the file still exists, evicts all
-#         same-path handles (sceIoClose + fd=-1: the POSIX "name gone"
-#         state) and retries the remove once.
-#
-# v01.37 (2026-09-08): REVERTED the v01.36 eviction. Making the remove
-#         succeed turned out to be WRONG: midp_remove_suite's cleanup
-#         loop targets the appdb entries of the RUNNING temp suite
-#         (FFFFFFFF* = UC's live RMS data), and the sharing violation
-#         had been accidentally PROTECTING that data across launches.
-#         v01.36 evicted fds still held by Java code -> RMS files came
-#         back half-written -> second launch broke (NPE, ~1 fps).
-#         pcsl_file_unlink now reports the failure (file survives);
-#         the registry + evict helper stay in place unused for a
-#         future targeted fix (evict only on real uninstall).
-#
-# v01.38 (2026-09-08): init-slowness fix + noise halving. (a) The
-#         per-open debug_log() (open+write+close of debug_log.txt for
-#         EVERY pcsl_file_open, two lines on success) multiplied UC's
-#         init I/O by ~3x - hundreds of opens during RMS/config/skin
-#         restore each costing 3 extra syscalls plus a Vita3K trace
-#         line per syscall. Disabled behind VITA_FILE_DEBUG (default
-#         0). (b) pcsl_file_unlink no longer falls back to the app0
-#         copy when the ux0 file exists but is locked: the app0 remove
-#         always failed too, doubling the "file in use" log noise with
-#         zero benefit. Net effect: UC data-init is much faster and
-#         the remaining sharing-violation lines are one group per
-#         protected suite file (expected, harmless).
-# v01.40: EBADFD (0x80010051) seek storm fix
-#   - VitaFileHandle.path was 256 bytes: deep UC cache paths were
-#     silently truncated; pcsl_file_truncate's close+reopen then opened
-#     a nonexistent path, left fd=-1, and every later seek on the
-#     still-live handle returned EBADFD - UC lost its local cache and
-#     re-downloaded everything ("too slow"). path now 600 bytes (same
-#     as the abs_path buffers).
-#   - truncate reopen failure now recovers a usable fd (no O_TRUNC)
-#     so the handle never stays half-dead.
-# v01.41: Vita3K O_TRUNC blind spot - the REAL I/O adaptation gap
-#   - Vita3K's translate_open_mode() (io/src/filesystem.cpp) has NO
-#     SCE_O_TRUNC branch: every sceIoOpen maps to "rb+" and O_TRUNC
-#     is silently dropped. Our close+reopen(O_TRUNC) truncate NEVER
-#     shrank anything under the emulator - the saved prefix was
-#     written back over the first `size` bytes and the stale tail
-#     survived forever. RMS compact "succeeded" while garbage record
-#     headers lived past the new logical size -> slow/damaged second
-#     launches; sizeofopenfile kept reporting the OLD size.
-#   - pcsl_file_truncate now swaps via remove+create+write-back and
-#     VERIFIES the new file is 0 bytes before writing (a failed
-#     remove under Vita3K = sharing violation now reports failure
-#     instead of silently corrupting).
-#   - pcsl_file_open emulates O_TRUNC the same way for the
-#     OPEN_READ_WRITE_TRUNCATE path (suite temp files).
-#   - pcsl_file_seek/read/write/sizeofopenfile fail fast on dead
-#     handles (fd<0) with a one-shot stderr breadcrumb, killing the
-#     EBADFD syscall noise at its source.
-# NOTE: real-device 0x8010113D still unresolved; eboot.bin verified
-#   byte-identical to a clean `vita-make-fself -s -c` (no -m) and the
-#   SFO matches VitaSDK defaults - needs A/B testing on hardware.
-# v01.41a: fd leak fix in the O_TRUNC open recovery (close the new fd
-#   before free on the failure path) + held-file stderr breadcrumbs.
-# v01.42: long-session memory leaks - the 6h Vita3K crash hunt
-#   - menu_fb: vita_menu_run() memalign'd 2MB EVERY round and the
-#     static pointer overwrite leaked the old block (comment claimed
-#     "once per process" but the code ran per round). Allocate once,
-#     reuse across rounds.
-#   - icon textures: restore_kept() parks last round's decoded icons
-#     in icon_pix[]; both scan_games paths decoded straight into the
-#     slot, overwriting (and leaking) the parked texture. Free before
-#     decode.
-#   - build.sh: `make | tail` exit code came from tail - a failed
-#     make printed "Build successful" and shipped a stale VPK. Now
-#     pipefail.
-# v01.43: kill the residual "file in use" log triplet at the source -
-#   pcsl_file_unlink pre-checks the open-handle registry and SKIPS the
-#   sceIoRemove when one of OUR live handles holds the path (Windows/
-#   Vita3K cannot delete an in-process-open file anyway). Same honest
-#   failure for the caller, but Vita3K no longer logs
-#   "Cannot remove file / Error code: 32 / io_error_impl" every round
-#   for the live FFFFFFFF suite data.
-# v01.44: pcsl_file_getnextentry no longer returns subdirectories.
-#   The b194 log proved the remaining "Error code: 32" came from the
-#   cleanup loop unlinking the appdb/FFFFFFFF DIRECTORY itself (it
-#   matched the iterator's prefix and was handed back as a file).
-#   Directories are skipped now (same filter getsizeoffilelist uses).
-# v01.45: the b195 stderr/vita3k pair exposed TWO residual issues.
-#   (a) Root cause of the 23:55 Error-32: an EMPTY-NAMED record store
-#       gets NO .db/.idx suffix (buildSuiteFilename ignores the
-#       extension when nameLen==0), so its db handle AND idx handle sit
-#       on the SAME path (legal on POSIX). pcsl_file_truncate's
-#       remove+create swap closes only its own fd - the twin handle
-#       still anchors the name, Vita3K refuses the remove, and the
-#       swap must be aborted. Same guard added to pcsl_file_open's
-#       O_TRUNC emulation. Both now check vita_handles_held BEFORE
-#       touching the name and fail fast (no doomed sceIoRemove).
-#   (b) vita_report_held deduped breadcrumbs by PATH only, so the
-#       later "truncate blocked" for a path already reported as "unlink
-#       blocked" was swallowed and the stderr trail went cold. Dedup
-#       key is now op+path.
-# 01.51 (2026-09-11): "delete rms -> first launch fine, save a bookmark,
-#   second launch wedged in init". The damaged part is the record store's
-#   BLOCK CHAIN, not its header: bytes that are not a block header sit in
-#   the LIVE data region (a stale tail survives there because Vita3K drops
-#   SCE_O_TRUNC and pcsl_file_truncate is a logical clamp that dies with
-#   the handle), so every walk in the RMS index advances past the end of
-#   the data area and NO record is found - the MIDlet never finishes
-#   restoring its state. The header alone still passed the v01.50 check.
-#   (a) RecordStoreImpl.isBlockChainConsistent(): read-only chain check
-#       (every block positive, inside the data area, walk lands exactly on
-#       dbSize). compactRecords() now refuses to move data on an
-#       inconsistent chain - it used to relocate garbage and shrink
-#       data_size, the step that turned a readable store into a bricked one
-#       at CLOSE time, i.e. exactly between launch 1 and launch 2 - and the
-#       constructor resets a structurally broken store to a pristine empty
-#       one (the automatic equivalent of deleting the store, the only
-#       manual action that made the MIDlet start again).
-#   (b) RecordStoreIndex.getFreeBlock(): never return an offset inside a
-#       block that overruns the data area; report "no free block" so the
-#       record is appended at the end instead of overwriting live data.
-#   (c) vita_pcsl.c pcsl_file_seek(): report the REAL position again. The
-#       v01.47 clamp told the caller the file ended at the pending logical
-#       size while the fd had in fact moved past it, splitting the position
-#       the file cache tracks from the position the handle is at. Hiding a
-#       stale tail belongs to the read clamp and sizeofopenfile, which
-#       still do it.
-# 01.52 (2026-09-11): "second launch: records and bookmarks gone, same as
-#   first launch". The v01.51 chain-reset ERASED the user's data: the
-#   hexdump of the wiped store showed version=1 next_id=1 data_size=0 -
-#   the exact signature values of the v01.51 reset block - over a 5856
-#   byte file whose record blocks were still physically intact. Erasing
-#   was the wrong recovery: the mismatch the chain check detects is
-#   caused by the HEADER lagging the block writes (midp_file_cache holds
-#   small header writes in memory while the block data goes to disk;
-#   Vita3K drops SCE_O_TRUNC so a stale tail also survives), so the
-#   blocks themselves are almost always complete.
-#   (a) RecordStoreImpl.salvageStore() replaces BOTH reset blocks: scan
-#       the physical file to EOF block by block (NOT to the header's
-#       data_size - the header lies), dedupe by record id (a stale tail
-#       holds the OLD copy; compact moves data down so the lowest offset
-#       is newest), rewrite the live blocks densely from the top, rebuild
-#       the header from what was actually recovered (next_id never
-#       regresses), commitWrite() then truncate. A store with nothing
-#       salvageable ends up empty - identical to v01.51 - but everything
-#       recoverable is kept.
-#   (b) Third damage shape detected at open: header claims an EMPTY
-#       store while live blocks are physically present
-#       (physicalFileHasLiveBlocks probe, payload-verified so a garbage
-#       header past EOF cannot re-trigger it forever). This is exactly
-#       what a v01.51-wiped store looks like, so this very device's
-#       bookmarks are recoverable on the first launch of 01.52.
-#   (c) isBlockChainConsistent() now also cross-checks num_live (a lost
-#       header write after successful block writes made the old check
-#       pass while the index found no records).
-# 01.60 (2026-09-14): JSR 75 (javax.microedition.io.file / FileConnection).
-#   A Vita-local subsystem under samples/j2me/jsr75 - the spec's interface
-#   signatures only, every line of implementation written here. 9 Java
-#   sources (5 public javax.microedition.io.file types, FileStore,
-#   FileConnectionImpl, FileSystemRegistryImpl, the "file" GCF Protocol)
-#   plus 21 natives in jsr75/src/share/native/jsr75_file.c, wired into the
-#   MIDP build by jsr75/build/cldc_application/subsystem.gmk and
-#   USE_JSR_75=true in phoneme-midp/build_vita.sh - no shared phoneME file
-#   was touched, ROMImage/nativeFunctionTable pick the natives up
-#   automatically because ROMGEN synthesises Java_<class>_<method>.
-#
-#   Root policy: one root only, the launcher's cwd ("ux0:/data/J2ME00001"),
-#   so JSR 75 and the PCSL layer resolve the same paths by construction.
-#   FileSystemRegistryImpl reports it as "file:///data/".
-#
-#   Byte I/O goes through the port's PCSL file API; the directory, time and
-#   volume natives go to sceIo* directly, because the pcsl_directory group
-#   v01.59 added lives in the executable (vita_pcsl.c) and is not in the
-#   PCSL set libmidp.so links against - the .so link reported them as
-#   undefined until they were replaced.  A missing second piece: the
-#   shared-object step of the makefile also fails on the pre-existing
-#   _rom_linkcheck_mffd_false, which the real (CMake) executable link
-#   resolves; JSR 75 does not change that state.
-#
-#   Verified: javac clean (source 1.3), classes.zip carries all 4 packages,
-#   ROMImage_01.cpp carries the 21 ROMized natives references,
-#   nativeFunctionTable.cpp 45 mentions, and nm on midp_vita shows the 21
-#   Java_com_sun_midp_jsr075_* symbols.  Not yet run on Vita3K/real
-#   hardware - the FileConnection runtime behaviour is untested.
-set(VITA_VERSION  "01.60")
-# 01.61 (2026-09-14): JSR 75 - listRoots() handed out a URL instead of a
-#   root name.  JSR 75 says a root is "a root name ending with '/'" that
-#   the caller concatenates with "file:///" to build a URL; returning
-#   "file:///data/" made every caller that follows the documented recipe
-#   ask for "file:///file:///data/", which resolvePath() rightly rejects
-#   (root name != "data") - the MIDlet sees an Alert and exits, i.e. the
-#   "launched then immediately done" symptom, before it ever opens a
-#   connection.  FileSystemRegistryImpl now returns "data/" and keeps
-#   ROOT_URL ("file:///data/") for the protocol layer; no other JSR 75
-#   path changed.
-#
-#   Same version, diagnostic-only: System.out tracing on the three JSR 75
-#   entry points (listRoots, Protocol.openPrim, FileConnectionImpl's
-#   constructor/listEntries) plus startApp enter/return/throw in
-#   MIDletStateHandler.  startApp exceptions are re-thrown into
-#   handleException(), which calls printStackTrace() on System.err - and
-#   CLDC's System.err *is* System.out (System.java), so an exception can
-#   never be silent in ux0:/data/vm_output.log; when that log shows no
-#   trace the MIDlet ended normally and the tracing is what tells us how
-#   far it got.
-set(VITA_VERSION  "01.61")
-# 01.62 (2026-09-14): JSR 75 - the spec's own "is it there?" probe.
-#   microedition.io.file.FileConnection.version was never defined, and that
-#   is exactly how a file manager decides whether JSR 75 exists before
-#   calling into it.  MiniXplorer reaches startApp, returns from it
-#   normally, yet never issues a single Connector/FileConnection call - the
-#   [JSR75] tracing was live in the v01.61 run and stayed silent - and
-#   leaves a screen whose only soft key is "Done", which phoneME produces
-#   from AlertLFImpl alone, i.e. an Alert the MIDlet itself raised.  The
-#   property now comes from config/system.config, the port-owned
-#   application-property file: midp_properties_dynamic.c's
-#   getSystemProperty() searches only that set, which is also why
-#   internal.config's "PS Vita" does not shadow the "j2me" the Connector
-#   resolution needs.
-#
-#   Diagnostic-only: Alert title/text and the MIDlet state loop's destroy /
-#   exit paths now log, so the next run says both what is on screen and
-#   whether the MIDlet is still alive.  Both sets of tracing come back out
-#   later.
-set(VITA_VERSION  "01.62")
-# 01.63 (2026-09-14): JSR 75 - resolvePath() rejected the spec's own URL
-#   syntax.  JSR 75 spells a file URL "file://<host>/<root>/<path>", the
-#   host of the local device being "localhost", and a MIDlet that follows
-#   the documented "file://localhost/" + root recipe (MiniXplorer does
-#   exactly that with the name it just got from listRoots()) was answered
-#   with IllegalArgumentException "not a file URL" - the URL did not start
-#   with the hard-coded "file:///" prefix.  Every directory open then
-#   failed, and MiniXplorer's own error path appended the root name again
-#   and again, so the log shows an unbounded "file://localhost/data/data/
-#   data/..." cascade.  resolvePath() now parses the authority and accepts
-#   both "localhost" and the empty one; every other host still names a
-#   device this single-root port does not expose.  No other JSR 75 path
-#   changed.
-#
-#   The headless Alert seen in the same logs ("This application does not
-#   use the screen and runs in the background.", ResourceConstants
-#   LCDUI_DISPLAY_HEADLESS) is phoneME's own CldcMIDletStateListener /
-#   HeadlessAlert notification, not a MIDlet diagnostic: it is only
-#   brought to the foreground when startApp() returns with
-#   Display.getCurrent() == null, which is why the earlier run's "Done"
-#   screen was a symptom of the MIDlet dying, not its cause.
-set(VITA_VERSION  "01.63")
-# 01.64 (2026-09-14): JSR 75 - diagnostics out, fixes in.  v01.63 was
-#   verified in Vita3K: MiniXplorer starts, listRoots() is consumed, and the
-#   directories it could not open now open.  The temporary tracing that made
-#   that possible is gone - the [ALERT] lines in Alert, the [MIDLET]
-#   startApp/destroyApp/state-loop lines in MIDletStateHandler, the [JSR75]
-#   lines in Protocol / FileConnectionImpl / FileSystemRegistryImpl - so the
-#   only JSR 75 sources left modified are the two that carry real fixes:
-#   FileSystemRegistryImpl (root name from listRoots, authority parsed by
-#   resolvePath) and the javadoc of the javax FileSystemRegistry facade.
-#   Note that MIDletStateHandler's [MIDLET] creating/created/FAILED/startSuite
-#   lines are NOT tracing: they date from the 2026-08-31 baseline commit
-#   (8a04358) and stay.
-#
-#   Keep the lesson: adding printlns to a large AOT-compiled method moves its
-#   literal pool and can hit the 12-bit limit - that is what crashed romgen -
-#   so future diagnostics belong in small methods or on code paths romgen
-#   does not compile.
-set(VITA_VERSION  "01.64")
-# 01.65 (2026-09-14): two things a file manager MIDlet needs.
-#
-#   (1) The JSR 75 roots are the storage volumes, not the launcher's data
-#   directory.  listRoots() hands out "ux0/", "imc0/", "uma0/" (the last
-#   two only when the card answers a directory probe) and "app0/", and
-#   file:///ux0/data resolves to the absolute path ux0:/data.  The single
-#   "data" root is gone - the data directory is reachable as
-#   ux0/data/J2ME00001 - so MiniXplorer can browse the whole device
-#   instead of one directory of it.  availableSize()/totalSize() now take
-#   the target path and report the capacity of the volume it lives on,
-#   and FileStore.isDirectory() recognises a volume root even though
-#   sceIoGetstat does not always set IFDIR on one (it opens the root
-#   instead, which also answers whether the volume is mounted).
-#
-#   (2) The UI font is a J2FB v2 bank: the Latin sections come from
-#   DejaVu Sans at 20 px with 8-bit coverage and per-glyph advances, the
-#   CJK sections stay 1-bit DengXian at 18 px.  Latin is proportional now
-#   ('.' is 5 px, 'A' is 12) and every glyph is placed against the
-#   baseline, so descenders and punctuation sit where they belong instead
-#   of hanging from the top of the cell.  The bank is generated by
-#   tools/fontgen.c + tools/gen_font.sh and is the only font asset in the
-#   VPK: the 16 MB font.ttf the old build shipped is no longer needed, so
-#   the package went from 13.7 MB to 3.6 MB.
-set(VITA_VERSION  "01.65")
-# 01.66 (2026-09-14): ideographs are rasterised at 20 px too, not 18.
-#
-#   The v01.65 bank baked the CJK sections from DengXian at 18 px while
-#   the line box is 22 rows with the baseline 18 rows down.  An
-#   ideograph's ink is about 0.85 em, so 18 px gave only 15 rows of ink;
-#   placed on the baseline it covered rows 5..19 and left 5 blank rows
-#   above it.  Chinese therefore looked small and sat sunk at the bottom
-#   of the line, and the pen advanced the 18 px the face asks for, which
-#   is 2 px tighter than the cell.  Latin was unaffected - its ink hugs
-#   the baseline - which is why only Chinese looked wrong.
-#
-#   At 20 px the ink lands on rows 3..20 (inside the cell: the tallest
-#   ideographs reach row 20 and nothing is clipped), the section advance
-#   comes out at the 20 px cell width again, and the strokes survive the
-#   1-bit threshold better.  Only the CJK sections changed - the header,
-#   the Latin advance tables and the Latin bitmaps are byte identical to
-#   the v01.65 bank, so English is bit-for-bit the same.
-set(VITA_VERSION  "01.66")
-# 01.67 (2026-09-14): real-hardware boot crash fix - PIC veneers.
-#   Both real-hw coredumps (v01.65 and v01.66, fw 3.65 + plugins) died
-#   BEFORE main(): the loader slides the code segment (+0x72000 observed)
-#   and the RW segment (+0x120000) and applies the ELF relocations, but
-#   ld's default long-range ARM->Thumb interworking veneers carry an
-#   absolute literal with NO relocation entry (38 veneers, 0 relocs).
-#   The 4th .init_array ctor branches through ____aeabi_atexit_from_arm,
-#   jumps to the stale link-time address and data-aborts - which is why
-#   no log file (boot_log/crumb/net_log/vm_output) ever appeared.
-#   -Wl,--pic-veneer turns all 38 into pc-relative sequences; verified
-#   reloc count unchanged, Vita3K unaffected (it never slides segments).
-set(VITA_VERSION  "01.67")
-# 01.68 (2026-09-15): real-hw black screen after boot fix - CDRAM fbs.
-#   The pic-veneer fix (01.67) got the app past static ctors on real hw
-#   (boot_log.txt now appears) but the screen stayed black: both the
-#   native menu framebuffer and the LCDUI vita_fb were memalign()ed
-#   heap buffers, i.e. normal CACHEABLE user memory. On real hardware
-#   the Cortex-A9 D-cache keeps the CPU writes in-cache while the
-#   display controller scans main memory, so the panel never sees a
-#   single pixel. Vita3K does not emulate caches (same class of
-#   emulator-only success as the veneer bug). Both buffers now come
-#   from sceKernelAllocMemBlock(USER_CDRAM_RW) via the new
-#   vita_fbmem.h helper - the mapping is UNCACHED on the CPU side, the
-#   pattern every official SDK sample (debugScreen/camera/ime) uses.
-set(VITA_VERSION  "01.70")
-# 01.71 (2026-09-15): ToneTest hang diagnostics - instrument the three
-#   decision points of the "one beep then dead" freeze. Facts so far:
-#   vm_output.log ends at "stg1: playTone returned" and every timed
-#   waiter after that (2.5 s stage timer, 1 Hz heartbeat, 60 s
-#   watchdog) never fires, yet an earlier session logged button
-#   samples while the app appeared hung - so the VM thread MIGHT still
-#   be pumping. Three suspects need separating:
-#   H1 stuck in a blocking native before the ANI wait (repaint path),
-#   H2 wall clock (gettimeofday == Os::java_time_millis source) froze,
-#   H3 stuck inside ANI_WaitForThreadUnblocking.
-#   Probes (all lightweight, all to ux0:/data/J2ME00001/):
-#   - input heartbeat now carries ms= + CE=/ani= counters, so one line
-#     proves pump liveness AND clock liveness at the same instant
-#   - ani_mark.log is a watchdog slot: every ANI enter/leave pwrites
-#     over byte 0; the last state written is where the VM thread sits
-#   - audio_debug.log now APPENDS (was TRUNC: every hard restart
-#     destroyed the previous session's tone records - the ToneTest
-#     audio evidence was erased by the next app's startup)
-#   - tone_player_thread logs req/done with chunk counts, and any
-#     sceAudioOutOutput error code
-set(VITA_VERSION  "01.71")
-# 01.72 (2026-09-16): hang forensics watchdog - v01.71 verdict first:
-#   log4 proved ani_mark ends "OUT" (not inside the ANI wait -> H3 out),
-#   the pump froze for good at CE #115 (~4.4 s) in the last round, and
-#   the tone thread finished every chunk (audio innocent). But the
-#   heartbeat samples only once per 1024 pump calls (~40 s), so H2
-#   (clock freeze) was never actually excluded - the hang lands at
-#   2-10 s, between samples. What remains: (a) VM thread blocked in a
-#   kernel wait, or (b) VM thread running hot (Java/GC loop, never
-#   blocks, never pumps). ONE snapshot tells them apart.
-#   New vita_watchdog.c: low-prio thread watches vita_ce_count; when it
-#   stalls >3 s during a MIDlet round it snapshots the VM and tone
-#   threads via sceKernelGetThreadInfo (status + waitType + waitId -
-#   the wait class names the blocking primitive: io/mutex/cond/delay/
-#   semaphore) and takes two gettimeofday readings 100 ms apart (d==0
-#   -> clock frozen -> H2 on the spot). One report per hang, appended
-#   to ux0:/data/J2ME00001/watchdog.log.
-set(VITA_VERSION  "01.72")
-# 01.73 (2026-09-16): watchdog v2 - log5 lesson. The v01.72 watchdog stayed
-#   SILENT while the pump froze with the exact log4 signature (ani_mark
-#   "OUT", pump dead after touch events). watchdog.log did not even exist.
-#   Two failure modes, both fixed:
-#   1. silent startup: thread-create failure returned without a trace, and
-#      nothing proved the thread ever ran. Now every outcome writes a line:
-#      "[WD] alive tid=... start rc=..." at startup, "[WD] create FAILED"
-#      on error.
-#   2. clock-blind detection: the 3 s stall threshold was measured with
-#      gettimeofday - if H2 (clock freeze) is real, the threshold can
-#      never be reached and the watchdog is blind to its own target
-#      scenario. Detection now counts poll ITERATIONS (12 x 250 ms),
-#      clock-free; the dual gettimeofday readings stay in the report as
-#      H2 evidence (d==0 -> frozen clock).
-set(VITA_VERSION  "01.73")
-# 01.74 (2026-09-16): log6 verdict - [WD] create FAILED rc=0x80028023 on
-#   every boot: SCE_KERNEL_ERROR_ILLEGAL_PRIORITY. Real hardware rejects
-#   0x10000300 (Vita3K accepted it - emulator gap, again). Watchdog
-#   priority lowered to 0x10000150, inside the band this project has
-#   verified on hardware for months (cldc_ticker / j2me_tone at
-#   0x10000100; numeric higher = lower priority, so the watchdog stays
-#   the most pre-emptable thread in the process).
-set(VITA_VERSION  "01.74")
-# 01.75 (2026-09-17): code-review pass on vita_watchdog.c against the
-#   vitasdk headers (no behaviour change on the happy path):
-#   - thread stack 0x2000 -> 0x4000 (matches j2me_tone, the project's
-#     verified floor; a stack overflow gets the thread kernel-killed,
-#     i.e. a silently dead watchdog)
-#   - HANG report samples BOTH clocks now: gettimeofday AND
-#     sceKernelGetSystemTimeWide - if H2 is real, WHICH one froze names
-#     the broken layer (newlib/sceRtc chain vs kernel time)
-#   - cpuAffinityMask uses SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT
-#   - dropped unused <psp2/kernel/processmgr.h> include
-set(VITA_VERSION  "01.75")
-# 01.76 (2026-09-17): code-review pass on the audio path + dead-file purge:
-#   - alog() spinlock is now ATOMIC: the old "while (lock)...; lock = 1;"
-#     was check-then-set, racy on the Vita's 3 user cores - and alog IS
-#     called concurrently (VM thread + tone thread). A garbled line in
-#     audio_debug.log would poison the hang-hunt evidence. Now
-#     __sync_lock_test_and_set/__sync_lock_release (ARMv7 ldrex/strex).
-#   - j2me_tone thread: bare-0 affinity ->
-#     SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT (matches watchdog).
-#   - DELETED src/vita_audio.c: dead file, never in the build; its
-#     sceAudioOutOpenPort call misused param 2 as "channel count" (it is
-#     samples-per-call) - a landmine if anyone ever compiled it in.
-set(VITA_VERSION  "01.76")
-# 01.77 (2026-09-17): Graphics/input review round (no IO round - that was
-#   01.76; memory audit came back clean, no code change needed there).
-#   - vita_display.c flip_to_display: after the NEXTFRAME submit it now
-#     calls sceDisplayWaitVblankStart() before handing the buffer back
-#     as the new back buffer. NEXTFRAME only takes effect at the next
-#     vblank; until then scanout still reads the old front, so a fast
-#     repaint loop could blit into the just-swapped buffer before the
-#     flip landed and tear the frame. menu_flip() always paired the two;
-#     display side now matches. Also caps refresh at 60 Hz (fine for a
-#     software blit).
-#   - flip_to_display now checks sceDisplaySetFrameBuf's return code and
-#     logs it once per process to stderr (menu_flip already did; this is
-#     how the 01.69 IMMEDIATE 0x80290006 on fw 3.65 was found).
-#   - lfjport_ui_finalize: comment documenting the one-frame scanout
-#     window on release (left as-is; runs only at VM shutdown).
-#   - vita_input.c ring_push: comment nailing down the SPSC invariant
-#     (exactly one producer AND one consumer, both the VM thread today).
-set(VITA_VERSION  "01.77")
-# 01.78 (2026-09-17): TV-style tab menu (vita_menu.c rewrite of the
-#   main loop; scan/install/dialog internals untouched).
-#   Left tab column (已安装/未安装/文件/设置/退出) + right content area.
-#   - 已安装: classic list OR 4x3 icon grid (SQUARE or 设置 tab
-#     toggles; persisted in ux0:/data/J2ME00001/menu.cfg, one byte
-#     'l'/'g'). Grid supports dpad left/right/up/down-by-row and taps.
-#   - 未安装: scans inbox/ at menu start and after every install
-#     (this IS the "auto scan + cache" - the jars stay on disk, the
-#     scan is a cheap dopen walk). X installs all, tap installs one.
-#   - 文件: sandboxed browser rooted at ux0:/data/J2ME00001 (dirs
-#     first with a virtual "..", .jar rows highlighted; X/tap on a
-#     jar installs it via the same rename+cfg path as inbox).
-#   - 设置: game view toggle + ux0 free/total (sceAppMgrGetDevInfo) +
-#     games/inbox counts + JIT hint + data dir.
-#   - 退出: X or tap quits to launch.cfg/bundled tests (TRIANGLE on
-#     the games tab still works).
-#   - Tabs switch with L/R shoulder or by tapping the tab column;
-#     touch normalized via sceTouchGetPanelInfo exactly like
-#     vita_input.c (real hw 1920x1088 -> 960x544).
-#   - Messages auto-expire after 4 s instead of sticking forever.
-#   Untouched on purpose: game scan/cache/dialog, install_inbox,
-#   icon cache, CDRAM fb lifecycle, heartbeat/crumb diagnostics.
-set(VITA_VERSION  "01.79")
-# 01.80 (2026-09-18): 已安装 tab dpad fix - see the long comment above
-#   the 01.78h entry: v01.78f's `tab == 0 && GRIDMODE` first branch let
-#   the LIST case fall through to the tab-4 `else` (has_cursor = 0), so
-#   UP/DOWN moved nothing on the installed tab. Heartbeat now logs
-#   tab/focus/view.
-set(VITA_VERSION  "01.80")
-# 01.81 (2026-09-18): log7 forensics round 1 - the hang watchdog has
-#   NEVER RUN on real hardware.
-#   log7 (v01.80 session): every MIDlet round hung (4/4, zero
-#   "runMidlet returned"), menu healthy as always; watchdog.log still
-#   shows `[WD] create FAILED rc=0x80028023` x5 - so v01.74's
-#   0x10000150 "fix" failed exactly like 0x10000300 did, and every
-#   v01.71-v01.75 hang report we never saw was actually "no watchdog".
-#   The ONLY priority empirically proven on this fw 3.65 unit is
-#   0x10000100 (j2me_tone + cldc_ticker create AND run with it; tone
-#   req/done pairs in audio_debug.log prove execution). There is no
-#   verified "legal band" - that assumption was wrong twice. The
-#   watchdog now uses 0x10000100 too (it sleeps 250 ms at a time on a
-#   3-core machine; same priority as the VM thread cannot starve it).
-#   Also: input heartbeat sampling 0x3FF -> 0x3F (every 64 pumps,
-#   ~1-3 s) so a frozen gettimeofday shows as stuck ms= lines BEFORE
-#   the log goes silent - the v01.73 H2 hypothesis (clock freeze,
-#   never ruled out) becomes directly readable from input_debug.log.
-#   Expected after this build: watchdog.log starts with `[WD] alive`,
-#   and the NEXT hang produces the full report (vm/tone/wd thread wait
-#   states + dual clock sample) that finally discriminates
-#   blocked-in-native vs spinning-in-userland vs frozen-clock.
-set(VITA_VERSION  "01.81")
-# 01.82 (2026-09-18): log8 - the watchdog finally ran, and its first two
-#   HANG reports rewrote the case file:
-#   - H2 (frozen clock) is DEAD: clock d=100 (exactly the 100ms sample
-#     gap), kclock kd=100062us - both clocks alive during the hang
-#   - THE line: vm 'J2ME00001' status=RUNNING wait=none - the VM thread
-#     is in NO kernel wait at all. It is spinning in USERLAND.
-#   - hang points (consistent with log7's mid-println truncations):
-#     file manager froze during startApp (CE=342), ToneTest froze between
-#     stg1 and stg2 (CE=206, ani 192/192 balanced - not inside the ANI
-#     wait). In every session the process ended in a force-kill; zero
-#     "runMidlet returned" since log3.
-#   The kernel API cannot see WHERE in userland it spins. A coredump
-#   can: faulting PC + stack memory name the exact interpreter/GC/native
-#   site. So the watchdog now deliberately triggers a data abort (write
-#   to the read-only .text base) right after logging the HANG report:
-#   the process dies, the system writes psp2core-*.psp2dmp, and the
-#   dump's VM-thread PC is the first hard address of this bug in 5
-#   sessions of hunting. Deliberate process death is acceptable - every
-#   hung session so far ended in a force-kill anyway, and the dump is
-#   worth more than a frozen process.
-#   Next session procedure: reproduce the hang, copy BOTH the new
-#   psp2core-*.psp2dmp AND the logs into debug/logs/log9/.
-set(VITA_VERSION  "01.82")
-# 01.83 (2026-09-18): log9 coredump ROOT CAUSE CLOSED. The dump pinned
-#   the VM thread at pc=start_lightweight_thread_asm+0x8 with lr=stub
-#   entry, sp at the dispatch frame ([sp]=JVM::start+0x178, right after
-#   `bl primordial_to_current_thread`), r1=0 (no TERMINATING) - i.e. the
-#   scheduler handing a NEVER-RUN green thread to its bootstrap stub.
-#   Combined with CE frozen for 3s, RUNNING wait=none, and stale frames
-#   showing the last real activity was a thread switch during early
-#   class-loading (fread chain + adjust_priority_list/set_current/
-#   on_task_switch), the only self-consistent picture is a thread
-#   create/die cycle spinning through the bootstrap stub with no
-#   interpreter tick checkpoints in the loop. In that state the VITA
-#   pump gate in Scheduler::wake_up_timed_out_sleepers
-#   (_timer_has_ticked || _estimated_event_readiness > 0) never opens:
-#   _estimated_event_readiness only decrements INSIDE
-#   check_blocked_threads, and the cldc_ticker can starve. Fix (VM
-#   side, phoneme-cldc Scheduler.cpp): wall-clock backstop - any loop
-#   through yield() drives JVMSPI_CheckEvents at least every 50ms.
-#   The pump's ANI wait then really sleeps, throttling the cycle and
-#   letting input/events flow again. Also: OS_vita.cpp counts ticks in
-#   vita_tick_count and the watchdog HANG report prints it, so the next
-#   hang (if any) separates "ticker dead" from "gate closed".
-set(VITA_VERSION  "01.83")
-# 01.84 (2026-09-20): log10 coredump round - the case REVERSED. The dump
-#   (HANG ce=337 polls=12 tick=745) proves the cldc_ticker never stopped
-#   (745 ticks ~= the full 7.5 s session), so ticks were DELIVERED but
-#   never consumed: the interpreter ran no bytecode for the last 3+ s and
-#   yield() was never called - otherwise the v01.83 wall-clock backstop
-#   inside yield() would have fired. The spin therefore lives in native
-#   C++ code on a green thread's Java stack (the OS stack only shows the
-#   dispatch frame at start_lightweight_thread_asm+4, and the Java heap
-#   is not part of the coredump), so the dump physically cannot name the
-#   loop. v01.84 adds the site ring: vita_site_mark() records one return
-#   address per call at native entry points on the death path
-#   (finish/force_terminated/lightweight_thread_exit/thread_task_cleanup/
-#   cleanup_terminated_task) plus GC (ObjectHeap::collect), class verify
-#   (Verifier::verify_class) and class-file reads (JarFileParser::
-#   open_entry). On HANG the watchdog dumps the 16-slot ring to
-#   site_ring.log (sceIo*, no stdio) before requesting the coredump:
-#   frozen seq + repeated tail addresses = the loop, addr2line-able.
-#   NB: mark is deliberately NOT on Scheduler::yield - log10 proved the
-#   loop bypasses yield, and a yield site would only flood the ring.
-set(VITA_VERSION  "01.84")
-# 01.85 (2026-09-20): log11 - THE RING SPOKE. site_ring.log (seq=10
-#   frozen=yes) decoded with the self= anchor (slide 0x80FFB040): the
-#   last two distinct sites alternate JarFileParser::open_entry+28 and
-#   JVMVerifier::verify_class+24 - a normal class-load rhythm - and the
-#   FINAL event is verify_class entry, followed by 3+ s of total silence
-#   (no GC collect, no thread death, no next open_entry). The spin is
-#   INSIDE the bytecode verifier, running on the green thread's Java
-#   stack: invisible to the coredump (core11 vm thread still parked at
-#   start_lightweight_thread_asm+0x14) and to the OS stack residue
-#   (verified: zero verifier frames there). v01.85 adds verifier deep
-#   tracing: verify_class_internal records the class name,
-#   VerifyMethodCodes::verify records the method name (dumped on HANG
-#   via site_ring.log "verify class=... method=..." line), plus two
-#   phase marks in the ring (verify_class entry/return, iterate begin)
-#   so the next dump names the exact loop.
-set(VITA_VERSION  "01.86")
-# 01.86 (2026-09-20): log12 - ROOT CAUSE FOUND AND FIXED. The ring named
-#   com/app/filemanager/UI*.<clinit> frozen in verification, and the
-#   trigger-chain walk closed the case: UseVerifier defaults to TRUE
-#   (Globals.hpp:292), so Universe::load_jar_entry verified EVERY
-#   lazily-loaded jar class on the VM thread. The 12 identical ring
-#   entries = 12 classes verified back-to-back during gameplay; UI*'s
-#   <clinit> hit the verifier's quadratic stackmap scan
-#   (get_stackmap_index_for_offset) and froze the VM for seconds while
-#   the ticker stayed alive (matches log9..log12 exactly: ticker alive,
-#   CE frozen, yield never called, spin invisible to coredump). Java-side
-#   verify paths were all dead ends (VERIFY_ONCE=false). Fix: midp_run.c
-#   calls JVM_SetUseVerifier(FALSE) before midpRunVm under #if
-#   defined(VITA) - MIDlet jars are WTK-preverified (J2ME spec), runtime
-#   re-verification is redundant. Also fixes the v01.85 Symbol-name bug:
-#   Symbols are length-prefixed, NOT NUL-terminated, so the name copy ran
-#   past the end (the garbage after "com/app/filemanager/UI" in log12);
-#   vita_site_verifier_class/method now take an explicit length.
-# 01.87 (2026-09-20): log13 - the v01.86 fix NEVER SHIPPED. boot_log
-#   showed v01.86 b274, but site_ring.log still showed "verify
-#   class=com/app/filemanager/UI method=<clinit>" with the SAME 12-mark
-#   pattern as log12 - yet with a CLEAN class name, proving the cldc
-#   side (rebuild_vm.sh -> libcldc_vm.a) was new while the verifier
-#   stayed on. The midp side was never rebuilt: midp_run.o in libobj.a
-#   was dated Sep 14 (5 days older than the v01.86 source edit), because
-#   the v01.86 edit used JNI_FALSE which does NOT exist on the midp side
-#   (only KNI_FALSE from kni.h) - the single-object recompile FAILED
-#   with "'JNI_FALSE' undeclared", the error went unnoticed, and the VPK
-#   silently linked the stale Sep-14 object. Fix: KNI_FALSE + full midp
-#   rebuild (rm midp_run.o first), verified U JVM_SetUseVerifier now in
-#   libobj.a's midp_run.o. Lesson recorded: after ANY midp-side source
-#   edit, build_vita.sh must be run and its COMPILE ERRORS checked - a
-#   failed compile leaves the old .o in libobj.a.
-# 01.88 (2026-09-20): log14 - VERIFIER CONFIRMED OFF, SPIN MOVED INTO
-#   CLINIT EXECUTION. site_ring.log: "verify class=(none)" and only 3
-#   open_entry marks (seq=3) - but the game ran 345 frames (~5 s,
-#   input HEARTBEAT + menu hb logs) before the freeze, so the round
-#   progressed far past v01.86/87 boots. THREAD_REG_INFO from the log14
-#   coredump: VM OS thread parked at start_lightweight_thread_asm
-#   (dispatch frame, same as log11) => the spin is on a green thread's
-#   Java stack - now inside the EXECUTION of the 4th lazily-loaded
-#   class's <clinit>, not its verification. Also unified the VPK output
-#   into out/vpk/ (midp_vita.vpk + midp_vita_v<ver>.vpk, POST_BUILD
-#   copy). New forensic hook: vita_site_clinit_class() records the
-#   class whose clinit is about to run; the watchdog HANG dump appends
-#   "clinit class=..." to site_ring.log.
-# 01.89 (2026-09-20): log15 - CULPRIT CLASS NAMED. site_ring.log:
-#   "clinit class=com/app/filemanager/UI" with the ring showing 13
-#   clinit marks interleaved with 3 open_entry marks (seq=38) - a
-#   class-load STORM inside UI.<clinit>: the static initializer keeps
-#   triggering new lazy class loads and never returns. Same shape as
-#   the frozen register set as log11/14 (VM parked in dispatch frame,
-#   spin on the green-thread Java stack). Note the watchdog's depth
-#   forensics: v01.89 adds a 16-slot clinit HISTORY ring + depth
-#   counters (storm of sequential clinits vs deep recursive chain) +
-#   a return hook in set_initialized, all dumped on HANG.
-# 01.90 (2026-09-20): log16 - THIRD keypress (UP) freeze; storm CONFIRMED
-#   but depth=0 was an artifact (set_initialized is also called by
-#   bootstrap_initialize for ROM classes, silently decrementing).
-#   Fixes/forensics this round:
-#   (a) clinit return hook moved to Java_java_lang_Class_init9() - the
-#       real "clinit finished" point (what Class.invoke calls after
-#       <clinit> ran);
-#   (b) vita_gc_count: GC pass counter (a stop-the-world GC spin is
-#       invisible to every current hook - coredump has no Java heap);
-#   (c) watchdog PROGRESS-AWARE: clinit/GC counters advancing = "storm
-#       in progress", not "dead" - keeps the round alive up to ~30 s
-#       (WD_STORM_MAX_POLLS) instead of killing at 3 s. This directly
-#       addresses "real HW dies, emulator/old phones don't": the same
-#       storm on the emulator's x86 JIT + host fs finishes sub-second;
-#       vendor KVMs preloaded whole jars into RAM; we do neither, so a
-#       slow storm was misreported as a hang and abort'ed.
-# 01.91 (2026-09-20): log17 - the case is CLOSED at instruction level.
-#   First non-parking freeze point: PC=invoke_pending_entries+0xc
-#   (the pending_entries NULL test itself, r1=0 = about to return),
-#   LR=start_lightweight_thread_asm+0 (the address every green thread
-#   starts from - setup_stack_asm plants it). Single-shot sampling hit
-#   the same path 3 dumps in a row => the VM thread cycles through
-#   green-thread first-scheduling at high frequency. Decisive: the
-#   site ring froze on JVMInstanceClass::clinit+0x34 (x13) alternating
-#   with JarFileParser::open_entry+0x1c (x3) - a lazy class-load chain
-#   (clinit -> open_entry -> define -> next clinit, count=35 in log16)
-#   running in the native pending-entry loop: no interpreter tick
-#   checkpoint, no yield() pump backstop, CE starves, watchdog kills.
-#   Fix (phoneme-cldc ec747ab): EAGER class preload at VM start -
-#   JVM::load_main_class now calls Universe::load_all_in_classpath
-#   (the romizer's own upstream walk) before the first byte runs.
-#   Define-only, no initialize: <clinit> chains stay in the
-#   interpreter and every later resolve hits the dictionary instead
-#   of real ux0: I/O. vita_preload_count feeds the watchdog (preload
-#   advancing = boot sweep in progress, wait without deadline); the
-#   STORM log line gains preload=%u and the site-ring stats line
-#   gains preload=%u.
-# 01.92 (2026-09-20): log18 - v01.91 regression root-caused WITH A CORE
-#   DUMP, not by guessing. vm_boot.log: "[preload] begin" present,
-#   "[preload] done" MISSING. Watchdog: one STORM line (preload=28),
-#   then HANG at 3 s with a core dump. Site-ring stats: preload=303
-#   (sweep did advance 28 -> 303 between the STORM line and the dump).
-#   The core's VM thread: PC=sceIoWrite+8, LR=_write_r - frozen INSIDE
-#   the write syscall, and the write buffer still holds
-#   "POST_NATIVES idx=166 oop=0x812143f8 klass_bytes=[4d 6f 64 65 ...]".
-#   Root cause: ClassFileParser.cpp carried uncommitted-looking (but
-#   committed in 016e041) DEBUG dumps - PRE_NATIVES/POST_NATIVES print
-#   one stderr line PER CONSTANT-POOL ENTRY, unconditionally, for every
-#   class with natives. Before the sweep, only classes loaded lazily
-#   triggered them (stderr was a constant 1644 bytes in log10..log17);
-#   the v01.91 boot sweep parses every jar class up front => 713 dump
-#   lines / 52 KB in log18, each fprintf its own sceIoWrite on the
-#   unbuffered stderr stream. Hundreds of back-to-back small writes
-#   starved the ux0: storage stack (Vita3K's host FS hides this -
-#   microsecond latency). Fix: delete the two dump loops, keep the
-#   conditional CORRUPT scanners (silent unless actually corrupt).
-#   Also: watchdog preload grace is now bounded (extension counter,
-#   same WD_STORM_MAX_POLLS cap) so a stalled sweep can never again
-#   run past the deadline without producing a core dump.
-# 01.93 (2026-09-20): log19 - v01.92 verified working (preload begin/done
-#   both present, stderr 3924 B with 29 BEFORE/AFTER_NATIVES pairs and
-#   zero dumps), but the freeze returned in its OLDEST form (log9/16/17
-#   family). Forensics, this time instruction-level: PC=
-#   start_lightweight_thread_asm+0x10 (the tst/bleq pair), LR=entry ->
-#   the dump caught a FRESH call: the VM was re-entering the stub in a
-#   loop. clinit chain (35 entries) byte-identical to log16 ends in
-#   java/util/Timer; CE froze at #364 for 3.3 s; ticker thread alive
-#   (thread[4] in delay loop). Root cause: the java.lang.Thread
-#   create/die cycle (start0 -> Thread::allocate seeds the stub address
-#   -> Scheduler::start -> dispatch) NEVER calls yield(), so the v01.83
-#   pump backstop inside wake_up_timed_out_sleepers() is unreachable on
-#   this path; the interpreter tick checkpoint that would consume the
-#   ticker's flag only runs while executing Java bytecode, and the
-#   spawned thread dies in natives before any. Fix lives in the CLDC
-#   tree: Scheduler::pump_events_vita() (the same 50 ms-throttled pump,
-#   now callable from non-yield contexts) invoked at the end of
-#   Java_java_lang_Thread_start0 - one kick per spawn-cycle iteration.
-# 01.94 (2026-09-19): forensic ring coverage - log20 retest confirmed
-#   v01.93 works: CE advanced 364 -> #371 (~7 more pumps during boot,
-#   so the start0 pump fires in the spawn path). But the freeze has the
-#   SAME signature as log19/log9 (last CE completes ANI OUT, the next
-#   never starts) and no longer passes through start0 - the loop is one
-#   level deeper (pure stub ping-pong or another non-start0 cycle).
-#   log20 evidence was thin (4 files; watchdog.log/site_ring.log/
-#   coredump missing). v01.94 adds vita_site_mark() at: the
-#   pump_events_vita() gate (ring sees the pump actually run),
-#   Java_java_lang_Thread_start0 head (loop re-enters start0?), and
-#   Scheduler::start (spawn registration). Next hang's site_ring.log
-#   names the cycle directly. CLDC: Scheduler.cpp + Natives.cpp, +21
-#   lines, all inside #if defined(VITA).
-# 02.16 (2026-09-26): log40 verdict (VMPROG NEITHER - cpu1 kernel scheduler
-#   DEAD) + launcher-side A/B infrastructure. Direction A (user-space
-#   observation) is exhausted, so the only remaining question user space
-#   can answer is "is the freeze tied to WHAT the MIDlet does, or to the
-#   path EVERY MIDlet takes?".
-#   - read_launch_cfg() now also parses an optional line-start "menu=0"
-#     and reports it. When set, the round skips vita_menu_run() entirely
-#     and launches the cfg's jar/class directly, so an A/B run carries no
-#     menu state (2 MB fb, touch init, fs scan) that could be blamed.
-#     Line absent -> behaviour byte-identical to 02.15.
-#   - read_launch_cfg() no longer writes its out-params while parsing. A
-#     jit-only launch.cfg ("jit=0", written by the menu's JIT setting)
-#     used to leave jar="jit=0" behind even though the function returned
-#     -1, so the "fall back to the bundled defaults" path actually tried
-#     to load a jar literally named "jit=0". Now parsed into locals and
-#     copied out only on success.
-#   A/B recipe (real hw), ux0:/data/J2ME00001/launch.cfg:
-#       Hello.jar
-#       HelloMIDlet
-#       portrait
-#       menu=0
-#   -> boots straight into the smallest self-built MIDlet (pure LCDUI,
-#   no audio/network/RecordStore). If it freezes with the same
-#   start_lightweight_thread_asm + cpu1-stall signature the freeze is
-#   path-generic, not jar-content driven.
-set(VITA_VERSION  "02.16")
-# 02.17: one-shot forensics - EVERY remaining probe in ONE build, because
-#   a real-hardware round (rebuild + reinstall + relaunch + capture) is
-#   the expensive part, not the CPU time.
-#   Rationale: log36..log41 all died on the same ambiguity - a single
-#   frozen sample cannot say whether a counter stopped because the VM
-#   deadlocked or because it is merely slow. v02.17 therefore prints
-#   everything TWICE (400 ms apart, one file) and adds the counters that
-#   name the path instead of the symptom:
-#   - lifecycle counters: run / sched_start / th_start / th_finish /
-#     lw_exit / start0 / justborn (JVM.cpp, Scheduler.cpp, Thread.cpp,
-#     Natives.cpp). "Created but never dispatched" and "dispatched but
-#     never finished" are now distinguishable numbers.
-#   - Java thread-name ring (last 8 Class.run created): a create/die
-#     spin prints the SAME pair over and over -> names the responsible
-#     Java code without the (never-captured) Java heap.
-#   - dispatch ring (last 16 threads switched away from) with status +
-#     pending_entries bits: shows WHAT the scheduler was cycling through
-#     right before the freeze.
-#   - next-runnable cache (cell/object + id/pri/status/jsp/wait).
-#   - Java-stack top of the current thread (16 words): the bootstrap
-#     frame built by setup_stack_asm has never been observable before
-#     (coredumps hold only native stacks); if the top still matches the
-#     template the thread never entered Java at all.
-#   - ticker liveness: loops + last_ms + ago_ms, sampled twice, plus the
-#     pinned cpu. Directly tests the v02.14 "ticker on the VM's core"
-#     change and the log40/log41 "cpu1 scheduler DEAD" picture.
-#   - runtime A/B switches (ux0:/data/J2ME00001/<name>, no rebuild):
-#       ticker_cpu  = 0 | 1 | 2   (all user cores | cpu1 | cpu2)
-#       tickgate    = 1 | 2       (skip JIT compile while the ticker is
-#                                  >1 s stale | never compile on ticks)
-#       tick_compile.cfg "0"      (v02.11 switch, unchanged)
-#     Absent files = current behaviour exactly.
-#   Still no syscalls on foreign threads (that killed the watchdog in
-#   log33/log34): every probe is a volatile read from the watchdog's own
-#   thread.
-set(VITA_VERSION  "02.17")
-# 02.18 (2026-11-06): unpinned by default + kernel-side forensics + the
-#   log42 probe self-wound fixed. One build, one hardware round, three
-#   questions answered (a real-hardware round is the expensive part):
-#   1. UNPINNED by default. log37..log42 proved pinning never changed
-#      the freeze - unpinned(1..36), CPU0(37), CPU1(38..42) all froze
-#      with the same signature and the stalled core always FOLLOWS the
-#      VM. Default mask is now 0 (kernel 3-core default). Runtime A/B
-#      WITHOUT rebuild: ux0:/data/J2ME00001/vm_cpu containing '1' or
-#      '2' pins to CPU1/CPU2 for a comparison round; absent/'0' =
-#      unpinned. The pin state is logged in boot_log.txt every round.
-#   2. KERNEL forensics via kubridge: the coredump's SYSTEM_INFO2 is
-#      hashed (4 MB, zero plaintext thread names) so the kernel half
-#      was never readable offline. With the kubridge plugin installed,
-#      vita_kernel_forensics.c reads the threadmgr per-core context
-#      from kernel memory at HANG time (twice, 400 ms apart) into
-#      kernel_forensics.log. Without the plugin: one explicit "kubridge
-#      ABSENT" line (the build still works, all v02.17 readouts kept).
-#      kubridge.skprx is bundled in the VPK root for one-stop install
-#      (copy to ux0:tai/ and add to *KERNEL in config.txt by hand).
-#   3. log42 probe self-wound FIXED: the watchdog died inside
-#      vita_sched_nrt_info dereferencing thread_obj (priority()
-#      chains through it) - the process was killed and sample 2 +
-#      dispatch ring + java-stack-top never reached the file. All
-#      scheduler probes now do raw-offset word reads with range
-#      checks, and every snapshot section ends with a [rdN ok] line
-#      so a truncated file names the section that died.
-set(VITA_VERSION  "02.18")
-# 02.19 (2026-09-27): the unpinned default was INCOMPLETE in 02.18 -
-#   vita_main.c's #ifndef fallback was set to 0 but THIS compile
-#   definition still carried v02.13's 0x20000, so the preprocessor
-#   guard never took effect and every 02.18 boot was still pinned to
-#   CPU1 (log43 boot_log "pin vm cpu mask=0x20000" came from HERE, not
-#   from any vm_cpu file - the file never existed on the card). Fix:
-#   default is now truly 0 (unpinned, kernel 3-core). The vm_cpu
-#   runtime switch (read_vm_cpu_mask) is unchanged and remains the A/B
-#   knob: create ux0:/data/J2ME00001/vm_cpu containing '1'/'2' to pin.
-set(VITA_VERSION  "02.19")
-# 02.20 (2026-09-27): boot-time kubridge precheck (vita_kf_precheck).
-#   kubridge.skprx deployed on ur0:tai/ (path is irrelevant to TaiHEN);
-#   the real risk is that the userspace module-list probe might not see
-#   kernel modules at all, which would only surface after a HANG before.
-#   The precheck runs the same probe at launcher start and logs the
-#   tri-state into boot_log.txt ("kubridge precheck: present/ABSENT"),
-#   so kernel-visibility is decidable from boot alone - no wasted
-#   hardware round.
-set(VITA_VERSION  "02.20")
-# 02.21 (2026-09-27): precheck upgrade after the v02.20 real-hardware
-#   result "kubridge precheck: ABSENT". Decisive fact: the process BOOTED,
-#   and kuKernelCpuUnrestrictedMemcpy is a STRONG fstubs import - had the
-#   kubridge module been missing the module loader would have refused to
-#   start the process at all. Conclusion: the plugin IS resident; the
-#   userspace module-list enum (flag 0x00) simply cannot see kernel
-#   modules. v02.21 precheck: (a) try every documented list flag
-#   (0x00/0x01/0x02/0x04) and OR the verdict; (b) cache enum rc + module
-#   count; (c) tri-state becomes four-state - present /
-#   installed-NOT-visible (enum blind but skprx file exists on either
-#   tai dir -> readout route must change to a kernel-side dumper,
-#   NOT reinstall) / ABSENT (no file) / enum-failure->ABSENT.
-set(VITA_VERSION  "02.21")
-# 02.22 (2026-09-27): log45 double verdict.
-#   (a) "ABSENT" root cause found - MY enum flags were wrong: bare
-#   0x00..0x04 are user-domain selectors that list NOTHING (log45:
-#   rc=0 nmod=0 for all four); the SDK's own prx_loader sample uses
-#   0x80|0x1 ("0x80 = system") and sees ~13 modules from userspace.
-#   Probe now walks the 0x80|0x1..4 system-domain matrix, records the
-#   winning flag, and vita_kf_list_modules() dumps the whole module
-#   table into kernel_forensics.log at boot.
-#   (b) "whole-core scheduler dead" hypothesis RETIRED: log45 shows VM
-#   thread frozen on cpu2 (runClocks d=0) while cpu2 itself stays alive
-#   (idle d=199129, switchN d=90); cpu1's all-zero window was an
-#   unrelated core. The stall is a THREAD-level uninterruptible kernel
-#   wait (KICK signal accepted-but-ignored + suspend 0x80020008 fit),
-#   and the freeze signature stays in the stdio->sceIo path for the
-#   4th round running (site=interpreter_fast_method_entry_4, C stack
-#   =inflate/png decode; log43 _fseeko_r, log44 _vfprintf/__ssvfscanf).
-set(VITA_VERSION  "02.22")
-# 02.23 (2026-09-27): log46 verdict - kubridge really ABSENT.
-#   v02.22's module table settled it: flag 0x81 lists 15 modules incl.
-#   taiHEN-injected oclockvita/Framecounter (taiHEN itself works), but
-#   NO kubridge; sceIoGetstat finds kubridge.skprx on NEITHER tai dir.
-#   The v02.21 inference "strong fstubs import + process boots =>
-#   module resident" is RETIRED: VitaSDK stub libs emit GEN_WEAK_EXPORTS
-#   weak imports, which do not block process start when unresolved.
-#   v02.23: (a) kuPowerGetSysClockFrequency() DIRECT CALL at boot/HANG -
-#   one call answers "is the code in kernel" with a sane 111..444 clock,
-#   no enum, no stat; precheck gains a "CALLABLE (enum blind)" state.
-#   (b) the fix hint now points at the skprx BUNDLED in our own VPK
-#   (app0:kubridge.skprx): one config.txt line (*KERNEL
-#   app0:kubridge.skprx) loads it, no file hunting needed.
-set(VITA_VERSION  "02.23")
-# 02.24 (2026-09-27): log47 verdict - kubridge IS loaded, my gate was wrong.
-#   User's config.txt worked (app0:kubridge.skprx line - the skprx bundled
-#   in our own VPK since v02.18). Three proofs: precheck "CALLABLE (enum
-#   blind)", kuPowerGetSysClockFrequency=190, and the kernel boot log in
-#   the coredump "[kubridge]:Starting... OK". But BOTH gates - kf_read()
-#   and kf_find_threadmgr() - still used the BLIND userspace enum, so the
-#   kernel reads printed "ABSENT (kernel probes skipped)" and never ran.
-#   Fix: (a) availability = enum OR direct clock call >= 41;
-#   (b) threadmgr lookup PRIMARY route = taiHEN taihenModuleUtils
-#   (module_get_by_name_nid + module_get_offset with KERNEL_PID 0x10005),
-#   which reads the kernel's OWN module table; enum kept as fallback.
-set(VITA_VERSION  "02.24")
-# 02.25 (2026-09-28): log48 verdict - the taiHEN cross-domain query
-#   (module_get_by_name_nid, KERNEL_PID) BLOCKS FOREVER when issued
-#   from the HANG path: the core dump caught the watchdog thread with
-#   r0-r3 = the exact call args, pc on the SVC veneer, and the result
-#   buffer still zeroed - the syscall never returned. v02.24's other
-#   half worked: "kubridge: present" + clock 190 finally printed, so
-#   the gate fix landed. Fix: resolve SceKernelThreadmgr's data
-#   address at BOOT (vita_kf_boot_resolve on the main thread, healthy
-#   system), cache it; the HANG path consumes the cache and issues
-#   ONLY kuKernelCpuUnrestrictedMemcpy reads from then on. Also: VM
-#   user-stack recovered from the core (0x81381000, 256K) - last
-#   frames are _svfprintf_r + jar-iterator + app0: path strings.
-set(VITA_VERSION  "02.25")
-# 02.26 (2026-09-28): log49 verdict - REGRESSION, game crashed AT
-#   STARTUP. Both core dumps catch the MAIN thread (tid 0x40010003,
-#   only main + SceCommonDialogWorker exist) dying on the SAME SVC
-#   veneer as log48's watchdog, with module_get_by_name_nid's exact
-#   args - i.e. v02.25's vita_kf_boot_resolve() killed the app at
-#   boot. My log48 theory ("the query only blocks in the HANG
-#   context") was WRONG: on this console that taiHEN syscall never
-#   returns in ANY context (tai ux0:0 ur0:0 - no user taiHEN at all).
-#   Fix: retire the taiHEN route ENTIRELY (imports removed from the
-#   link); threadmgr address = boot-time userspace enum + ku memcpy
-#   read-back self-check, HANG path reads the cache as before.
-set(VITA_VERSION  "02.26")
-# 02.27 (2026-09-30): log50 verdict - offline kernel forensics fully
-#   dead (SYSTEM_INFO2 SECA-encrypted, no kernel LOAD segments,
-#   MODULE_INFO user-only, THREAD_REG_INFO pc/sp artifacts - "mla
-#   deadpoint" retracted). New direction: make the process ITSELF
-#   remember. vita_trace.c: zero-I/O per-thread syscall slots wrapped
-#   around every sceIo*/delay/display/ctrl/touch call; at the next
-#   HANG the watchdog dumps trace_ring.log - a slot with ODD seq is
-#   the call that never returned = the deadpoint. Also answers the
-#   user's Vita3K observation: the open/write/close storm there was
-#   our diagnostic heartbeat x a hyperactive pump (12k/s vs 92/s on
-#   HW) - not the bug, but this tracer replaces disk churn with
-#   memory slots anyway.
-set(VITA_VERSION  "02.27")
-# 02.28 (2026-09-30): user directed - add the whole sync family NOW,
-# not incrementally. Census of the v02.27 ELF first: the blocking
-# surface actually present is LwMutex(23 sites) Mutex(12)
-# PollEventFlag(5) WaitSema(4) ThreadEndCB/SignalSema(2) MsgPipe(4);
-# WaitEventFlag/WaitCond/WaitSignal are never called and have no
-# plain-name stub (wrapping them = sceIoChdir-style link death), so
-# they stay out. Release ops (unlock/signal/set) never block but
-# their per-thread counters expose lock/unlock imbalance = WHO holds
-# the thing the VM thread is stuck on.
-set(VITA_VERSION  "02.28")
-# 02.29 (2026-09-30): log51 verdict follow-up - close the EVEN-slot
-# holes. log51: VM slot ended io_pwrite RETURNED (not inside any
-# traced syscall) yet the thread shows TCB=RUNNING wait=none with
-# runClocks d=0 and its core's idle/idleN/switchN all frozen. Two
-# hypotheses remained: (B) wedge inside a syscall the v02.27/28 set
-# never traced - head suspect newlib fsync -> sceIoSyncByFd, the
-# natural call right after pwrite - or (D) a spin no wrapper sees.
-# v02.29 wraps the remaining blocking-capable surface (12 symbols,
-# census-verified): IO SyncByFd/Lseek32/Rename/Rmdir/Chstat/
-# ChstatByFd/GetstatByFd/Devctl, AudioOutOutput, NetEpollWait,
-# ExitDeleteThread/ExitProcess. Next HANG discriminates directly:
-# slot ODD on one of these = B wins (deadpoint named); still EVEN =
-# D (deadpoint outside every syscall wrapper, i.e. userland native).
-# 02.30 (log52 second round): full dump-note forensics. Kernel-side
-#   THREAD_INFO says VM=RUNNING, VM tid in NO wait queue (all sync
-#   object notes scanned), all 5 thread register records decoded -
-#   only the VM thread is frozen (PC=birth stub +0x18, LR=stub entry
-#   = the primordial_to_current_thread gadget signature, SP on the
-#   native stack under JVM::run()'s inlined bl). 190k normal green
-#   switches happened first. v02.30 adds birth-stub visibility:
-#   swjb_seen/swjb_clear (switch_thread JUST_BORN counting moved out
-#   of the never-active _debugger_active short-circuit) and pe_enter
-#   (generated invoke_pending_entries stub entry-with-body counter,
-#   SharedStubs_arm.cpp). Next HANG: pe_enter climbing with dispatch
-#   ring flat = birth-stub re-entry loop named; pe_enter stuck =
-#   stub never ran after the last dispatch.
-# 02.31 (log53 verdict): the bleq micro-loop theory is RETRACTED
-#   (0x0bffff42 has L=1, BL+EQ links correctly - no in-stub loop).
-#   log53 froze at invoke_pending_entries+0x8 with the SAME LR=stub
-#   entry, same cpsr 0x40070010, cpu1 busy-but-never-context-switching
-#   and ALL lane counters frozen (switch/yield/gnrt/fast/site) - so
-#   the loop (if any) never touches switch_thread/time_slice. The
-#   only C++ a stub-tail cycle can reach are the call_on_primordial_
-#   stack bodies: finish / force_terminated / thread_task_cleanup /
-#   lightweight_thread_exit(terminate+yield). v02.31 instruments
-#   exactly those (all in live _MergedSrc objects, no loopgen
-#   dependency) plus set_current, a terminate post-check for
-#   still-listed threads, and an 8-slot exit ring. Next HANG, two
-#   snapshots: any v231 counter climbing names the spinning body;
-#   all frozen with cpu1 busy = the loop is confined to stub asm.
-# 02.32 (log54 verdict, runClocks attribution table): the loop
-#   narrative is RETIRED - all three candidates excluded by frozen
-#   counters (stub-tail: v231 all 0 with live setcur=59 probe;
-#   gadget: switch lane frozen; scheduler C++: six counters frozen).
-#   VM thread is PARKED in the birth window: runClocks d=0 (spin
-#   burns clocks), kernel RUNNING/wait=none yet never dispatched
-#   across 3 idle cores, KICK5 0x80020008 (ghost-TCB family, log33/
-#   34). The cpu0 200ms zero-switch busy owner is an UNOBSERVED
-#   thread; THREAD_INFO note names 5 threads and SceCommonDialog-
-#   Worker (system-injected on real HW, never sampled) froze
-#   bit-identical at pc=0xe0009304 across log53+log54 hangs - but
-#   that pc sits in the kernel-reserved range (below the lowest
-#   PT_LOAD 0xe0010000) = blocked in a kernel call, a NORMAL wait
-#   shape on real HW, not a hang verdict. v02.32 census: uid-scan
-#   0x40010001..0x400101ff with GetThreadInfo per tid (log-before-
-#   query safety), runClocks double-sampled 200ms. Spinner = tid
-#   with d ~= window; VM d=0 re-confirms park. phoneME-vs-system
-#   split decided by ONE line: who owns the busy core.
-#   with d ~= window; VM d=0 re-confirms park. phoneME-vs-system
-#   split decided by ONE line: who owns the busy core.
-# 02.33 (log55 verdict): census DECIDED - all in-process threads
-#   exonerated (VM d=0, SceCommonDialogWorker d=0 AND its dump pc
-#   MOVED 0xe0009304->0xe000cd64, exonerated with prejudice); the
-#   spinner is the VM thread's own KERNEL context (left user mode
-#   at ipe+0x4 via interrupt, never returned; core idle/switch
-#   frozen = kernel-mode spin with preemption off; KICK 0x80020008
-#   = kernel transition state). Userspace observation is EXHAUSTED.
-#   v02.33 goes kernel-side: boot-time K0 signature scan (Kubridge
-#   memcpy over the whole 0x81000000..0x84000000 direct map, no
-#   holes) for the "J2ME00001" thread name, tid-self-verified within
-#   +-0x100 - locks the VM TCB address without any module enum (the
-#   enum is structurally blind here) and without taiHEN queries
-#   (log48/49: never return on this console). HANG path dumps the
-#   raw TCB twice 400ms apart; offline join with THREAD_REG_INFO
-#   names the kernel wait point. vmalloc window deliberately NOT
-#   scanned: unmapped holes there abort uncatchably.
-# 02.33a HOTFIX: the K0 scan REBOOTED the real console at launch.
-#   Root cause: 0x81000000..0x84000000 is NOT a kernel-only window
-#   on this firmware - our own process maps live there (log55:
-#   site_dump runtime 0x81087fd0, heap_top 0x8389d580), so a bulk
-#   ku memcpy across the range walks pages that are unmapped (or
-#   remapped) under the kernel address space -> kernel-context
-#   abort -> reboot. Scan DISABLED (call commented out); the
-#   kernel-window premise must be re-proven with single-word probe
-#   reads before any bulk read ever runs again.
-# 02.35 (2026-10-02): birth-delay A/B - the first experiment after
-#   the ten-proof "first newborn dispatch freeze" verdict. The freeze
-#   lands on the FIRST dispatch of the first java.lang.Thread spawned
-#   by the MIDlet (fp=0 trampoline frame, pc in the first <=10 ipe
-#   instructions, set_current total = 97 switches, swjb_seen = 0:
-#   no newborn ever completed a first slice). Prime suspect: an
-#   interrupt taking the context during the switch critical window.
-#   Runtime-gated (ux0:/data/J2ME00001/birth_delay, digit 1..9 =
-#   ms): before the JUST_BORN context switch in Scheduler.cpp we
-#   sleep 1 ms, moving the dispatch off any tick/IRQ boundary it was
-#   about to collide with. Absent/0 = v02.34 behaviour. Also printed
-#   in the wd 'boot' readout so every dump self-documents its A/B
-#   config. Companion zero-code switch: ticker_cpu.2 / tickgate.*
-#   (shipped v02.17, never actually run - log46..55 all defaults).
-set(VITA_VERSION  "02.38")
-# 02.38 (2026-10-03): vm_cpu runtime pin - the scheduler-loses-thread
-#   experiment. log61/62 kernel-state verdict chain: VM thread RUNNING,
-#   wait=none, runClocks d=0, last syscall returned, KICK suspend
-#   rejected 0x80020008 cross-core, aff=0x70000 (all 3 cores),
-#   chgcpu ~2800 (constant migration), freeze walked cpu1->cpu2 across
-#   builds, dose-independent (birth_delay 1/5/10ms all froze). One
-#   story fits it all: Vita3K's kernel run-queue drops a thread that is
-#   migrating between cores at suspend/kick time. v02.38 kills migration
-#   for the VM thread entirely: Os::initialize() reads digit 0/1/2 from
-#   ux0:/data/J2ME00001/vm_cpu and calls
-#   sceKernelChangeThreadCpuAffinityMask(self, SCE_KERNEL_CPU_MASK_USER_0
-#   <<pin). Absent = off (control run, prints current aff). Result line
-#   in vm_boot.log ("vm_cpu=N aff 0x..->0x.. rc=0x.."), cross-checkable
-#   against watchdog's affinity readout. A/B: run control (no file)
-#   first, then vm_cpu=1. If pinning fixes the hang: scheduler loss
-#   confirmed -> permanent default pin (or launcher-side). If not:
-#   hypothesis dead, back to the stub<->ipe ping-pong line (fix loopgen
-#   float stubs so the probes finally build).
-set(VITA_VERSION  "02.39")
-# 02.39 (2026-10-04): born_dsp first-dispatch decision counter. log64/65
-#   coredump forensics nailed the freeze signature: pc at birth trampoline
-#   +0/+8, lr=trampoline entry, sp=boot gadget park level with
-#   [sp]=JVM::start+0x18c, fp=0, jsp=newborn birth stack, cpsr User/I=0.
-#   run=1 + ts_enter=0 pin the C side (boot crossing happened exactly
-#   once); all 5 direct gadget call sites accounted (JVM::run, time_slice,
-#   Universe::ipe x2 [romizer-dead], JVM::start); no GP-table reference.
-#   Mid-run first dispatch is pure asm: C++ switch_thread -> birth-delay
-#   gate -> asm switcher -> trampoline. Open question: did the trampoline
-#   EXECUTE 0-2 instructions before the cpu was lost, or is the frozen pc
-#   a SNAPSHOT the switcher never actually dispatched? _vita_born_dsp
-#   (Scheduler.cpp, right after the birth-delay gate consumes
-#   vita_last_started_id) counts the dispatch DECISION in C++ - before
-#   any trampoline instruction could run. Readout added to the wd
-#   snapshot v230 line (born_dsp=N). At the next freeze:
-#     born_dsp=0  -> scheduler never decided; frozen pc is not from this
-#                     path's decision -> trampoline really ran (snapshot
-#                     hypothesis DEAD)
-#     born_dsp>0  -> decision made; freeze sits between decision and
-#                     trampoline completion (combined with pe=0 pe-
-#                     consumption: lost cpu before/at stub entry)
-#   Note: generator-side probes (InterpreterStubs_arm.cpp) are compiled
-#   into the loopgen-frozen Interpreter_arm.o and never reach the binary
-#   (v02.30 pe_enter lesson) - C++ side is the only live placement.
-set(VITA_VERSION  "02.40")
-# 02.40 (2026-10-05): C landing pad - moving the freeze boundary into
-#   instrumentable code. Six rounds (log61..66) froze the VM at the
-#   birth/death trampoline head (pc=+0/+8, half-executed, r1=0 in log66)
-#   but the trampoline is inside the loopgen-FROZEN Interpreter_arm.o -
-#   it can never carry a probe (v02.30 lesson). Plan A (approved after
-#   the log66 verdict killed the snapshot hypothesis): the bootstrap
-#   sentinel word seeded by setup_stack_asm (InterpreterRuntime_arm.cpp,
-#   fresh _MergedSrc004.o) now points at a NEW naked-asm landing pad,
-#   vita_landing_pad, instead of the trampoline. Both consumers of the
-#   sentinel - the birth tail of primordial_to_current_thread and the
-#   interpreter unwind at run() return - must cross the pad first.
-#   Pad ABI (verified against the v02.39 binary): entry lr=pad addr,
-#   fp=0, jsp=r6=exit word (trampoline reads [r6,#16] later => pad must
-#   not clobber r4-r11), gp/r5 undefined. Pad = movw/movt absolute
-#   probes, touches ONLY r0/r1, then bx to the trampoline. Probes
-#   (watchdog v240 line): land = sentinel handoffs executed in fresh
-#   code; fp/lr = last entry template (expect fp=0, lr=pad).
-#   Next-freeze matrix:
-#     land=0           -> freeze BEFORE any sentinel handoff (switcher
-#                         never dispatched; combined with born_dsp>0
-#                         this pins the asm gap itself)
-#     land>0, pc in pad-> freeze INSIDE fresh code (first ever)
-#     land>0, pc still trampoline head -> boundary is the pad->trampoline
-#                         handoff; pad execution proves dispatch happened
-#   Sentinel-template diagnostics updated (OS_vita rd2 stacktop,
-#   vita_sched_dump_stack): the never-executed template now shows the
-#   pad address as its 6th word, not the trampoline's.
-set(VITA_VERSION  "02.41")
-# 02.41 (2026-10-16): landing-pad register/exit-table recorder (probe only,
-#   NO behaviour change). log85 (v02.40) disproved the "kernel froze the
-#   core" reading of log61..66: vita_v240_land climbed 317,984,101 ->
-#   323,798,186 in ~550 ms (~10-14M/s) while switch/ttk/site_seq stayed
-#   constant and the VMPROG verdict was "ticker RUNS, VM NOT EXECUTING".
-#   The VM thread is spinning in userland asm through vita_landing_pad
-#   (coredump pc=pad+0x18, lr=pad entry, fp=0). Every earlier "dead pc"
-#   was a random sample of the same loop. The pad now snapshots r4-r12,
-#   sp, lr, the exit-table words [r6+0..16] and the current thread's
-#   stack_pointer/status/pending_entries for land=1..8 (healthy handoffs)
-#   and land=1000000..1000007 (inside the loop). Watchdog prints them as
-#   "v241 rec[i]" lines. Reading: loop records identical => fixed cycle;
-#   compare r6 / [r6+16] / cur.sp against the healthy set to find which
-#   link of the run()-return unwind is wrong.
-set(VITA_VERSION  "02.42")
-# 02.42 (2026-10-16): shadow trampoline. log86 (v02.41) showed the loop is
-#   a fixed cycle (8 records at land=1000000.. byte-identical) with a
-#   HEALTHY exit table ([r6+0..16] = lw_exit/uncaught/finish/force_term/0),
-#   cur.st=0, cur.pe=0 - by the real trampoline's own code that state must
-#   call Thread::finish, yet finish=0 after 2.6e8 laps. The trampoline is
-#   inside the loopgen-frozen Interpreter_arm.o (no probes possible), so
-#   once land>=1000000 the pad now diverts to vita_tramp_shadow, a
-#   hand-written instruction-for-instruction copy with a counter before
-#   each stage. Every probe sits BEFORE the step it describes (the real
-#   call_on_primordial_stack resumes via the CURRENT thread's saved
-#   stack_pointer, so it only fails to return to its caller when the
-#   target switched threads - wording corrected in 02.43). Watchdog prints "v242 st=..." (see
-#   OS_vita.cpp): the first st[i] below st[0] marks where laps leave the
-#   trampoline body. Healthy threads (land<1000000) still use the real one.
-set(VITA_VERSION  "02.45")
-# 02.45 (2026-10-17): FIX "network test hangs, never connects" (log94, real
-#   hw). log94 proved the 02.44 NBIO fix worked ("set_nbio fd=15 rc=0") and
-#   connect() now returns EINPROGRESS correctly, BUT the completion is never
-#   reported: 158 s of event-pump polling (14942 JVMSPI_CheckEvents rounds,
-#   each calling vita_net_poll -> select -> sceNetEpollWait) produced ZERO
-#   EPOLLOUT, while `curl` connects the SAME host (219.133.46.205:80) in
-#   2.7 ms and log88's blocking connect returned "immediate OK". The
-#   official net_http_bsd sample uses a blocking connect too. Conclusion:
-#   Vita's non-blocking connect + sceNetEpoll completion detection is
-#   unreliable. Fix in pcsl_socket_open_start(): connect BLOCKING (fast when
-#   the host is reachable), then vita_set_nbio() only AFTER connect so the
-#   subsequent read/write stay non-blocking for the event-pump model.
-#   open_start now never returns WOULDBLOCK (socket is blocking during
-#   connect), so pcsl_socket_open_finish is dead code (kept for safety).
-#   Trade-off: an unreachable host blocks connect ~27 s (the pre-v02.44
-#   "27s freeze" behaviour) instead of hanging forever - acceptable and
-#   recoverable; can be improved later with a connect-timeout scheme.
-set(VITA_VERSION  "02.48")
-# 02.48 (2026-10-17): fixes from log95..log99 (real hardware).
-#   - log97/98 "audio toggle freezes for seconds": core pc=sceIoWrite r2=1,
-#     chain JVMStream::print -> print_raw -> crumb_append. MediaException.
-#     printStackTrace() wrote ONE BYTE per sceIoWrite (~13 ms each on ux0:)
-#     and every byte TWICE (vm_output.log + vm_stderr.log are byte-identical).
-#     JVMSPI_PrintRaw (midp_run.c) is now line-buffered: one write per sink
-#     per line. Output bytes/files/order unchanged.
-#   - log95 white screen: the preload spends 85-87% of its time in sceIoRead
-#     (4338 reads, 1.77 ms each), and 502 of 932 midp_system.jar entries are
-#     classes the dictionary already holds. load_jar_entry now skips those
-#     BEFORE open_entry/read (find_class_or_null, no allocation).
-#     "[preload] phases2 ... skipped=N" reports how many.
-#   - log96 UC freeze while operating: VM thread blocked in sceNetConnect to
-#     safe.ucweb.com (sockaddr verified in the core). Blocking connect now
-#     carries SO_SNDTIMEO=5 s and logs "ms=" for every attempt; whether
-#     sceNet honours it for connect() is unverified (the log will say).
-#   - watchdog forensic mode (wd_early_dump.cfg) skipped site_ring/trace_ring
-#     (log98/99 came back without them); it now writes them before aborting.
-set(VITA_VERSION  "02.50")
-# 02.50 (2026-10-18): probes from log100/log101 (probes only, no behaviour
-#   change).
-#   - log101 (pad_nodivert + wd_early_dump) finally returned site_ring.log
-#     with the landing-pad records. The loop is a FIXED POINT: from land=6
-#     (the 2nd pad entry of one thread, cur.pe=0, cur.sp=r6-0xbc) every
-#     field of every record is identical, the exit table is healthy
-#     (lightweight_thread_exit / uncaught_exception / Thread::finish /
-#     force_terminated / 0), th_finish=0. The trampoline's static model says
-#     it must call Thread::finish (and call_on_primordial_stack would then
-#     rewrite cur.sp to r6-8) - neither happens. Pad records gain the one
-#     trampoline input they lacked, [gp+1040] pending exception, plus
-#     [cur.sp] and [cur.sp+4] (the slot call_on_primordial_stack's tail
-#     returns through): "v241 rec[i] pendexc[gp+1040]=.. [cur.sp]=..".
-#   - log100: a constant 63 sceIoWrite calls cost 1.25 s per start (0.24 s
-#     in log95) and one sceIoWrite blocked the VM for >3 s. "[preload]
-#     io_write fd=N (path) n= us=" splits the sweep's writes per file, and
-#     "[WD-STALL] ... lastop=io_write arg=fd(path)" names the file of the
-#     call a stall sits in.
-set(VITA_VERSION  "02.51")
-# 02.51 (2026-10-18): system IME (sceImeDialog) bridge - first text input for
-#   MIDlets. The Vita port maps only physical buttons (no 0-9 digit keys), so
-#   phoneME's multi-tap InputMode chain can never produce a character: that
-#   is why J2ME programs had no input method. New vita_ime.c owns the
-#   sceImeDialog lifecycle (show -> sceImeDialogInit, poll -> GetStatus/
-#   GetResult/Term), and SELECT opens the keyboard (MVP trigger; auto-pop on
-#   TextField focus is a follow-up). The finished UTF-16 text is fed back
-#   through phoneME's built-in IME event (MIDP_KEY_EVENT, ACTION=IME=4,
-#   stringParam1) which DisplayEventListener routes to
-#   handleInputMethodEvent -> TextBox.insert(). TextBox covered; TextField
-#   needs the same event routed in the Java layer (follow-up). vita_ime_poll
-#   delivers straight into pNewMidpEvent (not the SPSC ring) because
-#   stringParam1 ownership transfers to the MIDP event queue. Links
-#   SceCommonDialog_stub (sceImeDialog* lives there, not in SceIme_stub).
-set(VITA_VERSION  "02.52")
-# 02.52 (2026-10-18): TextField support + auto-pop system keyboard. Two parts,
-#   both in phoneme-midp (midp classes load from midp_system.jar, NOT the ROM
-#   image, so these Java changes only need a midp rebuild + repack - no romize).
-#   (1) Fix handleInputMethodEvent (Display.jpp): the old `current instanceof
-#       TextBox` never matched because `current` is a DisplayableLF and TextBox
-#       is a Displayable - so the v02.51 TextBox path was actually DEAD code.
-#       Now resolves via current.lGetDisplayable(), and additionally routes the
-#       typed text into the focused TextField of a Form (current instanceof
-#       FormLF -> lGetCurrentItem() -> TextFieldLFImpl.commit()).
-#   (2) Auto-pop: TextFieldLFImpl.enableInput() (gained focus) calls
-#       VirtualKeyboardInputMode.showNativeKeyboard(), disableLayers() (lost
-#       focus) calls hideNativeKeyboard(). Because TextBoxLFImpl extends
-#       TextFieldLFImpl and also calls enableInput() from uCallShowNotify, both
-#       TextBox and TextField now auto-pop. vkdefault's VirtualKeyboardInputMode
-#       gained the two public static natives; lfj_native_input_mode.c implements
-#       them under VITA to forward to vita_ime_show()/vita_ime_abort(). The
-#       SELECT-key manual trigger in vita_input.c stays as a fallback.
-set(VITA_VERSION  "02.53")
-# 02.53 (2026-10-18): make the system IME actually render. log103 (real hw)
-#   showed the keyboard never appeared - only phoneME's built-in soft keyboard.
-#   Root cause: sceImeDialog is built on the CommonDialog framework, which the
-#   port never wired up. vita_ime.c called sceImeDialogInit/GetStatus/GetResult
-#   /Term but missed the three CommonDialog prerequisites:
-#     1. sceCommonDialogSetConfigParam (one-time; else Init can fail
-#        0x80020407 NOT_CONFIGURED)
-#     2. sceGxmInitialize (else 0x80020436 GXM_IS_UNINITIALIZED) - the port
-#        draws with sceDisplaySetFrameBuf, so GXM was never started
-#     3. sceCommonDialogUpdate every frame with renderTarget = back buffer
-#   Fix: vita_ime.c now calls SetConfigParam (MAX_VALUE = system defaults) and
-#   logs Init rc / first poll status; vita_display.c lazily sceGxmInitialize's
-#   (NULL vsync callback - the port keeps submitting via SetFrameBuf) and calls
-#   sceCommonDialogUpdate in flip_to_display() after the blit, only while
-#   vita_ime_is_active(). Diagnostic logs go to stderr -> midp_stderr.log.
-set(VITA_VERSION  "02.54")
-# 02.54 (2026-10-18): probes only, no behaviour change.
-#   - log102 (v02.52, pad_nodivert + wd_early_dump): the FileManager loop
-#     reproduced identically (thread id 4 = 5th pad entry: birth at land=5,
-#     first death-type entry at land=6, then a fixed point). The v02.50
-#     fields RULED OUT two hypotheses: pendexc[gp+1040]==0 in every record
-#     (not the uncaught_exception branch) and [cur.sp+4] is an interpreter
-#     return point (L318+0x8), not the pad sentinel (not a
-#     call_on_primordial_stack tail "return" to the sentinel). All three
-#     dumps (log99/101/102) have the VM thread's pc INSIDE vita_landing_pad.
-#     New: in nodivert mode the pad plants sentinels in r5 (0xdead0505) and
-#     r12 (0xdead0c12) before jumping to the real trampoline; the next
-#     rec[i] r5/r12 say how far the trampoline got (see the asm comment).
-#   - log102 vm_boot: 58 of the sweep's 63 sceIoWrite calls (1.31 s, ~22 ms
-#     each) go to ONE fd that the fd->path table reported as "?" - the 16
-#     slot round-robin table was overwritten by short-lived fds. Slots are
-#     now freed at sceIoClose (32 slots) and "[preload] io_write" also
-#     prints bytes= so call count vs volume can be told apart.
-set(VITA_VERSION  "02.55")
-# 02.55 (2026-10-18): fix the GXM chicken-and-egg deadlock in the system IME.
-#   log104 (real hw) showed Init rc=0x80020436 (GXM_IS_UNINITIALIZED) on every
-#   show. The v02.53 GXM init lived inside the per-frame CommonDialog update
-#   path, which only runs while vita_ime_is_active() - but active is set only
-#   after sceImeDialogInit succeeds, which needs GXM up: Init can never
-#   succeed, so GXM can never start. Fix: extract the idempotent GXM init
-#   into shared vita_gxm.c/vita_gxm.h and call vita_gxm_ensure_init() from
-#   vita_ime_show() BEFORE sceImeDialogInit. vita_display's update path still
-#   calls it (a no-op after first success) for safety.
-set(VITA_VERSION  "02.56")
-# 02.56 (2026-10-18): drop the BEFORE/AFTER_NATIVES stderr lines (VITA only).
-#   log105 (v02.54): the 58 preload sceIoWrite calls (1.26 s) were exactly
-#   those two fprintf lines x 29 classes with natives -> midp_stderr.log,
-#   2204 bytes total, ~38 B/call, ~22 ms/call (latency, not volume).
-#   Expected: preload ~5.8 s -> ~4.5 s. Same ClassFileParser.cpp family as
-#   the v01.92 PRE/POST_NATIVES removal. No behaviour change otherwise.
-set(VITA_VERSION  "02.57")
-# 02.57 (2026-10-18): probe only - does the loaded trampoline's "bleq" link?
-#   log105 (v02.54 sentinel run): VM thread pc = invoke_pending_entries+0x8
-#   with lr = landing pad (should be trampoline+0x1c if the bleq linked),
-#   r12 still the sentinel, r5 = gp, th_finish = 0. Of the three callers of
-#   invoke_pending_entries only the trampoline's CONDITIONAL "bleq" can
-#   produce lr=pad if its L bit is lost at load time (R_ARM_JUMP24, code 29;
-#   the image has just 5 conditional BLs, all of this type; every other
-#   caller, incl. the shadow's bne+bl, uses unconditional bl = R_ARM_CALL).
-#   vm_boot.log now carries "[v257] bleq(w6)=.. L=.. cond=.." read back from
-#   the loaded code (file image: 0bffff42, L=1). L=0 -> confirmed.
-set(VITA_VERSION  "02.58")
-# 02.58 (2026-10-18): FILEMANAGER EXIT-LOOP ROOT CAUSE FIXED (needs hw check).
-#   log107 (v02.57 read-back): the trampoline's "bleq invoke_pending_entries"
-#   is 0x0affff42 in memory vs 0x0bffff42 in the file - the loader dropped
-#   the L bit of that one instruction (SCE reloc code 29 / R_ARM_JUMP24; the
-#   sibling blne 0x1bffff48 and the unconditional bl 0xebffff46 are intact).
-#   Without the link, lr stays = the landing pad, invoke_pending_entries'
-#   "moveq pc,lr" returns to the pad, the pad re-enters the trampoline:
-#   an endless pad<->trampoline loop, Thread::finish never reached.
-#   Fix: vita_landing_pad always runs vita_tramp_shadow (bne + unconditional
-#   bl, immune). The real trampoline remains reachable via pad_nodivert.cfg.
-#   Expected on hardware: exit_probe.log "v243 trip_rep=0" (the detector no
-#   longer has anything to catch) and land == shadow_in (log108: 5 == 5;
-#   th_finish < th_start is normal, threads still alive at exit); no FileManager
-#   exit loop even with pad_nodivert.cfg absent. Also reads back the three
-#   "blne shared_entry" words ([v258] lines in vm_boot.log).
-set(VITA_VERSION  "02.59")
-# 02.59 (2026-10-19): system IME renders (方案1). log106 (v02.57): Init rc=0 /
-#   poll first status=1 - the dialog logically came up (v02.55 fixed the GXM
-#   chicken-and-egg) - but nothing appeared on screen and the frame froze
-#   (watchdog #3 vm=RUNNING sw+0 site+0 jsmp+0 since_ms=6081). CommonDialog
-#   renders THROUGH GXM, which still lacked two resources:
-#     1. sceGxmMapMemory on the CDRAM framebuffer: GXM cannot touch CPU
-#        memory it was never given, so the render was invisible.
-#     2. a valid SceGxmSyncObject in displaySyncObject (was NULL): nothing
-#        for the render to signal, and the no-sync render/submit race stalls.
-#   Fix: vita_display.c gains vita_cd_ensure_resources() - after
-#   vita_gxm_ensure_init() it sceGxmMapMemory's the double-buffer CDRAM block
-#   (READ|WRITE) once and sceGxmSyncObjectCreate's once, then
-#   vita_common_dialog_update() passes vita_cd_sync every frame. Diagnostics
-#   to stderr: "[CD] map fb base=.. bytes=.. rc=.." / "[CD] sync create rc=..".
-set(VITA_VERSION  "02.60")
-# 02.60 (2026-10-19): software MIDI (SMF) playback - first sound in MIDI-BGM
-#   games. log97 (fengshenbang): the BGM is a .mid file, but the port declared
-#   only tone + WAV caps, so Manager.createPlayer threw "Player cannot be
-#   created for audio/midi" and the game stayed silent. phoneME open-source
-#   ships NO MIDI renderer (SUN's was proprietary). This adds a software GM
-#   synthesizer:
-#     - TinySoundFont (src/tsf.h, MIT)   : SF2 synthesizer
-#     - TinyMidiLoader (src/tml.h, ZLIB) : SMF Format 0/1/2 parser
-#     - TimGM6mb.sf2 (assets/, GPL-2)    : 5.7 MB GM sound bank (bundled)
-#   New vita_midi.c/.h owns the synth (loads the bank from ux0: then app0:,
-#   renders 48 kHz stereo via vita_midi_play). vita_audio_javacall.c adds the
-#   "audio/midi" cap, a midi discriminator in realize(), byte accumulation in
-#   do_buffering() (like WAV), a g_midi_req/seq handshake in start(), and a
-#   MIDI branch in tone_player_thread that calls vita_midi_play with output/
-#   stop callbacks. The bank ships in the VPK at data/J2ME00001/TimGM6mb.sf2
-#   (+5.7 MB VPK) and is loaded read-only from app0:.
-set(VITA_VERSION  "02.61")
-# 02.61 (2026-10-19): fix MIDI routing - log109 (fengshenbang) still silent.
-#   v02.60 added the "audio/midi" cap and the synth, but get_player_controls()
-#   returned TONE|VOLUME for EVERY player. HighLevelPlayer.getPlayerFromType()
-#   is an else-if over nIsToneControlSupported -> nIsMIDIControlSupported, so a
-#   MIDI player was routed to DirectTone (the JTS player), whose checkSequence()
-#   validator rejects SMF bytes with "Tone sequence check failed at offset 0:
-#   missing version information" (log109 vm_output). Fix: get_player_controls
-#   now returns MIDI|VOLUME for a MIDI player (pl->midi) so getPlayerFromType
-#   lands in DirectMIDI, which inherits DirectPlayer's javacall-backed
-#   doBuffering/start (our MIDI branch). TONE|VOLUME unchanged for tone/JTS.
-set(VITA_VERSION  "02.62")
-# 02.62 (2026-10-19): auto-pop the system IME only for TextBox, not TextField.
-#   log109 problem 2: the in-game Form navigation flashed the system keyboard
-#   repeatedly. Root cause: v02.52 put show/hideNativeKeyboard in the SHARED
-#   TextFieldLFImpl.enableInput()/disableLayers(), and a Form's TextField
-#   re-enters those every time navigation crosses it (firstTimeInTraverse
-#   toggles on traverse-out). Fix: move the auto-pop to
-#   TextBoxLFImpl.uCallShowNotify()/uCallHideNotify() (whole-screen editor
-#   only); TextFieldLFImpl no longer calls the native keyboard. TextField input
-#   still works via the SELECT-key manual trigger. MIDP Java change => romize
-#   (classes.zip -> ROMImage -> libobj.a rebuilt).
-set(VITA_VERSION  "02.63")
-# 02.63 (2026-10-19): system IME rendering - give CommonDialog a real GXM
-#   display queue (log109 problem 3, the freeze). v02.59/02.60 mapped the
-#   framebuffer and created a sync object but left the GXM display-queue
-#   callback NULL and still submitted via sceDisplaySetFrameBuf. CommonDialog
-#   renders THROUGH GXM, whose output only reaches the screen via the display
-#   queue (sceGxmPadHeartbeat + sceGxmDisplayQueueAddEntry + a vsync callback
-#   that does the real sceDisplaySetFrameBuf); with the callback NULL the
-#   dialog's render had nowhere to go and the VM stalled in the render path.
-#   Fix: vita_gxm.c now initializes GXM with a display-queue callback (2 sync
-#   objects, double-buffered) and exposes vita_gxm_dialog_frame() which paints
-#   the dialog (sceCommonDialogUpdate) then submits through the display queue.
-#   vita_display.c's flip_to_display() branches: while the IME is active it
-#   calls vita_gxm_dialog_frame(vita_fb) instead of sceDisplaySetFrameBuf, so
-#   the two submit paths never mix. Software path unchanged when IME is idle.
-set(VITA_VERSION  "02.64")
-# 02.64's full description is below (after 02.65); this set line is kept so the
-# 02.64 VPK that produced log111 can still be rebuilt from this tree.
-set(VITA_VERSION  "02.65")
-# 02.65 (2026-10-19): log111 fixes - keyboard stuck/overlapping, MIDI cost.
-#   log111 confirmed v02.64: MIDI parses (11 ch / 3638 notes / 109 s) and plays,
-#   one start per player, no restart storm; the keyboard now appears.
-#   - IME close protocol. UC's field takes focus by itself at start-up (no
-#     input between CE 9473 and 10369), then loses it within seconds ->
-#     hideNativeKeyboard -> vita_ime_abort() called sceImeDialogTerm() on a
-#     RUNNING dialog and dropped g_ime_active. Term is only legal after
-#     FINISHED (the SDK sample never does otherwise), so the dialog stayed
-#     alive in the system with nobody calling sceCommonDialogUpdate: frozen
-#     keyboard, input swallowed ("cannot type / cannot close"; log111 shows
-#     "[IME] abort" and never "status -> 2"). abort now sends
-#     sceImeDialogAbort() and the poll Terms after FINISHED while the display
-#     tick keeps driving Update; 3 s safety net; a show() during the close is
-#     replayed afterwards. NOT verified on hardware (inference from the log
-#     and the SDK sample; Abort/Term return codes are logged to confirm).
-#   - Input isolation: pad and touch are not forwarded to the MIDlet while the
-#     keyboard is up (a tap meant for the dialog also hit UC). A touch that is
-#     still visible to the app during the dialog is logged (max 3 per show).
-#   - Letterbox: the blit only writes the scaled MIDlet rectangle; the bars
-#     keep whatever the full-width keyboard painted there -> permanent
-#     "overlap". Bars are cleared every dialog frame and in the 2 frames
-#     after it closes (one per CDRAM buffer; the tick also runs for those).
-#   - MIDI cost: tsf_set_max_voices(32) (TSF grew the pool unbounded; kills
-#     the oldest released voice first), tsf_reset at song start/stop (cut
-#     songs left voices ringing), muted player no longer renders flat out
-#     (it skipped sceAudioOutOutput, the only pacing), cur_time_ms advances
-#     during playback (was 0 until the end). One "[MIDI] ended/stopped: ...
-#     render avg/max us, voices" line per song, printed after playback (a
-#     stderr write costs 12-22 ms > the 10.7 ms chunk budget).
-#     Whether this removes the frame drops is NOT verified: no render timing
-#     existed before; the new line gives it. The heartbeat rate in the game
-#     phase was unchanged vs log110 (774 vs 835 ms / 64 CE).
-# 02.64 (2026-10-19): log110 fixes - MIDI silence/lag, SELECT popping the IME,
-#   IME not drawing.
-#   - MIDI: KNI copies every Java window to the START of the buffer we hand
-#     out (pl->jts_data) and then calls do_buffering with buffer == jts_data;
-#     the port appended to jts_data + midi_len, so from the 2nd 4 KB chunk on
-#     it overwrote the bytes already collected (MThd header included). The
-#     size stayed right (29139) but tml_load_memory failed 198 times. The SMF
-#     now accumulates in its own block (midi_acc). Reproduced on the host
-#     (/tmp/alias_sim.c): old = no MThd, new = byte-identical.
-#   - A failed play is paced (~1 s, interruptible) and remembered (midi_bad)
-#     instead of END_OF_MEDIA at once -> the game's loop-restart storm (308
-#     rounds / 133 s, each ~10 synchronous log writes) is gone. get_time /
-#     get_duration / set_volume log every 64th call. TML_ERROR/TML_WARN now
-#     print, and a parse failure prints the first 8 bytes.
-#   - SELECT opened the system keyboard unconditionally (v02.50), so pressing
-#     it in a game popped the IME (confirmed by the tester). It now does so
-#     only while a TextField/TextBox has focus (flag set by
-#     show/hideNativeKeyboard); otherwise it is '#' again (key_map).
-#   - IME: sceCommonDialogUpdate only ran from flip_to_display (Java repaint);
-#     an idle screen never drove the dialog (log110: Init rc=0, status=1, VM
-#     alive, no keyboard). vita_display_ime_tick() resubmits every 16 ms from
-#     the event pump while the IME is up. [GXM] dialog frame lines now log the
-#     three return codes; [IME] status -> N logs every status change.
-#     NOT verified on hardware: whether this makes the keyboard appear.
-set(VITA_VERSION  "02.66")
-# 02.66 (2026-10-20): two audio defects found while reviewing v02.64/02.65
-#   (neither came from the logs - log111 only shows start -> pause on every
-#   player).
-#   1. start -> pause/stop race. javacall_media_start() queued the request but
-#      the player thread was the one that set pl->playing = 1, while
-#      pause()/stop() were written as "if (pl->playing) pl->stop_flag = 1".
-#      A pause that arrived before the thread ran therefore did nothing, and
-#      even an unconditional set was wiped by the thread's own
-#      "pl->stop_flag = 0" at branch entry: the MIDI song kept playing for
-#      up to its full length (109 s in log111) while Java believed it was
-#      paused. stop_flag is now cleared in javacall_media_start() (VM thread,
-#      before the request is queued) and cleared nowhere in the player
-#      threads; pause()/stop() set it unconditionally.
-#   2. WAV accumulator. The WAV path had exactly the MIDI aliasing bug fixed
-#      in v02.64 for MIDI: KNI copies each Java window to the START of
-#      jts_data (returned by get_buffer_address) and then calls do_buffering
-#      with buffer == jts_data, so appending to jts_data + wav_buf_len
-#      overwrote the bytes already collected from the 2nd 4 KB window on.
-#      Worse, wav_ensure_cap() realloc'd jts_data, which could MOVE it while
-#      `buffer` still pointed at the freed block (use-after-free). WAV now
-#      accumulates in its own block (wav_acc, 64 KB start, WAV_MAX_BUFFER
-#      ceiling) like MIDI; jts_data stays a fixed 32 KB KNI staging buffer.
-#      No archived log has a "wav buffered" line, so long WAV was never
-#      proven working. realize() also resets wav_buf_len/data_off so a
-#      re-download cannot append to (or skip parsing) a previous copy.
-#   NOTE: this is a code-review fix; log111 was v02.64 and says nothing about
-#   either defect. Verify on hardware: a paused BGM must go silent, and a
-#   >4 KB WAV must still play.
-set(VITA_VERSION  "02.67")
-# 02.67 (2026-10-20): log112 (v02.66) - the keyboard shows once and never again.
-#   log112 confirms: MIDI render avg 2.9-4.3 ms per 10.7 ms chunk, 0 over, voices
-#   avg 26-30 max 32 (the cap is hit), no frame drops felt -> audio load fixed.
-#   v02.65's close protocol works: Abort rc=0 -> status 2 -> Term rc=0 (+3.9 s;
-#   UC took the keyboard away 3.1 s after showing it, no user input in between:
-#   first touch is 65 s later). Then 13 x sceImeDialogInit = 0x8002047f
-#   (UNEXPECTED_FATAL), no success. Nothing in any archived log shows a typed
-#   text ever being committed ("committed" count is 0 in all of them).
-#   CAUSE NOT KNOWN. This build is an experiment that separates two guesses:
-#   - the SDK sample calls sceCommonDialogUpdate every frame, also right after
-#     Term; we stopped at once -> 6 more dialog-path frames after Term.
-#   - Init fails only while the system is still tearing down -> a failed Init
-#     is retried every 100 ms for 3 s from the event pump (cancelled by hide).
-#   New log: "[IME] show: Init rc=.. (status before=N, M ms since last Term,
-#   attempt K, t=..)", "[IME] Init succeeded on retry K" / "giving up", and
-#   "[IME] text_wanted -> 0|1 (t=..ms)" = the Java side's show/hide rhythm.
-#   Read: success on attempt 1 -> post-Term Update was it; success on retry K
-#   -> timing, K*100 ms; still failing after 30 -> neither, next lead is the
-#   state before Init / the parameters.
-set(VITA_VERSION  "02.68")
-# 02.68 (2026-10-20): log113 (v02.67) - typed text never reaches the app, and
-#   the keyboard still shows once only.
-#   log113 facts: first dialog ran 18.4 s (user typing; no input reached the
-#   app, no "touch visible" line -> the dialog owns the panel), then
-#   status 2, "finished: button=0", "dismissed (button=0)". SDK enum:
-#   0=NONE 1=CLOSE 2=ENTER; CLOSE is the explicit cancel, so NONE is not "the
-#   user cancelled". Every later Init: 0x8002047f with status before=0, up to
-#   84 s after Term -> the timing guess is dead (retries cut 30 -> 3).
-#   Whether the post-Term Update frames ran is unproven (no counter).
-#   - Result handling: the SceImeDialogResult was never cleared and the return
-#     of sceImeDialogGetResult never checked; the code only committed on
-#     button==ENTER. Now: memset, check rc, log result/button/text length/first
-#     char, and ENTER *or* (NONE with text in the buffer) commits; CLOSE and
-#     NONE-with-empty-buffer still drop. Whether the buffer really holds the
-#     typed text is exactly what the new "finished:" line will show.
-#   - New observability for the Init failure: free user/cdram/phycont memory
-#     and the number of dialog frames since Term on the Init line, and the
-#     dialog's frame rate in the "finished:" line (log113 printed #300 but not
-#     #600 over 18 s, i.e. < 32 fps).
-#   NOT a fix for the Init failure: its cause is still unknown.
-set(VITA_VERSION  "02.69")
-# 02.69 (2026-10-21): log113 follow-up - the four remaining differences from
-#   samples/ime, in ascending order of risk. log113 is v02.67: the first
-#   dialog worked (18.4 s, status 2, button=0, text dropped) and every later
-#   sceImeDialogInit returned 0x8002047f = SCE_COMMON_DIALOG_ERROR_UNEXPECTED_
-#   FATAL (status before=0, still failing 84 s after Term, across MIDlets).
-#   1. sceSysmoduleLoadModule(SCE_SYSMODULE_IME) - ime_dialog.h names the
-#      module in its usage line and it was never loaded here. If the system
-#      auto-loads it for the first dialog and drops it on Term, the second
-#      Init fails forever - the exact observed shape. Logged with its rc.
-#   2. sceAppUtilInit, called before sceCommonDialogSetConfigParam like the
-#      sample (CommonDialog reads app info). Logged with its rc.
-#   3. One SceGxmColorSurface PER framebuffer, initialised once (the sample's
-#      dbuf[].surf) instead of re-running sceGxmColorSurfaceInit on a single
-#      shared surface every frame - that rewrote a description the GPU may
-#      still have been reading.
-#   4. displayQueueMaxPendingCount 2 -> 1 (DISPLAY_MAX_PENDING_SWAPS in the
-#      sample) and sceDisplayWaitVblankStart() after each dialog submit, so
-#      AddEntry cannot block the VM thread and the dialog is paced at 60 fps
-#      (log113 printed frame #300 but not #600 over 18 s = 16-32 fps).
-#   Also clear_letterbox() now memsets each run instead of looping per pixel
-#   (it ran up to 62x/s on the VM thread while the keyboard was up).
-#   NOT verified on hardware. Expected next-run markers: the new
-#   "[IME] sysmodule IME load rc=.., apputil init rc=..", a second
-#   "[IME] show: Init rc=0x00000000" after the first dialog closed, and
-#   "[IME] finished: ... text=N chars ..." telling whether the buffer holds
-#   the typed text.
-set(VITA_VERSION  "02.70")
 # 02.70 (2026-10-21): boot white-screen - read the jar once into RAM.
 #   log113 (v02.67), round 0: round_begin -> first_content_flip = 10.0 s, of
 #   which the boot preload (load_all_in_classpath) is 5.59 s and 4.49 s of that
@@ -1664,90 +48,433 @@ set(VITA_VERSION  "02.70")
 #   and in "[preload] sys(VM thread, delta)": io_read n collapsing from ~3900
 #   to a handful, total_us from ~5.6 s towards the resolve-only ~1.6-2 s.
 
+# ============================================================================
+# 04.25 (2026-11-03): log183 - 极品飞车 still freezes on the loading screen, and
+#   for the first time the stack points at code we wrote rather than at a
+#   constant. Two defects in Object3D.duplicate() plus one in find().
+#   PART 1 - v04.22 CONFIRMED. "java.lang.Error:  95" (== IllegalAccessError
+#   off Appearance.setLayer) is gone. The title is now 49 bytes further along.
+#   PART 2 - THE NEW FAILURE:
+#       [TIMEREXC] task v@e16b5918 cancelled: java.lang.NullPointerException:   0
+#        - ab.a(), bci=135
+#        - x.q(), bci=196
+#        - x.a(), bci=1608
+#        - ab.a(), bci=688
+#   ("  0" is empty_message - this build prints the ErrorMsgTag enum index, see
+#   the 04.22 block; NPE is the exception itself, not the tag.)
+#   Decompiled the title:
+#       x.q() bci=196 -> ab.a(int, Node x8, boolean)
+#       ab.a() bci=75  : node14 = ac.a(3)          // resource 3 == "/d"
+#       ab.a() bci=104 : node14.find(12)           -> g16
+#       ab.a() bci=116 : node14.find(13)           -> g15
+#       ab.a() bci=135 : g16.addChild(...)         <- NPE, so g16 was null
+#   ac.a(3) is `((Object3D) Loader.load(o.a[3])[0]).duplicate()` - measured from
+#   ac.class, o.a[3] == "/d" (the title's own string table).
+#   DEFECT A: duplicate() dropped the user ID. The "/d" object is Group userID=12,
+#   so find(12) was searching for a CHILD with ID 12, found nothing, returned
+#   null, and addChild(null) threw. duplicate() now carries the ID over in ONE
+#   place (the return of duplicate()) so no per-type branch can forget it. The
+#   title corroborates the intent: ab.b(Node) explicitly does duplicate() then
+#   setUserID(getUserID()).
+#   DEFECT B: duplicate() of a Group returned a CHILDLESS Group. A loaded model
+#   duplicated for instancing was an empty shell - nothing under it drew, and
+#   find() on the copy could see nothing. Now the children are duplicated too
+#   (recursively, which is safe: addChild rejects a node that already has a
+#   parent and an M3G file is a tree). Vertex/index data is still SHARED, which
+#   is what the spec asks for and keeps duplicate() cheap.
+#   DEFECT C: find() could not leave its own sub-tree. Measured on "/d": it is
+#   ONE tree of 9 Groups, and the two anchors the title wants (userID 12 and 13)
+#   are nodes IN it - the 12 node is a leaf, the root is a third Group.
+#   Loader.load("/d")[0] therefore hands the title the 12 node, not the root, so
+#   a strict sub-tree search can never reach 13. bci=855 does exactly the same
+#   addChild with the find(13) result, so fixing only bci=135 would have moved
+#   the crash 720 bytes. find() now falls back to (1) the root of the tree the
+#   object belongs to and (2) the sibling top-level roots of the same load.
+#   The fallback is stored on the object itself (Object3D.sceneRoots), so a
+#   duplicated copy keeps it, and it cannot cross files because user IDs are
+#   unique within one .m3g.
+#   WHY NOT JUST PUT THE ROOT AT INDEX 0 - deliberately NOT done. v04.08 made
+#   index 0 the first Node in FILE order because 极品飞车 addresses objects by
+#   POSITION in this array. Measured: /aq's first Node is index 0 but its first
+#   ROOT is index 3, and /af, /bl are the same shape. Re-sorting would re-target
+#   every position-addressed lookup and would bring back the log177
+#   ClassCastException / log179 wrong-texture class of bug. The ordering is
+#   untouched; only find() got smarter.
+#   VERIFIED ON HOST (no device needed, all 28 .m3g in debug/3d_game):
+#     - every file parses, readAll()s and duplicates every Node: 28 ok, 0 fail
+#     - "/d" end-to-end simulation of the title's sequence:
+#         model=objs[0].duplicate() -> id=12
+#         find(12) -> Group id=12      (was NULL before A)
+#         find(13) -> Group id=13      (was NULL before B+C)
+#         addChild on both -> OK       (both bci 135 and bci 855 clear)
+#     - 生化危机's files still load (they have a World, so index 0 is unchanged)
+#   NOT verified on device. What is claimed: the two NPE sites in this title's
+#   loading path are gone, and no .m3g in the sample set regressed.
+#   STILL MISSING, found while measuring and not fixed here: duplicate() of a
+#   World goes through the Group branch and returns a plain Group (type and the
+#   activeCamera/background are lost). No title in the sample set duplicates a
+#   World, so it is recorded rather than changed blind.
 
-set(VITA_VERSION  "02.71")
-# 02.71 (2026-10-21): log114 (v02.70) - GPU crash on the keyboard in the 2nd
-#   MIDlet, and the letterbox bars turning white while the keyboard is up.
-#   log114 confirms v02.69 fixed the keyboard: Init rc=0 on all 11 shows
-#   (sysmodule IME + sceAppUtilInit), typed text commits ("button=2 ENTER,
-#   text=2 chars", "committed 2 chars"), 19 fps -> the 02.68 NONE-with-text
-#   workaround was never needed (button is 2 or 1 in every finished line).
-#   1. GPU crash. psp2core-...-GPUCRASH.psp2dmp, last show = first show of
-#      round 1 (FileManager), log stops after "dialog frame #4 fb=0x62800000".
-#      Every MIDlet round allocates a fresh CDRAM framebuffer block (round 0
-#      0x61400000, round 1 0x62800000). The block was GXM-mapped through a
-#      boolean (vita_fb_gxm_mapped) that nothing ever cleared, so "[CD] map
-#      fb" is printed ONCE in the whole log and the round-1 block was never
-#      sceGxmMapMemory'd. The dialog then rendered into unmapped memory.
-#      Evidence in the dump: GPU_INFO contains 0x62b2a024 (inside the round-1
-#      block); MEM_BLK_INFO lists the block at 0x62800000. Fix: remember the
-#      mapped BASE; remap whenever the block changes; sceGxmDisplayQueueFinish
-#      + sceGxmUnmapMemory before the block is freed (lfjport_ui_finalize) and
-#      before mapping a different one.
-#   2. White bars. v02.69 rewrote clear_letterbox() with memset(..., 0xFF, ...)
-#      "to be faster"; memset repeats the byte in all four channels, so the
-#      bars became 0xFFFFFFFF = white. Now 0x00 (black; what ui_init uses and
-#      what the SDK sample's memset(data, 0xff000000, ..) actually writes).
-#   NOT verified on hardware. Expect "[CD] unmap fb ... rc=0" at the end of
-#   round 0, "[CD] map fb base=0x62..." before the first dialog of round 1.
-set(VITA_VERSION  "02.72")
-# 02.72 (2026-10-21): log114 follow-up - where did 4 MB of CDRAM go?
-#   Facts (log114 + crash dump MEM_BLK_INFO): free CDRAM at IME Init is 90112K
-#   in all 10 round-0 dialogs (so a dialog itself costs nothing) and 86016K in
-#   round 1 (-4096K = one framebuffer block). CDRAM layout at the crash:
-#   menu fb 0x61000000-0x61400000, a 4096 KB HOLE 0x61400000-0x61800000 (round
-#   0's freed MIDlet block), SceGxmParamBuffer 16 MB, round-1 fb 0x62800000.
-#   The new block was not placed in the hole although it is exactly 4 MB; the
-#   -4096K says the hole is not free, it is held by something. The only thing
-#   known to have touched that range is the sceGxmMapMemory made in round 0
-#   (never unmapped before the block was freed, fixed in 02.71); a display-queue
-#   reference to the old framebuffer is the second candidate. Not proven.
-#   This build only ADDS observation: "[fb] alloc|finalize begin|after unmap|
-#   after release base=.. cdram free=..K" at every round. Read: if "after
-#   release" is 4096K above "after unmap"'s predecessor and the next "alloc"
-#   reuses 0x61400000 with the same free number as round 0, the 02.71 unmap
-#   fixed the leak; if free stays 4096K low, something else holds the block.
-set(VITA_VERSION  "02.74")
-# 02.74 (2026-10-21): the system keyboard opens with the TextBox's current text and
-#   its result REPLACES it (was: always opened empty, result inserted at the caret,
-#   so earlier input could be neither seen nor edited; v02.73 only added a Clear key
-#   to work around that). Chain: TextBoxLFImpl (lSetChars/lInsert/lDelete/lSetMaxSize
-#   and show) -> VirtualKeyboardInputMode.setNativeKeyboardText(text, capacity) KNI
-#   -> vita_ime_set_initial_text() (a cache, because SELECT opens the dialog from
-#   native code without passing through Java) -> sceImeDialogParam.initialText +
-#   maxTextLength = capacity. Result -> IME event -> Display.handleInputMethodEvent
-#   -> TextBox.setString(result); an empty result is delivered (= user cleared it).
-#   The cache is dropped when the TextBox is hidden, so it cannot leak into another
-#   keyboard. Only the whole-screen TextBox is wired; a Form TextField still inserts.
-#   Needs a MIDP rebuild (Java + KNI table -> ROM). NOT verified on hardware.
-# 02.73 (2026-10-21): log115 (v02.72) - CDRAM leak confirmed gone; add a Clear key.
-#   CDRAM (the "[fb]" lines, two rounds): alloc 106496K -> (GXM param buffer 16 MB
-#   appears at the first dialog) -> finalize begin 90112K -> after unmap 90112K ->
-#   after release 94208K; round 1: alloc base=0x61400000 (the hole is REUSED),
-#   free 90112K -> release 94208K again. "[CD] unmap fb rc=0x00000000" both
-#   rounds, no hang in sceGxmDisplayQueueFinish, no GPU crash, and round 1's
-#   dialog works (map fb 0x61400000, committed 3 chars). So the 4 MB per round is
-#   returned: the 02.71 unmap (+ display-queue finish) fixed it. The two causes
-#   were fixed together, so which of the two it was is not separable. The
-#   remaining 16 MB vs the first alloc is the GXM param buffer, created once per
-#   process (sceGxmInitialize), by design - not a leak.
-#   Clear key. After the system keyboard committed text there was no way to
-#   delete it: no button maps to KEYMAP_KEY_CLEAR (-8), though phoneME handles it
-#   (TextFieldLFImpl.handleClearKey: short press = delete the char before the
-#   cursor; a second event for the same key before its release = long press =
-#   empty the field). TRIANGLE now sends Clear while a TextBox/TextField has
-#   focus and the keyboard is down (same context test as SELECT, vita_ime_
-#   text_wanted); held 0.7 s it sends one KEYMAP_STATE_REPEATED = empty field.
-#   Games are unaffected (no text focus -> still GAME_A). It stands down if any
-#   button is already mapped to Clear or TRIANGLE was remapped in 设置 > 按键映射.
-#   Limits: text_wanted is only set for a whole-screen TextBox (v02.62 removed it
-#   for Form TextFields), so a Form TextField gets no Clear key; and whether the
-#   field really empties depends on BasicInputMode.processKey returning
-#   KEYCODE_NONE for Clear - phoneME's standard path, not exercised here.
+# (superseded by the 04.26 set() below)
+# 04.26 (2026-11-03): log184 - two defects, both mine, both fixed here.
+#   (1) SECOND-ROUND CRASH (regression v04.18 -> v04.21). log182 (v04.20) ran
+#       several rounds fine; log183 (v04.23) and log184 (v04.25) die on EVERY
+#       round after the first with
+#           [heap] chunk alloc FAILED heap_chunk=33562624
+#           free=33577072  -> "Could not allocate VM heap"
+#       exit_probe.log: round 0 status=0, rounds 1+ status=-1.
+#       Cause: v04.18 routed BOTH chunks through vita_try_vm_chunk, so each
+#       round also allocated and freed a 2 MiB VM block for the bit-vector.
+#       sceKernelOpenVMDomain() is irreversible and the block charges the
+#       process budget, so after the first round a 32 MiB malloc no longer
+#       fits - log184's arena has only ~14 KB of slack against the request.
+#       Raw [heapmem] line counts agree: log182 had 10, log184 has 47.
+#       Fix: only slot 0 (the heap) may use a VM-domain block. The bit-vector
+#       holds no code, so executable memory for it was never useful.
+#   (2) jitprobe.cfg WAS A SECOND, CONTRADICTORY SWITCH. The probe already runs
+#       only when the user asks for jit!=0, so requiring a file as well meant
+#           [JITPROBE] skipped: ux0:/data/J2ME00001/jitprobe.cfg absent
+#           jit: executable-memory probe FAILED
+#           jit: cfg=2 -> policy 0 (interpreter); no executable memory
+#       i.e. turning the JIT on produced a permanent "no executable memory"
+#       verdict naming a file the user never created. That is also why log182
+#       probed and log184 did not. The gate and the "JIT 探针" settings row are
+#       both gone; the probe now runs whenever the policy needs it.
+#   NOT addressed here: a 32 MiB heap still cannot be executable (VM blocks cap
+#       at 16 MiB), so the JIT still stays off until "Java 堆" is lowered.
+
+# ---- version marker ---------------------------------------------------
+# Every release used to append its own essay + set(VITA_VERSION) above this
+# point: 180 of them, and only the last one had any effect (CMake is
+# last-set-wins). Those essays are preserved in PROJECT_MEMORY.md, findable
+# by version number; keeping them here buried the real configuration.
+# Keep this as the LAST set(VITA_VERSION) in the file.
+set(VITA_VERSION  "04.54")
+# 04.29 (2026-11-04): log186 - the Java heap finally became executable, and the
+#   JIT was STILL off. Two independent ordering faults, both in runMidlet.c,
+#   both fixed here.
+#
+#   What log186 proved (one boot, three rounds):
+#       round 1: heap_mb=15 -> Java heap 15728640 bytes
+#                [heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: 0x85c00000,
+#                15728640 bytes => THE JAVA HEAP IS EXECUTABLE; JIT may run
+#       every round: JIT requested but the Java heap is not in executable
+#                memory -> -int (interpreter)
+#   So the memory work from v04.17/v04.18 was CORRECT all along; the decision
+#   that consumes it was asking the question at a moment when the answer could
+#   not exist yet.
+#
+#   (1) THE HEAP IS NOT ALLOCATED WHERE v04.24 ASSUMED.
+#       v04.24 moved the JIT decision to "right after JVM_Initialize()", on the
+#       belief that JVM_Initialize() allocates the heap. It does not - it only
+#       sets up tty and Argument parsing (utilities/Arguments.cpp:505). The
+#       heap is created by Universe::initialize() -> ObjectHeap::create()
+#       (handles/Universe.cpp:549), which runs inside JVM::start(), i.e. from
+#       midpRunVm - AFTER the last point where "-int" can still be injected.
+#       Every vita_heap_executable() query ever made from runMidlet.c was
+#       therefore answered by the PREVIOUS round's state, and round 0 always
+#       got 0. Querying cannot be fixed by moving it; it has to go.
+#       Fix: PREDICT from the requested size instead. The arithmetic is exact
+#       and lives in OsMemory.cpp:
+#           heap_chunk = HeapCapacity + 8192     (MimimumMarkingStackSize)
+#           a VM block is a 1 MiB multiple, <= 16 MiB
+#           15 MiB -> 15736832 -> 16777216  FITS (exactly)
+#           16 MiB -> 16785408 -> 17825792  does NOT fit
+#       so "heap_mb <= 15" is the precondition, and the VM still logs the real
+#       outcome ("[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY" vs "... outside
+#       the VM block range -> malloc") so a wrong prediction is visible.
+#
+#   (2) setHeapParameters() SILENTLY UNDID THE OVERRIDE.
+#       The heap_mb value was applied before setHeapParameters(), which does
+#           JVM_SetConfig(JVM_CONFIG_HEAP_CAPACITY, getHeapRequirement());
+#       unconditionally (ams_common/native/heap.c:135). That is why log186
+#       printed "heap_mb=15" and still booted a 32 MiB heap.
+#       Fix: split into vita_read_heap_mb() (called early, feeds the JIT
+#       decision) and vita_apply_heap_mb() (called right after
+#       setHeapParameters(), so nothing overwrites it).
+#
+#   Also in this build: build.sh Step 0.5, which recompiles the orphaned
+#   obj/arm/runMidlet.o. Without it none of the above reaches the VPK at all -
+#   v04.19 through v04.28 were dead code (see the v04.28 note).
+
+# 04.29 (2026-11-04): log185 - and the big news is that this is NOT a freeze.
+#   PART 1 - v04.27 CONFIRMED, DECISIVELY. For the first time in this title the
+#   game is REACHED AND RUNNING:
+#       - no more [TIMEREXC] in the log at all
+#       - frames=320, render calls=685, 1,098,444 vertices drawn
+#       - gameplay meshes drawn: "gmesh#7 n=675", "rootstate#71 mesh=185ab735"
+#       - RMS written ('nfs10set' ver=12, then '0' store created)
+#       - exit_probe: 4 launches, all status=0 at the menu
+#   The last m3g line is "rootstate#71", not an exception - the scene simply
+#   stops being interesting at the sample point.
+#   PART 2 - THE ONE REAL BUG FOUND IN log185:
+#       [APPEXC] java.lang.IllegalArgumentException: parametric camera
+#        - javax.microedition.m3g.Camera.getProjection(), bci=31
+#        - ab.a(), bci=2        <- ab.a(Camera, Transform, Transform)
+#        - x.a(), bci=83 / z.a(), bci=855 / h.b(), bci=30 / x.a(), bci=46
+#        - ab.paint(), bci=156
+#   It fired ONCE, at ab.paint() - i.e. inside a frame, and the frame died.
+#   THE CAUSE WAS OUR OWN INVENTION. Camera.getProjection(Transform) threw
+#   whenever the camera was PERSPECTIVE/PARALLEL and the caller passed a real
+#   Transform. JSR-184 says the opposite in so many words:
+#       "This method is available REGARDLESS OF THE TYPE OF PROJECTION, since
+#        parallel and perspective projections can always be returned in the 4x4
+#        matrix form."
+#     and the only documented throw is ArithmeticException for near == far.
+#   极品飞车 builds a PERSPECTIVE camera and calls getProjection(t) with a real
+#   Transform because it wants the matrix to pre-multiply into its own camera
+#   space (ab.a bci=2..21 then postMultiply). We threw; paint() died.
+#   This is the SIXTH instance of "a legal API call throws" (FUNC_BLEND v03.29,
+#   WINDING v04.17, SPOT v04.17, setLayer v04.22, Loader node v04.27, this one) -
+#   and the first one this port invented rather than inherited.
+#   FIX: the matrix is built for all three types. The construction was moved out
+#   of Renderer.projection() into Renderer.buildProjection() so there is exactly
+#   ONE definition of it and the camera-reported matrix can never disagree with
+#   the one we render with. Behaviour kept identical for the render path
+#   (buildProjection(type, fovy, viewportAspect, near, far, null) is what
+#   Renderer.projection() now calls). near == far still throws ArithmeticException
+#   as documented - and is unreachable from Java anyway because setPerspective /
+#   setParallel reject it.
+#   GUARD ADDED: debug/tools/m3gprobe/ApiSweep.java. It calls every JSR-184 entry
+#   point this title's constant pool references (55 calls, extracted with
+#   `javap -v | grep '// javax/microedition/m3g/'`, not from the spec) with legal
+#   arguments and fails on any throw: "55 calls, 0 threw -> ALL PASS".
+#   debug/tools/m3gprobe/CamChk.java covers Camera specifically (all three
+#   projection types, the numeric values of the resulting matrix, GENERIC
+#   round-trip, and that the setters reject near == far).
+#   PART 3 - WHY IT STILL *LOOKS* STUCK, and it is not a bug in this area:
+#       [PERF] f=300 fps=5.3 period=187.64(33.36..3553.60)
+#             flip=21.16(12.37..39.13) prepare=12.33 arm=333MHz
+#       [PERF] VERDICT: arm stuck at 333 MHz (asked 444, all strategies failed)
+#   The device refuses the 444 MHz bump, so everything runs at 333 MHz with the
+#   GPU at 111 MHz. The per-frame Java work is only ~74-100 ms (ptime total=74,
+#   of which draw=3..5, present=19..21, skin=3..6); the killer is the 46-127 ms
+#   "gap" plus occasional 3553 ms outliers, i.e. the title is waiting, and at
+#   5.3 fps a loading screen that should take 3 s takes 25 s and reads as a hang.
+#   NOT caused by m3g: shade/draw/walk are all single-digit ms. Recorded, not
+#   "fixed" - the honest next lever is the ARM clock (clock.cfg / AC / Wi-Fi off,
+#   as the log itself suggests) and the 3553 ms outlier, which needs its own
+#   measurement round.
+#   NOT verified on device.
+# 04.17 note (2026-11-02): the JIT memory question is ANSWERED - see the block
+#   above v04.17's set() in this file for the log181 evidence. What follows is
+#   the immediate consequence: the crash in log181 was the probe PASSING and the
+#   policy therefore being left at 2 while ObjectHeap still generates into the
+#   managed heap.
+#   (1) The probe result no longer decides the policy on its own.
+#       vita_main.c now requires vita_jit_code_area_ready() as well, and that
+#       returns 0 until the VM actually uses the VM-domain block. So "jit=2"
+#       prints "executable memory WORKS (probe passed) but the compiler area is
+#       still inside the Java heap" and stays on the interpreter instead of
+#       killing the process in the first frame. This is the difference between a
+#       useful log line and a coredump.
+#   (2) vita_jitmem.c gains the code area itself:
+#         vita_jit_code_area_acquire()  4 MiB VM block, OpenVMDomain FIRST then
+#                                       alloc (the order log181 proved), domain
+#                                       left OPEN (a JIT patches constantly)
+#         vita_jit_code_area_ready/base/size
+#         vita_jit_flush_icache()       -> sceKernelSyncVMDomain
+#       Acquire proves the block is usable before anyone trusts it: stores at
+#       the head AND at block-16, reads them back, then EXECUTES the head. The
+#       kernel still reports access=0x4 for this memory, so the access field is
+#       not used as a gate - log181 showed the writes and the call succeed while
+#       it claimed R only, which is what misled v03.77 for seven versions.
+#   (3) Nothing on the default path changes: jit=0 never calls any of it.
+#   STILL TO DO, and it is the real work: point ObjectHeap at this area. The
+#   compiler area is [compiler_area_end() - size, compiler_area_end()) inside the
+#   heap, and compact_and_move_compiler_area() can relocate it during GC. Moving
+#   it out means (a) compiler_area_end() returning the VM block end under VITA,
+#   (b) skipping the GC relocation, (c) relaxing verify_layout()'s heap-order
+#   guarantees for the compiler area. Doing that in one step without a way to
+#   A/B it is how the last 12 rounds went; this version first makes the backing
+#   store provable on its own, so the ObjectHeap change has something known-good
+#   to point at.
+# 03.33 (2026-10-27): log135 - the "steady sizzle" on the xiyangyang ring tones,
+# polyphase FIR upsampler (see vita_wav_resample.h).
+#   (its description is in the block above 03.34's set(); kept as history)
+# 03.28 (2026-10-27): log133 diagnostics only - NO behaviour change. Neither game's failure could be located:
+#   (1) 极品飞车 never touched Graphics3D (no [m3g] line at all) and the screen stayed on the pre-init fill colour
+#       (ab.paint draws ad.a(g,54) while ab.c==false). Its main loop is a 15 ms java.util.Timer task; TimerThread
+#       cancelled any task that threw, with NO trace, which would look exactly like this (heartbeat alive, nothing
+#       drawn, no [APPEXC] because paint() itself does not throw). Timer.java now prints "[TIMEREXC] ..." with the
+#       stack for a cancelled task, an Error, and a dying timer thread (System.out -> vm_output.log).
+#   (2) 生化危机 printed "render calls=1 frames=0" with every reject counter 0, then never again: the old report
+#       needed frames to advance by 30, which can never happen when frames stays 0. Renderer now reports every 120
+#       releaseTarget() calls and counts the two previously silent exits (noCamWorld = renderWorld without a camera,
+#       nullNode = render(null, ...) -> NPE swallowed by BioCanvas.printException, which is an empty method).
+#   Not verified on hardware.
+#   (version line removed in 03.29 - this block is history; see 03.29 above)
+
+# 03.23 (2026-10-26): log129 + user: "crackle ALWAYS, clicks and hiss; J2ME Loader on a phone sounds better; dump the audio".
+#   Honest state: every audio change since v03.12 was reasoned from a WAV rendered on the HOST. Nothing measured what the
+#   DEVICE sends to the DAC, and my "no underrun" evidence (ran - cur within a few ms) was wrong: when the audio thread is late
+#   the port queue is empty, sceAudioOutOutput returns at once and the thread catches up, so wall time and submitted audio
+#   stay equal - underruns are invisible to that number. A late chunk is exactly a click.
+#   This version changes NO sound; it measures (vita_pcm_probe.h, host-tested by debug/tools/wavq/test_pcm_probe.c):
+#     1. audio_debug.log "[PCM] wav submissions=N intervals(ms): <9.0=.. 9-10=.. 10-10.5=.. 10.5-10.9=.. 10.9-11.5=..
+#        11.5-13=.. 13-16=.. 16-25=.. 25-50=.. >=50=.. max=.. us, quick-returns(<2ms)=.."  one line per tune. A healthy stream
+#        has everything in 10.5-10.9 (a 512-frame chunk is 10.667 ms). Anything in >=13 or any quick-return is an underrun.
+#     2. ux0:/data/J2ME00001/pcm_dump.raw = the first 6.4 s (600 chunks) EXACTLY as handed to sceAudioOutOutput
+#        (raw s16le stereo 48000 Hz). Written once per process, after the tune stops, so it cannot disturb the timing.
+#        Analyse with debug/tools/wavq/analyze_dump.py (clipping, jumps, L/R mismatch, 512-frame seams, zero runs, diff
+#        against the host reference).
+#   Also settled from log129: it is v03.21 and its audio code is byte-identical to v03.20 (RingTone.java, Sound.java,
+#   vita_audio_javacall.c, vita_wav_resample.h untouched since 02:44 / 15:43).
+# 03.20 (2026-10-26): user: "obviously the decoding of this audio type is wrong". Decoding re-checked from scratch:
+#   an independent OTA bit-stream decoder written from Sonivox eas_ota.c (not from RingTone.java) was run on the
+#   three real blobs. The BIT STREAM is right (header, 1 pattern, instrCount 34 / 255 / 255, notes 32 / 181 / 253,
+#   tempo/scale/style handled, all bits consumed up to zero padding; the melodies are plausible: D1 is a bass line
+#   C C G C C A# C A ..., D0 a C-major tune). The PITCH is wrong: RingTone took the frequency from Sound.FREQ_TABLE,
+#   Nokia's table for the Sound(freq, duration) constructor, which sits +50..+54 cents (HALF A SEMITONE) above
+#   equal temperament at every note (midi 60 -> 270 Hz, not 261.6; midi 69 -> 453, not 440). An OTA note is a MIDI
+#   note number (nibble + scale*12 + 59 in eas_ota.c) and Sonivox - what J2ME-Loader / Android use - plays it at
+#   A4 = 440. Measured on the rendered WAVs: every note was -46..-50 cents off its note name, now -1.6..+0.8.
+#   That is a different, constant mistuning against any reference recording, and a tune played half a semitone
+#   sharp against nothing sounds "off" even with a clean waveform. RTTTL notes go through the same code, so they
+#   are fixed too. Sound(freq, duration) still uses Nokia's table (its input is a frequency from that table).
+#   Not found wrong: pattern repeat (all three have instrCount > 0, no repeat headers), loops (0), unknown
+#   instructions (none), note durations. Unknown/unchecked: whether the reference decoders apply the +50 cents
+#   themselves (Sonivox does not: it feeds the MIDI note straight to its synth).
+#   Needs `build.sh midp` (RingTone is ROMized). Host test: RingToneTest now checks 11 pitches (<4 cents) and
+#   the Nyquist / negative cases.
+# 03.19 (2026-10-26): log127 (v03.17): "pause/resume no longer stalls, but the crackle is still there -
+#   a rasping tail". Asked which moment: the user answered "all the way through the tune, the tail of a
+#   note is just more obvious". Measured on the REAL tune (host JVM runs the real RingTone.toWav on the
+#   three blobs from the game; Hann-windowed DFT; power that is NOT on the note's own harmonic lines):
+#   the plain 8 kHz square wave leaves -15.5 / -13.9 / -12.8 / -13.8 dB (270 / 404 / 539 / 800 Hz)
+#   relative to the note - its odd harmonics above 4 kHz fold back into the audible band at frequencies
+#   that are not multiples of the note (2.7 - 5.0 % of the power, on EVERY note). That is a rough,
+#   metallic buzz, and it is the only measured defect left that is present throughout a tune.
+#   Things measured and ruled out: note data (no jumps larger than the swing, fades are clean, 16 distinct
+#   levels per 16-sample fade), the end of the tune (renderer pads real zeros), port volume, underruns,
+#   the resampler (images at 8k+-f are -57..-68 dB), the pause fade-out (soft thump < 200 Hz, not a buzz).
+#   Fix: integer PolyBLEP band-limited square in RingTone.synth (blepSquare, no float, no sin()):
+#   -29.9 / -30.1 / -31.0 / -31.7 dB with the same peak (44/127) and the same pitch; a pure-Java run on
+#   the real tunes: note counts unchanged (22 / 181 / 127), lengths unchanged, only the 2 samples around
+#   each edge differ (48279 of 48307 changed samples in the 34 s tune are within 2 samples of an edge).
+#   This is a 14-18 dB improvement, NOT silence: the residual left is the 8-bit rounding and the 8 kHz
+#   rate itself. Whether it removes what the user hears is not established. RingToneTest's synthetic
+#   OTA case had been failing since v02.89 (it used the v02.88 bit layout, before AND after every later
+#   change); fixed, all 13 checks pass. Needs `build.sh midp` (RingTone is ROMized).
+#   Pause -> next start is still ~2.5 s (log127 median 2525 ms): 2.4 s of it is BEFORE Sound.init, i.e.
+#   the game's own loading between stopMusic and new Sound(); our Sound() takes ~0.33 s now.
+# 03.16 (2026-10-25): log126 audio follow-ups (user: "sound still not great, some crackle - slightly better;
+#   pause -> resume stalls ~3 s"). Another session took 03.15 for the CAPCOM title in the same minutes (see
+#   below), so this is 03.16 and contains both.
+#   Stall: reproducible now that the log has timestamps - pause -> next start is 3041, 2689, 2778, 2984,
+#   2967, 2840, 3187, 3324 ms (median 2984); log125 (v03.13) has the SAME gap (median 2835 ms; I had not
+#   computed it then), so it is not a v03.14 regression. NOT the cause (each measured): render thread
+#   (stops 1..10 ms after the request), sceAudioOutOutput (never blocked), the toWav synth (0..2 ms, cache
+#   hit; first calls 530 / 2214 ms), synchronous audio_debug writes (17 VM-thread lines per player, ~0.1-0.4 s
+#   at the measured 14.7-21.9 ms each), the watchdog (nothing stalled in the window). The remaining ~2.4 s is
+#   inside Java createPlayer / MediaDownload / prefetch and is NOT located yet, so this version only measures:
+#   "[NS] t=.. create / first packet / buffered / acquire_device / prefetch / start" (audio_debug.log) and
+#   "[SOUND] t=.. init / ringtone->wav / wav player created createPlayer=N ms / play steps stop=..
+#   prefetch=.. setMediaTime=.. start=.." (vm_output.log), all on one wall clock.
+#   Crackle: log126 has no quality signal. Measured instead: the WAV data is click-free (0 jumps larger than the
+#   square swing, tunes start from 0), the port volume is 0 dB, no underrun (ran-cur -9..+3 ms over 21 pauses).
+#   What IS there: every pause cut the square wave mid-note = a step of 34 % of full scale to 0 in one sample,
+#   ~91 % of cuts land on full-level sound. wav_render_player now plays one 512-frame linear fade-out chunk
+#   after a stop/superseded exit (vwr_fadeout, host-tested: first step 22 instead of 11264). Whether that is
+#   the crackle the user hears is NOT established; the other candidate is the bare square-wave timbre.
+# 03.15 (2026-10-25): log126 fixes - the CAPCOM title no longer black-screens.
+#   (1) log126: "IllegalArgumentException: viewport outside the target" at
+#       Graphics3D.setViewport bci=70 from BioCtrl.D_Game_JSR184(), then EVERY
+#       later frame threw "already bound" because the escaped exception left
+#       bound=true. setViewport now CLAMPS to the target (a viewport sized for
+#       another handset is normal) and returns silently when it lands entirely
+#       outside; bindTarget now treats a re-bind as an implicit release.
+#   (2) The clip-space result is now mapped into the viewport rectangle
+#       (scale + offset matrix applied after the projection in Renderer.frame).
+#       Before this, a sub-viewport was drawn full-screen and then clipped,
+#       leaving the rectangle blank; present()/drawRGB blit only the viewport.
+#   (3) Projection aspect comes from the viewport, not the whole target, and
+#       setScissor keeps the software rasteriser inside the same rectangle.
+#   Diagnostics: one "bind target WxH clip=x,y" line per target and a
+#   "viewport clamp ..." line whenever a title asks for more than it got.
+# 03.14 (2026-10-25): log125 (v03.13): sound plays, no stutter, no stall - but "poor quality, some of
+#   it cannot be made out". log125 itself has no quality signal (pause latency 0..10 ms, log write avg
+#   4.7..5.9 ms, no sceAudioOutOutput stall), so this was analysed on the real tunes with the host JVM
+#   running the real RingTone.toWav on the three blobs from the game (D0/D1/D2). Two measured defects:
+#   (1) RingTone: style defaulted to 1 (continuous, no gap). The reference parser (Sonivox eas_ota.c:895)
+#       starts at 0 (last 1/16 of each note is silent), and none of the three tunes sends a style
+#       instruction. Result: in the 34 s tune 180 of 181 note boundaries had a 0 ms gap, 46 of them
+#       between two notes of the SAME pitch -> one long tone, rhythm lost. Now median gap 11 ms.
+#       (nokia_src is ROMized: needs `build.sh midp`.)
+#   (2) wav_render_player: output length = frames * (48000 / rate) with an INTEGER ratio, nearest sample.
+#       11025/22050/44100 Hz WAVs played 8.8 % fast (+147 cents), 32000 Hz 50 % fast, > 48000 Hz not at
+#       all; and nearest-sample upsampling keeps every image tone (SNR on a 1 kHz sine: 8.2 dB for an
+#       8 kHz source, 21.7 dB for 44.1 kHz, vs 25.1 / 54.6 dB with linear interpolation). New header
+#       vita_wav_resample.h (exact 32.32 position, linear interpolation), tested on the host with the
+#       real header: debug/tools/wavq/test_resample.c (found and fixed a uint64 overflow in the first
+#       draft: (n*rate)<<32 overflows once n*rate >= 2^32, a 34 s tune at 8 kHz already does).
+#   NOT changed, on purpose: the timbre (8 kHz / 8-bit square wave). A softer 16 kHz/16-bit tone is
+#   measurably cleaner on paper (non-harmonic energy -49 dB vs -15 dB at 340 Hz) but needs twice the
+#   samples in the interpreter, and the first-call cost of RingTone.toWav on the device is not
+#   measured - it could bring the load stall back. Next step is a timing probe, not a guess.
+# 03.13 (2026-10-25): listen to the audio pause/resume path (user: "pause then resume stalls a few
+#   seconds, only with sound on"). My v03.12 analysis said "no pause/resume event" - wrong: the log has
+#   7 "[IN ] pause" lines, one per player; the Java side's Player.stop() is DirectPlayer.doStop() ->
+#   nPause -> javacall_media_pause(). What was missing is TIMING: audio_debug.log has no timestamps, so
+#   a pause could not be put on the heartbeat timeline. Now, all with the same wall clock as the
+#   HEARTBEAT ms= field in input_debug.log (gettimeofday):
+#     [PR] t=.. pause#N ran=..ms playing=.. cur=..ms   pause()/stop() reached the port
+#     [PR] t=.. render stopped, Nms after the request  the render thread really left its loop
+#     [PR] t=.. sceAudioOutOutput blocked N us         one 10.7 ms chunk took > 50 ms
+#     [PR] t=.. resume (restarts from 0)               javacall_media_resume() was called
+#     [T]  t=.. close took N us / 64 log writes: avg   VM-thread cost of close() / of a log write
+#   Not a behaviour change except for the logging.
+# 03.12 (2026-10-25): log124 follow-ups. v03.11's FP fix is CONFIRMED on the device:
+#   "[ALERT-LAYER] fp i2d=240 dmul*2=480 dadd=241 dmul.95=228 d2l=228 f=228
+#   cmp.95<w=true int-math=228" (every step correct) and the UC Alert box draws.
+#   Xiyangyang sound "not continuous, stuttering" - root cause found in code and
+#   reproduced numerically: wav_render_player computed the source frame as
+#   rendered * frames / out_frames_total in 32-bit long arithmetic. On the Vita
+#   long is 32 bits, so the product passes 2^31 after 0.17 s (270 KB tune) or
+#   0.62 s (72 KB tune) of output; from then on the read position wraps to a small,
+#   half-negative frame number and the player replays a 0.3-1.2 s window of the
+#   tune (reading memory BEFORE the PCM buffer half of the time). Now 64-bit.
+#   Stall on pause/resume: not reproduced as an event - the log has no pause/resume
+#   record (javacall_media_resume was never called, the port handles no PS-button
+#   suspend). The game re-creates its Sound on every scene change; each create ran
+#   ~60-170 synchronous sceIoWrite audio_debug lines on the VM thread
+#   (get_buffer_address + do_buffering once per 4 KB packet, 68 per 270 KB tune).
+#   They are HOT-sampled (1 in 64) now, and a timing probe records what a log
+#   write and close() really cost ("[T] ..." lines in audio_debug.log).
+#   Needs ./rebuild_vm.sh? No: port layer only -> build.sh.
+# 03.11 (2026-10-25): the FP fix moves into the CLDC layer, and the C++ side of
+#   the same bug is fixed. Nothing for it lives in this file any more.
+#   Layout: phoneme-cldc/src/vm/os/vita/vita_fp_overlay.S (adapters) +
+#   patch_interp.sh, run by rebuild_vm.sh pack_lib, so libcldc_vm.a already
+#   contains the fixed Interpreter_arm.o; no objcopy rule, no extra source
+#   here, no ASM language, no link-order trick (03.10 had all four).
+#   New in 03.11: jvm_d2i/jvm_f2i were integer-protocol for EVERY caller. The
+#   C++ sin/cos/tan kernels call them hard-float (double in d0), so
+#   ieee754_rem_pio2 got n = 0 and Math.sin/cos/tan were wrong for |x| > pi/4
+#   (model on the real ELF: sin(10) = 532.9, cos(100) = -1.1e17, tan(10) =
+#   19.4). Small arguments, floor, ceil were right. Now jvm_d2i/jvm_f2i are
+#   hard-float entries that tail-call the interpreter's own bodies, renamed
+#   jvm_d2i_isoft/jvm_f2i_isoft.
+#   Needs ./rebuild_vm.sh (the library has to be repacked), then build.sh.
 #   NOT verified on hardware.
-
-
-
+# 03.10 (2026-10-25): the Java VM's floating point was broken (log123 follow-up).
+#   Symptom: AlertLayer printed (int)(.95 * 240) == 0 while the javac-folded
+#   constant (int)(.95 * 240) printed 228, i.e. the same Java expression gave
+#   different answers depending on who computed it.
+#   Cause (measured, not guessed): the interpreter (Interpreter_arm.o) calls
+#   every FP helper - jvm_dadd/dmul/i2d/f2d/d2f/dcmp*/fadd.../sin.. - with the
+#   operands in INTEGER registers (r0:r1 = double high:low) and takes the result
+#   from r0/r1. The C helpers behind those names live in libcldc_vm.a and are
+#   compiled -mfloat-abi=hard, so they read d0/d1 and return in d0. Only
+#   jvm_d2i/jvm_f2i (hand-written, defined inside Interpreter_arm.o) matched.
+#   I ran the REAL bc_impl_* handlers from the ELF through an ARM/VFP model
+#   (calibrated against GCC-compiled soft-float references, 0 mismatches):
+#   6/40 FP bytecode cases correct before, 40/40 after.
+#   Fix (moved out of this file in 03.11, see there): 28 jvm_X_isoft adapters
+#   that move r0-r3 into VFP registers, call the real helper and move the
+#   result back, wired in by renaming the interpreter's references.
+#   Affects every game that does float/double math (UI layout, animation,
+#   physics, Math.sqrt/sin/cos). NOT verified on hardware.
 
 # 02.49 (2026-10-18): restore non-blocking connect. The v02.45 "epoll never
 #   reports EPOLLOUT" attribution was wrong: log94 ALSO had the
@@ -2481,8 +1208,16 @@ add_custom_command(
     COMMAND arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} lfjport_fb_export.o
     COMMAND arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} mastermode_export.o
     COMMAND arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} gxjport_text.o
+    # v02.87: the annunciator stub always answered "no vibrate support".
+    # src/vita_vibrate.c provides anc_start_vibrate/anc_stop_vibrate.
+    COMMAND arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} anc_st_vibrate.o
+    # v02.90: upstream's hard-coded permission policy prompts (and so
+    # blocks the MIDlet thread) for an unsigned jar's first network/file
+    # call. src/vita_permissions.c provides the same eight symbols with a
+    # relaxed default and restores the upstream tables in strict mode.
+    COMMAND arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} generic_policy_load.o
     DEPENDS ${MIDP_OBJ_DIR}/libobj.a
-    COMMENT "Preparing libobj_no_main.a (dropping runMidlet_md, lfjport_fb_export, mastermode_export)"
+    COMMENT "Preparing libobj_no_main.a (dropping runMidlet_md, lfjport_fb_export, mastermode_export, generic_policy_load)"
     VERBATIM
 )
 
@@ -2498,6 +1233,10 @@ add_executable(${PROJECT_NAME}
     src/vita_icon.c
     src/vita_display.c
     src/vita_input.c
+    # v02.85: on-screen keypad drawn over the letterbox bars
+    src/vita_vkey.c
+    # v02.92: screenshot capture (SELECT+START / on-screen camera button)
+    src/vita_shot.c
     src/vita_pcsl.c
     src/vita_net.c
     src/vm_rom_stubs.c
@@ -2505,9 +1244,67 @@ add_executable(${PROJECT_NAME}
     src/vita_audio_javacall.c
     src/vita_wav.c
     src/vita_midi.c
+    # v02.88: shared compressed-audio decoder layer (vita_pcm_dec) +
+    # MP3 (minimp3), AMR-NB (vendored 3GPP reference codec) and AAC
+    # (sceAudiodec).
+    src/vita_pcm_dec.c
+    src/vita_mp3.c
+    src/vita_amr.c
+    src/amr3gpp/interf_dec.c
+    src/amr3gpp/sp_dec.c
+    src/vita_aac.c
+    # v04.45: Ogg Vorbis (stb_vorbis). stb_vorbis.c itself is NOT listed:
+    # vita_ogg.c #includes it, and that file is implementation + declarations
+    # in one, so a second translation unit would duplicate every symbol.
+    # NOTE: this line was lost once when the file was reverted to its 04.31
+    # state (the v04.47->v04.48 window); the build then failed with
+    # "undefined reference to vita_dec_ogg" while the packaged VPK looked fine.
+    # If that link error ever reappears, check this line first.
+    src/vita_ogg.c
+    src/vita_vibrate.c
+    # v02.90: MIDP permission policy (replaces generic_policy_load.o)
+    src/vita_permissions.c
+    # v04.32/v04.38: suspend-resume listeners, the six-axis publisher and the
+    # locale timezone. These three lines were lost together with vita_ogg.c
+    # when the file was reverted to its 04.31 state; the linker then reported
+    # "undefined reference to vita_lifecycle_init / vita_motion_start".
+    src/vita_lifecycle.c
+    src/vita_motion.c
+    src/vita_timezone.c
+    # v02.91: HTTPS for MIDP. vita_https.c drives SceHttp (the console's TLS
+    # stack) and vita_https_kni.c is the bridge the com.sun.midp.ssl tunnel
+    # on the Java side calls. SEE ALSO: the nativeFunctionTable entries are
+    # generated from VitaHttpNative.java by the MIDP build.
+    src/vita_https.c
+    src/vita_https_kni.c
+    # v02.94: per-round JIT policy restore + JIT probe
+    src/vita_jit.c
+    # v02.97: 444 MHz clock request + per-frame timing (P1-3). Reads
+    # ux0:/data/J2ME00001/clock.cfg, writes ux0:/data/J2ME00001/perf.log.
+    src/vita_perf.c
+    # v02.99: native loading screen for the round_begin -> first frame
+    # window (P1-2). Draws as an overlay inside flip_to_display(), so it
+    # reuses the single sceDisplaySetFrameBuf path.
+    src/vita_splash.c
+    # v03.45: framebuffer write-bandwidth probe (measurement only). Explains
+    # the prepare=17.1 ms that perf.log reports every frame: the blit writes
+    # 884 KB per frame into UNCACHED CDRAM, which is ~52 MB/s - so the
+    # question is "how wide are the stores", not "is the ALU fast enough".
+    src/vita_membw.c
+    # v03.70: on-screen diagnostics overlay (P1-8): fps / period / prepare /
+    # arm clock on one line, plus the measured blit and bandwidth on a second
+    # when diag.cfg asks for detail. Pure sampling - no behaviour change.
+    src/vita_diag.c
+    # v03.71: VM-domain executable-memory probe (JIT groundwork). Opt-in via
+    # jitprobe.cfg; it allocates 4 KB, writes ARM instructions, opens the VM
+    # domain and calls them - the decisive test for whether a JIT can run here.
+    src/vita_jitmem.c
     src/vita_media_notify.c
     src/vita_ime.c
     src/vita_gxm.c
+    src/vita_gl3d.c
+    src/vita_sw3d.c
+    src/vita_3d.c
     src/vita_sms_javacall.c
     src/vita_checkevents.c
     src/vita_watchdog.c
@@ -2571,6 +1368,22 @@ target_link_libraries(${PROJECT_NAME}
     ${MIDP_OBJ_DIR}/runMidlet.o
     -Wl,--no-whole-archive
     -Wl,--allow-multiple-definition
+    # v02.85: 64 KiB of headroom before the RW segment.
+    #   vitasdk's linker script does
+    #     . = DATA_SEGMENT_ALIGN(0x10000, 0x10000);
+    #     . += DEFINED(__sce_headroom) ? __sce_headroom : 0;
+    #     . = ALIGN(0x10000);
+    #   so the RW segment normally starts at the next 64 KiB boundary after
+    #   the RO content. vita-elf-create then has to fit its SCE metadata at
+    #   the END of segment 0 - and v02.85's new code grew .text/.rodata past
+    #   that boundary by ~3.3 KB, which failed as
+    #     "Cannot allocate 4040 bytes for SCE data at end of segment 0;
+    #      segment 1 overlaps"  (followed by a vita-elf-create segfault).
+    #   Defining the symbol moves .data/.bss one 64 KiB page later, giving
+    #   the metadata room and leaving ~60 KB of future growth. Relocations
+    #   cover the change (the loader applies them), and the only absolute
+    #   addresses affected are inside our own image.
+    -Wl,--defsym=__sce_headroom=0x10000
     # v01.67 REAL-HW BOOT CRASH FIX: on a real console the loader slides
     # the code segment (observed +0x72000 on fw3.65, plugins present) and
     # the RW segment independently (+0x120000), and it applies the ELF's
@@ -2700,6 +1513,20 @@ target_link_libraries(${PROJECT_NAME}
     -Wl,--end-group
 )
 
+# v02.94: the VM is linked as "-lcldc_vm" etc., which CMake cannot see as
+# file dependencies. Rebuilding the VM (./rebuild_vm.sh) therefore did NOT
+# relink midp_vita: build.sh printed "Build successful" with the OLD VM
+# inside (found while adding the JIT probe: the library had the probe, the
+# ELF did not, ELF mtime 03:53:50 < library 03:54:07). LINK_DEPENDS makes
+# a newer library force the relink.
+set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY LINK_DEPENDS
+    ${CLDC_DIST}/lib/libcldc_vm.a
+    ${CLDC_DIST}/lib/libcldc_vm_ani.a
+    ${CLDC_DIST}/lib/libcldc_vm_anix.a
+    ${CLDC_DIST}/lib/libcldc_vmtest.a
+    ${PCSL_LIB_DIR}/libpcsl_multimedia.a
+)
+
 target_link_libraries(${PROJECT_NAME}
     pcsl_string
     pcsl_file
@@ -2712,6 +1539,11 @@ target_link_libraries(${PROJECT_NAME}
     SceDisplay_stub
     SceCtrl_stub
     SceTouch_stub
+    # v04.49: vita_motion.c (JSR-256 Condition monitoring for the accelerometer)
+    # calls sceMotionGetSensorState/sceMotionStartSampling but the stub was
+    # never added here, so every build after that file landed died with
+    #     undefined reference to `sceMotionGetSensorState'
+    SceMotion_stub
     SceNet_stub
     SceNetCtl_stub
     SceLibKernel_stub
@@ -2719,6 +1551,19 @@ target_link_libraries(${PROJECT_NAME}
     SceAppMgr_stub
     SceGxm_stub
     SceAudio_stub
+    # v02.91: sceHttpInit/CreateTemplate/CreateConnection/SendRequest/
+    # ReadData/GetAllResponseHeaders. This is the only TLS the console
+    # exposes to user code (SceSsl has no record layer in vitaSDK).
+    SceHttp_stub
+    # v02.88: sceAudiodecInitLibrary/CreateDecoder/Decode for AAC in
+    # vita_aac.c. Probed at runtime: if the module is unavailable (Vita3K
+    # without SceAudiodec) AAC simply stays unsupported instead of
+    # crashing. MP3 does NOT use this path - see vita_mp3.c.
+    SceAudiodec_stub
+    # v02.97: scePowerSet{Arm,Bus,Gpu}ClockFrequency + the matching getters
+    # in vita_perf.c. The getters are what make the log honest - a refused
+    # request is reported with the clock that stayed in effect.
+    ScePower_stub
     # v02.51: sceImeDialogInit/GetStatus/GetResult/Term for the system
     # keyboard (vita_ime.c). These live in the CommonDialog stub, not the
     # SceIme stub (which only has the low-level sceImeOpen/Close/SetText).
@@ -2731,6 +1576,23 @@ target_link_libraries(${PROJECT_NAME}
     # v01.67: sceKernelAllocMemBlock/GetMemBlockBase for the CDRAM
     # framebuffers (vita_fbmem.h)
     SceSysmem_stub
+    # v04.32: sceRtcGetCurrentClockLocalTime/sceRtcGetCurrentClock in
+    # src/vita_timezone.c - the local-timezone report. v04.38: SceMotion for
+    # src/vita_motion.c (sceMotionStartSampling/sceMotionGetSensorState, the
+    # six-axis feed). Both lines were lost with the 04.31 revert; the linker
+    # said "undefined reference to sceRtcGetCurrentClock" / "sceMotion*".
+    SceRtc_stub
+    SceMotion_stub
+    # v03.83: pss_code_mem_alloc / pss_code_mem_flush_icache / pss_code_mem_free
+    # (psp2/pss.h) - the JIT code memory and the USERLAND instruction-cache
+    # flush that every other route failed to provide. These live in the
+    # SceLibMonoBridge stub, i.e. the PSS/Mono managed-runtime bridge: a JVM
+    # has the same problem a .NET runtime has, and Sony solved it there.
+    # WEAK rather than strong on purpose: a firmware without SceLibMonoBridge
+    # must not fail to start the app. vita_jitmem.c treats a NULL return from
+    # pss_code_mem_alloc as "no JIT here" and downgrades the policy, which is
+    # exactly what the weak import then allows.
+    SceLibMonoBridge_stub_weak
     # v02.06: sceKernelChangeThreadCpuAffinityMask (therapeutic kick in
     # the hang watchdog) lives only in the ThreadMgr stub; SceLibKernel
     # re-exports most threadmgr symbols but not this one. Duplicate
@@ -2751,6 +1613,20 @@ target_link_libraries(${PROJECT_NAME}
     # module_get_offset) REMOVED - log49 proved those syscalls never
     # return on this console: the main thread died on the SVC veneer
     # at boot, game crashed at startup. Do not re-link this stub.
+    # 3D backend (vita_gl3d.c): vitaGL and its deps. Order matters (static);
+    # stdc++ after vitaGL because it contains C++ objects.
+    vitaGL
+    vitashark
+    SceShaccCgExt
+    mathneon
+    taihen_stub
+    SceShaccCg_stub
+    SceKernelDmacMgr_stub
+    SceGxm_stub
+    SceDisplay_stub
+    SceAppMgr_stub
+    SceSysmem_stub
+    stdc++
     m
 )
 
@@ -2761,7 +1637,9 @@ target_link_libraries(${PROJECT_NAME}
 # normal app except 0 (see vita-make-fself usage); passing 128 wrote an
 # invalid memory budget into the SELF control info -> real-device install
 # fails with 0x8010113D (Vita3K never checks it).
-vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
+# v03.04: UNSAFE (no -s). Needed so vitaGL can see ur0:data/libshacccg.suprx;
+# the safe sandbox hides ur0:data entirely (log122).
+vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} UNSAFE)
 
 # NOTE (v01.52): the jar output MUST live OUTSIDE the classes/ directory.
 # It used to be ${MIDP_BUILD}/classes/midp_system.jar while the package
@@ -2884,4 +1762,5 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.vpk
 # module_start field; patching e_entry to _start makes Vita3K parse
 # .text bytes as sce_module_info_raw in load_imports and crash with a
 # read violation right after "Linking SELF" (b137->b146 startup crash).
+# (version assigned above, next to the 03.31 comment block)
 
