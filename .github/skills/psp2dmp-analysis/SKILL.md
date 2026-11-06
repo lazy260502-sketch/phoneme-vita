@@ -12,6 +12,9 @@ psp2dmp = gzip → ELF32 LE ARM core note 文件。判读三步：
 2. 内核 PC（0xe0xxxxxx）的线程 → r12 是 syscall 槽号，r0-r3 是参数
 3. 参数里的 0x81xxxxxx 指针 → `elfstr`/`mem` 解引用
 
+**基址优先读 `MODULE_INFO`（每段各自的 delta），锚点法只作后备** —— 见下
+"基址判定顺序"。log174 就是这样定案的（锚点法失败但 MODULE_INFO 成功）。
+
 ## 工具用法
 
 ```bash
@@ -24,6 +27,31 @@ python3 debug/tools/psp2dmp.py elfstr  <dump.psp2dmp> 812e43b8      # 读 ELF �
 ```
 
 默认 ELF 为 `vita-port/build/cmake/midp_vita`，`--elf` 可覆盖。
+
+## 基址判定顺序（log174 后修订）
+
+0. **先看 dump 文件名与 APP_INFO 的版本号**，确认是不是你想要的那个版本
+   （`python3 -c` 解 `APP_INFO` note；`BUILD_VER_INFO` 里那串
+   `release_branches/release_03.650` 是 **SceLibc 的版本，不是我们的**）。
+1. **`MODULE_INFO` note — 最可靠。** 里面按模块名（如 `midp_vita`）列出段表，
+   结构是"每段一条 {type, addr, size, align}"：
+   ```
+   +0x734: type=5  addr=0x81005000  size=0x3e356c   ← 对应 ELF 段0（RE）
+   +0x748: type=6  addr=0x81500000  size=0x6d18e4   ← 对应 ELF 段1（RW）
+   +0x6f0: pc0 = 0x810078b5
+   ```
+   **交叉验证**：`pc0 − <ELF 的 e_entry>` = 段0 的 delta。
+   log174：`0x810078b5 − 0x810028b5 = 0x5000` ✓
+   **注意各段 delta 可以不同**（log174 段0 = +0x5000、段1 = +0x10000），
+   因为 vita-elf-create 对每段独立按 0x1000 对齐。
+2. 锚点法（`base` 命令）：需要恰好有线程睡在 `sceKernelDelayThread` stub 里。
+   **没有睡眠线程时会 FAIL，这不等于无解** —— 回到第 1 步。
+3. 再不行：用 dump 页内容与 ELF 对比（**只对未重定位的 .rodata 有效**，.data
+   被 R_ARM_RELATIVE 改写过，比值一定不匹配，别据此否定）。
+
+**判据自检**：符号化后如果 pc/lr 落在不可自洽的位置（函数中间、.rodata、
+`_GLOBAL__sub_I_*+0x3f` 这种奇怪偏移），先怀疑 delta。
+
 
 ## 已实证的机制（照抄即可）
 
@@ -46,8 +74,45 @@ python3 debug/tools/psp2dmp.py elfstr  <dump.psp2dmp> 812e43b8      # 读 ELF �
   - 第 5 个寄存器条目以后是扩展区（75B）——我们只解 17 u32 头部
   - `ar r` 重打包要在目标目录内用 basename（历史坑，与 dump 无关但同源）
   - ring trap / jstack 消息被截断 → 先看 TTY_INFO 是否还有未消费的尾部
+  - **psp2core 里没有"异常类型"字段**（log187 实测）：`SUMMARY_INFO` 是线程状态表
+    `{status,size,size}`，`EVENT_LOG_INFO` 是内核模块事件日志，`kernel_forensics.log` 只有模块表。
+    `THREAD_REG_INFO +0x170/+0x174` 只在 log174 那种 permission fault 下可读成
+    `0x0d` + `FAR==pc`；另一种值（如 log187 的 `0xf5` / 内核段地址）**没有文档可依，不要硬解读**。
+  - **故障页里可能没有"出问题的那段代码"**：psp2core 只 dump 线程栈 + 故障周边页。JIT 生成的代码
+    在 Java 堆块里（如 `0x85d00000`），若 `list` 的 PT_LOAD 里没有该块，就**不可能**反汇编出
+    出错指令 —— 这时候要靠"pc 落在哪个块 + 哪个阶段没往下走"来定案。
+  - **分析某次 dump 前先确认本地 ELF 还是那个版本**。`vita-port/build/cmake/midp_vita` 会被下一次
+    构建覆盖；版本不符时用 dump 页内容在 ELF 里搜会得到**假匹配**（log187 复盘：曾算出
+    `delta=0x10f80`，不是 0x1000 的倍数 ⇒ 假的）。判据：`cmd` 的 `boot_log.txt` 的 `version:` 行。
+  - **`midp_vita_v0x.xx.sym` 是 vita-elf-create 的二进制格式**，不是文本 `nm` 输出 ——
+    grep/awk/bisect 都用不了，别在它上面浪费时间。
+  - **`.psp2dmp.tmp` 说明 dump 没写完**：解压后长度小于 note 解析所需长度时 `psp2dmp.py` 会直接
+    `struct.error`，换另一个 dump 或放弃。
 
-## 两个已定案的历史案例（判读模板）
+## 三个已定案的历史案例（判读模板）
+
+### log174（v04.03 真机启动即崩）：`pc = 0` = 调用未解析的 vitalink import stub
+
+判读路径（**全程不需要日志，只有 dump**）：
+- 只有 **2 个线程**（主线程 + SceCommonDialogWorker）、sp 距栈顶仅 0xE0
+  ⇒ 崩在 `_start` 里，应用代码一行没跑。
+- 两次 dump 的 lr 差恒定 0x22000 ⇒ 确定性 bug + ASLR。
+- `base` 失败 → 改读 `MODULE_INFO`：段0 delta = +0x5000、段1 = +0x10000。
+- `lr 0x8100766b − 0x5000 = 0x8100266b` = `_GLOBAL__sub_I_...freeres + 0x3f`，
+  即 `.init_array[6]`（C++ 静态初始化）。
+- 反汇编该处：`movw/movt r0, .LC4` 然后 `blx getenv`；**dump 里的
+  r0 = 0x811e32cc，减 delta = 0x811de2cc = `.LC4`** ⇒ lr 就是这条 blx 的返回址。
+- `getenv` @ 0x811c3510 是 16 字节 stub（`00000008 / hash / hash / nop`），
+  位于 `.vitalink.fstubs.SceLibMonoBridge` ⇒ 无 Sce 模块导出 ⇒ 目标解析为 0
+  ⇒ 执行地址 0 ⇒ prefetch abort。
+
+**可复用的判据**：
+- `pc == 0` 且只有极少数线程 ⇒ 优先查 `.init_array` / `_start` 里的未解析 import。
+- 用 `debug/tools/check_vitalink_stubs.py` 一次列出所有"混进 Sce stub 段的非 Sce
+  符号"（白名单 `sce/_sce/pss_/tai`）。
+- **修这类问题不要顺手引用另一个未验证符号**：第一版修法遍历 `environ`，
+  加了 `extern char **environ;` 之后 `lib_a-environ.o` 不再被拉入，`environ`
+  自己变成 `T`（stub）而不是 `D` —— 等于把崩溃往下挪一层。
 
 ### log70（v02.45 movt 回归）
 - 基址 0x8101a000（锚点法，双锚点吻合）

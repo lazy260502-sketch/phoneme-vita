@@ -95,11 +95,31 @@ build_target() {
     # plus -DPRODUCT (FLAVOR=release adds nothing) and -DROMIZING=1 (cfg only
     # exports ROMIZING=true as a make variable, not a -D).
     CPP_DEF_FLAGS_TARGET="-DPRODUCT -DROMIZING=1 -DARM -DVITA -D__PSP2__ \
+        -DMSW_FIRST_FOR_DOUBLE=1 -DMSW_FIRST_FOR_LONG=0 \
         -Wno-narrowing -fpermissive \
         -marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3 \
         -DSUPPORTS_MEMORY_MAPPED_FILES=0 -DSUPPORTS_ADJUSTABLE_MEMORY_CHUNK=0 \
         -DSUPPORTS_TIMER_THREAD=1 -DSUPPORTS_TIMER_INTERRUPT=0 \
         -DUSE_VM_EXCEPTIONS=0 -DUSE_BSD_SOCKET=1"
+    # 2026-11-04 FIX: -DMSW_FIRST_FOR_DOUBLE=1 -DMSW_FIRST_FOR_LONG=0 are
+    # MANDATORY, and their absence broke the link rather than the behaviour.
+    #
+    # ROMImage.hpp:265-269 turns these into a link-time self check:
+    #     #if MSW_FIRST_FOR_DOUBLE
+    #     #define _ROM_LINKCHECK_MFFD _rom_linkcheck_mffd_true
+    #     #else
+    #     #define _ROM_LINKCHECK_MFFD _rom_linkcheck_mffd_false
+    # and every object carries a reference to the symbol it was compiled
+    # against. vita_arm.cfg:235 exports MSW_FIRST_FOR_DOUBLE := true, which is
+    # what the FROZEN Interpreter_arm.o was built with, and _MergedSrc005.o is
+    # where ObjectHeap/OsMemory end up. Compiling that member without the -D
+    # leaves it defaulting to 0, so the archive contains both spellings:
+    #     _MergedSrc005.o: defines _rom_linkcheck_mffd_false
+    #     Interpreter_arm.o: U  _rom_linkcheck_mffd_true
+    # and the final link dies with
+    #     undefined reference to `_rom_linkcheck_mffd_true'
+    # The self check is doing its job: it is telling us the two halves of the
+    # VM disagree about double word order. Always pass both flags.
     # 2026-09-04 FIX: NEVER pass ENABLE_C_INTERPRETER=true. It compiles
     # Interpreter_c.cpp into _MergedSrc006, which brings a second, BSS
     # (zero-initialized) definition of jvm_fast_globals that silently
@@ -144,13 +164,33 @@ pack_lib() {
     # lost the jvm_f2i/jvm_d2i float stubs (GP table + fast globals only).
     # NOTE: once the regenerated interpreter gains working jvm_f2i/jvm_d2i,
     # remove this and use the fresh member instead.
+    # 2026-10-25: a FULL regeneration (loopgen -generateoptimized +GenerateGNUCode) is byte-identical to the
+    # frozen .s and keeps jvm_f2i/jvm_d2i; only +GenerateGPTableOnly drops them. Extracting from the old library
+    # is a shortcut, not a necessity.
     # SAFETY: after packing, verify the library has EXACTLY ONE definition
     #   arm-vita-eabi-nm $L | grep jvm_fast_globals   -> single "D" line
     # and zero C-interpreter symbols (g_jpc/g_jsp/interpreter_dispatch_table).
-    cd /tmp
-    $AR p $L.bak Interpreter_arm.o > Interpreter_arm.o 2>/dev/null \
+    # v03.11: all intermediate files live in a private mktemp dir that is removed on exit. The old fixed /tmp names
+    # were silently reused when a stale same-name file was left behind by an earlier (or another session's) run.
+    local W; W=$(mktemp -d "${TMPDIR:-/tmp}/pack_lib.XXXXXX") || die "mktemp failed"
+    trap "rm -rf '$W'" EXIT      # double quotes: expand W NOW (it is a function-local, gone when EXIT fires)
+    mkdir -p "$W/patched"
+    $AR p $L.bak Interpreter_arm.o > "$W/Interpreter_arm.o" 2>/dev/null \
         || die "cannot extract Interpreter_arm.o from backup"
-    $AR r $L Interpreter_arm.o
+    # v03.11: FP-ABI overlay.  The interpreter calls the jvm_* FP helpers with integer registers while the helpers
+    # are hard-float C, and its integer-protocol jvm_d2i/jvm_f2i also answered the C++ callers (sin/cos/tan kernels).
+    # patch_interp.sh renames the interpreter's references to *_isoft adapters, merges
+    # src/vm/os/vita/vita_fp_overlay.S into the member and defines hard-float jvm_d2i/jvm_f2i.  Idempotent.
+    # Details: the header of vita_fp_overlay.S, PROJECT_MEMORY "v03.11".
+    bash "$CLDC/src/vm/os/vita/patch_interp.sh" "$W/Interpreter_arm.o" "$W/patched/Interpreter_arm.o" \
+        || die "patch_interp.sh failed"
+    # ar takes the member name from the file's basename, so run it inside the dir that holds the patched member
+    ( cd "$W/patched" && $AR r $L Interpreter_arm.o ) || die "ar r Interpreter_arm.o"
+
+    # v03.48: KNI natives that return float/double (Float.intBitsToFloat / Double.longBitsToDouble) answered in s0/d0 while
+    # the interpreter reads r0 / r0:r1 (log143: every M3gReader.f32() was 0x813f3258).  Rename the C bodies and add
+    # vita_kni_fp_overlay.S as its own member.  Idempotent.  Details: header of vita_kni_fp_overlay.S.
+    bash "$CLDC/src/vm/os/vita/patch_kni_fp.sh" "$L" || die "patch_kni_fp.sh failed"
 
     # ar chains fail silently - verify members are non-empty
     local sz; sz=$($AR p $L Interpreter_arm.o 2>/dev/null | wc -c)
@@ -165,6 +205,16 @@ pack_lib() {
     [ "$dcount" -eq 1 ] || die "jvm_fast_globals: expected exactly 1 D definition, got $dcount"
     local ccount; ccount=$("$VITASDK/bin/arm-vita-eabi-nm" $L 2>/dev/null | grep -cE "g_jpc|g_jsp|interpreter_dispatch_table" || true)
     [ "$ccount" -eq 0 ] || die "C-interpreter symbols leaked into library ($ccount)"
+
+    # v03.11: FP overlay check at LIBRARY level (patch_interp.sh already checked the member): every symbol the overlay
+    # defines must appear exactly once in the whole archive, otherwise the link silently picks one of several.
+    local s n
+    for s in jvm_d2i jvm_f2i \
+             $(for h in dadd dsub dmul ddiv drem fadd fsub fmul fdiv frem dcmpl dcmpg fcmpl fcmpg sin cos tan sqrt \
+                        ceil floor i2d i2f f2d d2f l2d l2f f2l d2l d2i f2i; do echo jvm_${h}_isoft; done); do
+        n=$("$VITASDK/bin/arm-vita-eabi-nm" $L 2>/dev/null | grep -c " T $s\$" || true)
+        [ "$n" -eq 1 ] || die "FP overlay: $s defined $n times in $L (expected exactly 1)"
+    done
 
     local cnt; cnt=$($AR t $L | wc -l)
     echo "== library packed: $cnt members =="

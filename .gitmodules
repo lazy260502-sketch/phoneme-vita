@@ -1,0 +1,3 @@
+[submodule "phoneme_source/phoneME"]
+	path = phoneme_source/phoneME
+	url = https://github.com/magicus/phoneME.git

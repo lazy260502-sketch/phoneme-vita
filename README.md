@@ -14,6 +14,7 @@ phoneME Feature (CLDC-HI + MIDP 2.0) JVM/J2ME 运行时移植到 Sony PS Vita
 ├── patches/          # ★ 工作副本相对上游基线的完整补丁（见下）
 ├── tools/            # 手工重编辅助脚本
 ├── rebuild_vm.sh     # VM 重编脚本（含完整 PRODUCT 旗标配方）
+├── UPSTREAM_SOURCES.md  # 上游源码/归档来源、基线 commit 与获取命令
 └── *.md              # 文档（AGENTS.md / BUILD.md / PORTING.md / PROJECT_MEMORY.md …）
 ```
 
@@ -35,8 +36,12 @@ phoneME Feature (CLDC-HI + MIDP 2.0) JVM/J2ME 运行时移植到 Sony PS Vita
 
 `patches/` 下的补丁是工作副本相对上游基线的完整 diff，供对照与向上游回提。
 
-`phoneme_source/phoneME`（magicus/phoneME @ 5a13f65）的 gitlink 目标在公开
-远端，可直接 `git submodule update --init` 获取。
+`phoneme_source/phoneME`（magicus/phoneME @ 5a13f65）的 gitlink 已登记在
+`.gitmodules`，可直接 `git submodule update --init` 获取（约 155 MB，只读参照）。
+
+> 完整的上游来源清单（PhoneJ2ME 组织的 29 个模块仓、各基线 commit、官方 zip 归档
+> 现状、易混淆仓库）与获取/核验命令见 **`UPSTREAM_SOURCES.md`**；API/JSR 规范
+> Javadoc 镜像（CLDC/MIDP/JSR-75/135/184、Nokia/厂商 API）也在该文档第 3 节。
 
 ## 构建
 
@@ -45,7 +50,9 @@ phoneME Feature (CLDC-HI + MIDP 2.0) JVM/J2ME 运行时移植到 Sony PS Vita
 - MIDP：`phoneme-midp/build_vita.sh`（`USE_JSR_75=true`，JSR_75_DIR 指向本仓库 `jsr75/`）
 
 详细文档：`BUILD.md`（构建）、`PORTING.md`（移植总览）、`VM_BUILD.md`（VM 细节）、
-`FILE_LAYOUT.md`（产物/日志位置）、`PROJECT_MEMORY.md`（开发记忆/踩坑记录）。
+`FILE_LAYOUT.md`（产物/日志位置）、`PROJECT_MEMORY.md`（开发记忆/踩坑记录）、
+`UPSTREAM_SOURCES.md`（上游源码/归档来源）、`COMPATIBILITY_ROADMAP.md`（对标主流
+J2ME 模拟器的差距分析与开发路线图）。
 
 ## 日志与产物（不入库）
 

@@ -3221,6 +3221,1763 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### ⬛ 2026-11-05 log189 分析（+ v04.49 修复）：相机两点重合 → 矩阵全 NaN → `Transform.invert()` 抛异常 → Timer 任务被取消 → **黑屏卡死**
+
+**用户报告**：分析log189, 极品飞车，黑屏卡在不动。
+
+**编号说明**：log189 打的是 **04.48**；本轮落 **04.49**。
+
+#### 1. 现象与卡死机制（先确认"卡"是什么）
+
+```
+[m3g] cam xform eye=NaN,NaN,NaN m00=NaN m11=NaN m22=NaN
+[m3g] gcam#1 camW r0=7fc00000,...        ← 7fc00000=NaN, 7f800000=+Inf
+[m3g] threw java.lang.ArithmeticException: singular transform
+[TIMEREXC] task v@e16b5918 cancelled: ArithmeticException: singular transform
+ - javax.microedition.m3g.Transform.invert(), bci=20
+ - ab.a(), bci=268 / ai.f(), bci=283 / ai.a(), bci=1332
+ - ab.a(), bci=688 / v.run(), bci=57
+```
+
+**决定性判据**：`TIMEREXC` 之后 `[m3g]` **只剩 1 行**（就是异常堆栈），渲染彻底停止。
+coredump 佐证：**只剩 2 个线程**（空闲的 J2ME 主线程 + `SceCommonDialogWorker`），
+Java 层无任何活跃工作。这就是"黑屏卡住不动"。
+
+#### 2. NaN 从哪来（游戏数据，不是解码错）
+
+`ai.f()` bci=236..283 用**两个 3D 点**构造相机基：
+
+```
+d      = (p1 - p0) / 65536          // ab.a(Transform,int×6) bci=0..52
+invLen = 1 / sqrt(|d|²)             // bci=53..70  ← 两点重合时 |d|=0
+```
+
+`1/0 = +Inf`，随后 `0 × Inf = NaN` ⇒ 矩阵整行 NaN。
+host 复现（`ZeroLenChk.java`）：`p0 == p1 → len2=0, invLen=Inf`。
+
+**这是游戏的合法输入**（相机在路径上插值时，两个采样点可能相等）。
+
+#### 3. 缺陷 A：`Matrix4.invert()` 把不可逆矩阵判成可逆
+
+原判定 `det == 0.0f` 有**两个漏洞**：
+
+| 输入 | det 值 | `det == 0` | 实际结果 |
+| --- | --- | --- | --- |
+| 含 NaN | **NaN** | **false**（NaN≠0） | 返回 `true` + 全 NaN 逆矩阵 |
+| 含 Inf | **+Inf** | **false** | 返回 `true`，但逆矩阵含 `0×Inf=NaN` |
+
+host 实测确认（`InvChk.java`）：NaN 矩阵 → `invert returned true`、`inverse` 全 NaN。
+
+修复：判定改 `!(|det| > 0)`（NaN 也会失败），**并额外逐元素校验结果是否有限** ——
+"可逆"对调用方意味着"逆矩阵可用"，Inf 行列式不等于有有限逆。
+
+#### 4. 缺陷 B（真正冻结 app 的那个）：`Transform.invert()` 抛异常
+
+JSR-184 确实写着 `Throws: ArithmeticException — if this transformation is not invertible`，
+**所以抛是合规的**。但：
+
+- 参考实现（J2ME Loader 的绑定，包 Nokia m3g 核心）里 `invert()` 就是
+  `_invert(matrix)` —— **void native 调用，Java 层从不检查返回值**，奇异时**静默**。
+  这正是这个标题能在真机上跑起来的原因。
+- 极品飞车在 `ai.class` 里**没有任何异常表覆盖 bci=283**，即完全不捕获。
+
+⇒ 按规范抛 = 一个**一帧的相机抖动**升级成**永久死循环黑屏**。
+
+**修复**：奇异时矩阵**保持不变**、继续执行（与参考实现一致），并打一行 trace 便于取证。
+这是**有意的规范让位于兼容性**：本移植里没有任何内部调用依赖这个 throw ——
+`Node.getTransformTo` / `Renderer.view` / `SkinnedMesh` 都走
+`Matrix4.invert(float[],float[])` 并检查 boolean。
+
+#### 5. 缺陷 C：`Renderer` 对不可逆相机直接 `return`
+
+原代码 `else if (!Matrix4.invert(view, camSrc)) { dbgNoView++; return; }`
+⇒ 整帧**一个 draw call 都不发**，纯黑。
+改为**复用上一个可逆的视图矩阵**（首帧用单位矩阵），退化从"黑屏"变成"相机慢一帧"。
+
+#### 6. host 验证（`debug/tools/m3gprobe/SingularChk.java`，新增）
+
+| 断言 | 结果 |
+| --- | --- |
+| NaN 矩阵 `invert()` 不抛 | ok |
+| 矩阵保持原样（逐 bit 比对） | ok |
+| 健康矩阵仍能求逆，`orig × inverse == identity` | ok |
+| `Matrix4.invert(NaN 矩阵) == false` | ok |
+| `Matrix4.invert(Inf 矩阵) == false` | ok |
+| `Matrix4.invert(identity) == true` | ok |
+
+回归：`CamChk` / `ApiSweep` 仍 `ALL PASS`（相机与 API 面无副作用）。
+
+> 顺带修了 `NativeBridgeHost.java`：缺 `setFog(int,int,int,int,int)`（v04.41 加的
+> NativeBridge 入口），导致整个 host 探针树**编译不过**。这也是本轮发现问题的入口 ——
+> **新增 NativeBridge 方法时必须同步 host stub**。
+
+#### 7. 构建注意（会再踩）
+
+`vita-port/build.sh` 报链接失败时，先查 ROM 是否真生成：
+
+```sh
+ls -la phoneme-midp/build/vita_arm/ROMImage_00.cpp     # < 100KB 就是空的
+```
+
+`ROMImage.cpp` 是 make 目标，依赖 `classes.zip`；**空文件 + 时间戳较新 → make 跳过重建**，
+而增量日志只会说 `no need to recompile .java files`。修法：
+
+```sh
+rm -f phoneme-midp/build/vita_arm/ROMImage*.cpp \
+      phoneme-midp/build/vita_arm/ROMImageGenerated.hpp \
+      phoneme-midp/build/vita_arm/obj/arm/ROMImage.o
+```
+
+本轮 `ROMImage_00.cpp` = **601049 字节**（正常）。
+
+> 另：ROM 化会**裁剪未被引用的字符串**，所以用 `grep "invertible"` 在 `ROMImage_*.cpp`
+> 里找不到新日志串是**正常的**（`M3gTrace.log` 参数在 PRODUCT 下被优化）。
+> 可靠的判据是**旧抛点是否消失**：本轮 `ArithmeticException` 引用 0 处、
+> `"singular transform"` 0 处、最终 ELF 里也 `absent`。
+
+#### 8. 交付
+
+| 项 | 结果 |
+| --- | --- |
+| MIDP 重建 | 0 error，ROM 601KB |
+| `Transform.invert` 字节码 | 不再含 `ArithmeticException` |
+| 旧串 `singular transform` | ROM / 最终 ELF 均 **absent** |
+| `SingularChk` / `CamChk` / `ApiSweep` | 全部 `ALL PASS` |
+| 版本号 | `04.49` |
+| 产物 | `vita-port/out/vpk/midp_vita_v04.49.vpk`，md5 `05f7f84541183b65c96a2b5aeffde5d4` |
+
+#### 9. 诚实的边界
+
+- **未上真机验证。** 能断言：该 NaN 矩阵不再使 app 停摆；`Transform.invert` 不再抛；
+  `Matrix4.invert` 正确识别 NaN/Inf；相机退化时不再交白帧。
+- **根治点在游戏数据**（两点重合），我们只保证"不因此崩"。若 log190 仍黑屏，
+  应查相机是否**长期**停在 NaN（即游戏侧插值参数一直退化），那是另一个问题。
+- 规范与实现的这处偏离**已明确记录**在此与 `Transform.invert()` 的注释里，
+  未来不要"顺手改回抛异常"——那会重新把兼容性牺牲掉。
+
+#### 改动文件
+
+- `jsr184/.../javax/microedition/m3g/Transform.java`（`invert()` 奇异时静默保持）
+- `jsr184/.../com/sun/m3g/Matrix4.java`（NaN/Inf 判定：det 与结果双重校验）
+- `jsr184/.../javax/microedition/m3g/Renderer.java`（相机不可逆时复用上一视图矩阵 + `lastGoodView` 字段）
+- `debug/tools/m3gprobe/SingularChk.java`（新增）、`NativeBridgeHost.java`（补 `setFog`）
+- `vita-port/CMakeLists.txt`（04.49 版本块）
+
+---
+
+### 🎥 2026-11-04 log185 分析（+ v04.29 修复）：`Camera.getProjection(Transform)` 抛了我们**自己编造**的异常 —— 而且这次**不是卡死**
+
+**用户报告**：分析log185, 还是卡在，请认真分析和处理。
+
+**编号说明**：log185 打的是 **04.28**；本轮落 **04.29**。
+
+#### 1. 最重要的一句话：v04.27 成功了，游戏**跑起来了**
+
+这是这个标题第一次真正进入游戏，不是加载卡死：
+
+| 证据 | 数值 |
+| --- | --- |
+| `[TIMEREXC]` | **一个都没有** |
+| 渲染帧数 | `frames=320`，`render calls=685` |
+| 顶点数 | `verts=1,098,444` |
+| 游戏内网格 | `gmesh#7 n=675`、`rootstate#71 mesh=185ab735` |
+| 存档 | `[rms] open name='nfs10set' ver=12`，随后 `'0' (new store)` |
+| `exit_probe` | **4 次启动全部 status=0** |
+
+日志最后一行是 `rootstate#71`，**不是异常**。
+
+#### 2. 本轮唯一的真实 bug：我上一版编造的异常
+
+```
+[APPEXC] java.lang.IllegalArgumentException: parametric camera
+ - javax.microedition.m3g.Camera.getProjection(), bci=31
+ - ab.a(), bci=2        ← ab.a(Camera, Transform, Transform)
+ - x.a(), bci=83 / z.a(), bci=855 / h.b(), bci=30 / x.a(), bci=46
+ - ab.paint(), bci=156
+```
+
+只触发 **1 次**，但在 `paint()` 里 → 那一帧死掉。
+
+**根因是我写错了**。旧实现：GENERIC 以外的相机传非 null Transform 就抛 `IllegalArgumentException("parametric camera")`。JSR-184 原文**明确否定**这一点：
+
+> "Gets the current projection matrix and type. This method is available **REGARDLESS OF THE TYPE OF PROJECTION**, since parallel and perspective projections can always be returned in the 4x4 matrix form."
+> 唯一文档化抛出：`ArithmeticException`（`near == far` 时无法计算）。
+
+极品飞车建的是 **PERSPECTIVE** 相机，用真实 `Transform` 调 `getProjection(t)`，因为要把矩阵前乘进自己的相机空间（`ab.a` bci=2..21 然后 `postMultiply`）。
+
+**这是"合法调用抛异常"的第 6 次**（FUNC_BLEND / WINDING / SPOT / setLayer / Loader node / 本次），也是**第一次由本移植自己引入**而非继承上游。
+
+#### 3. 修复方式：矩阵只有一个定义
+
+把矩阵构造从 `Renderer.projection()` 抽成 `Renderer.buildProjection(type, fovy, aspect, near, far, generic)`：
+
+- `Camera.getProjection(Transform)` 调它 → 相机报告的矩阵与渲染用的矩阵**永远一致**
+- `Renderer.projection()` 也调它，渲染路径行为一字未变
+- `near == far` 仍按规范抛 `ArithmeticException`（而且 Java 层根本构造不出来，`setPerspective`/`setParallel` 已拒绝）
+
+#### 4. 新增两道护栏（已入库）
+
+| 工具 | 覆盖 | 结果 |
+| --- | --- | --- |
+| `debug/tools/m3gprobe/ApiSweep.java` | 用**游戏常量池里实际出现的 55 个 API 调用**（`javap -v \| grep '// javax/microedition/m3g/'`，不是照规范编的）逐个用合法参数调用 | `55 calls, 0 threw → ALL PASS` |
+| `debug/tools/m3gprobe/CamChk.java` | Camera 专项：三种投影类型、矩阵数值（`m5=1/tan(35°)=1.4281`、`m0=f/aspect=1.9042`）、GENERIC 精确往返、setter 拒绝 `near==far` | `ALL PASS` |
+
+#### 5. 为什么**看起来**还卡：不是 bug，是 5.3fps 的门槛效应
+
+```
+[PERF] f=300 fps=5.3 period=187.64(33.36..3553.60)
+      flip=21.16(12.37..39.13) prepare=12.33 arm=333MHz
+[PERF] VERDICT: arm stuck at 333 MHz (asked 444, all strategies failed)
+```
+
+| 事实 | 数据 |
+| --- | --- |
+| 每帧 Java 实际工作 | `ptime total=74~101ms`（draw=3~5、present=19~21、skin=3~6） |
+| **真正的大头** | `gap=46~127ms`（等待），偶发 **3553ms** 离群值 |
+| ARM 频率 | 请求 444MHz，**内核拒绝，实际 333MHz**；GPU 仅 111MHz |
+
+⇒ 一个本该 3 秒的加载界面在 5.3fps 下要 **25 秒**，读起来就是"卡住"。
+**不是 m3g 的锅**（shade/draw/walk 全是单位数毫秒）。下一步该查的是 ARM 频率（`clock.cfg` / 接电源 / 关 Wi-Fi，日志自己也这么建议）和那个 3553ms 离群值。
+
+#### 6. 构建踩坑（重要，会再次遇到）
+
+`vita-port/build.sh` 链接失败，报 `_rom_methods_start / _rom_data_block / system_symbols` 未定义。**根因不是代码**：
+
+| 检查 | 现象 |
+| --- | --- |
+| `phoneme-midp/build/vita_arm/ROMImage_*.cpp` | **全部 0 字节**（13 个） |
+| `ROMImageGenerated.hpp` | 0 字节 |
+| `libobj.a` 里的 `ROMImage.o` | 712 字节空对象，**0 个 ROM 符号** |
+
+原因：`ROMImage.cpp` 是 make 目标，依赖 `classes.zip`。**文件已存在（0 字节）且时间戳比依赖新，make 判定无需重建** —— 而增量构建日志只有一句 `no need to recompile .java files`，不会提 ROM。
+
+**修法**：删掉空产物强制重跑
+
+```sh
+rm -f phoneme-midp/build/vita_arm/ROMImage*.cpp \
+      phoneme-midp/build/vita_arm/ROMImageGenerated.hpp
+MIDP_EXTRA_GOAL="$PWD/phoneme-midp/build/vita_arm/obj/arm/libobj.a" \
+  PATH=/tmp/shimbin:$PATH bash phoneme-midp/build_vita.sh
+```
+
+之后 `ROMImage_00.cpp` = 571KB、`ROMImage.o` = 2.1MB、三个符号齐全，链接通过。
+
+> **判定方法**：`arm-vita-eabi-nm libobj.a` 抽出的 `ROMImage.o` 若小于 1MB 就是空的。
+
+#### 7. 交付
+
+| 项 | 结果 |
+| --- | --- |
+| MIDP 重建 | 0 error，ROM 真实生成（571KB / 13 文件） |
+| ROM 符号 | `_rom_methods_start` / `_rom_data_block` / `system_symbols` 齐全 |
+| 链接 | 成功 |
+| `parametric camera` 字符串 | **已从最终 ELF 消失** |
+| 版本号 | `04.29` |
+| 产物 | `vita-port/out/vpk/midp_vita_v04.29.vpk`，md5 `ef4e6e5e335bb8c4b3880aa704018a60` |
+
+#### 8. 诚实的边界
+
+- **未上真机验证。** 能断言：`paint()` 里那条 `getProjection` 不再抛；55 个游戏实际用到的 API 调用在 host 上全部不抛；ROM 与链接产物真实完整（上一轮的空 ROM 不可能跑起来，是这次发现的）。
+- **性能问题未修，只测量并记录。** 5.3fps 的主因是 ARM 锁在 333MHz + 帧间 gap，不在 m3g 层。
+
+#### 改动文件
+
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/Camera.java`（`getProjection(Transform)` 按规范返回矩阵）
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/Renderer.java`（抽出 `buildProjection`，成为矩阵唯一实现）
+- `debug/tools/m3gprobe/ApiSweep.java`、`CamChk.java`（新增护栏）
+- `vita-port/CMakeLists.txt`（04.29 版本块）
+
+---
+
+### 🌳 2026-11-04 log184 分析（+ v04.27 修复）：`Loader.load()` 把**内部节点**当模型返回 → `find()` 看不见兄弟分支 → `getTransformTo(null,…)` 抛 NPE
+
+**用户报告**：分析log184, 加载又卡住了，能不能一次性修复好，认真排查。
+
+**编号说明**：log184 打的是 **04.25**（我上一版）；树上 04.26 属 JIT 并行线，本轮落 **04.27**。
+
+#### 1. 先确认上一轮有效（v04.25 是真的起效了）
+
+`bci=135` / `bci=855` 的 NPE 全部消失，标题**多走了 720+ 字节**：加载完 `/bv`、`/af`，动了 RMS（`nfs10set`），模型**旋转了 593 次**，才死在新的一处：
+
+```
+[TIMEREXC] task v@e16b5918 cancelled: NullPointerException:   0
+ - ab.a(), bci=7        ← Node.getTransformTo(null, Transform)
+ - x.j(), bci=636
+ - x.a(), bci=2084
+```
+
+#### 2. 为什么 receiver 是 null
+
+```
+x.a() bci=465 : x.n = new World();
+x.a() bci=477 : x.n.addChild(ac.a(2));   // ac.a(2) == Loader.load("/c")[0]
+x.a() bci=507 : x.o = x.n.find(10);      // → NULL
+x.a() bci=523 : x.p = x.n.find(11);      // → 成功
+x.j() bci=636 : ab.a(x.o, x.n, out)      // getTransformTo on null → NPE
+```
+
+#### 3. 根因不在 `find()`，在 `Loader.load()` 返回什么
+
+实测全部 **28 个** `.m3g`（`StructChk`）：
+
+| 类别 | 文件 | 数量 |
+| --- | --- | --- |
+| 多根 | `af aq aw bl bm i j k l m n o p q y` | 13 |
+| 单根 | `bz c ca d` | 4 |
+| 无 Node | Image2D 包 | 9 |
+
+**四个单根文件的 `objs[0]` 全部是内部节点，从来不是根**：
+
+| 文件 | `objs[0]` | 真正的根 |
+| --- | --- | --- |
+| `/c` | Group(11) | Group(0) |
+| `/d` | Group(12) | Group(0) |
+| `/bz` | Mesh | Group(0) |
+| `/ca` | Mesh | Group(0) |
+
+把内部节点当"模型"交出去，`find()` 自然看不到兄弟分支里的 ID —— log183 需要 12 **和** 13，而 `/d` 交出来的是 12 号节点，同一个病根。
+
+#### 4. 修复：只给**单根**文件补一条排序
+
+`M3gReader.readAll()` 顶层排序新增一个分支：
+
+| 文件结构 | 处理 |
+| --- | --- |
+| 没有 Node | 不变 |
+| **恰好一个**顶层节点 | **该节点移到索引 0**，其余保持文件顺序 |
+| 多个顶层节点 | **完全不变** |
+
+第三行是硬约束：极品飞车对多根文件**按数组下标**取对象，本轮重新核对了它的表：
+
+```
+ac.b(raw), raw = 1536,1538..1559 → n.b_[6] → "/bl", idx 0..23
+19/19 全部落在 Node 上（Mesh/Group 交替）→ v04.08 的顺序是对的，不动
+```
+
+#### 5. 中途推翻过一次自己的方案（记录，避免重犯）
+
+本轮一开始我给 `Object3D` 加了 `sceneRoots` 字段，让 `find()` 在子树找不到时**跳到同批兄弟根**继续找。它能修好这两个 NPE，但**会让 `find()` 返回调用方场景图之外的对象**：
+
+- host 实测：带该字段时 `getTransformTo(o10, o11)` 返回 **false**（因为两者真的不在同一棵树）
+- 游戏拿到 false 不抛异常，只会**静默地用错矩阵**
+
+改成"根排到索引 0"后，`getTransformTo` 返回 **true** —— 因为它们是**真的**在同一棵树里。方案已撤回，`sceneRoots` 字段与 `Group.adoptSceneRoots()` 全部删除，**没有留在交付代码里**。
+
+#### 6. host 验证（28 个 m3g，不需要设备）
+
+| 探针 | 结果 |
+| --- | --- |
+| `NfsSim`（复现游戏两条真实序列） | `ALL PASS`：`/d`→duplicate→`find(12)`,`find(13)` 都是 Group，两处 `addChild` 通过；`/c`→`new World`→`addChild`→`find(10)`,`find(11)` 都成功，`getTransformTo(o10,o11)==true` 且矩阵有限 |
+| `OrderDump` 改动前后 `diff` | **只有 4 个单根文件变化**（根移到槽 0）；13 个多根 + 9 个 Image2D 包**逐字节一致** |
+| `Pos2` | `/bl` 的 19 个位置寻址 **19/19 是 Node**，0 失败 |
+| `RegChk` | 28 文件全部 解析+readAll+每个 Node 都 duplicate → `ok=28 fail=0` |
+
+> 本轮排查踩的坑，已写进 `debug/tools/m3gprobe/README.md`：
+> - `ac.b` 有**三个重载**：`b(int)[B` / `b(int)LNode` / 私有 `b(int)V`。只看方法名会把"取原始字节"误判成"取节点"，我一开始就因此得出过"19 个索引全是非 Node"的错误结论。
+> - `raw` 的高字节是**逻辑组**，要先经 `n.b_[]` 映射到资源，直接当资源索引用会集体错位。
+> - JDK 8 的 `ZipFile` 不接受中文路径，jar 要先复制成 ASCII 名。
+
+#### 7. 交付
+
+| 项 | 结果 |
+| --- | --- |
+| MIDP 重建 | 0 error，ROM 重生成 |
+| 版本号 | `04.27`（`04.26` 属 JIT 并行线） |
+| `vischk.py` | 5 jar / 0 problem |
+| `check_vitalink_stubs.py` | rc=0 |
+| 产物 | `vita-port/out/vpk/midp_vita_v04.27.vpk`，md5 `40c9fb002cc0c620ddaff53fb07663e0` |
+
+#### 8. 诚实的边界
+
+- **未上真机验证。** 能断言的是：这条加载路径上的第三个 NPE 点在 host 上已复现并走通；28 个 `.m3g` 无回归；多根文件的位置寻址顺序一行没动。
+- 已知未修（样本集无标题触达）：`duplicate()` 一个 **World** 会走 Group 分支返回普通 `Group`（类型、`activeCamera`、`background` 都丢）。已登记 `COMPATIBILITY_ROADMAP.md`。
+- 若 log185 再出现新的 `[TIMEREXC]`，那是**第四个**独立缺口 —— 但这次的修法是结构性的（让 `loaded[0]` 恒等于"模型"），不再是一个点一个补丁。
+
+#### 改动文件
+
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/M3gReader.java`（`readAll` 单根排序）
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/Object3D.java`（保留 v04.25 的 userID/深拷贝；删除中途方案）
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/Group.java`（删除中途方案）
+- `debug/tools/m3gprobe/{StructChk,OrderDump,Pos2,NfsSim}.java` + `README.md`（新增/追加）
+- `vita-port/CMakeLists.txt`（04.27 版本块）
+
+---
+
+### 🧬 2026-11-03 log183 分析（+ v04.25 修复）：`Object3D.duplicate()` 丢 userID / 不复制 Group 子节点 / `find()` 出不了自己的子树 → NPE → 加载第三次卡死
+
+**用户报告**：分析log183, 还是卡在加载中。
+
+**编号说明**：log183 打的是 **04.23**；树上 04.24 已被 JIT/heap 并行线占用，本轮落 **04.25**。
+
+#### 1. 先确认上一轮有效（v04.22 是真的起效了）
+
+`java.lang.Error:  95`（= `IllegalAccessError`，`setLayer`）消失了，标题代码从 `ab.a()` **bci=206 走到 bci=255**，这次死在 **bci=135**（另一处）。
+
+```
+[TIMEREXC] task v@e16b5918 cancelled: java.lang.NullPointerException:   0
+ - ab.a(), bci=135
+ - x.q(), bci=196
+ - x.a(), bci=1608
+ - ab.a(), bci=688
+ - v.run(), bci=57
+```
+
+`0` = `empty_message`（本构建打印 `ErrorMsgTag` 枚举值，见 log182 那段）。
+
+#### 2. 反编译定位
+
+```
+x.q() bci=196 -> ab.a(int, Node×8, boolean)
+  ab.a() bci= 75 : node14 = ac.a(3)          // 资源 3 == "/d"
+  ab.a() bci=104 : node14.find(12)  -> g16
+  ab.a() bci=116 : node14.find(13)  -> g15
+  ab.a() bci=135 : g16.addChild(...)         <- NPE，g16 为 null
+  ab.a() bci=855 : g15.addChild(...)         <- 同样用法，下一步就轮到它
+```
+
+`ac.a(3)` = `((Object3D) Loader.load(o.a[3])[0]).duplicate()`；实测 `o.a[3] == "/d"`（游戏字符串表，`javap -c o.class` 逐个 `aastore` 索引确认）。
+
+#### 3. 三个缺陷叠在一起
+
+**A. `duplicate()` 丢掉 userID**
+
+`/d` 的对象是 Group userID=12。userID 被清零后，`find(12)` 变成"找一个 ID 为 12 的**子节点**"，必然 null → `addChild(null)` 抛 NPE。
+
+修复：在 `duplicate()` 的**统一出口**赋值 `d.userID = this.userID`（不在每个类型分支里各自赋值 —— log182 的 `setLayer` 已经证明"每个分支都要记得做"就是缺陷来源）。
+
+游戏自己印证了这个意图：`ab.b(Node)` 显式做 `duplicate()` 然后 `setUserID(getUserID())`。
+
+**B. `duplicate()` 的 Group 分支返回空 Group**
+
+```java
+if (this instanceof Group) {
+    Group c = new Group();
+    copyNodeState((Group)this, c);
+    return c;          // ← children 一个没复制
+}
+```
+
+duplicate 一个加载好的模型 = 得到一个**空壳**：底下什么都不画，`find()` 也看不见任何东西。
+
+修复：递归 `duplicate()` children（安全：`addChild` 拒绝已有 parent 的节点，M3G 是树）。顶点/索引数据仍**共享**（`Mesh.duplicateMesh()`），符合规范且开销可控。
+
+**C. `find()` 出不了自己的子树**
+
+实测 `/d`（42 对象）：**一棵树，9 个 Group**，userID 12 和 13 都是树里的节点，12 是叶子，根是第三个 Group（`objs[8]`）。
+
+而 `Loader.load("/d")[0]` 给的是 **12 号节点，不是根**（我们的排序规则：索引 0 = World，否则"文件顺序第一个 Node"）。
+
+⇒ 严格的子树搜索永远到不了 13。只修 A 会让崩溃从 bci=135 **搬到 bci=855**。
+
+修复：`find()` 在子树搜索失败后，回退到 (1) 自己所属树的根，(2) 同一次加载的兄弟顶层根。回退信息存在 `Object3D.sceneRoots` 上，`duplicate()` 会一起带走，且 **userID 在单文件内唯一 ⇒ 不会跨文件误命中**。
+
+#### 4. 为什么**不**把根排到索引 0（重要，防止后人"顺手优化"）
+
+v04.08 把索引 0 定义为"文件顺序第一个 Node"，是因为极品飞车**按数组下标**取对象。实测：
+
+| 文件 | firstNode | firstRoot | 是否相同 |
+| --- | --- | --- | --- |
+| `/aq` | **0** | **3** | ❌ 不同 |
+| `/af` | 0 | 2 | ❌ 不同 |
+| `/bl` | 0 | 2 | ❌ 不同 |
+| `/d` | 0 | 8 | ❌ 不同 |
+
+改成"根优先"会让每个按位置寻址的查询全部错位 → log177（ClassCastException）/ log179（贴图错乱）那类问题回归。**排序一行没动，只让 `find()` 变聪明。**
+
+#### 5. host 验证（不需要设备）
+
+工具在 `debug/tools/m3gprobe/`：`IdDump.java` / `TreeDump.java` / `GroupChk.java` / `RootChk.java` / `SimChk.java` / `RegChk.java`（本次新增，输入直接取 jar 内条目）。
+
+| 检查 | 结果 |
+| --- | --- |
+| 全部 28 个 `.m3g` 解析 + `readAll` + **对每个 Node 做 duplicate** | `28 ok, 0 fail` |
+| `/d` 端到端复现游戏的调用序列 | `model id=12` → `find(12)=Group id=12` → `find(13)=Group id=13` → **两处 addChild 均 OK** |
+| `/d` 结构 | 9 Group / 1 棵树 / 根是 `objs[8]` / 12、13 均为树内节点 |
+| `/af` | 458 对象，userID 仅 20 和 23（与独立 Python 解析一致） |
+| 生化危机 | 有 World，索引 0 不变，加载正常 |
+
+> 踩过的坑：`M3gFile.parse(byte[], int)` 第二参数是 **offset 不是长度**，且它用 `data.length` 当读取上限 —— host 测试必须传"正好长度"的数组，否则会报 `bad section length 0`。
+> 另一个坑：`Node` **没有** `public getParent()`（游戏引用的是它，设备 classpath 里有），包内字段是 `parent`。我第一次写 `((Node)o).getParent()` 直接编译失败，而 `grep -c error` 把错误吃掉了，导致误判"改动没生效"。
+
+#### 6. 仍未完善（本次不动的已知缺口）
+
+`duplicate()` 一个 **World** 会走 Group 分支，返回普通 `Group`（类型丢失，`activeCamera`/`background` 也丢）。样本集里没有标题 duplicate World，所以只记录、不盲改。
+
+#### 7. 交付
+
+| 项 | 结果 |
+| --- | --- |
+| MIDP 重建 | 0 error，ROM 重新生成 |
+| 新符号进 ROM | `sceneRoots` ✓ / `duplicateInternal` ✓ / `rootNodeOf` ✓ |
+| `vischk.py` | 5 jar / 0 problem |
+| `check_vitalink_stubs.py` | rc=0 |
+| 版本号 | `04.25`（`04.24` 属 JIT 并行线） |
+| **CMakeLists 陷阱** | `set(VITA_VERSION)` 必须写在 `configure_file`（约 6292 行）**之前**；追加到文件末尾会导致版本号不生效（本轮踩到，`vita_version.h` 仍显示 04.24） |
+| 产物 | `vita-port/out/vpk/midp_vita_v04.25.vpk`，md5 `f65c2fdd7f1b18bab91e446aa2404861` |
+
+#### 8. 诚实的边界
+
+- **未上真机验证。** 能断言的是：这条加载路径上的两个 NPE 点（bci=135、bci=855）在 host 上已复现并可走通；样本集 28 个 `.m3g` 无回归。
+- 若 log184 出现新的 `[TIMEREXC]`，那是下一个独立缺口。
+
+#### 改动文件
+
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/Object3D.java`（userID 保留、Group 深拷贝 children、`find()` 上溯、`rootNodeOf`）
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/M3gReader.java`（`readAll` 登记同批顶层根）
+- `debug/tools/m3gprobe/{IdDump,TreeDump,GroupChk,RootChk,SimChk,RegChk}.java`（新增）
+- `vita-port/CMakeLists.txt`（04.25 版本块）
+- `COMPATIBILITY_ROADMAP.md`（登记 World.duplicate 缺口）
+
+---
+
+### 🔓 2026-11-03 log182 分析（+ v04.22 修复）：`Appearance.setLayer` 不是 public → `IllegalAccessError` 被打印成 `java.lang.Error:  95` → 加载再次卡死
+
+**用户报告**：分析log182, 又卡在加载中了，哪一部分代码没完善？
+
+**编号说明**：log182 打的版本是 **04.20**；树上 04.21 已被 JIT/heap 那条并行线占用，本轮落 **04.22**。
+
+#### 1. 先确认上一轮有效（v04.17 是真的起效了）
+
+```
+[m3g] load '/af' ok objects=458
+[m3g] rot#17 ... rot#33 ...
+[TIMEREXC] task v@9c875b9 Error: java.lang.Error:  95
+ - ab.a(), bci=255
+ - x.a(), bci=1232
+ - ab.a(), bci=688
+ - v.run(), bci=57
+```
+
+log180 是在 `ab.a()` **bci=206** 的 `setWinding(169)` 抛 `IllegalArgumentException: bad winding`。
+log182 已经**越过 206**，死在 **bci=255** —— 相隔 49 字节。`WINDING` 那轮修复可以关闭了。
+
+#### 2. "java.lang.Error:  95" 是什么（关键解读）
+
+这行日志**一个单词都没有**，看着像垃圾，其实是有意义的：
+
+| 事实 | 依据 |
+| --- | --- |
+| 本构建 `USE_VERBOSE_ERROR_MSG` 关闭 | `GlobalDefinitions.hpp:1709` 的 `#if !USE_VERBOSE_ERROR_MSG` 分支下，`ErrorMsgTag` 就是 enum 索引 |
+| `Throw::error()` 直接把 tag 值班进去 | `Throw.cpp:177` `allocate_and_throw(Symbols::java_lang_Error(), err)` |
+| `illegal_access_error` 的 0-based 索引 = **95** | 用脚本从 `ERROR_MESSAGES_DO` 宏块计数得出（共 167 条），不是肉眼数的 |
+
+⇒ **`java.lang.Error:  95` == `IllegalAccessError`**（前缀那个空格是枚举号被格式化时的产物）。
+
+#### 3. bci=255 是什么：`Appearance.setLayer(2)`
+
+反编译游戏 `ab.class` 的 `ab.a(javax.microedition.m3g.Node, int)`：
+
+```
+253: aload_0            // this (Appearance)
+254: iconst_2           // layer = 2
+255: invokevirtual javax/microedition/m3g/Appearance.setLayer:(I)V   <-- 死在这里
+258: return
+```
+
+而我们的实现是：
+
+```java
+void setLayer(int layer) {      // ← package-private！
+    this.layer = layer;
+}
+```
+
+JSR-184 规定 `setLayer` 是 **public API**。游戏发 `invokevirtual`，VM 访问检查失败 → `IllegalAccessError` → `TimerThread` 取消那个 15 ms 任务 → 加载画面停住。
+
+**这是同一类缺陷的第 4 次**：
+
+| 版本 | 缺陷 |
+| --- | --- |
+| v03.29 | `Texture2D.FUNC_BLEND` 常量缺失 |
+| v04.17 | `PolygonMode.WINDING_CCW/CW` 值错（176/177 → 168/169） |
+| v04.17 | `Light.SPOT` 常量缺失 |
+| **v04.22** | **`Appearance.setLayer` 可见性错（package → public）** |
+
+#### 4. 修复
+
+```java
+public void setLayer(int layer) {
+    if (layer < LAYER_MIN || layer > LAYER_MAX)      // -1 .. 15
+        throw com.sun.m3g.M3gTrace.fail(new IllegalArgumentException("bad layer: " + layer));
+    this.layer = layer;
+}
+```
+
+`LAYER_MIN/LAYER_MAX` 保持 **private**：JSR-184 只在 `setLayer` 的说明里用文字给出范围，并**没有定义公开常量**，凭空加 public 常量本身就是另一种"造 API"。
+
+#### 5. 新增工具：`debug/tools/m3gprobe/vischk.py`（这次的核心产出）
+
+不再靠"我记得规范说什么"，而是**拿游戏自己的常量池对照我们编出来的 class**：
+
+1. 解包 jar，逐 class `javap -v`，抽出所有指向 `javax/microedition/m3g` 或 `com/sun/m3g` 的 `Methodref`/`Fieldref`；
+2. 用 `javap -p -s` 解析我们的类，得到每个成员的可见性；
+3. 报告 `MISSING` / `PACKAGE` / `PRIVATE` / `PROTECTED` / `CLASS-MISSING`，全 public 才 exit 0。
+
+**双向验证（"只报 OK 的检查器没有价值"）**：
+
+| 场景 | 结果 |
+| --- | --- |
+| 5 个 `debug/3d_game` jar（修复后） | `5 jars, 0 problems` |
+| 反向测试：把 `setLayer` 改回 package-private 单独编译到侧目录并置于 classpath 首位 | 精确报出 `PACKAGE javax.microedition.m3g.Appearance.setLayer(I)V`，且只对**极品飞车**和**生化危机**报（这两个真的调它），另外 3 个报 OK |
+
+附带发现：**生化危机也引用 `setLayer`**，同一个洞它也在暴露面内。
+
+> 写这个脚本时自己踩了两个坑，都已写进文件头：正则一度丢掉包前缀（把类名解析成 `Node` 而不是 `javax/microedition/m3g/Node`，于是所有类都报 CLASS-MISSING）；`javap` 打印构造函数用的是**类名**而不是 `<init>`，不归一化就会把每个 `new Foo()` 误报成缺方法。
+
+#### 6. 仍未完善的部分（本次只修崩溃，没修功能）
+
+`Renderer` **从不读 `Appearance.getLayer()`** —— layer 存下来但完全不参与渲染。JSR-184 里它有两个语义：
+- 决定同一 `Mesh` 各 submesh `Appearance` 的绘制顺序；
+- **layer == -1 表示"不绘制"**。
+
+所以依赖 layer 排序、或用 `layer=-1` 隐藏 submesh 的游戏会画错/多画。不崩，但不对。已登记到 `COMPATIBILITY_ROADMAP.md`。
+
+#### 7. 验证与交付
+
+| 项 | 结果 |
+| --- | --- |
+| `Appearance.setLayer` 签名 | `public void setLayer(int)` ✓ |
+| MIDP 重建 | ROM 重生成，0 error |
+| `vischk.py` 全量 | 5 jar / 0 problem |
+| 反向验证 | 精确命中 `PACKAGE ...setLayer(I)V` |
+| `check_vitalink_stubs.py` | rc=0 |
+| 版本号 | `04.22`（`04.21` 属 JIT/heap 并行线） |
+| 产物 | `vita-port/out/vpk/midp_vita_v04.22.vpk`，md5 `c0a5daa6ec8e17d40520512eb2ab6212` |
+
+#### 8. 诚实的边界
+
+- **未上真机/模拟器验证。** 能断言的只有：`setLayer(2)` 不再抛 `IllegalAccessError`；这 5 个 3D 标题引用的 m3g 成员**已无一个是非 public**。
+- `ab.a()` bci=258 就 `return`，所以这条路径已走完。若 log183 再出现新的 `[TIMEREXC]`，那是**另一个**缺口（`x.a()` 的 bci 已从 log180 的 332/557 推进到 1232，一路在前进）。
+
+#### 改动文件
+
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/Appearance.java`（`setLayer` 改 public + 范围校验 + 说明注释）
+- `debug/tools/m3gprobe/vischk.py`（新增，可见性交叉检查器）
+- `vita-port/CMakeLists.txt`（04.22 版本块）
+- `COMPATIBILITY_ROADMAP.md`（登记 `Appearance.layer` 未实现）
+
+---
+
+### 🔢 2026-11-02 log180 分析（+ v04.17 修复）：`PolygonMode.WINDING_*` 常量错值 → `setWinding(169)` 抛异常 → Timer 任务被取消 → 加载卡死
+
+**用户报告**：分析log180, 贴图显示了，后续加载又卡住了。
+
+**编号说明**：log180 当时打的是 **04.09**；此后树上的 04.10–04.14 与 04.16 皆属并行会话（04.14 是 kubridge 那条线，`out/vpk` 里已有 17:18 构建的 `midp_vita_v04.16.vpk`）。为不撞号，本轮落 **04.17**。
+
+#### 1. 先确认上一轮有效（v04.12 是真的起效了）
+
+| 证据 | log179 | log180 |
+| --- | --- | --- |
+| 实际绑定的纹理 handle | 只有 `tex=2/3`（旧的单张图集） | **`tex=15` / `tex=16`** |
+| 说明 | 调色板/顺序修完仍只用一张图 | 多图集真正用起来了 ⇒ v04.06 + v04.08 + v04.12 全部在生效 |
+
+用户"贴图显示了"的描述与日志一致，**不是错觉**。
+
+#### 2. 新故障链（log180 原文）
+
+```
+[m3g] load '/bv' ok objects=1
+[m3g] load '/af' ok objects=458
+[m3g] threw java.lang.IllegalArgumentException: bad winding
+[TIMEREXC] task v@1be3a289 cancelled: java.lang.IllegalArgumentException: bad winding
+  - javax.microedition.m3g.PolygonMode.setWinding(), bci=21
+  - ab.a(), bci=206
+  - x.a(), bci=332 / x.a(), bci=557
+  - ab.a(), bci=688 / v.run(), bci=57
+```
+
+`/af` 加载成功之后才炸，随后 `[TIMEREXC]` 取消了这个 15 ms 定时任务 ⇒ 加载动画停住。
+**`[TIMEREXC]` 探针（v03.28 加的）第二次抓到"静默卡死"的真因**，不要删。
+
+#### 3. 根因：常量值错了，且是"被去重"去错的
+
+| 常量 | 原值 | 规范值 | 后果 |
+| --- | --- | --- | --- |
+| `PolygonMode.WINDING_CCW` | **176** | **168** | 文件里存的 168 读出来是非法值 |
+| `PolygonMode.WINDING_CW` | **177** | **169** | 游戏传 169 → 抛异常 |
+| `PolygonMode.SHADE_FLAT` | **缺失** | **164** | 需要时无处可引 |
+| `PolygonMode.SHADE_SMOOTH` | **缺失** | **165** | 同上 |
+| `Light.SPOT` | **缺失** | **131** | `setMode(131)` 会抛异常 |
+
+JSR-184 里 `WINDING_CCW == POINT == 168`、`WINDING_CW == LINE == 169` —— **值相同是规范本意**（分属不同方法名空间）。之前有人看到"撞值"就重编号成 176/177，结果**两个方向同时坏掉**：文件里的值全非法，API 的合法调用全抛异常。
+
+#### 4. 两个独立信源互相印证（不靠记忆里的表）
+
+1. **文件内容**：极品飞车 `/aq` 的 22 个 PolygonMode 全部读到 `culling=162`(CULL_NONE)、`shading=165`(SHADE_SMOOTH)、`winding=168`(WINDING_CCW)。
+2. **游戏字节码**：5 个 `debug/3d_game` jar 里唯一的 PolygonMode 调用是 `ab.a(Node,int)` 偏移 202..206 的 `sipush 169; invokevirtual setWinding`。
+
+修完 host 端 `NfsSim` 复现：`file-loaded winding=168` → `after setWinding(169): winding=169 isCW=true`，**CW 分支第一次真正可走**。
+
+#### 5. 顺带补掉的同类缺口
+
+- `Light.SPOT=131` 并让 `setMode` 接受。渲染器暂时按 OMNI 着色（锥形聚光尚未实现）——**只画得不对，不会崩**。43 个样本 `.m3g` 全都只用 128/129，所以这个洞一直没暴露。
+- `PolygonMode` 实例默认值改为文件中实测值：`culling=CULL_BACK`、`shading=SHADE_SMOOTH`、`winding=WINDING_CCW`。
+
+#### 6. 新增常量完整性测试（host，已入库）
+
+`debug/tools/m3gprobe/SetterChk.java`：把每个 setter 的每个合法值都调一遍，只要抛异常就失败。
+这一类缺陷已经 **3 次**（`FUNC_BLEND` v03.29、`WINDING` v04.17、`SPOT` v04.17），值得 40 行永久护栏。**任何改动 `javax.microedition.m3g` 常量的提交都应跑一遍。**
+
+两个踩过的坑写进了它的文件头：
+- **javac 会把 `static final int` 内联**，测试必须用"要跑的那份 class"来编译。我第一次用缺 `$WORK/out` 的 `-cp` 编，得到假结果"还是 176"。
+- 我第一次跑还把 `Texture2D.FILTER_BASE_LEVEL` 当 `imageFilter` 传（非法组合），差点误判 208/209/210 是错的。**先怀疑测试，再怀疑代码。**
+
+#### 7. 验证与交付
+
+| 项 | 结果 |
+| --- | --- |
+| `SetterChk`（仓库版，host） | `ALL PASS` |
+| built classes 常量（`javap -p -constants`） | 168 / 169 / 164 / 165 / 131 全部正确 |
+| ROM 重生成 | `ROMImage.cpp` 17:18:10 > `PolygonMode.class` 17:18:02 |
+| 常量名进最终 ELF | `SHADE_SMOOTH` / `SHADE_FLAT` / `SPOT` 均为本轮新增字段名，已在 `out/vpk/midp_vita_v04.17.sym` 中找到 ⇒ ROM 装的是新类 |
+| `check_vitalink_stubs.py` | rc=0，30 个 stub section 全属 Sce 库 |
+| 产物 | `vita-port/out/vpk/midp_vita_v04.17.vpk`，md5 `423e7843bb58dd4b8801f371a52fe535` |
+
+#### 8. 诚实的边界
+
+- **未上真机/模拟器验证。** 176/177 本身也从未在设备上验证过；能断言的只有"`setWinding(169)` 不再抛异常"和"`/aq` 里的 `winding=168` 现在能原样往返"。
+- 预期是加载画面能越过 `/af` 继续走；若 log181 在 `/af` 之后出现**新的** `[TIMEREXC]`，那是下一个独立缺口，不是本修复失效。
+
+#### 改动文件
+
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/PolygonMode.java`（值修正 + SHADE 常量 + 默认值 + 禁止再去重的说明）
+- `jsr184/src/share/core/common/classes/javax/microedition/m3g/Light.java`（新增 `SPOT`，`setMode` 接受）
+- `debug/tools/m3gprobe/SetterChk.java`（新增）
+- `vita-port/CMakeLists.txt`（04.17 版本块）
+
+---
+
+### 🎨 2026-11-02 log179 分析（+ v04.12 修复）：贴图/着色两处真实缺陷 —— "有纹理无 UV 读地址 0" 与 "无光源场景亮度 0.04"
+
+**用户报告**：极品飞车加载进去了，但贴图显示有问题，附图（选车界面 "ESCOLHER CARRO" / "NISSAN 370Z (Z34)"）。
+
+**先说结论**：**不是"没适配好"这种笼统问题，是两处可定位的代码缺陷**；同时**加载链路（v04.06 调色板 / v04.08 对象顺序）是好的，不在嫌疑范围**。
+
+#### 1. 排查过程（先证伪，再定因）
+
+| 检查 | 结果 |
+| --- | --- |
+| 3 张纹理图集对不对 | `/bo` `/bp` `/bs` 各 128×128 RGB+调色板，**导出成 PNG 后内容正确**（UI 图标、数字 65..72、车身内饰板） |
+| 是不是图集 | `/bl` `/bm` `/bz` `/m` 的 **Image2D 数量为 0** ⇒ 所有模型都采样这 3 张，UV 是子矩形（如 u[0.064,0.121]） |
+| UV 对不对 | `/aq` 的 **97/97 mesh 都有 UV**，用渲染器公式 `componentRaw*scale+bias` 算出的值都在 [0.06,0.61] 合理区间 |
+| 投影对不对 | `m5=2.141` → fovy=50°，`m0=2.859 = m5/0.75`（aspect 240/320）✓ |
+
+⇒ **UV、投影、图集内容、纹理上传全部正常**，问题在别处。
+
+#### 2. 缺陷 A：有纹理但没有 UV 时，GL 从**地址 0** 取纹理坐标
+
+Renderer 传的是：
+```java
+NativeBridge.draw(pos, (texHandle != 0) ? uv : null, rgba, idx, ...);
+```
+`texHandle != 0` 但 `vb.texCoords == null`（M3G 允许）⇒ 后端收到 **纹理已绑定 + uv2==NULL**，而 `vita_gl3d_draw_uv` 当时这么写：
+```c
+if (g_tex_bound) {
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(2, GL_FLOAT, 0, uv2);   // uv2 == NULL → 从 0 地址取
+}
+```
+⇒ 每个顶点都从地址 0 读 (s,t) → **整块 mesh 用一个垃圾 texel 铺满**，或读取即崩。
+
+**修复**：`uv2 == NULL` 时对该次绘制 `glDisable(GL_TEXTURE_2D)`，退回顶点色/材质色。
+软件后端（`vita_sw3d_draw_uv`）有同一缺陷的静默版本（`draw_impl` 把 u=v=0 代入，整个 mesh 采样 texel (0,0)），一并对齐成"丢弃纹理"。
+
+#### 3. 缺陷 B：无光源场景亮度只有 0.04 —— 这才是"车全黑"的主因
+
+`shade()` 的光源只可能来自两处：`render(World)` 或 `Graphics3D.addLight()`。
+极品飞车**全程用 `render(Node, Transform)`**，且没有 `addLight()` ⇒ **光源列表为空** ⇒ 每顶点累加项一个都不执行，颜色退化为：
+```
+emissive + ambient*0.2
+```
+而 `/aq` 的 24 个 Appearance **material 全为 null**（已核实）、无纹理，VertexBuffer **也没有顶点色** ⇒ 顶点色 = `vb.defaultColor`，乘积 ≈ `0.04 × defaultColor` ⇒ **近乎全黑**。
+
+这与截图的"车只有深色轮廓"完全吻合，也与日志吻合（几何确实在屏幕上：`inside=609/698`、19050 顶点/帧、18 mesh/帧）。
+
+**修复**：当**没有任何带方向的非环境光源**时，用一个固定世界空间 key light（左上前方 (0.32,0.64,0.75)，0.25 亮度下限）。
+- 它是顶点法线的纯函数 ⇒ 不依赖相机状态，两个后端结果一致；
+- **只在该情况下生效** ⇒ 有光源的场景输出**逐字节不变**。
+
+#### 4. 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `Renderer.java` 编译 | 通过 |
+| `vita_gl3d.c` / `vita_sw3d.c` 语法 | 零 error / 零 warning |
+| MIDP 全量重编 | 零 error，ROM 24936 objects |
+| `check_vitalink_stubs.py` | `rc=0` |
+
+**产物**：`vita-port/out/vpk/midp_vita_v04.12.vpk`（12072560 B），md5 `9ace559c261c950544ab05f4fc653db2`。
+
+#### 5. 如实说明局限
+
+- **没有在宿主复现出截图**：这里没有 GL，软件后端本来就渲染出不同图像。**已证明的是机制**（纯色 + 0.04 亮度）与两条代码路径确实错误。
+- `/aq` 那种"无 material / 无 texture / 无顶点色"是**数据本身**，不是解析错：`readAppearance()` 字段顺序与规范一致，且每个对象体强制"恰好消费完"（VB 若错位一个字节必然抛异常，43 个 m3g 全过）。
+- **版本号**：log179 是 **04.09**，本树已有并行会话留下的 04.10/04.11，故本轮取 **04.12**。
+
+#### 6. 下一轮判据
+
+1. 车是否不再全黑（缺陷 B）——这是最明显的变化。
+2. 若仍有"整块纯色/拉伸贴图"，看是否还有 `tex=N` 但无 UV 的 mesh（缺陷 A 的降级会显示材质色而非拉伸 texel）。
+3. 若贴图内容仍不对，下一个要 dump 的是"哪个 mesh 用哪个 texture handle"（log179 里 18 mesh/帧只出现 tex=2 和 tex=3 两个句柄），判断图集子矩形是否就是标题想要的那块。
+
+
+### 🧩 2026-11-02 log177 分析（+ v04.08 修复）：`Loader.load()` 返回顺序 — 极品飞车按**位置**寻址，文件顺序里那些位置不是 Node
+
+**用户报告**：极品飞车加载一会，还是卡住不动。
+
+#### 1. v04.06 的调色板修复确实生效了
+
+log176 是 `load FAILED '/bo'` 就断，log177 变成：
+```
+[m3g] load '/bo' ok objects=1     '/bs' ok   '/bl' ok   '/bm' ok
+[m3g] load '/d'  ok objects=42    '/c' ok    '/aq' ok objects=1506
+```
+7 个文件全部加载成功。**接着出现的是另一类异常**：
+```
+[TIMEREXC] task v@9c875b6 cancelled: java.lang.ClassCastException: 0
+ - ac.b(), bci=32
+ - ai.a(), bci=602
+ - ab.a(), bci=688
+ - v.run(), bci=57          ← 又是 TimerTask，所以又是"加载动画停住"
+```
+（顺带：v04.03 加的 `menu_probe` 这次仍是三项全绿，`free` 轮间不变、`guard=ok`、`sp` 恒定，v04.03 那两个假设继续被排除。）
+
+#### 2. 反编译游戏，把寻址方式挖出来
+
+jar 里类名被混淆，但字节码可读。`ac.b(int)` 是**按位置寻址**：
+```java
+ac.b(int id):
+    g   = n.b_[(id >> 8) & 0xFF];        // 逻辑组 → 文件序号
+    idx = id & 0xFFFF00FF;                // & 0xFFFF00FF 清掉 bits 8..15
+    return (Node) ((Object3D[]) ac.a(g, 2))[idx].duplicate();   // bci 32 的 checkcast
+```
+关键表（均为显式 `bipush`/`aastore`，不是顺序巧合）：
+- `n.b_ = {16,24,31,48,64,63,42,13,12,11,14,10,9,15,8}`
+- `o.a[42] = "/aq"`（`bipush 42; ldc "/aq"; aastore`），`o.a[66]="/bo"`、`70="/bs"`、`63="/bl"`、`64="/bm"`
+
+所以 `n.b_[6]=42` → **`/aq`**（1506 对象，最后加载的那个）。游戏对 `/aq` 用的全部打包 id 解出来是：
+```
+idx = 0,2,3,6,7,8,9,10,11,12,13,14,15,16,18,20,21,22,23
+```
+**这 19 个位置必须是 Node**，`checkcast Node` 才不会抛。
+
+顺便澄清两个易错点：
+- `ac.a(77)`/`ac.a(78)` 里的 77/78 是**文件序号不是数组下标**（该重载是 `a(id,1)` = 返回 `arr[0]` 再 cast Node）。所以 `/q`、`/bz`、`/ca` 那些调用**不约束数组顺序**，只要求 `arr[0]` 是 Node。
+- `ac.a(66)` = `a(66,0)` = 取 `arr[0]` cast Image2D；`/bo`、`/bp`、`/bs` 各只有 **1 个对象**（Image2D）且**无 Node**，所以顺序改动对它们无影响（已验证）。
+
+#### 3. 实测：文件顺序下 `/aq` 的 19 个位置有 12 个不是 Node
+
+```
+/aq 文件顺序：[0]VA [1]VA [2]VA [3]VB [4]TriStrip [5]CM [6]PM [7]Appearance
+              [8]Mesh [9]G [10]G [11]G  ← 每 12 个一组，即"一个模型的资源 + 它的 4 个节点"
+```
+`/aq` = 约 78 个模型的资源池；游戏要的 0/2/3/6/7/12/13/14/18 全是 VertexArray / VertexBuffer / PolygonMode / Appearance。
+
+⇒ **文件顺序对 `/aq` 被证伪**（否则这游戏在真手机上也会崩）。
+
+反证：`/q`（`/bz`、`/ca` 之外唯一的"真下标"调用不存在）——其实**没有任何文件能反证文件顺序**，因为唯一按下标访问的文件就是 `/aq`。所以只需让"节点在前"。
+
+#### 4. 修复：`M3gReader.readAll()` 三段式排序
+
+```
+1. World（若有）→ index 0
+2. 其余 Node 按文件顺序
+3. 其余非 Node（资源）按文件顺序
+```
+
+- 第 1 段保住 v03.29 的要求（生化危机 `loaded[0].find(id)`，它的 15 个 `.m3g` 里 World 都在**文件末尾**，`hunter.m3g` 第一个 Node 是 index 104 的 Group）。
+- 第 2 段是修极品飞车的关键：`/aq` 变成 `Mesh,G,G,G,Mesh,G,G,...`，游戏的 19 个下标全部落在 Node 上。
+- 顺手删掉死代码 `findRootIndex()` —— 它"随便找个未被引用的 Node 当 root"的兜底正是会给 `/aq` 选错 root 的逻辑。
+
+#### 5. 验证（宿主，真实 reader）
+
+| 检查 | 结果 |
+| --- | --- |
+| `/aq` 游戏用的 19 个下标 | **全部是 Node**（改前 12 个不是） |
+| 生化危机 hunter/jill_han/zombie 的 `out[0]` | 仍是 **World**（未变） |
+| `/bo`（1 对象 0 Node）的 `out[0]` | 仍是 **Image2D**（未变） |
+| 5 个 jar 里全部 43 个 `.m3g` | **43 ok / 0 fail** |
+| `/aq` 的 97 个 Mesh | 0 个零 submesh，`duplicate()` 0 失败 |
+
+**产物**：`vita-port/out/vpk/midp_vita_v04.08.vpk`（12067868 B），md5 `4bf4a6a40ccb61ac96e1bac1159d565a`。
+
+**版本号说明（重要）**：log177 跑的是 **04.07**，但**本树没有 04.07 的版本块**（只有 04.05、04.06，然后直接到本轮的 04.08）。可能是并行会话改动后回退。为避免同一个号在设备上代表两份不同代码，本轮取 04.08 并在此记录缺口。
+
+**未验证 / 下一轮判据**：
+1. 加载画面能否推进。若仍停，看新的 `[TIMEREXC]` / `[m3g] load FAILED`。
+2. 若加载过了但**车/场景是错的**，嫌疑在第 2 段的 Node 顺序（真实实现可能另有顺序）——**不要**立刻改回来，先加一条"每次 `arr[idx]` 取到的类名"的探针，用真机日志定序。
+
+
+### 🖼️ 2026-11-02 log176 分析（+ v04.06 修复）：极品飞车卡在"加载中" —— `Image2D` 调色板图像根本解不开，任务被 cancel
+
+**用户报告**：极品飞车进入菜单后一直"加载中"，不动。
+
+**先确认前一版的结果**：v04.04 的 `getenv` 修复**生效了**——真机启动成功，crumb.log 里有 4 完整轮（
+`menu enter → menu exit → round begin → runMidlet enter/exit → round end`），log173 那个"回菜单崩"也**没有复现**：
+
+| 轮 | 游戏 | 结果 |
+| --- | --- | --- |
+| 0 | 文件管理器 | 完整退出 |
+| 1 | UC 浏览器 | 完整退出 |
+| 2 | 生化危机3D | 完整退出（**硬件 3D 后端**，`gl3d: vglInit returned 0`） |
+| 3 | **极品飞车** | **卡在"加载中"** |
+
+**v04.03 加的 `menu_probe` 也给出了判决**（三项全绿 ⇒ 上一轮的两个假设都排除）：
+
+| 时点 | arena | free | guard | sp |
+| --- | --- | --- | --- | --- |
+| menu enter r0 | 24K | 4K | ok | 81c3f84c |
+| round end r0 | 40324K | 33954K | ok | 81c3f84c |
+| menu enter r1 | 40324K | **33954K** | ok | 81c3f84c |
+| round end r2 | 54284K | 34440K | ok | 81c3f84c |
+| menu enter r3 | 54284K | **34440K** | ok | 81c3f84c |
+
+- `free` 在 `round end` → 下一次 `menu enter` 之间**完全不变** ⇒ **(a) VM 堆没有每轮泄漏**。
+- `guard` 全程 `ok`、`sp` 恒定 ⇒ **(b) 栈没有被破坏**。
+- ⇒ log173 的"回菜单崩"要么被 v04.04 顺带解决，要么是 Vita3K 特有。**不再追。**
+
+#### 根因：`[TIMEREXC]` 探针直接给出答案
+
+`vm_output.log` 结尾：
+```
+[m3g] load FAILED '/bo' (java.io.IOException: Image2D pixel length mismatch)
+[TIMEREXC] task v@9c875b6 cancelled: java.lang.NullPointerException: 0
+ - ac.a(), bci=164
+ - ac.a(), bci=3
+ - ai.a(), bci=531
+ - ab.a(), bci=688
+ - v.run(), bci=57
+```
+
+链条：**`.m3g` 加载失败 → 游戏拿到 null → 自己的代码 NPE → `TimerThread` 按规范 `task.cancel()` → 15ms 主循环永久停止 → 加载动画不再推进**。
+
+`[TIMEREXC]` 是 v03.28 加的探针，**这次正是它把"界面卡住"变成了可定位的异常**。不要再把这类探针当噪音删掉。
+
+#### 真正的 bug：调色板 `Image2D` 从来没能被解析
+
+`M3gReader.readImage()` 原来：
+```java
+int paletteLength = c.count();
+if (paletteLength > 0) {
+    c.skip(paletteLength);         /* paletted images: not decoded */
+}
+int pixelLength = c.count();
+int bpp = Image2D.bytesPerPixel(format);
+if (pixelLength != w * h * bpp) {
+    throw new IOException("Image2D pixel length mismatch");
+}
+```
+有调色板时像素字节是**索引**，`w*h*bpp` 永远对不上 ⇒ **必然抛异常**。
+
+**宿主复现（改任何代码之前，用出厂 reader 跑 jar 里的 `bo`）**：
+```
+Img2D len 16384 want 49152 format=99(RGB) 128x128 bpp=3 palette=768
+```
+`768 = 256 条 × 3 字节` ⇒ 每像素 **8 位索引** ⇒ `128×128×1 = 16384` ✓
+⇒ **文件一直是对的，reader 是错的。**
+
+#### 修复（`M3gReader`，两个新方法）
+
+- `readPalette()`：按 RGB 三元组读；当长度能被 4 整除且商为 2 的幂时按 RGBA 读（兼容某些导出器）；**索引 0 强制为全透明**（M3G 调色板编码的约定）。
+- `decodePaletted()`：索引位宽由条目数决定（2→1b、4→2b、16→4b、其余 8b），**行按字节对齐**，读取以声明的 `pixelLength` 为硬边界（短包体绝不会读到下一个对象），长度不符时**报告但不中止**整个模型——一张怪图不能拖垮整个 `.m3g`，更不能拖垮标题的主循环。
+
+#### 验证（宿主，5 个 `debug/3d_game` jar 里全部 43 个 m3g 资源）
+
+| | 结果 |
+| --- | --- |
+| 修复前 | **34 ok / 9 FAIL**（全部是 `Image2D pixel length mismatch`） |
+| 修复后 | **43 ok / 0 FAIL** |
+| `paletted ... expected N, file says M (lenient)` 告警 | **0 条** ⇒ 样本集里每张调色板图的长度都**精确等于**行对齐公式，解码器是逐位正确，不是"勉强能过" |
+| 像素抽查 `m07.m3g`(256×256) | 55372 不透明 / 10164 个 index-0 像素，首像素 `0x00000000` ⇒ 透明约定与内容分布都正常，不是纯色填充 |
+
+非调色板 RGB 路径**未改动**；`w*h*bpp` 真不符时仍保留诊断行（下一次遇到未知布局，一条日志就能定位，而不是静默卡死）。
+
+**产物**：`vita-port/out/vpk/midp_vita_v04.06.vpk`（12068469 B），md5 `8b381a6228f181a150611d92a7763d3e`。
+**ELF 验证**：`strings -e l` 能查到 `paletted` / `Img2D len` / `palette ` 各 1 条；`check_vitalink_stubs.py` 仍 `rc=0`。
+**未验证**：真机画面。预期加载动画恢复、那 9 个模型能加载。
+
+#### 遗留（下一轮看什么）
+
+1. 极品飞车能否越过加载画面。若仍卡，看是否有新的 `[m3g] load FAILED` 或 `[TIMEREXC]`。
+2. `[m3g] load FAILED '/bo'` 里的 `/bo` 是**真实资源名**（jar 里就有 `bo`，17242 B），不是截断——混淆器把扩展名去掉了。
+3. 生化危机3D 这轮已走**硬件 3D 后端**（vitaGL），v04.02 的 `CompositingMode` 改动第一次有机会在真机上验证。
+
+
+### 💥 2026-11-02 log174 真机 dump 分析（+ v04.04 修复）：`getenv` 是未解析的 vitalink import stub，C++ 静态初始化一调就跳地址 0
+
+**用户报告**：v04.03 在**真机**上启动就报异常（Vita3K 上没这个现象）。
+
+#### 1. dump 硬事实
+
+两个 `psp2core`（间隔 14 秒，两次上机）：
+
+| | d1 | d2 |
+| --- | --- | --- |
+| 线程数 | **2**（主线程 + SceCommonDialogWorker） | 2 |
+| 主线程 pc | **0x00000000** | **0x00000000** |
+| 主线程 lr | 0x8100766b | 0x8102966b（差 0x22000，ASLR） |
+| sp | 0x81480f20 | 0x814c0f20（距栈顶仅 0xE0） |
+| r0 | 0x811e32cc | 0x812052cc |
+
+- 只有 2 个线程 + 栈几乎没动 ⇒ **崩在 `_start` 里，我们自己的代码一行都没跑**。
+- 两次崩溃在**完全相同偏移**（lr 差恒定 0x22000）⇒ 确定性 bug。
+
+#### 2. 基址：`MODULE_INFO` 才是权威来源（skill 里的锚点法这次失败）
+
+`psp2dmp.py base` 报 `FAIL: no sleeper anchor found`（没有线程停在 DelayThread stub 里）。**不要因此放弃**——`MODULE_INFO` note 里有段表：
+
+```
++0x734: 段type=5  addr=0x81005000  size=0x3e356c   → 对应 ELF vaddr 0x81000000，delta = +0x5000
++0x748: 段type=6  addr=0x81500000  size=0x6d18e4   → 对应 ELF vaddr 0x81400000，delta = +0x10000
++0x6f0: pc0 = 0x810078b5
+```
+
+**两个段 delta 不同**（0x5000 vs 0x10000），因为 vita-elf-create 对每段独立按 0x1000 对齐。
+
+**交叉验证**：`pc0 0x810078b5 − 0x5000 = 0x810028b5` = `readelf` 的 Entry point ✓
+
+⇒ **新规则：符号化前先读 MODULE_INFO 的 pc0，减去 readelf 的 e_entry，得到段0 delta。** 比 0x81011b4b 锚点法可靠（那个需要恰好有线程睡在 DelayThread stub 里）。
+
+#### 3. 崩溃点精确定位
+
+段0 delta = +0x5000：
+
+| 寄存器 | 运行时 | ELF vaddr | 符号 |
+| --- | --- | --- | --- |
+| lr | 0x8100766b | **0x8100266b** | `_GLOBAL__sub_I__ZN9__gnu_cxx9__freeresEv + 0x3f` |
+| r0 | 0x811e32cc | 0x811de2cc | **`.LC4`**（字符串常量） |
+| r12 | 0x811c8510 | 0x811c3510 | getenv |
+| 栈上 | 0x81007903 | 0x81002903 | `_start + 0x4f` |
+
+反汇编该处：
+```asm
+81002654:  movw r0, #:lower16:.LC4
+8100265c:  movt r0, #:upper16:.LC4      ; r0 = 0x811de2cc = .LC4 ✓ 与 dump 完全吻合
+81002666:  blx  getenv                  ; ← lr = 0x8100266a，dump 给 0x266b
+```
+
+**`_GLOBAL__sub_I_...freeres` 是 `.init_array[6]`**，即 `__libc_init_array` 跑的 C++ 静态构造。栈上还有 `_start+0x4f`，完整的启动序列。
+
+#### 4. 根因：`getenv` 是未解析的 import stub
+
+```asm
+811c3510 <getenv>:            ; 在 .vitalink.fstubs.SceLibMonoBridge 段内！
+811c3510:  .word 0x00000008
+811c3514:  .word 0xd46680e4   ; hash 占位
+811c3518:  .word 0x2aeba06e   ; hash 占位
+811c351c:  nop
+```
+
+- 16 字节 = **vita-elf-create 的 import stub**；真实现不长这样。
+- 同段里 `pss_code_mem_alloc/flush_icache/free/initialize` 也是 stub —— 那是**正常的**（SceLibMonoBridge 真的导出它们）。
+- **没有任何 Sce 模块导出 `getenv`** ⇒ 加载时解析目标为 0 ⇒ 第一次调用执行地址 0 ⇒ prefetch abort ⇒ dump。
+
+**为什么未定义**：newlib 的 `lib_a-getenv.o` **没被拉进镜像**，只有 `lib_a-getenvr.o`（`_getenv_r` @ 0x811bd2fc 是真代码）。printf/malloc/locale 只用 `_r` 变体，所以正常链接不会带进 `getenv`。而 libstdc++ 的静态初始化**直接**调 `getenv`。
+
+#### 5. 为什么"看起来是 v04.03 引入的"
+
+- 同一个 stub **在 v04.00/01/02 都存在**（`getenv` @ 0x811c2970 / 0x811c3460，同一调用点）。
+- **log173（v04.01 跑满 4 轮）是 Vita3K**，Vita3K 对未解析 import 的处理与真机不同，不会跳 0。
+- **log174 是这个移植自 log159（v03.7x）以来第一次真机运行**。log159 是另一次崩溃（4 个线程活着、pc 在模块内，晚期）。
+- v04.03 vs v04.02 的唯一差别：`main` 大了 0x2c（我加的 menu_probe 内联），`.init_array` 各项整体 +0x2c，**顺序和内容都没变**。⇒ **不是 v04.03 的回归，是长期潜伏的缺陷第一次被真机暴露。**
+
+#### 6. 修复（`vita-port/src/vita_pcsl.c`）
+
+```c
+char *getenv(const char *name) {
+    (void)name;
+    return NULL;
+}
+```
+
+**为什么不遍历 `environ`**（第一版就是这么写的，差点引入第二个 bug）：
+
+加了 `extern char **environ;` 并引用它之后，链接行为变了——`lib_a-environ.o` 不再被拉入，`environ` **自己变成了 import stub**（`T` @ 0x811c3590，而不是 `.data` 里的 `D`）。把 stub 的代码字节当 `char**` 读，会得到一个垃圾指针，遍历必崩。**修一个崩溃不能引入对另一个未验证符号的依赖。**
+
+**为什么不用 `_getenv_r`**：`_REENT` 在启动这么早不保证有效。
+
+**语义正确性**：Vita 没有进程环境变量，"查不到"就是正确答案；libstdc++ 的调用点都先判断返回值（反汇编里是 `cbz r0, ...`），NULL 是处理过的路径。
+
+#### 7. 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `nm` getenv | **0x81019788 `T`**（`.text` 真实现），不再是 0x811c3510 stub |
+| 反汇编 | `movs r0, #0 ; bx lr` ✓ |
+| `nm` environ | 回到 **0x81404ab0 `D`**（`.data`）✓ |
+| 30 个 `.vitalink.fstubs.*` 段审计 | **零个非库符号**（`taiHook*` 属 taihen 库本身，正常） |
+| `init_array[6]` 构造函数的全部调用 | `pthread_mutex_init`(0x8110cf80) / `getenv`(0x81019788) / `memcmp`(0x811afbe8) / `strchr`(0x811b1a98) **全是真实现** ✓ |
+
+**产物**：`vita-port/out/vpk/midp_vita_v04.04.vpk`（12066037 B），md5 `accabcfd32f78f7aa2858647f4e7fe1f`，`J2ME Player v04.04 b330`。
+
+#### 8. 新增防踩坑工具
+
+`debug/tools/check_vitalink_stubs.py`：扫所有 `.vitalink.fstubs.*` 段，报出**不属于该 Sce 库**的符号（白名单前缀 `sce/_sce/pss_/tai`）。
+
+- v04.04：`OK - every symbol in a stub section belongs to a Sce library`（rc=0）
+- v04.03：`SUSPICIOUS ... getenv 0x811c3510`（rc=1）✓ 能抓住这次的真凶
+
+**建议**：以后每次构建后跑一次；新引入任何会调 libc 的 C++ 静态对象时尤其要跑。
+
+
+### 🔬 2026-11-02 log173 分析（+ v04.03 插桩）：退出游戏回菜单后崩溃 —— 与 3D / v04.01 无关，是长期存在的轮循环缺陷
+
+**用户报告**：v04.01，退出 Java 程序后 Vita3K 直接卡死闪退。
+
+#### 1. 四个进程、四种游戏，同一个死法
+
+`crumb.log` 按 `==== launcher start ====` 分属 **4 次独立进程启动**（日志是追加的，这条要记住）。
+
+| 进程 | 跑的游戏 | 结果 |
+| --- | --- | --- |
+| P1 | 极品飞车13之变速英文3D版 | 无 `runMidlet exit`（游戏中被杀） |
+| P2 | UC 浏览器 `app` | 退出正常 → 回菜单心跳 `217/228` → **死** |
+| P3 | 文件管理器 `app (1)` | 退出正常 → 回菜单心跳 `220/228` → **死** |
+| P4 | 生化危机3D `BioMain` | 退出正常 → 回菜单心跳 `290/298` → **死** |
+
+⇒ **不是 3D 特有的，也不是 v04.01 引入的**：`log170` 只有 1 轮、签名完全相同（`206/213`）。
+
+**跳率是决定性指标**：进游戏前菜单约 **60 flips/s**（心跳间隔约 60），回来后降到 **8–11 flips/s**，2 秒内彻底停。
+
+#### 2. vita3k.log 钉死死点
+
+```
+[19:15:37.347] _sceIoDopen: Opening dir ux0:/data/J2ME00001/games
+[19:15:37.348] |C| EXCEPTION_ACCESS_VIOLATION (0xC0000005)
+[19:15:37.348] |C| Read violation at address 0x460800000.      <- 无意义地址
+... 扫描 14 个游戏 ...
+[19:15:37.357] 日志在一行中途被截断
+```
+
+- 崩在**回菜单后 `scan_games()` 里**，正是读第一个游戏 `cache.bin` 的那一刻；
+- 全程只有 **1 次** 访问违例，且 guest 之后又跑了 9 ms —— 是"野指针读"，不是干净的 abort；
+- 无时间停滞（最大间隔 0.7 s），所以是**硬崩溃**而非卡死。
+
+#### 3. 顺带查出的确定缺陷：`JVM_CleanUp()` 没有任何调用者
+
+最终 ELF 实测：
+
+```
+nm  | grep midp_slavemode_event_loop   -> 0（不在二进制里）
+nm  | grep midp_slavemode_time_slice   -> 0
+objdump -d | grep 'bl.*<JVM_CleanUp>'  -> 空（有符号，无调用者）
+```
+
+- 唯一会调用 `JVM_CleanUp()` 的是 `midp_slavemode_time_slice()`（slavemode 事件系统）；本构建走 **mastermode**，那两个符号根本没链进来。
+- 于是 `Universe::apocalypse()` → `ObjectHeap::dispose()` → `OsMemory_free_chunk()` **永不执行**：**每轮泄漏整个 Java 堆 chunk（32MB）+ bitvector chunk**。
+- `midpFinalize()` 兜不住：它只到 `pcsl_mem_finalize()`；而 VM 堆来自 `jvm_malloc`，在 `GlobalDefinitions.hpp:2452` 就是裸 `malloc`。
+
+#### 4. 两个仍然存活的机制需要不同修法 → 本轮只加判据，不乱改
+
+| 机制 | 判据 |
+| --- | --- |
+| (a) VM 堆不释放（上条） | `mallinfo().fordblks` 在 `round end` 与下一次 `menu enter` 之间**永久掉 ~32MB** |
+| (b) 栈被破坏（v01.78h 已记录：保存寄存器块在长会话中被清零） | 局部金丝雀 `guard` 变了，或 `sp` 在轮间漂移 |
+
+**v04.03 改动**（仅诊断，零行为变化）：`vita_main.c` 新增 `menu_probe()`，在 `round end` / `menu enter` / `menu leave` 各打一行 `crumb.log`：
+
+```
+probe <what> round=N sp=XXXXXXXX guard=ok|BAD arena=K free=K max=K
+```
+
+- `free` = `mallinfo().fordblks`，`arena` = `mallinfo().arena`，`max` = `keepcost`；
+- `guard` = 写在局部变量里的 `0x5A5AA5A5`，跨调用比对；
+- 无分配、不调 VM、不调菜单，不会干扰被测对象。
+
+**为什么不本轮直接修 (a)**：盲改 VM 收尾正是这个项目付过代价的那类改动（PRODUCT/非 PRODUCT ABI；且 `JVM_CleanUp()` 带 `GUARANTEE(SlaveMode)`，而本构建不是 slave mode）。一行插桩就能定案，猜错要再花一整轮才能发现，还会把 (b) 的线索搅混。
+
+**产物**：`vita-port/out/vpk/midp_vita_v04.03.vpk`（12065797 B），md5 `837160d3442ce94d861405e8be8d5e67`，`J2ME Player v04.03 b330`。
+**验证**：最终 ELF 含 `menu_probe`、`mallinfo`，格式串 `probe %s round=%d sp=%08x guard=%s arena=%uK free=%uK max=%uK` 存在；构建零 error。
+
+**下一轮判读方式**：跑两次"进游戏 → 退出 → 回菜单"，看：
+1. 第二次 `menu enter` 的 `free` 是否比第一次少 ~32MB 且不回升 → (a) 成立；
+2. `guard` 是否变 BAD、`sp` 是否在轮间变化 → (b) 成立；
+3. 若都正常，病根在别处（下一嫌疑：`scan_games()` 的 icon 缓冲，或 `inbox_scan`/`fe_scan` 的 dirent 用法）。
+
+
+### 🔗 2026-11-02 v04.02：M3G `CompositingMode` 全链路接线（3D API 阶段 5 第一项）
+
+**为什么选这个当"继续完善 3D API"的第一刀**：不是因为它最简单，而是因为它是**正确性缺口**，不是"功能没做"。全部 setter/getter 早就存在、`.m3g` 读取器也早就填好了值，唯独 `Renderer.drawMesh()` 只读了其中一项：
+
+```java
+// 改前（v03.30 起）
+blend = (cm.getBlending() == CompositingMode.REPLACE) ? 0 : 1;
+NativeBridge.setState(cull != 0, blend != 0);
+```
+
+后端只能听到"混合开/关"，无法区分四个不同方程。后果（都能在真实游戏里看到）：
+
+| API | 改前实际效果 | 游戏里看到 |
+| --- | --- | --- |
+| `MODULATE` / `MODULATE_X2` | 当成 alpha-over | 阴影/光照贴图变成半透明方块 |
+| `ALPHA_ADD` | 当成 alpha-over | 加法发光被目标色压暗 |
+| `depthWrite=false` | 忽略（永远写） | 贴花/水渍挡住它覆盖的东西 |
+| `depthTest=false` | 忽略（永远测） | HUD/覆盖层被 3D 物体遮住 |
+| `alphaThreshold` | 完全忽略 | 树叶/铁丝网画成实心方块 |
+
+**改动（8 个文件）**：
+
+| 文件 | 内容 |
+| --- | --- |
+| `jsr184/.../com/sun/m3g/NativeBridge.java` | `setState(bool,bool)` → `setState(bool cull, int blendMode, bool depthTest, bool depthWrite, bool colorWrite, float alphaThreshold, int blendColor)` |
+| `jsr184/.../javax/microedition/m3g/Renderer.java` | `drawMesh` 读全部 6 项；`drawSprite` = ALPHA + 不写深度；背景四边形 = REPLACE + 写深度（正是被删掉的两个 `setState` 的原义） |
+| `jsr184/src/share/native/m3g_native.c` | 读 7 个 KNI 参数原样转发；**翻译放在后端**，避免任何一层再悄悄合并模式 |
+| `vita-port/src/vita_3d.[ch]` | 新 7 参 `v3d_set_state` + `V3D_BLEND_*` 常量（**直接用 JSR-184 原值 64..68**，日志不用查表就能对 Javadoc） |
+| `vita-port/src/vita_gl3d.[ch]` | REPLACE=不混合、ALPHA=`SRC_ALPHA/1-SA`、ALPHA_ADD=`SRC_ALPHA/ONE`、MODULATE=`DST_COLOR/ZERO`、MODULATE_X2=`DST_COLOR/SRC_COLOR`；`glDepthMask`/`glColorMask` 跟标志走 |
+| `vita-port/src/vita_sw3d.[ch]` | 同样五个方程**逐像素**实现，外加**逐像素 alpha test**（唯一能真正实现 JSR-184 alpha test 的路径） |
+| `debug/tools/m3gprobe/NativeBridgeHost.java` | 宿主桩记录全部字段 |
+| `debug/tools/m3gprobe/BlendStateRun.java` | **新增测试**（不需 `.m3g` 文件，全走公开 API） |
+
+**验证**：
+
+- 宿主真 `Renderer` + 桩后端跑 `BlendStateRun` → **ALL PASS**：五种模式 64..68 原样到达；`depthTest/depthWrite/colorWrite=false`、`alphaThreshold=0.5`、`blendColor=0x00FF8000` 全部完好；无 `CompositingMode` 时默认映射到 REPLACE + 全标志开。
+- 最终 ELF：`Java_com_sun_m3g_NativeBridge_setState` 反汇编确认依次 `KNI_GetParameterAsBoolean(1)` / `AsInt(2)` / `AsBoolean(3,4,5)` / `AsFloat(6)` / `AsInt(7)`，末了 `blx v3d_set_state`。
+- `vita_gl3d_set_state` 里 **4 处 `glBlendFunc`** 调用（对应四个非 REPLACE 分支），常量没被优化掉。
+- `vita_sw3d_set_state`、`vita_3d_set_state` 均在 ELF 中。
+- MIDP 全量重编零 error（只有既有的 `Renderer.java:82` 中文注释 ASCII 编码 warning 和 javac 1.3 target 提示）。
+- 产物 `vita-port/out/vpk/midp_vita_v04.02.vpk`（12065076 B），md5 `d9139997f21c6476eff838d6c9e5c26c`。
+
+**已知风险（如实记录，别当成"没风险"）**：
+
+1. **软件光栅的深度写入变了**。旧代码是 `if (!g_blend) g_depth[idx] = z;`（混合时一律不写深度），新代码跟 `depthWrite` 走，而 M3G 默认 `true`。这是规范行为，但确实是行为变化：**没显式设 `depthWrite=false` 的半透明物体现在会写深度，可能挡住其后绘制的半透明层**。若某个标题出现新的"半透明穿帮"，先看日志 `ndc` 行里的 `blend=` 值，再怀疑其他。
+2. **硬件路径的 alpha test 仍是 no-op**（GLES1 无 alpha test，这个后端没有 fragment shader 可 discard）。真机上第一次遇到 `alphaThreshold>0` 时 `CRUMB` 会打一行提示。需要硬件路径也支持的话，要给 vitaGL 加 shader + discard。
+3. **`blendColor` 只在非 0 时生效**。M3G 默认 `0x000000`，若严格按 `src*blendColor*dst*blendColor` 算，所有 MODULATE 都会变全黑——所以 0 视为"未设置"。
+4. **未上机**。本轮没有任何 `.m3g` 标题的实际帧输出被比对过。
+
+### 🧹 2026-11-02 v04.01：清掉全部调试探针 + 补全 PCSL 数值转换（VPK 04.01）
+
+**起因**：v04.00 修好后，用户要求"调试用的打印去掉，补全 pcsl 未实现的函数，避免后续踩坑"。
+
+#### 1. 探针全部移除（源码 + 镜像双重验证）
+
+判据：`strings -e l`（Java 字符串是 UTF-16LE）与 `strings`（C 字符串）在最终 ELF 里**都查不到**。
+
+| 文件 | 移除内容 | 备注 |
+| --- | --- | --- |
+| `phoneme-midp/src/core/javautil/reference/classes/java/util/Timer.java` | `[TIMER] fire/ran/STUCK`、`timerFires`/`timerLoops`、2s watchdog `Thread` | **保留 v03.28 的 `[TIMEREXC]`**（只在真出错时触发） |
+| `phoneme-midp/.../lcdlf/lfjava/classes/javax/microedition/lcdui/CanvasLFImpl.java` | `[LFSHOW]`/`[LFHIDE]`、`vitaLfStageOn()` | 文件已与 HEAD 一致 |
+| `phoneme-midp/.../lcdui/reference/classes/javax/microedition/lcdui/Display.jpp` | v03.35 `[DISPLAY]` 全部（setCurrent/getCurrent/callScreenChange）+ 40 行预算状态机 | 见下面的坑 |
+| `phoneme-midp/.../image_api/reference/classes/javax/microedition/lcdui/Image.java` | `[img] ok`（80 行）、`[gfx] Image.createImage`、`DBG_GFX`/`dbgGfxOn` 整套 | **保留** `[img] load *-fail`（错误路径） |
+| `vita-port/src/vita_pcsl.c` | v01.55 的 `[pcsl] open path=` rms 溯源、v01.53 的 `[pcsl] getusedspace` 面包屑 | **保留** 3 条真错误报告：twin handle 阻塞、死句柄 seek、负 offset seek |
+
+**刻意保留（显式开关、默认零 I/O）**：
+- `Graphics.java` 的 `[gfx]` 全套 + `DBG_BUDGET`（`j2me.gfxdebug` / `j2me.gfxbudget`）；
+- `gxapi_graphics_kni.c` 的 `vita_gfx_fill_log`（标记文件 `ux0:/data/J2ME00001/gfxtrace.on`，进程内只探测一次）。
+理由：这是目前**唯一**能看到 `fillRect`/`drawString`/`drawRegion` 目标矩形与生效裁剪的手段，下一次"菜单画不出来"必须靠它。
+
+#### 2. 两个新踩的坑（已写进 CMakeLists 04.01 版本块）
+
+1. **`Display.java` 是 make 目标，不是源码**：`phoneme-midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/` 下只有 `Display.jpp`；真正的 `.java` 在 `build/vita_arm/generated/classes/...`，由 `src/highlevelui/lcdui/lib.gmk:63` 的 `runjpp` 规则生成。
+   - 直接改 generated 的 `.java` → 下次 jpp 跑就被覆盖；
+   - 更糟：generated 文件比 `.jpp` **新**时 make 判定"已是最新"**根本不重新生成**，改了 `.jpp` 也进不了镜像。**改完 `.jpp` 必须 `rm` 掉 generated 的那个 `.java`。**
+2. **删掉的匿名类会留下孤立 `.class`**：`TimerThread$1.class`（旧 watchdog）在 `classes/` 与 `classes.zip` 里都残留，ROM 也多带 8 个对象。`javac` 不会清理，`classes.zip` 的打包是增量追加。**必须 `rm` 该 class 并删掉整个 `classes.zip` 重编**（实测 24901 → 24893 objects）。
+
+#### 3. PCSL 数值转换补全（`vita-port/src/vita_pcsl.c`）
+
+这一类桩正是 v04.00 那种"看着合理、没人调用、其实错的"陷阱：
+
+| 函数 | 原状 | 现状 |
+| --- | --- | --- |
+| `pcsl_string_convert_to_jint` | **不接受符号**，`"-1"` 直接 EINVAL | 接受 `+`/`-`，越界返回 `PCSL_STRING_OVERFLOW`（先按 jlong 解析再收窄，与上游一致） |
+| `pcsl_string_convert_to_jlong` | 转调 jint 后强转 ⇒ **超过 32 位被截断** | 真正 64 位解析 + 溢出检测（`MAXINT_DIV_10` 检查，`INT64_MIN` 特判） |
+| `pcsl_string_convert_from_jlong` | 先 `(jint)` 强转 ⇒ **格式化出别的数** | 真正 64 位格式化，`INT64_MIN` 走字面量（不取负） |
+| `pcsl_string_convert_from_jint` | 反向填字符，`INT_MIN` 会颠倒数字 | 转调 jlong 版 |
+
+实现逐行对照上游 `phoneme_source/phoneME/pcsl/string/utf16/pcsl_string.c:1170-1300`。
+**验证**：宿主端单元测试 21 个用例全过（`INT64_MIN`/`INT64_MAX`/正负溢出/`"12a3"`/`""`/`"-"`/`INT_MIN` 往返）。
+注意宿主编译要用 `/usr/bin/gcc -B/usr/bin`——默认 `gcc` 是 ARM 交叉编译器，`as` 会报 `--64` 不认识。
+
+另外核对了两个**不是** bug 的：`pcsl_string_predict_size` 上游本身就是空实现；`platformRequest` 返回 0 正是"平台无法处理该 URL"的契约（`ams_base_cldc/reference/native/midlet.c` 据此抛 `ConnectionNotFoundException`）——这两处只加了注释说明，没有改行为。
+
+#### 4. `pcsl_file_commitwrite` 从空实现变为真正落盘
+
+原来 `(void)handle; return 0;`。现为 `sceIoSyncByFd(vf->fd, 0)`，死句柄或同步失败返回 -1（`midpStorage.c` 用 `status < 0` 判错，契约一致）。
+不是假想修复：suite store 的 `write_file()` 就是 temp-写-commit-rename，rename 跑在 flush 前面正是这个项目已经付过一次代价的失败模式。
+
+#### 5. `jvmspi.cpp` 的定位（实测，不是推测）
+
+`nm` 实测：`libcldc_vm.a` 与 `libobj.a` 里**都没有**来自 `jvmspi.cpp` 的 `JVMSPI_*` 成员（`JVMSPI_PrintRaw` 等在 `libobj.a` 的 `midp_run.o`），`JVM_monotonicTimeMillis` 只在 `vita-port/src/vita_pcsl.c` 定义。
+所以 v04.00 改动**只有 vita_pcsl.c 那份生效**；`jvmspi.cpp` 与 `vita_stubs.c` 的副本都不参与链接。`jvmspi.cpp` 的修复**保留**（防止将来 jvmspi.o 进入链接时把 `return 0` 带回来），注释已改成上述实测事实。
+
+#### 6. 产物与验证
+
+- `vita-port/out/vpk/midp_vita_v04.01.vpk`（12063219 B），md5 `a4bf72f58d97b26f9c0847f6eb2c7f50`。
+- 机器码复核时钟修复仍在：
+  ```asm
+  810196b4 <Java_com_sun_cldchi_jvm_JVM_monotonicTimeMillis>:
+      push {r3, lr}
+      blx  sceKernelGetSystemTimeWide
+      mov.w r2, #1000
+      bl   __aeabi_ldivmod
+      pop  {r3, pc}
+  ```
+- `pcsl_file_commitwrite` 反汇编确认调用 `__wrap_sceIoSyncByFd`。
+- MIDP 重编零 error/warning；ROM 重新生成；探针字符串在 ELF 中为 0 条。
+
+#### 7. 收尾：`vita_stubs.c` 的有毒 atoi 改成明确失败的空桩
+
+`phoneme-midp/src/vita_stubs.c` 的 `pcsl_string_convert_to_jint` 里存的是 **v01.55 之前**的写法（`for (i = 0; i < str->length; i++)`，即终止零被当数字解析 ⇒ 每次调用必返回 EINVAL）。该文件不参与链接，所以这是个"死代码 + 一行就能炸"的雷。
+
+v04.01 把它改成：
+```c
+pcsl_string_status pcsl_string_convert_to_jint(const pcsl_string *str, jint *value) {
+    (void)str;
+    (void)value;
+    return PCSL_STRING_EINVAL;
+}
+```
+理由写在函数头注释里：**看起来合理的死代码比明显什么都不做的死代码更危险**。若将来有人把该文件加进构建，立即失败且一眼看懂，而不是静默给出错误的数然后被算在调用方头上。完整实现在 `vita-port/src/vita_pcsl.c`。
+
+> 注意：这条与 v04.01 前面"`vita_stubs.c` 还原成 pristine"的记录**不冲突**——那次还原的是 `JVM_monotonicTimeMillis`（`return 0`），这次是有意改 `convert_to_jint`。
+> `arm-vita-eabi-gcc -fsyntax-only`（全量 include 路径）通过，零 error / 零 warning。
+
+#### 8. 一条重要的构建事实：`nams` 不参与构建，别去改它
+
+追查 `convert_to_jint` 调用方时发现 `phoneme-midp/src/ams/example/nams/native/{jadParser.c,fileInstallerShared.c}` 里也有 `jarSizeByJad` 的"失败时打印未初始化值"问题（`\*value` 未写入就读出来打印）。本来想顺手初始化成 −1，**查证后回滚了**：
+
+- `phoneme-midp/build/vita_arm/Options.gmk:79` / `Settings.gmk:63`：`USE_NATIVE_APP_MANAGER = false`
+- `phoneme-midp/src/ams/example/subsystem.gmk`：`USE_NATIVE_APP_MANAGER=false` ⇒ `SUBSYSTEM_AMS_MODULES = jams`（不是 nams）
+- 实测 `ar t libobj.a` 里**没有** `jadParser.o` / `fileInstallerShared.o`；`find build/vita_arm -name "jadParser.o"` 也是空
+- `ams/example/jams/native/` 只有 `runMidlet.c`，不含这套 JAD 逻辑
+
+⇒ **改这两个文件对产物零影响，纯属扩大 diff。** 以后见到 `ams/example/nams/` 下的代码要记住这一点（与 `vita_stubs.c`、`runMidlet.c` 同属"看着在源码树里、其实不进镜像"的一类）。
+
+### ✅ 2026-11-02 log172 验收：v04.00 **修复确认生效**，画面正常
+
+- **用户确认**："可以了，正常显示出来了"。
+- **日志硬证据**：
+  ```
+  loop #1 → fire #1 → ran #1 +165ms
+  loop #2 → fire #2 → ran #2 +0ms      ← 修复后才可能出现的第二/三次
+  loop #3 → loop #4 → fire #3 → ran #3 +0ms
+  ...
+  [TIMER] further fires silent          ← 该行只在 fire 计数到 21 时打印
+  ```
+  ⇒ **`further fires silent` 出现 = 单进程内任务触发超过 20 次**（我设的打印上限）。而修复前所有日志都只有 `fire #1`。
+  - `ran #1 +168ms` → 后续 `ran #N +0ms`：首次调用耗时长（与启动期日志/GC 重叠），之后每次开销可忽略。
+  - 零 `TIMEREXC` / 异常。
+- **对比修复前后（同一探针）**：
+  | | loop 迭代 | fire 次数 |
+  | --- | --- | --- |
+  | log171（修复前） | #1..#50 正常转 | **1**（永不再到期） |
+  | log172（修复后） | 同样正常转 | **>20** |
+- **一个仍待观察的现象（不影响结论）**：log172 里 4 次 Timer 实例化中，有 1 个实例只 fire 了 1 次就继续空转。与"任务被 cancel 后 `queue.removeMin(); continue;`"的形态一致（该分支只空转不 fire），但当前用户侧显示正常，不阻塞。若将来复现"某一轮不刷新"，从这里入手。
+- **验收判据已满足**：`fire #2` 之后持续触发 ⇒ `JVM.monotonicTimeMillis()` 返回真实毫秒 ⇒ 面板滑入动画（约 60 帧）得以完成 ⇒ 文字行滑到面板内。
+
+### 🏆 2026-11-02 v04.00：**根因找到并修复** —— `JVM.monotonicTimeMillis()` 恒返回 0，冻结了所有周期 TimerTask（VPK 04.00）
+
+- **用户提供的 `[TIMER] loop` 数据是决定性的**：
+  ```
+  loop #1 → fire #1 → ran #1 +168ms
+  loop #2 #3 #4 #5 #10 ... #50        ← 循环跑了 50+ 次
+  但只有 fire #1
+  ```
+  ⇒ **线程没卡、队列没堵**，循环正常转，只是**任务永不再被判定为到期**。
+- **判定条件**（`TimerThread.mainLoop`）：
+  ```java
+  taskFired = (task.nextExecutionTime <= Timer.monotonicTimeMillis());
+  queue.rescheduleMin(currentTime - task.period);   // period = -15
+  ```
+  `Timer.monotonicTimeMillis()` = `JVM.monotonicTimeMillis()` − 固定偏移。**时钟恒定**时：
+  ```
+  fire #1         delay 0 首次检查即到期（唯一一次）
+  reschedule      nextExecutionTime = clock + 15
+  下一轮          clock + 15 <= clock 为假 —— 永远
+  ```
+- **根因：树里有三处定义，全部 `return 0`**
+  | 文件 | 是否参与构建 |
+  | --- | --- |
+  | `vita-port/src/vita_pcsl.c` | **是（且赢得链接）** |
+  | `phoneme-midp/src/vita_stubs.c` | **否** —— `vita_stubs.o` 不在 `libobj.a` 里，符号始终是 `U` |
+  | `phoneme-cldc/.../jvmspi.cpp` | CLDC fallback，未重编 |
+  链接用 `--allow-multiple-definition`，谁先谁赢，而**三份都是错的** —— 这就是为什么加了十几轮探针都找不到：**bug 在一行没人看过的桩函数里**。
+- **对屏幕的完整解释**：标题主循环是 `Timer.schedule(task, 0, 15)`，只跑了 1 次 ⇒ 只请求了 1 帧。IDIOMA 面板的静止位是**右移一个面板宽度**（x=240=画布宽），文字行又在面板右侧约 145px。
+  - 面板滑入需要约 60 帧（1-3px/帧），只画 1 帧 ⇒ 面板完全在画布外 ⇒ **"只显示蓝屏"**
+  - 文字行同理 ⇒ 只有 "DI" 从左边缘露进来
+  - **此前所有推测（locale、编码、裁剪、坐标运算、属性集、我自己的探针）全部是这个 bug 的下游。**
+- **修复**：三处统一为 `return (jlong)(sceKernelGetSystemTimeWide() / 1000);`（该 API 单调、单位**微秒**；本方法要毫秒）。CLDC fallback 在 `#if !defined(VITA)` 下保持 `return 0`。
+- **机器码级验证（最终 ELF）**：
+  ```asm
+  81019384 <Java_com_sun_cldchi_jvm_JVM_monotonicTimeMillis>:
+      push {r3, lr}
+      blx  sceKernelGetSystemTimeWide
+      mov.w r2, #1000
+      bl   __aeabi_ldivmod
+      pop  {r3, pc}
+  ```
+  且 `vita_pcsl.c.obj` 内 `T Java_...monotonicTimeMillis` + `U sceKernelGetSystemTimeWide` ⇒ **生效的是 vita_pcsl.c 这份**。
+- **注意（v04.01 已实测澄清）**：`phoneme-cldc` 的 `libcldc_vm_g.a`/`libcldc_vm.a` 与 `libobj.a` 里**都没有** `jvmspi.cpp` 的成员（`nm` 查无 `JVMSPI_*`），所以"CLDC fallback 未重编"其实**不影响任何东西**——`JVM_monotonicTimeMillis` 全树只有 `vita-port/src/vita_pcsl.c` 一份真正参与链接。见 v04.01 记录第 5 条。
+- **产物**：`vita-port/out/vpk/midp_vita_v04.00.vpk`（12075282 B），md5 `dfb1b9cb09d8861052318ce9ad8ece91`，`J2ME Player v04.00 b330`。
+- **验收判据**：日志应出现 `fire #2`、`fire #3`…，且面板 `setClip` 的 x 从 240 逐步降到 64，文字行随之左移进入画布。
+
+### ⭐⭐⭐⭐⭐ 2026-11-02 v03.99：用户质疑"你改了什么" —— 我确实往绘制路径里塞了阻塞 I/O，现在全部改成默认关闭（VPK 03.99）
+
+- **先给数据（面板首行 y=90 的 x 范围，即滑入动画走了多远）**：
+  | log | 版本 | 面板 x | 可见性 |
+  | --- | --- | --- | --- |
+  | log153 | v03.58 | **64..224** | 完整可见（64+176=240 正好贴右） |
+  | log154 | v03.63 | **64..224** | 完整 |
+  | log155 | v03.67 | **64..224** | 完整 |
+  | log156 | v03.71 | **169..332** | 右移 |
+  | log165 | v03.89 | **240..400** | 完全不可见 |
+  | log169 | v03.95 | **237..399** | 完全不可见 |
+  ⇒ **偏移在 v03.67→v03.71 之间开始变差，之后没恢复。**
+- **我改了什么的诚实回答：诊断打印，而且有几处是"无条件"的（即使 gfx 开关关着也在跑）**：
+  | 探针 | 行数上限 | 位置 |
+  | --- | --- | --- |
+  | `[img] ok` | 80 | `Image.createImage`（启动期） |
+  | `[gfx] fillRect` | 120 | `gxapi_graphics_kni.c`（**v03.92 那版根本没查 gfxdebug**） |
+  | `[DISPSTAGE]` | 12 | `Display.callScreenChange/callPaint`（v03.93） |
+  | `[LFSHOW]/[LFHIDE]` | 4 | `CanvasLFImpl.uCallShow/uCallHide`（v03.95） |
+  - **log171 是铁证**：那一轮 `[prop] ask 'j2me.gfxdebug' -> null`（没有 gfx.cfg），`midp_stderr.log` 里**仍有 10 行 `[gfx] fillRect`**。
+  - 每条 System.out 写两遍，一次 ux0: 小同步写约 13 ms（v02.48 实测）⇒ **每行 ≈26 ms 的阻塞 I/O，而且就在绘制线程上**。而面板 x 是**按帧推进的动画值**，所以往绘制路径加阻塞 I/O，会直接拖慢被测量的对象本身。
+- **本版改动（只动诊断，不动任何渲染逻辑）**：四处探针全部改为默认关闭，统一用已有的 `j2me.gfxdebug` 属性（C 侧看不到属性集，改用标记文件）：
+  ```
+  Image.createImage   -> if (DBG_GFX && ...)
+  Graphics.fillRect   -> 需存在 ux0:/data/J2ME00001/gfxtrace.on
+  Display DISPSTAGE   -> if (VITA_STAGE)     (VITA_STAGE = gfxdebug)
+  CanvasLFImpl LF*    -> if (VITA_LFSTAGE)   (VITA_LFSTAGE = gfxdebug)
+  ```
+  **以上文件都不存在时，绘制路径零 I/O，诊断视角等同 v03.67。**
+- **验证**：`classes.zip` 10:14:11 → `ROMImage.o` 10:14:25（**ROM 已重建**）→ `libobj.a` 10:14:26；`javap` 确认 `Display.class` 含 `VITA_STAGE` 字段且字节码是 `getstatic VITA_STAGE → ifeq skip → println`（真的会跳过）；`CanvasLFImpl.class` 含 `VITA_LFSTAGE`；VPK `vita-port/out/vpk/midp_vita_v03.99.vpk`（12074866 B）。
+- **若装上 v03.99 面板仍不可见**：说明我的探针无罪，原因落在 **v03.68–v03.71 这个窗口**（03.68 撤销了强制 `microedition.locale`；03.70 新增了 `vita_display.c` 里的屏幕浮层）。下一步就是直接对这两个做二分，而不是继续加探针。
+
+### ⭐⭐⭐⭐ 2026-11-02 v03.98：log171 回答"任务会返回"，并暴露我探针里的一个假阳性 bug（VPK 03.98）
+
+- **log171 的结论**：`[TIMER] fire #1 period=-15` → `[TIMER]   ran #1 +167ms`。**任务确实返回了，耗时 167 ms。**
+- **我的探针 bug（必须记住）**：v03.97 的看门狗 `catch (Exception e) { }` 是空的，`interrupt()` 唤醒它后**继续往下执行 println**，于是同一轮里同时出现 `ran #1 +167ms` 和 `STUCK: run #1 ... +168ms` —— 逻辑上不可能。**log171 里任何 `STUCK` 行都作废**。已改为 `catch { return; }`。
+- **问题收窄**：一个 15 ms 周期任务返回后**再无第二次 fire**（所有日志一致）。停顿必然发生在"本轮结束到下一轮开始"之间，两种可能：①循环内 `synchronized(queue)` / `queue.wait`；②`task.run()` 返回途中（尾声或看门狗机制）。
+- **本版观测**：在 `while(true)` **第一条语句、取队列锁之前**加计数 `[TIMER] loop #N`（前 5 次 + #10 + #50）。
+  | 现象 | 结论 |
+  | --- | --- |
+  | 有 `loop #2` 但无 `fire #2` | 卡在循环**内部**：`synchronized(queue)` 或 `queue.wait` |
+  | 无 `loop #2` | 卡在 `task.run()` **返回途中** |
+- **167 ms 的含义（待验证）**：约等于 6 条 26 ms 的追踪行开销。若后续运行仍是这个量级，说明任务的 `repaint()` 在等 `LCDUILock`，而 Display 线程正在 `showNotify()` 里持锁 —— 即**标题的每帧 repaint 可能与启动计时器的那次调用本身在争锁**。loop 计数可区分这一点与队列侧停顿。
+- **log171 无绘制数据**：`seed: system.config tmpl=1217 gfx=0 out=1285 wr=1285` + `[prop] ask 'j2me.gfxdebug' -> null` ⇒ 这轮 `gfx.cfg` 不存在。计时器问题不需要它。
+- **构建验证**：`midp_vita.velf` 含 `J2ME Player v03.98` 与 `[TIMER] loop #`；VPK `vita-port/out/vpk/midp_vita_v03.98.vpk`（12073921 B）。
+
+### ⭐⭐⭐⭐⭐ 2026-11-02 v03.97：**文字位置的机制查清了** —— 不是布局/裁剪/坐标错误，是滑入动画只走了 1-2 帧（VPK 03.97）
+
+- **决定性数据（log169 同一进程的两帧，同 y 行对比）**：
+  ```
+  y=94   [247,251,259,263,273,284] → [247,251,259,263,273,284]   静止
+  y=114  [330,...,396]             → [331,...,397]                +1 px
+  y=152  [362,...,401]             → [363,...,402]                +1 px
+  y=191  [340,...,385]             → [340,...,385]                静止
+  ```
+  ⇒ **文字行是从右侧以约 1 px/帧 滑入的，最终应停在面板左侧。只画了约 2 帧，所以它停在右边。**
+- **"文字在右边、只露出 DI" 的真相**：不是布局错误、不是裁剪、不是坐标系偏移，**是动画几乎没开始**。面板 `x=240`（= 画布宽度）是**停放起始位**，`x=237/239` 是走了 1-2 步；log154/156 里字形在 `x=209..366` 是因为那两次跑得更远。**标题的算术从来没有错。**
+- **算术已被证明无误（log170 的 ArithmeticTest）**：设备与宿主机 JVM **逐行相同**，含指纹 `sum=10575939 x=1696031889` ⇒ `idiv/imul/ishl/i2s/saload/arraycopy` 全部正确。**彻底排除"解释器算错"。**
+- **唯一剩下的问题（是非题）**：标题主循环是 `java.util.Timer.schedule(task, 0, 15)`，但**每份日志 `[TIMER] fire #1` 只出现一次**。返回的任务不可能 15 ms 后不再次触发 ⇒ 要么任务体没返回，要么队列侧有问题。本版加两行分开这两种情况：
+  ```
+  [TIMER]   ran #N +<ms>                        任务已返回
+  [TIMER] STUCK: run #N has not returned +<ms>  看门狗 2 秒后打印，线程卡死也会出现
+  ```
+- **为什么可能阻塞**：该标题在帧路径上调用 `ab.a(boolean)` → `ab.j()` = `System.gc(); Thread.yield(); Thread.sleep(15)`。看门狗同时打印耗时 ⇒ 1-2 秒 gc 表现为"返回了但 +ms 很大"。
+- **下一份日志判读**：`ran #1 +小` 且随后 `fire #2` → 停顿在 schedule/队列；`ran #1 +几百ms` → 每帧 gc 是主要开销；`STUCK` → 任务体被锁阻塞。
+- **构建验证**：`midp_vita.velf` 含 `J2ME Player v03.97` + 两个新字符串各 1 处；VPK `vita-port/out/vpk/midp_vita_v03.97.vpk`（12073436 B）。
+
+### ⭐⭐⭐⭐⭐ 2026-11-02 v03.95：静态逆向闭合 —— 主循环启动的唯一条件是 **hideNotify→showNotify**，本版直接测这一环（VPK 03.95）
+
+**静态事实（全部来自 `javap -p -c`，无新日志）：**
+- `new Timer()` 在整个 `ab` 类里**只有 1 处**，在 `ab.c()` 内。
+- `ab.c()` **只有 1 个调用点**：`canvas.showNotify()` 内，且被 `if (b /*#187*/) { f(); c(); }` 守卫。
+- 暂停位 `b` **只在 `ab.e()` 里被置 true**，而 `ab.e()` **只有 1 个调用点**：`ab.hideNotify()`。
+- `b` 在构造函数中**未初始化（默认 false）** ⇒ **第一次 `showNotify()` 必然什么都不做**。
+⇒ **标题必须先经历一次 `hideNotify()`，再收到 `showNotify()`，才会创建 15 ms 主循环 Timer。**
+- 移植侧：`canvas.hideNotify()` 由 `CanvasLFImpl.uCallHide()` 调用，且**仅当 `oldState == SHOWN`**。若 hide 在 Canvas 不是 SHOWN 时到达，`hideNotify` 被静默跳过 ⇒ 暂停位永远为 false ⇒ 之后每次 `showNotify` 都空转 ⇒ **Timer 从未创建** ⇒ 首帧之后不再请求任何帧 ⇒ 屏幕停在那唯一一帧留下的背景色（面板当时还在 x=240 画布外）。
+- **这条链解释了"只显示蓝屏"，且不需要把环境/locale/编码/属性集/绘制代码当成原因。**
+
+**本版新增的测量（补齐缺失的一环）：**
+```
+[LFSHOW] uCallShow state=<n>
+[LFSHOW] -> canvas.showNotify()
+[LFHIDE] uCallHide oldState=<n> SHOWN=<n>
+[LFHIDE] -> canvas.hideNotify()
+```
+加上 v03.94 已有的 `[TIMER] fire #N period=15`。
+
+**下一份日志的判读表：**
+| 现象 | 结论 |
+| --- | --- |
+| 有 `[TIMER] fire` | 上述第 4 点被推翻，另找原因 |
+| 无 fire、也无 `[LFHIDE]` | hide 在更上游就被跳过，需查 `Display.callScreenChange`/Chameleon 层 |
+| 有 `[LFHIDE]` 但 `oldState != SHOWN` | **hideNotify 在此处被跳过** —— 状态机从未把 Canvas 置为 SHOWN，这是可修点 |
+| 有 `[LFHIDE] -> hideNotify` 但之后无 `[LFSHOW]` | 没有配对 show，Timer 无法启动 |
+| 有 pair 但仍无 `[TIMER] fire` | `Timer.schedule` 或 `Timer` 实现有问题 |
+
+**验证**：`midp_vita.velf` 含 `J2ME Player v03.95`、`[LFSHOW] uCallShow state=`、`[LFHIDE] uCallHide oldState=`、`[TIMER] fire #` 各 1 处；VPK `vita-port/out/vpk/midp_vita_v03.95.vpk`（12069714 B）。
+
+### ⭐⭐⭐⭐⭐ 2026-11-02 极品飞车**静态逆向结论**：主循环 Timer 的启动条件从未满足 → 只画 1 帧（无代码改动，字节码分析）
+
+以下全部来自 `debug/3d_game/极品飞车13之变速英文3D版.jar` 的字节码（`javap -p -c`）+ 仓库内 `/cx` 数据，**不依赖任何新日志**。
+
+- **一、绘制路径**：`ab extends Canvas`，`paint(Graphics g)` 走离屏路径：
+  1. 若离屏 Image 为空或尺寸不符 → `Image.createImage(getWidth(), getHeight())`
+  2. `if (!c /*#196*/) { ad.a(gOff,54); gOff.fillRect(0,0,W,H); }` ← **那 7 条全屏清屏**
+  3. `if (this.a != null && this.a /*#173*/) { if (g /*#229*/) {a(gOff); g=false;} this.a.a(gOff); }` ← 场景绘制
+  4. `g.drawImage(离屏Image, 0, 0, 0)` ← **`<<FULLBLIT`**
+  5. `f /*#221 static*/ = false` ← **主循环解锁**
+  - `this.a` 是 `x` 实例，`x.a(Graphics)` 内部经 `z.a(Graphics,int,x1,y1,x2,y2)` 画面板：`fillRect(x1, y1, x2-x1, y2-y1)`。**面板坐标是"动画推进后的结果"，不是静态布局常量。**
+- **二、面板为什么在 x=240**：`x=240` **恰好等于画布宽度**。这是面板**滑入动画的起点**（停在右边缘外），y=90、宽 175、高 117 全部正确。log154 抓到 x=64 是因为那次**画了多帧**，动画已经走完。⇒ **不是坐标算错、不是裁剪、不是坐标系偏移。**
+- **三、动画由谁推进**：主循环是 `java.util.Timer` + `Timer.schedule(new v(this), 0, 15)`（15 ms 周期），`v.run()`：
+  ```java
+  if (!ab.a(this.a)) { ab.a(this.a).destroyApp(true); return; }   // 退出
+  if (ab.b(this.a) || ab.m()) return;      // ★ b(#187)=暂停标志; m() 返回 f(#221)
+  this.a.a((int)(now - last));             // ★ 推进动画
+  last = now;
+  this.a.repaint();                        // ★ 请求重绘
+  ```
+- **四、根因：Timer 只在一个条件成立时才被创建**
+  ```java
+  public final void c() {                  // 启动主循环
+      a /*#173*/ = true;
+      if (Timer != null) { Timer.cancel(); Timer = null; j(); }
+      Timer = new Timer();
+      Timer.schedule(new v(this), 0L, 15L);
+  }
+  public final void hideNotify() { try{Thread.sleep(1000);}catch(Exception e){} e(); }
+  public final void showNotify() {
+      try{Thread.sleep(1000);}catch(Exception e){}
+      if (b /*#187*/) { f(); c(); }        // ★ 只有 b==true 才启动 Timer！
+  }
+  public final void e() { ... b /*#187*/ = true; }   // 暂停
+  public final void f() { ... b /*#187*/ = false; }  // 恢复
+  ```
+  - **`new Timer()` 在整个 ab 类里只有 1 处**（`c()` 内，字节码第 936 行），而 `c()` 只能经由 `showNotify()` 且**必须 `b(#187)==true`**。
+  - **`b(#187)` 在构造函数中不初始化（默认 false）**，全类只有 `e()` 把它设为 true，而 `e()` 只由 `hideNotify()` 调用。
+  ⇒ **若 `hideNotify()` 从未被调用（`b` 一直 false），`showNotify()` 什么都不做 ⇒ Timer 从未创建 ⇒ 主循环从未运行 ⇒ 只画了启动那一帧 ⇒ 面板永远停在 x=240（画布外）⇒ 屏幕上只有背景色。**
+- **五、与观测完全吻合**：log165/166/167/168 的 `[gfx]` 都恰好 129 行（=1 帧），log168 有 7 次成功的 `callPaint` 但只有 1 次产生内容（其余只有 2 条 `setClip`，因为 `#173`/场景对象在该帧无内容）。`log154/156` 画了多帧（560 / 2211 条 drawRegion），面板才滑进画布。
+- **六、必须更正的历史误判**：
+  1. **`log154` 也有 blit**（`drawImage 240x320 d=0,0 a=0`），只是 v03.63 还没有 `<<FULLBLIT` 标记，所以我曾据"FULLBLIT=0"断定它走另一条绘制路径 —— **错，两条路径相同，差别只是帧数**。
+  2. **`ab.d`（直画屏幕 vs 离屏）不由 locale 决定**（v03.68 注释是错的）。`ab.a(true)` 里 `d = flag && af.b()`，`af.b()` 返回 `af.g != 0`，而 `af.g` 来自 **EA 产品码校验**：`ab` 用 `ac.b(101)` 读 `/cx`（60 B，`o.a[101]=60` 与文件长度一致），`af.a(byte[])` 解析出 3 个字符串 **"28182"/"24171"/"27282"**；校验魔数 `-26461`(0x98A3) 反推需要 "8792"、`-26472`(0x98A8) 需要 "8797"，**这三个码都不匹配 ⇒ 该 jar 上 `g=0` 是固有状态 ⇒ 永远走离屏路径**。与我们的 VM 无关。
+  3. `af.a(byte[])` 用 `new String(byte[],off,len)`（平台默认编码），而 `Helper.java:55` 在 `microedition.encoding` 缺失时回退 `ISO-8859-1`（单字节），**不会破坏 ASCII 数字串** ⇒ 编码不是本问题根因。
+- **七、下一步（唯一有价值的验证）**：v03.94 已内置 `[TIMER] fire #N period=15` 正向计数。若日志里**一条 fire 都没有**，本节第四条的结论即被实测确认，随后应查 `hideNotify()`/`showNotify()` 的调用序列（`lfjport`/`Display` 侧），确认是不是我们的平台层漏调或错序 —— 那才是可修的地方。注意两者都含 `Thread.sleep(1000)`，会在 Display 事件线程上阻塞 1 秒。
+
+### ⭐⭐⭐⭐ 2026-11-02 v03.94：log168 —— 阶段面包屑**撤回了 v03.93 的结论**：Display 线程没有卡死，DONE 缺失是正常 no-op（VPK 03.94）
+
+- **撤回 v03.93 的"线程卡死"结论**。log168 的 37 条 DISPSTAGE 证明每个阶段都是**成对完成**的：
+  ```
+  callPaint enter → past lock → pre-refresh canvas → post-refresh canvas   ×4
+  callPaint enter → past lock → chameleon path → post window.callPaint     ×3
+  post-callPaint → [DISPLAY] callScreenChange DONE (#9)
+  ```
+  **`refresh` 从不阻塞，paint 每次都跑完。**
+- **DONE 缺失的真相**：log168 最后三行是 `post window.callPaint` → `callScreenChange ENTER (#10)` → 结束。而 `Display.callScreenChange` 开头就是：
+  ```java
+  synchronized (LCDUILock) { if (current == newCurrent) return; }
+  ```
+  **重复 setCurrent 同一个 Displayable 会立即 return，永远走不到 DONE 追踪**。log168 里 `setCurrent(ab@1ee07f43)` 被调了 3 次（#4/#7/#8），所以 ENTER #10 正是这个 no-op。**`ENTER=3 / DONE=1` 是正常行为，不是卡死。**
+- **另两条曾被怀疑的 `callPaint RETURNS EARLY ... hasForeground=false` 也是正常的**：它们出现在 MIDlet 取得前台之前（在 ENTER #2 之前），符合预期。
+- **真正的问题只有一句话：这一屏被画了 1 次就再也不画了。**
+  - log168 `[gfx]` = **129 行**，与 log165/166/167 **完全相同**
+  - 7 次全屏清屏、10 条 fillRect、1 次 `<<FULLBLIT`
+  - 对照 log156（v03.71，同一标题）= **3068 行**
+  - **7 次成功的 callPaint，但只有 1 次画了面板** ⇒ 是**游戏自己的 paint() 决定不画**，不是被阻塞
+  - 无 `[ALERT]`、无异常、无 `[TIMEREXC]`、无 m3g 输出；本次运行用户**没有按键**（0 次 `[VKEY] press`），所以也还没有外部事件可响应
+- **本版要测的假设（此前从未测量过）**：v03.28 记录该标题主循环是 **15 ms 重复 TimerTask**。而所有既有的 Timer 探针**只报告失败**（异常、任务取消、线程死亡），所以「Timer 从未触发」和「没有 `[TIMEREXC]`」在所有日志里无法区分。现在给 `java/util/Timer.java`（`config.gmk` 里 `core/javautil = reference`，即真正参与构建的那份）加了**正向计数**：
+  ```
+  [TIMER] fire #1 period=15
+  ...
+  [TIMER] further fires silent
+  ```
+- **两种结果都是决定性的**：
+  - **有 fire** → Timer 在跑、动画节拍活着，那么是标题自己把面板画在画布外 → 下一步用 v03.91 的 `locale=-` 做 A/B
+  - **无 fire** → 15 ms 节拍从未运行 ⇒ 面板永远滑不进来、也没有后续帧 ⇒ 故障在任务调度/队列，**与绘制无关**
+- **附带线索**：该文件的 `THREAD_TIMEOUT = 30*1000L`（队列空 30 秒线程退出），而这些会话正好是 28 秒健康心跳 ⇒ 若无 fire，"队列空→线程静默退出"仍是活的备选解释。
+- **验证**：MIDP（romgen OK）+ `vita-port/build.sh` 通过；`midp_vita.velf` 含 `J2ME Player v03.94`、`[TIMER] fire #`、`further fires silent`；VPK `vita-port/out/vpk/midp_vita_v03.94.vpk`（12068836 B）。
+
+### ⭐⭐⭐⭐⭐ 2026-11-02 v03.93：log167 —— fill 追踪命中：**面板没被裁掉，是只画了 1 帧，而那一帧面板还在画布右边外**（VPK 03.93）
+
+- **fill 追踪首次工作**（10 条 `[gfx] fillRect`）：
+  ```
+  fillRect d=0,0 240x320 clip=0,0 240x320     ×7   全屏清屏
+  fillRect d=240,90 175x117 clip=0,0 240x320        IDIOMA 面板**底色**
+  fillRect d=0,322 15x10 / d=0,323 14x9              画布底部两块碎片
+  ```
+  三条推论，比此前任何结论都硬：
+  1. **图形坐标系是好的**：7 次全屏清屏用 `x=0`、有效 clip 是完整的 `240x320`，说明 `0,0` 确实是左上角。面板从 `x=240` 起**不是坐标系 bug**。
+  2. **`x=240` 恰好等于画布宽度**，面板比 log154/155 的位置（x=64）右移了整整一个面板宽（240-64=176），正好停在右边缘外 —— 这是"即将滑入"的静止位。y(90) 与面板高(117) 与 log154 完全一致。
+  3. **host 复算标题自己的 `/au` 解析器**结果正常（三元组表，x 原始 150..4650），标题的输入数据没有损坏。
+- **真正的发现：这一屏只被画了 1 次。**
+  - log167 `[gfx]` 行数 = **129**，与 log165/log166 **计数完全相同**
+  - 全屏清屏 7 次，全部发生在那一次 paint 内
+  - 对照 log156（v03.71，同一标题）：**3068** 行
+  - 且不是预算截断：129 / 300 允许行
+- **为什么停了 —— `[DISPLAY]` 追踪回答**：`callScreenChange ENTER=3，DONE=1`。而 `vitaTraceScreenChange()` **无条件打印**（上限 `VITA_TRACE_MAX=40`，本日志只到 #10），所以那些 DONE **从未被执行到** —— 最后一次 `callScreenChange` 确实没跑完。而该帧的绘制就发生在它内部（`[gfx]` 行位于 ENTER #10 与 DONE 应在的位置之间），所以停点在 `uCallShow`/paint **之后或其中**。
+- **同期状态（全部正常，反证不是"整体卡死"）**：进程又活了 **28 秒**（心跳/ANI/watchdog 均正常）、无 `[ALERT]`、无任何异常、整场 `refreshes=6`、**4 次方向键完全没有触发重绘**。
+- **不宣称"线程卡死"**：`DONE` 没打印 + 按键无响应，与"Display 线程卡住"一致，但也与"事件没送到 Java"一致。`platform_vita_swap_buffers()` 用 `SCE_DISPLAY_SETBUF_IMMEDIATE`（**不等 vblank**），`refresh()` 是 76800 像素纯循环，都不明显阻塞 —— 所以本版用测量代替猜测。
+- **本版改动（纯诊断，5 处阶段面包屑，全在 `Display.java`）**：
+  ```
+  [DISPSTAGE] pre-uCallShow / post-uCallShow
+  [DISPSTAGE] pre-callPaint / post-callPaint
+  [DISPSTAGE] callPaint enter / RETURNS EARLY(+paintSuspended,hasForeground,current) / past lock
+  [DISPSTAGE] pre-refresh canvas / post-refresh canvas
+  [DISPSTAGE] chameleon path / post window.callPaint
+  ```
+  **最后打印出来的那条 = 卡点**。若 `post-refresh canvas` 有了但没有 DONE → 故障移到 `DisplayableLFImpl`；若有 `pre-refresh` 无 `post-refresh` → 故障在 native refresh。
+- **验证**：MIDP（romgen OK）+ `vita-port/build.sh` 通过；`midp_vita.velf` 含 `J2ME Player v03.93`，8 个 DISPSTAGE 字符串逐个确认各 1 处；VPK `vita-port/out/vpk/midp_vita_v03.93.vpk`（12067892 B）。
+
+### ⭐⭐⭐⭐⭐ 2026-11-02 v03.92：**仪表只覆盖了一半绘图 API** —— 补上 fillRect / drawString 追踪（VPK 03.92）
+
+- **暴露矛盾的原始事实**：log165/166 说"77 条 drawRegion 无一落在 240x320 画布内（全部裁成 0x0）"，但同一状态的截图里**明明有一大块淡蓝抖动面板，右边缘还有两个字形 `DI`（IDIOMA 的开头）**。两件事同时成立只有一种解释：**可见的面板不是 drawRegion 画的**。
+- **我的错误**：此前所有探针只覆盖 `drawRegion` / `drawImage` / `translate` / `setClip`。**`fillRect` / `fillRegion` / `fillTriangle` / `drawString` / `drawChar` 从未被追踪过**。所以任何"该标题什么都没画"的结论都是**不成立的** —— 它真实含义只是"没有一条 drawRegion 逃过裁剪"，这弱得多。这个漏洞直接导致了前几轮的误判（包括把"只显示蓝屏"归因到 x=240 裁剪）。
+- **实现位置**：`phoneme-midp/src/lowlevelui/graphics_api/gxapi_native/native/gxapi_graphics_kni.c`（这些方法在 `Graphics.java` 里是 `native`，**Java 层加不了追踪**，必须在 KNI 原生实现里加）。
+  - 新增静态函数 `vita_gfx_fill_log()`（文件头，`#if defined(VITA)`），输出 `fprintf(stderr, ...)` → 已被启动器重定向到 `midp_stderr.log`（v03.88 的 `[cfg]` 行已验证这条通道可用）。
+  - `Graphics_fillRect`：`TRANSLATE()` 与 `GET_CLIP()` 之后调用 → **x/y 是已翻译坐标，clip 是有效 clip，与既有 drawRegion/drawImage 行完全可比**。
+  - `Graphics_drawString`：同样位置调用，记录 `strLen`。
+  - 自带 120 行上限 + 一条 `fill trace budget exhausted` 提示，**独立于 Java 侧 `j2me.gfxbudget`**。
+- **输出格式**：
+  ```
+  [gfx] fillRect d=<x>,<y> <w>x<h> clip=<x>,<y> <W>x<H>
+  [gfx] drawString d=<x>,<y> <len>x0 clip=<x>,<y> <W>x<H>
+  ```
+- **另一条仍成立的硬事实**：该标题对 IDIOMA 屏**只画 1 帧就停**（log166 的 `[gfx]` 块与 log165 逐字节相同，129 行 vs 300 预算，未截断）。所以问题出在**第一帧**。
+- **验证**：`gxapi_graphics_kni.o` 已重编（07:22:57）；`midp_vita.velf` 含 `J2ME Player v03.92`、`[gfx] %s d=%d,%d %dx%d clip=%d,%d %dx%d`、`fill trace budget exhausted (120)`；VPK `vita-port/out/vpk/midp_vita_v03.92.vpk`（12066426 B）。
+- **下一轮要看**：`midp_stderr.log` 里的 `[gfx] fillRect` / `[gfx] drawString` 行。若面板由 fillRect 画出且坐标落在画布内 ⇒ 面板本身没问题，问题只在那 77 条 drawRegion（拼块与字形）为何 x>=240；若 fillRect 的 x 也是 240 级 ⇒ 说明整个 Graphics 的坐标空间整体偏移，那是我们侧的问题，需要查 translate/clip 的原生实现。
+
+### ⭐⭐⭐⭐ 2026-11-02 v03.91：log166 —— 预算实验**阴性**（排除"动画第 0 帧"），并**撤回**跨版本对比（真机 vs Vita3K 混淆）（VPK 03.91）
+
+- **log166 与 log165 的 `[gfx]` 逐字节相同**（129 行全一致，仅时间戳与两条 `[img]` 顺序不同），且**预算 300 只用了 129 行、并未耗尽**。⇒ **该标题对 IDIOMA 屏只画 1 帧就不再重绘**，1 帧样本不是仪表截断。⇒ **x=240 是静止值，不是滑入动画的第 0 帧**（v03.90 的猜测被自己的实验否掉，如实记录）。
+- **"只显示蓝屏"被完整解释**（这是纯算术，不依赖猜测）：
+  ```
+  77 条 drawRegion 中落在 240x320 画布内的：0 条
+  4 条 drawImage 128x128 d=56,74            (广告/splash，直画屏幕)
+  Image.createImage 240x320                 (离屏面)
+  77 条 drawRegion，x_dest 全 >= 240        -> 全部裁成 0x0
+  drawImage 240x320 d=0,0 <<FULLBLIT        (把这张空图整屏盖上)
+  ```
+  ⇒ 离屏图里只有它自己的填充色，整屏 blit 后**屏幕 = 该填充色**。**蓝色是游戏自己的背景色，不是我们画的。**
+- **必须撤回的对比（重要教训）**：log165/166 是 **Vita3K**，而 log154/155/156 是**真机**。判据：
+  - Vita3K：每快照 7 个 `Sce*`、无 SceGxm/SceAppUtil、`tai ux0:0 ur0:0`、`kubridge ABSENT`、`[PERF] arm=444 MHz (boost applied)`
+  - 真机：`tai ux0:0 ur0:1`、`kubridge installed-NOT-visible`、`arm stuck at 333 MHz`
+  所以 v03.90 里"x 从 64 → 170 → 240 漂移"的表格**比较了两台不同机器，作废**。目前成立的只有：**真机上该标题把面板放在画布内；Vita3K 上（v03.89+）放在 x=240**。
+- **新增 A/B 开关（本版唯一代码改动）**：`locale=-`（写入 game.cfg / defaults.cfg）**删除** `microedition.locale` 这一行。此前 `system_cfg_override` 只能"设值"或"保留模板值"，一旦模板带了这个键，就**再也无法制造"属性缺失"**。而 v03.68 注释明确记录：**正是这一个属性的有无决定标题走"直画屏幕"还是"离屏 + blit"两条路径**，且所有"面板正确（x=64、全在画布内）"的观测都发生在属性缺失的那次。A/B 无需重编：
+  ```
+  locale=-        -> 属性缺失（x=64 / 无 FULLBLIT 那一支）
+  locale=en-US    -> 属性存在（离屏 / 有 FULLBLIT 那一支）
+  ```
+  单个 `-` 不可能是合法 locale，不会与真实值冲突。
+- **log166 其他确认**：无 `[ALERT]`（log163 的 "does not use the screen" 弹窗已消失）、无异常、心跳约 12 秒正常、整场 `refreshes=6`、4 次方向键（UP/DOWN/LEFT/RIGHT）**完全没有触发重绘**。
+- **验证**：`vita-port/build.sh` 通过；`midp_vita.velf` 含 `J2ME Player v03.91`；VPK `vita-port/out/vpk/midp_vita_v03.91.vpk`（12066367 B）。
+- **下一步（唯一有价值的动作）**：在同一台机器上做 locale 的 A/B。若 `locale=-` 让面板回到 x=64 并正常显示 ⇒ 问题定位到标题对该属性的响应，可继续查它读属性后改了什么；若仍是 x=240 ⇒ 与 locale 无关，转向"标题为何只画 1 帧"。**同时强烈建议在真机上（而非仅 Vita3K）跑一次带 `gfx.cfg` 的日志**，因为真机才是用户原始报障环境。
+
+### ⭐⭐⭐⭐ 2026-11-02 v03.90：**属性修复确认生效，第一批真实绘制数据到手** —— 极品飞车整个 IDIOMA 屏画在画布右侧外面（VPK 03.90）
+
+- **v03.89 的修复被真机数据完全确认**：
+  ```
+  [cfg] path='ux0:/data/J2ME00001/lib/internal.config' len=39 rc=0 / parsed 79 properties
+  [cfg] path='ux0:/data/J2ME00001/lib/system.config'   len=37 rc=0 / parsed 13 properties
+  [prop] ask 'j2me.gfxdebug'  -> '1'
+  [prop] ask 'microedition.locale' -> 'en-US'
+  [prop] ask 'j2me.gfxbudget' -> '300'
+  ```
+  → log162/163 的"属性集全空"根因（runMidlet 覆盖 configDir）确认无误。**仪表首次真正工作**：129 行 `[gfx]`、77 条 drawRegion、1 条 `<<FULLBLIT`。
+- **第一批真实绘制数据（硬事实）**：极品飞车把**整个 IDIOMA 屏画在画布右侧外面**。77 条 drawRegion 的 `x_dest` **全部 ≥ 240**，而画布宽 240 ⇒ 可见面积 0：
+  ```
+  setClip 240,90 175x117            <- x 起点正好等于画布宽度
+  drawRegion src=250x189 r=16,137 32x32 d=240,90 ... clip=0,0 0x0
+  drawRegion ... d=272,90 / 304 / 336 / 368 / 400    (32 px tile, 6 列)
+  drawRegion src=166x83 ... d=247..284,94             (位图字体字形)
+  drawRegion src=250x189 r=0,144 11x8 d=2,323         (最后一条, y 超出 320)
+  ```
+  **y 全程正确**（90/122/154/186，与历史所有日志同一组行位置），**面板宽度稳定**（176 → 175）。**只有 x 在漂移。**
+- **决定性四版对比（同一游戏、同一屏）**：
+
+  | 版本 | locale | FULLBLIT | panel x | 可见性 |
+  | --- | --- | --- | --- | --- |
+  | log154 v03.63 | 缺失 | **0** | **64** | ✓ 完整（64+176=240 贴右） |
+  | log155 v03.67 | en-US | **0** | **64** | ✓ 完整 |
+  | log156 v03.71 | en-US | **53** | **170** | 部分（被截成 70 宽） |
+  | log165 v03.89 | en-US | **1** | **240** | ✗ 完全不可见 |
+
+  **`<<FULLBLIT` 的有无与 x 偏移完全相关** —— 正是 v03.68 注释里记的"两条绘制路径"：无该属性时直接画屏幕（x=64 正确），有该属性时画进离屏 Image 再 blit（x 偏移）。**是游戏自身行为，不是本移植选择的。**
+- **另一硬事实**：log165 只画了 **1 帧**（`setClip 240,90 175x117` 仅 1 次 vs log156 的 5 次），只用了 400 行预算中的 129 行；**无 `[ALERT]`**（log163 那个 "This application does not use the screen" 弹窗已消失）、无异常、心跳约 12 秒正常。⇒ **画面没有冻结，是画了一帧就不再重绘**。
+- **本版改动（纯诊断 + 预算，未动任何绘制代码）**：
+  1. 默认预算 **400 → 900**（该标题约 77 行/帧，400 只能覆盖约 2 帧）。
+  2. 1/100 的 `clipped total=` 汇总**不再消耗预算**，并新增 `lines=` 字段 —— 详细追踪静默后它仍持续报告最新 `x_dest`，所以即使预算小也能看到 x 随时间的变化趋势。
+- **下一轮要判定的唯一问题**：x=240 是**静态错位**，还是**滑入动画的第 0 帧**（240 恰好等于画布宽度，即面板停在右边缘外准备滑入）？判据：若 x 逐帧下降 = 动画；若恒为 240 = 静态布局错误。
+- **构建陷阱提醒（本轮再次生效）**：`runMidlet.c` 仍需手工重编（不参与 make），本轮未改它，改用 `libobj.a` 目标即可。
+- **验证**：MIDP（24926 objects，romgen OK）+ `vita-port/build.sh` 通过；`midp_vita.velf` 含 `J2ME Player v03.90` 与 UTF-16LE 的 `lines=`；VPK `vita-port/out/vpk/midp_vita_v03.90.vpk`（12065951 B）。
+
+### ⭐⭐⭐⭐⭐ 2026-11-02 v03.89：**根因闭合** —— config 目录被 runMidlet 覆盖成相对垃圾路径，导致整个属性集为空（VPK 03.89）
+
+- **v03.88 的 `[cfg]` 探针一次命中，用户回贴的两行就是全部答案**：
+  ```
+  [cfg] path='./../../../appdblib/internal.config' len=35 rc=-1
+  [cfg] path='./../../../appdblib/system.config'   len=33 rc=-1
+  ```
+  两条都 `rc=-1`（打不开），且路径根本不是 `ux0:/data/J2ME00001/lib/`。
+- **完整因果链（逐环在源码里核实过）**：
+  1. `vita_main.c` 在 runMidlet 之前调用 `midpSetConfigDir(DATA_DIR "/lib")` —— **设置是对的**。
+  2. `phoneme-midp/src/ams/example/jams/native/runMidlet.c` 随后**无条件**执行 `confDir = getConfigurationDir(...); midpSetConfigDir(confDir);` 把它**覆盖**。它的孪生调用 `getApplicationDir()` 早在 v01.32 就加了 `if (midpGetAppDir() == NULL)` 保护，**configDir 这一路从来没加** —— 这个不对称就是全部 bug。
+  3. `getConfigurationDir()` 里 `getenv("MIDP_HOME")` 返回 NULL，走 fallback `getMidpHome()`；后者找不到 `appdb` 子目录，打印 `Warning: cannot find appdb subdirectory.`（**这句就在 log162/163 的 midp_stderr.log 里**）并返回 NULL —— 而老代码**仍然 `strcat(buf, "lib")`**。`./../../../appdb` + `lib` = 我们看到的 `./../../../appdblib`。
+  4. `storageInitialize()` 拿它当 `configRoot`，`initProps()` 打开一个不存在的相对路径，**把"打不开"当成"空文件"并返回成功** ⇒ 属性集整体为空、无任何错误。
+- **这个缺陷一直被误认成游戏自身问题**：`microedition.locale` 为 NULL（标题按语言分支就走错路）、`device.*` 身份全空、`j2me.gfxdebug`/`j2me.gfxbudget` 为 NULL —— **三个版本的仪表全部因为这个原因打不出任何 `[gfx]` 行**。真机 log157 同一标题却能拿到 `'en-US'`，说明它**依赖 MIDP_HOME 是否可见**，这也是它看起来像"Vita3K 特有的怪现象"而不是移植缺陷的原因。
+- **三处修复（全部对齐 v01.32 已有的 app-dir 修法）**：
+  1. `midpInit.c` + `midpAMS.h`：新增 `midpGetConfigDir()`，与 `midpGetAppDir()` 对称。
+  2. `runMidlet.c`：`if (midpGetConfigDir() == NULL) { ... }` 才计算并设置。
+  3. `commandLineUtil_md.c`：`getConfigurationDir()` / `getApplicationDir()` 在 `getMidpHome()` 返回 NULL 时**直接返回 NULL**，不再往失败缓冲区上 `strcat`。
+- **构建陷阱（本轮踩到两次，务必记住）**：
+  1. **`runMidlet.c` 不参与当前 make 构建！** `libobj.a-list` 里没有 `runMidlet.o`，`libobj.a` 里也没有；CMake 用 `target_link_libraries(... ${MIDP_OBJ_DIR}/runMidlet.o ...)` **直接链接对象文件**，连的是 10-13 的**遗留旧对象**。所以改 `runMidlet.c` 后 `build_vita.sh` 完全不会动它。本轮误删了该旧对象，只能用 `make -n`（先 `touch` 一个在清单里的源，如 `midp_run.c`）抓出完整编译命令，替换源/输出路径后手工重编恢复，并需去掉命令行里的 `-DENABLE_JAVA_DEBUGGER=0`（与 `jvmconfig.h:295` 的定义冲突，`-Werror` 下报错）。**改 `runMidlet.c` 之后必须手工重编 `runMidlet.o`，否则改动静默无效。**
+  2. 删除 `libobj.a` 成员（或 `rm` 单个 `.o`）后 make 可能仍认为库是最新的（archive 的 mtime 比源新，且规则不看成员是否存在）。可靠做法：`touch` 源 + `rm` 目标 `.o` + 用 `libobj.a` 作为 `MIDP_EXTRA_GOAL` 跑一次。
+- **验证**：`runMidlet.o` 内 `U midpGetConfigDir`（4 处引用）；`midpInit.o` 内 `T midpGetConfigDir`；库内 `midpInit.o` 已为新版；`midp_vita.velf` 内 `J2ME Player v03.89`、`[cfg] path=`、`0207cc9c T midpGetConfigDir`；VPK `vita-port/out/vpk/midp_vita_v03.89.vpk`（12065936 B）。
+- **下一轮预期（判据）**：`midp_stderr.log` 应出现
+  `[cfg] path='ux0:/data/J2ME00001/lib/internal.config' ... rc=0` 与 `... system.config ... rc=0`，随后 `[cfg] parsed N properties`（N>0）；`[prop] ask 'j2me.gfxdebug' -> '1'`；然后 `[gfx]` 追踪才真正开始输出。**只有到那一步，极品飞车 IDIOMA 的绘制数据才第一次可得。**
+
+### ⭐⭐⭐⭐ 2026-11-02 v03.88：log163 —— **写入侧已证清白，故障在 MIDP 读取侧**（VPK 03.88）
+
+- **判据（决定性，一行算完）**：v03.87 的 crumb 给出 `seed: system.config tmpl=1039 gfx=38 out=1145 wr=1145`。算术闭合：1039（模板）+ 38（gfx.cfg 两行：`j2me.gfxdebug: 1\n`=17、`j2me.gfxbudget: 300\n`=21）+ 68（`system_cfg_override` 追加的 `device.manufacturer/model/version` 三行）= **1145**，且 `wr == out`，内核写满了每一个字节。⇒ **卡上那个文件确实同时含有 `j2me.gfxdebug: 1` 和 `microedition.locale: en-US`**。
+- **矛盾点**：文件内容正确，但 `[prop] ask 'j2me.gfxdebug' -> null`、`'j2me.gfxbudget' -> null`，**连 `microedition.locale` 也是 null**。注意是**整个属性集为空**，不是某一行格式问题 ⇒ 这是 `initializeConfig()` 加载失败，与 gfx.cfg 的写法无关。这同时否掉了 03.86/03.87 关于"cfg 内容或通道"的猜测方向。
+- **为什么以前查不出来**：`initProps` 里唯一会报告失败的 `REPORT_WARN2(... "could not open config file(%s)" ...)` 在出厂的 `REPORT_LEVEL` 下**编译成空**；而且它把 `pathname` 传进去时，`pcsl_string_free(&pathname)` 已经执行过（上游 bug，打印的会是已释放内存）。
+- **新增诊断（3 行，stderr → midp_stderr.log，此时已重定向）**：
+  - `[cfg] path='ux0:/data/J2ME00001/lib/system.config' len=40 rc=0`
+  - `[cfg] parsed 12 properties`
+  - 失败时：`[cfg] path='...' rc=-1` / `[cfg] parse FAILED for '...'`
+  - `rc`/`parsed` 直接分叉：**路径错或 configRoot 为空**（相对名 `system.config` 说明查找目录坏了）/ 文件不存在 / 解析出 0 条。
+- **链路已核实（供下一轮判读）**：`System.getProperty0`（`Natives.cpp`，`[prop] ask` 在此）→ `JVMSPI_GetSystemProperty`（CLDC `jvmspi.cpp` 查自身链表 / MIDP `midp_run.c:309` 转发 `getSystemProperty`）→ `findProp(applicationProperties)` ← 由 `initializeConfig()`→`initProps()` 填充 ← `storage_get_config_root(INTERNAL_STORAGE_ID)` ← `storageInitialize(midpConfig, midpAppDir)` ← `midpSetConfigDir(DATA_DIR "/lib")`（`vita_main.c:1558`）。`midpInit.c:220/231` 确认 `storageInitialize` 在 `initializeConfig` **之前**，时序本身没问题。
+- **两个被排除的假线索（记录下来防止重复挖）**：① `[pcsl] open path=...` 只对含 `/rms/` 的路径打印（`vita_pcsl.c` 的 dedup 条件），**没有 system.config 的该行不代表没打开**；② `Warning: cannot find appdb subdirectory.` 是 `$MIDP_HOME/appdb` 的既有检查（我们 appdb 在 `rms/appdb_*`），真机同样存在，与本问题无关。
+- **log163 其他事实（用户报"只显示蓝屏，之前还有几个文字"）**：
+  - 仍是 **Vita3K**（`kubridge ABSENT`、24 模块、`arm=444 MHz`）。
+  - 新增了一段 log162 没有的系统 Alert：`[ALERT] text=This application does not use the screen and runs in the background. timeout=-2`，`[ALERT-PAINT] clip=0,0 228x125 ... bgColor=ffcc33` —— 228x125 的黄色框会**盖在游戏画面中央且无限等待**。这是既有 `AlertLFImpl.lCallShow` 追踪，不是我加入的；它是 MIDP 在 `getCurrent()==null` 后判定"不使用屏幕"弹出的，出现与否取决于 `startApp` 与后台线程 setCurrent 的**竞态**（log162 无、log163 有）。**未确认它是否是用户看到的"蓝屏"成因**。
+  - `[rms] ver` 在累积：log162 是 14→15，log163 是 16→17（`data=432` 不变）。**同一游戏反复测试会让存档状态漂移**，这可能是"之前还有几个文字、现在只有蓝屏"的来源之一；下次测试建议先备份并清空 `ux0:/data/J2ME00001/rms/appdb_A702`。
+  - 全场仍是 6 次刷新（`refreshes=6`），静态等输入的屏幕本就不重绘，**不能据此判定卡死**。
+- **构建验证**：MIDP（24925 objects，romgen OK）+ `vita-port/build.sh` 通过；`midp_vita.velf` 含 `J2ME Player v03.88`、`[cfg] path='%s' len=%d rc=%d`、`[cfg] parsed %d properties`；VPK `vita-port/out/vpk/midp_vita_v03.88.vpk`（12065897 B）。
+- **下一轮只读 4 行**：`midp_stderr.log` 的 `[cfg]` 行（internal.config 与 system.config 各一组）。
+
+### ⭐⭐⭐ 2026-11-02 v03.87：log162 是 **Vita3K**，属性集为空 → 仪表再次全灭；同时修掉 v03.86 的一个实现缺陷（VPK 03.87）
+
+- **环境判定（先说清楚，避免把模拟器结论带到真机）**：log162 = Vita3K。证据全在日志里：模块表 24 条 `Sce*`（真机 log158/160 是 44 条），且**没有 SceGxm / SceAppUtil**；`kubridge ABSENT`；`[PERF] VERDICT: arm=444 MHz (boost applied)`、`ac=1` —— 真机同一探针是 `arm stuck at 333 MHz (asked 444, all strategies failed)`、`ac=0`。log161（v03.85）与 log162（v03.86）是同一台 Vita3K；log158/160 是真机。
+- **仪表又一次没数据，这次原因查清了**：`[prop] ask 'j2me.gfxdebug' -> null`、`'j2me.gfxbudget' -> null`，**并且 `'microedition.locale' -> null`**（真机 log157 是 `'en-US' (len=5)`）→ 整个 application 属性集是空的，所以 `[gfx]` 一行都不会打印。**不是 v03.86 引入**：log161（v03.85，改动前）locale 已经是 null。唯一的正面信息：`[prop] ask 'j2me.gfxbudget'` 这条问句只在 v03.86 之后存在，**证明 03.86 的代码确实进了包**。
+- **v03.86 的实现缺陷（我自己的，已修）**：`seed_system_config()` 在模板 `app0:` 读不到时走 `copy_file(); return;` —— `copy_file` 读的是**同一条读不到的路径**，所以这个分支既救不了模板，又**把 `gfx.cfg` 静默丢掉**了，恰好在配置管线本身可疑的时候让唯一的开关失效。现改为：从空基线开始，仍然追加 `gfx.cfg`。
+- **新增一行 crumb 诊断**（每轮一条）：`seed: system.config tmpl=<n> gfx=<n> out=<n> wr=<n>`。`tmpl=-1`=app0 打不开；`wr=-1`=ux0 打开失败；`wr<out`=短写（留下截断的属性文件 → 半空属性集）。这三种故障症状完全相同（属性缺席），以前任何日志都无法区分。
+- **该版本对正常路径零行为变化**：输入相同 → 输出字节相同 → 同一个文件；不产生 crumb 行以外的新输出。
+- **log162 里仍然成立的（与被否掉的）事实**：
+  - 成立：`[dim] getWidth=240 getHeight=320`（画布正确）；`[res] skip want=0 got=0 remain=1024 block=0` 与 `want=442 got=442 remain=10738`（charmap 恒等表、无短读）；无 `APPEXC/TIMEREXC`；进程存活（`ani_mark CE #2356` 比最后一条 Java 输出晚约 20 s，`watchdog.log` 只有 1 行 → 无长时 I/O 阻塞）。
+  - 成立但**不能单独解读**：整场只完成 **6 次刷新**（`[VKEY] replay end ... refreshes=6`，5 次全为 `refreshes=6 diff=0`），`boot_timing first_content_flip flip#=4`。静态等待输入的屏幕本来就**不会**重绘，所以这既可能是"卡住"，也可能是"正常等按键"。用户按的是方向键（`key=-1/-2/-3/-4` = `emit_key_event()` 的 MIDP KEY_UP/DOWN/LEFT/RIGHT，**确实发出去了**），无变化；但 IDIOMA 屏可能需要确认键/软键，因此**不能据此断言"卡死"**。
+  - **MBW 数字不可用**：`fill32 cached=131072.0 MB/s` = 128 KB / 1 µs = 计时钳位值（`us==0 → us=1`）。真机 log157/158/160 都是 `2114.0`，Vita3K 的 log161/162 是完全相同的异常值 → **环境所致，不是 v03.86 回归；不要用 Vita3K 日志判断带宽/性能**。
+- **构建验证**：`vita-port/build.sh` 通过；`midp_vita.velf` 含 `J2ME Player v03.87`、`seed: system.config tmpl=%d gfx=%d out=%d wr=%d`、`... -> nothing to write`；VPK `vita-port/out/vpk/midp_vita_v03.87.vpk`（12065201 B）。
+- **下一轮要读的**：`crumb.log` 里那条 `seed:` 行。`tmpl>0 且 wr==out` → 属性本该生效，问题在 MIDP 侧读取；`tmpl=-1` → `app0:` 在该环境不可用，诊断开关必须换通道；`wr<out` → 写文件被截断。
+
+### ⭐⭐⭐⭐ 2026-11-02 v03.86：**log157 的"极品飞车没绘制"是我自己的仪表造成的** —— 仪表恢复 + 全局行预算 + 可用开关（VPK 03.86）
+
+- **判决：撤回 v03.74 之后基于 log157 的全部结论。** 三条都要撤：
+  1. "log157 开了 jit=2 导致崩溃" —— **错**。`crumb.log` 行 181/198 是极品飞车那一轮：`round 1: jit cfg=0 -> policy=0` + `vm UseCompiler(pre)=0 (jit policy=0)`。`jit cfg=2` 出现在行 310/364/418，属于**后面重启的** FileManager / fengshenbang。用户当场指出"测试极品飞车的时候 jit 就是 =0"，核实后确认用户正确。教训：**`crumb.log` 是跨 8 个进程累积的（`kernel_forensics.log` 里正好 8 份模块表快照），任何 "本轮配置" 必须按 `==== launcher start ====` / `==== round begin ====` 定位到具体轮次再读，不能 grep 全文件取一条。**
+  2. "极品飞车 gfx 只有 1 条、drawRegion=0，说明完全没绘制" —— **错，最要命的一条**。v03.72 把 `[gfx]` 追踪收进 `DBG_GFX`（读 `j2me.gfxdebug`，默认 false），而 `Image.createImage` 那条**漏了门控**。log157 里 `[prop] ask 'j2me.gfxdebug' -> null` 是直接反证；结果就是只漏出 1 条 `[gfx] Image.createImage 240x320 (#1)`、其余 0 条。**"量到 0" 是尺子被关掉，不是没画。**
+  3. "log156 的 1122 条 → log157 的 1 条是回归" —— **错**。跨越一次测量方式变更的比较，两边不可比。
+- **顺带自查**：我一度把 log156 极品飞车的 772 条 drawRegion 判成"全部越界"（x=170..330 + 宽 32 > 240），原文一看就否：`clip=170,90 70x117`，游戏自己在 70 宽窗口里平铺 32x32 图案，`<<CLIPPED` 是**正确行为**。教训：**判越界必须用日志里那一行自带的有效 clip，不能拿 surface 尺寸当 clip。**
+- **log157 极品飞车（jit=0）真正成立的事实**：`[dim] getWidth=240 getHeight=320`（画布尺寸正确，尺寸假说排除）；`[res] skip want=0 got=0 remain=1024 block=0` 与 `want=442 got=442 remain=10738`（**charmap 读的是 block 0 恒等表，无 `<<SHORT`**，charmap 假说排除 —— v03.74 推出的 `off=4 → skip(1024) → 表全 -1` 被这两行直接否掉）；`APPEXC/Exception/TIMEREXC` = 0（无 Java 异常）。
+- **另**：`midpRunVm` 在极品飞车里从不返回，但 log153/154/155/156 **全都如此**（按 PS 键强退），**不能当崩溃证据**；两个 `psp2core-*.psp2dmp.tmp` 是截断的（声明 5275552 B，实际 3763276 / 1139788），`psp2dmp.py` 解析不了，也不能归因。
+- **代码改动（4 个文件，全部是诊断，无绘制逻辑改动）**：
+  1. `phoneme-midp/.../lcdui/Graphics.java`：新增 `DBG_BUDGET`（`static final`，读 MIDlet 属性 `j2me.gfxbudget`，默认 **400**）+ `dbgLinesOut` + `dbgOut()`。四个追踪点（`translate` / `setClip` / `drawImage` / `drawRegion`）在原 per-site 上限（40/40/60/1500）之外再受**全局**预算约束 —— 400 行 ≈ 10 秒一次性 flash I/O，之后彻底静默。`<<FULLBLIT` 那行**不吃预算**（每帧最多一次，且它是"画面到底上屏没有"的唯一判据）。
+  2. `phoneme-midp/.../lcdui/Image.java`：给 `Image.createImage` 那条补上 `DBG_GFX` 门控（自带 `j2me.gfxdebug` 读取，20 行上限）。**没有任何追踪可以绕过总开关** —— 半真半假的输出比没有输出更坏，它看起来像证据。
+  3. `vita-port/src/vita_main.c`：新增 `append_gfx_cfg()`，把 `ux0:/data/J2ME00001/gfx.cfg` 的内容**逐行原样追加**到生成后的 system.config 属性集。**为什么必须加这个**：`seed_system_config()` 每一轮都用 `app0:` 模板**重写** `ux0:/data/J2ME00001/lib/system.config`，而 `app0:` 在 VPK 内部只读 —— 也就是说"手改 system.config"这个指令在真机上**根本不生效**，会被下一次 round 冲掉。原先我给用户的正是这句无效指令，已改。文件不存在 = 行为逐字节不变。
+  4. `vita-port/config/system.config` 末尾 + `vita-port/CMakeLists.txt`（03.86 块）：把开关用法写清，并注明**不要**改 system.config。
+- **使用方式（真机）**：创建 `ux0:/data/J2ME00001/gfx.cfg`，内容两行 `j2me.gfxdebug: 1` / `j2me.gfxbudget: 300`；删掉该文件即恢复静默。代价必须提前讲明：**开了追踪，极品飞车这种每帧 20-30 次 drawRegion 的游戏会掉成幻灯片**（每行 ~26 ms，v02.48 实测），这是预期，不是回归。
+- **构建验证**：`build_vita.sh`（MIDP，含 romgen，24925 objects）+ `vita-port/build.sh` 全通过；`midp_vita.velf` 内 `J2ME Player v03.86`、`ux0:/data/J2ME00001/gfx.cfg`、UTF-16LE 的 `j2me.gfxbudget` / `j2me.gfxdebug` / `[gfx] Image.createImage` 均在；VPK `vita-port/out/vpk/midp_vita_v03.86.vpk`（12064792 B），包内 `data/J2ME00001/lib/system.config` 已带说明注释。
+- **未验证**：一切都要等真机重跑极品飞车（带 `gfx.cfg`）。**留给下一轮的唯一问题**：拿到预算内前 300 行后，看 `<<FULLBLIT` 是否出现、IDIOMA 各行的 `d=` 与 `clip=` 关系 —— 这才是判断"菜单为什么没显示"的第一份可用证据。
+- **遗留风险**：`DBG_BUDGET` 是 `static final`，per-round 不重置（一个进程内 8 轮共用 400 行）—— 多轮测试要重开进程，或调大 budget。
+
 ### ⭐⭐⭐⭐ 2026-09-04 第三轮：新包确认生效但换形崩溃 → 面包屑环形缓冲+不变量巡检（cldc 3494149，VPK 01.03）
 - **版本确认与教训**：用户第三次日志（09:43）确认跑的是 17:02 新包：模块 NID 0xD947F3F4、e_entry 0x36E9E0（旧包 0xE92EFCF7/0x36E930）；此前 09:37 那份日志用户装的是旧包（LR=0x8108ee90=旧 undef_bc 的 svc 地址，与 23:25 现场逐字节相同）。教训：版本号 01.02 不变导致无法从日志分辨包版本——**已把 VITA_VERSION 升为 01.03 并写进 CMakeLists 注释惯例，今后每轮交付必须 bump 版本**。
 - **好消息**：`NID 0xE1A00001 not found`（undef→svc）已从日志消失——分发表 0..201 全注册 + undef_bc 安全停机均生效，jsr/ret 补洞被实测确认。
@@ -11636,4 +13393,11503 @@ TRIANGLE 在**文本框获焦 + 键盘没弹**时发 Clear：按下 PRESSED（�
 - 键盘里应能看到并修改原文本；确认后 `[IME] committed N chars`，UC 里文字被**替换**而不是追加。
 - 在键盘里删光再确认：应出现 `committed 0 chars (empty: clears the text)`，文本框清空。
 - 若 `initial=0` 但 TextBox 里有字：Java 推送没生效，检查 `nativeKbShown` / KNI 是否被调用。
+
+---
+
+## 菜单 v01.80：文件浏览器"打开文件夹是空的 / 首次选中无效"
+
+> 只改 `vita-port/src/vita_menu.c`（+约 120 行，含注释）；`make midp_vita` 通过（仅原有 format-truncation 警告）。**未上真机。**
+
+### 症状
+- [文件] tab 里每打开一个新文件夹，列表都是空的（或只有 `..`）。
+- 首次选中（尤其是列表里第一项）按 X / 点一下没有任何反应。
+
+### 根因（两个，叠加出现）
+1. **指针别名（主因）**：`fe_scan(const char *path)` 里的 `path` 常常就是 `fes[i].full` 本身（`fe_activate` 之前直接传 `&fes[idx].full`），而 `fe_scan` 内部会 `fe_count = 0` 后 `fe_insert("..")` 并继续插入新条目 —— 写的就是同一个 `fes[]` 数组：
+   - 当选中项 `idx == 0`（在根分区列表里就是第一个分区），插入 `".."` 直接覆盖 `fes[0].full`，紧接着 `sceIoDopen(path)` 打开的是父目录/`"/"`，真机失败 → `fe_count` 只剩 1 个 `..` → **空文件夹**。
+   - 当 `idx >= 1`，后续有序插入的 shift（`fes[j] = fes[j-1]`）以及覆盖 `fes[idx]` 会把 `path` 改成另一项的**纯文件名**（没有斜杠、没有目录），于是之后 `full` 全部按垃圾路径拼接；列表还显示名字，但选中后打开/安装都失败 → 表现为"选中没用"。
+2. **`sceIoDopen("ux0:")` 在真机上不成立**：根分区列表里的 `full` 存的是 `"ux0:"`（`fe_devices[]` 原样），真机固件只接受带分隔符的 `"ux0:/"`。Vita3K 宽松，所以模拟器看不出来。同样影响 `dir_exists()` 的分区探测。
+
+### 修法
+| 位置 | 改动 |
+|---|---|
+| `fe_scan()` | 入口先把 `path` 复制进私有 `char target[256]`，之后**只用 `target`**；`":"` 结尾补 `/`；**先 `sceIoDopen` 成功再清空列表**，失败返回 0 并保留原目录/列表（不再伪装成空文件夹）；返回 `int`（1 成功 / 0 失败） |
+| `fe_parent()` | `fe_scan` 现在存 `ux0:/` 形态，上跳时要区分 `ux0:/`（→ 伪根 `/`）和 `ux0:/data`（→ `ux0:`）；用 `dev_root` 标志判定，避免 CIRCLE 在卷根原地打转 |
+| `dir_exists()` | 探测前把 `"ux0:"` 规范成 `"ux0:/"`，真机分区探测才有效 |
+| 新增 `fe_activate(idx,msg,sz)` | 统一 X/点击的处理；**先把 `fes[idx].full` 和 `.name` 拷到局部**再调 `fe_scan`/`install_jar`；非 `.jar` 文件不再静默，给出 `"不是 .jar: xxx"`；打开失败给 `"无法打开: xxx"` |
+| tab 2 输入分支 | X/CIRCLE/点击/`SELECT` 刷新都走上面的返回值；进入目录后光标落到**第一个真实条目**（`fe_count > 1 ? 1 : 0`），而不是 `..`，避免"第一次按 X 只是往上跳" |
+
+### 下一轮怎么看
+- 进 [文件] → 第一分区上面按 X：应列出 `ux0:/` 的内容，而不是空列表。
+- 连续进两层子目录再退出两层：每层都应正常列出，`..` 与 CIRCLE 都能回上一层，卷根按 CIRCLE 回到分区列表。
+- 选中 `.jar` 按 X（或点一下）：应出现 `installed: <name>`；选中非 jar 应提示 `不是 .jar`。
+- 若仍出现"无法打开: X"：说明 `full` 路径拼接坏了或该目录真打不开，`crumb.log` 里没有额外线索时，可临时在 `fe_scan` 的 `Dopen` 失败分支打印 `(unsigned)d` 与 `target`。
+
+
+---
+
+## v02.75（VM 侧）：jarmem 镜像常驻，不再在最后一个句柄关闭时释放
+
+> 只改 `phoneme-cldc/src/vm/os/vita/OsFile_vita.cpp`（+41/-8，含注释）。`rebuild_vm.sh` 退出码 0（34 个 ARM 对象，库 21 个成员，`jvm_fast_globals` 恰好 1 个 D 定义），`vita-port/build.sh` 退出码 0，VPK 9334977 B。`APP_VER` 未改（仍是别的会话的版本号，本次没动 CMakeLists）。**未上真机。**
+
+### 依据（log115 的 `[jarmem]` 行，实测）
+第 0 轮（`vm_boot.log` 14-24 行）每个 jar 被整包读了 **3 次**，不是 1 次：
+
+| jar | 第 1 次 | 第 2 次 | 第 3 次 |
+|---|---|---|---|
+| midp_system.jar (1281346 B) | 133741 us | 134444 us | 136900 us |
+| game.jar (530861 B) | 61831 us | 59299 us | 107746 us |
+
+合计约 634 ms，其中 2/3 是重复读取，**可省约 440 ms**。
+
+### 根因
+`JarFileParser::get()` 的 parser 缓存在打开第二个 jar 时淘汰前一个 parser，`dispose()` 关闭其 `OsFile_Handle`。v02.70 的 `vita_jar_close` 在 `refs` 归零时 `free` 镜像，下一次再打开同一 jar 就是整包重读。两个 jar 交替访问（midp_system / game）时每次切换都触发。
+
+### 改动
+| 位置 | 改动 |
+|---|---|
+| `vita_jar_close` | 只 `refs--`（不低于 0），**不再 free**；镜像留在 `g_jar_img[]`，由 `vita_jar_acquire` 的 `strcmp` 命中复用 |
+| `vita_jar_acquire` | 无空槽时回收一个 `refs==0` 的槽（free 旧镜像、扣 `g_jar_total`）；全部在用则仍返回 NULL 回退 stdio |
+| 文件头注释 | 追加 v02.75 说明 |
+
+内存上限不变：8 个槽、`VITA_JARMEM_MAX_TOTAL`。游戏换 jar 时旧镜像常驻到槽被回收为止（log115 里小 jar 23646 B，影响很小）。
+
+### 构建踩坑
+先手动 `make OsFile_vita.o` + `ar r` 能编过，但**缺 `-DPRODUCT -DROMIZING=1 -marm` 等 flag**（见 `rebuild_vm.sh` 注释）。该手动对象已删除，改用官方 `./rebuild_vm.sh` 重编、全量重打包。手动对象不要入库。
+
+### 下一轮怎么看
+- `vm_boot.log` 的 `[jarmem] loaded`：第 0 轮每个 jar 应只出现 **1 次**（之前 3 次）。
+- `[preload] done` 到 `first_content_flip` 的区间预计少约 0.4 s；若没变，说明该段瓶颈不在 jar 读取（候选：stderr 逐字节输出约 0.7 s、vita_display 逐像素缩放）。
+- 第 1 轮起同路径会直接命中常驻镜像（不再有 `loaded` 行），属预期；换到别的 jar 才会出现新的 `loaded`。
+
+---
+
+## 菜单 v01.81：中文 MIDlet-Name 显示成 "4-"（signed char 吞掉 UTF-8 字节）
+
+> 只改 `vita-port/src/vita_menu.c`；`make midp_vita` + `vpk_out_copy` 通过，产物
+> `vita-port/out/vpk/midp_vita_v02.74.vpk`。**未上真机。**
+
+### 症状
+中文名的 jar 安装后，列表里有的名称只剩 "4-" 之类 ASCII 碎片，中文全不见；
+纯英文名正常。受影响的游戏在 `games/<名>/cache.bin` 里也已存成坏名字，所以
+重启后依旧是 "4-"。
+
+### 根因
+`manifest_get()` 提取 MANIFEST 值的循环：
+
+```c
+char ch = (char)buf[q];
+if (ch >= 0x20) out[o++] = ch;
+```
+
+`arm-vita-eabi-gcc` 的 **plain char 是 signed**（目标宏里没有 `__CHAR_UNSIGNED__`）。
+所有 `>= 0x80` 的字节先变成负数，`ch >= 0x20` 判假 → **UTF-8 中文字节被逐字节
+丢弃**，只剩名称里的数字/符号："泡泡龙4-豪华版" → "4-"。宿主机复现（x86 char
+同为 signed）：
+
+```
+old(128) = [4-] len=2
+new(128) = [泡泡龙4-豪华版] len=20
+```
+
+这修正了 v01.29 遗留风险里的误判（当时以为是 GBK 编码）：不是编码问题，是
+ASCII 过滤把非 ASCII 字节全删了。真正的 GBK manifest 仍会缺字，属另一件事。
+
+### 改动
+| 位置 | 改动 |
+|---|---|
+| `manifest_get()` | `unsigned char ch = buf[q]`（过滤控制字符的本意不变）；仅在 `q < ve`（确实被 `outsz` 截断）时对尾部做 UTF-8 回退 |
+| 新增 `utf8_trim_partial()` | 去掉被缓冲区截断的半截 UTF-8 序列（中文 3 字节，按字节截断会留 1~2 个残字节） |
+| `parse_manifest_icon()` / `parse_manifest_class()` | 同样改 `unsigned char`（这两处一般是 ASCII，属同类隐患） |
+| `CACHE_VERSION` | 1 → 2，`cache_valid()` 只认 2：旧 cache.bin 里存着已损坏的名字，必须失效重解析一次 |
+
+### 验证
+- 宿主机小程序复现旧输出 `4-`、新输出完整中文；16 字节缓冲截断得到
+  `泡泡龙4-豪`（14 字节，未切半个汉字）。
+- `make midp_vita` 与 `make vpk_out_copy` 均成功，VPK 03:50 生成。
+
+### 下一轮怎么看
+- 首次启动会重新解析每个游戏（一次性变慢），之后 `cache.bin` 为 v2。
+- 列表/详情/对话框里的中文名应完整；若个别字显示为方框（tofu），是字库缺字形，
+  不是本 bug。
+- 若名称仍只剩 ASCII，用 `xxd games/<名>/cache.bin` 看 name 字段：若里面已无
+  `>=0x80` 字节，说明该 jar 的 MANIFEST 本身是 GBK（需另做 GB→UTF-8 转换）。
+
+
+## 2026-10-22 3D 后端原型（vitaGL 离屏 FBO + 回读）
+
+### 环境
+- vitaGL(2bdbe89)/vitaShaRK 1.7/SceShaccCgExt 1.0.1/libmathneon 已手动编译装入 `$VITASDK/arm-vita-eabi`
+  （容器缺 `file`/`bsdtar`，`vita-makepkg` 不能用；构建目录 `/tmp/vglbuild/manual`，重装需按 VITABUILD 手工做）。
+- 安装顺序：SceShaccCgExt(`make install`) -> libmathneon -> vitaShaRK -> vitaGL。
+
+### 约束（读源码得出）
+- GXM 进程内只能初始化一次：vitaGL `init_gxm()` 调 `sceGxmVshInitialize` 并装自己的 display queue；
+  IME 路径 `vita_gxm_ensure_init()` 调 `sceGxmInitialize`。二者互斥，先到先得。
+  本次：vitaGL 激活后 `vita_gxm_ensure_init()` 返回 0（IME 不可用）；IME 先初始化则 `vita_gl3d_init` 返回 GXM_BUSY。
+- 运行时需 `ur0:/data/libshacccg.suprx`（或 `ur0:data/external/`）；缺失则 `vita_gl3d_init` 返回 NO_SHACC，不碰 GXM。
+- vitaGL 不调 `vglSwapBuffers`，不接管显示；3D 渲染进 FBO，`glReadPixels` 回读并翻转后写入 2D framebuffer。
+
+### 改动
+| 文件 | 内容 |
+| --- | --- |
+| `vita-port/src/vita_gl3d.{c,h}` | 新增：shacccg 探测、vglInit、RGBA+D16 FBO、回读合成、计时、自检 |
+| `vita-port/src/vita_gxm.{c,h}` | 新增 `vita_gxm_is_initialized()`；vitaGL 激活时 ensure_init 拒绝 |
+| `vita-port/src/vita_main.c` | 若存在 `ux0:/data/J2ME00001/gl3d_test` 则启动时跑 120 帧自检，结果写 crumb |
+| `vita-port/CMakeLists.txt` | 加 vita_gl3d.c；链 vitaGL/vitashark/SceShaccCgExt/mathneon 等；GXM/Display/AppMgr/Sysmem stub 需在 vitaGL 之后再出现一次（静态库顺序） |
+
+### 验证
+- `vita-port/build.sh` 通过，产物 `out/vpk/midp_vita_v02.74.vpk`（11.6MB，原 9.3MB）。
+- 未在 Vita3K/真机运行。vitaGL 在 Vita3K 上是否可用未知；真机需先装 shacccg。
+
+### 下一步
+- 真机跑 `gl3d_test`，看 crumb 中 `gl3d: selftest` 的 issue/readback/blit 耗时与中心像素值，决定是否转直接上屏。
+
+
+## 2026-10-22 log116 分析：中文路径 "JAR not found" + Nokia 桩类缺失
+
+### 症状（log116，v02.74）
+- 口袋灵兽/宠物王国4/魂斗罗4 启动即 `NoClassDefFoundError: com/nokia/mid/ui/FullCanvas`。
+- 目录名含中文的游戏每次启动前都有 `IOException: JAR not found`（`JarReader.readJarEntry`）；纯 ASCII 目录无此异常。
+- log110~115 从未启动过中文路径游戏，所以不是回归，是首次暴露。
+
+### 根因
+1. **`vita_pcsl.c` 的 `pcsl_string_convert_from_utf8` 按字节 `& 0xFF` 展宽（Latin-1），没有解 UTF-8。**
+   路径链：`runMidlet.c` → `pcsl_string_from_chars` → 该函数 → Java 得到乱码 → `pcsl_file_open`
+   用（正确的）`convert_to_utf8` 再编码一次 → 路径变形 → `sceIoOpen` 失败 → `JAR not found`。
+   类加载走 `OsFile_vita.cpp` 原始字节，不受影响，所以只丢 MANIFEST 属性。
+2. **Nokia 桩类不在 `midp_system.jar` 里**：`build_nokia_stubs.sh` 没人调用（`build.sh`/CMake 都没接），
+   b083c6d 又取消了 `nokia_classes/` 的跟踪；MIDP `classes/` 一重生成桩就丢。
+   8-31 记录里"桩已进 VPK"是当时手工跑脚本的结果。
+
+### 改动
+| 文件 | 内容 |
+|---|---|
+| `vita-port/src/vita_pcsl.c` | `pcsl_string_convert_from_utf8` 改为真正的 UTF-8→UTF-16 解码（1/2/3 字节序列）；畸形字节退回原逐字节行为；`length` 按解码后的 jchar 数计 |
+| `vita-port/build.sh` | `build_jar.sh` 之后新增一步 `build_nokia_stubs.sh`，桩类进 `classes/` 再由 CMake 打进 `midp_system.jar` |
+| `vita-port/CMakeLists.txt` | 新增版本块 **02.75**（置于 02.74 之后，last-wins 已核对） |
+
+### 验证
+- **版本**：每次改动都必须升版本。首次构建（15:02）漏了，产物仍叫 `v02.74`；补升后重建，
+  `out/vpk/midp_vita_v02.75.vpk`（11654286 B，15:35），ELF 内版本串 `J2ME Player v02.75 b330 (8611588)`，
+  `midp_vita.vpk` 与其逐字节相同。注意 b330/hash 8611588 未变（`vita_version.h` 取自 HEAD，改动未提交）。
+- `build.sh clean` 成功；VPK 内 `midp_system.jar` 1222 条（原 1217），
+  含 `com/nokia/mid/ui/FullCanvas.class`、`DirectUtils.class`。
+- 解码算法用 python 等价实现对照：`games/魂斗罗4中文版/game.jar`、`games/宠物王国4-白金/game.jar`
+  往返一致，ASCII 不变，截断序列 `a\xE4\xB8` 退回逐字节。宿主 gcc 的汇编器坏了（`as: unrecognized option '--64'`），
+  没能直接编译 C 版本做单测。
+- **未在真机/Vita3K 运行**，上述两个症状是否消失待下一轮日志确认。
+
+### 未解决：UC 输入框点 copy 报错
+- log116 里 UC 全程无 Java 异常、无 `[IME]`/`[GXM]` 行、watchdog 无挂死；无直接证据。
+- 用户补充：该输入框是 J2ME 通用的输入界面（其他程序同样），即走 `vita_ime.c` 的系统 IME 对话框，
+  copy 按钮属于系统对话框，不是 UC 自己的。需下一轮带 `[IME]` 日志复现再判。
+
+
+## 2026-10-22 log117 分析（v02.75）：Nokia 游戏能启动但画面/按键异常 → v02.76
+
+### 先确认：log116 的两处修复生效
+- `vm_output.log` 无 `JAR not found`、无 `NoClassDefFoundError`，五个 MIDlet 全部 `created+registered OK`，全程无 Java 异常。
+- 四个中文路径的 `argv[2]` 正确，`boot_log` 版本 `v02.75`。
+
+### 用户症状 vs 日志
+| 游戏 | 症状 | 日志 |
+|---|---|---|
+| 口袋灵兽 | 进入后无文字/贴图 | 无异常；仅 `scorePet`/`petGame` 两个新 RMS |
+| 喜羊羊与灰太狼 | 黑屏无反应 | 无异常、无 RMS 访问 |
+| 魂斗罗4 | 卡在声音开关，按键无反应 | `rms0` 读写正常；该进程有 10 次按键、触摸 0 次 |
+| 宠物王国4 | 底部一块蓝色，别的无内容 | `Random minId`、`baijinSMS` 新 RMS |
+| UC 输入框 menu 点复制/粘贴 | 异常界面 + 响声 | `[IME]` 三轮 show 全部 `button=0 text=0`；`audio_debug` 只有 `note=72` 两次 |
+
+### 已证实的一个缺陷（本版修复）
+- **`FullCanvas` 桩不是全屏。** 桩是普通 `Canvas`，窗口留在 NORMAL 模式：
+  底部保留 `SOFTBTN_HEIGHT=18` 的软键栏，颜色 `SOFTBTN_COLOR_BG=0x264DB6`（蓝）= 宠物王国4 的蓝条；
+  `SoftButtonLayer.isSoft1Active()/isSoft2Active()`（`SoftButtonLayer.java:655-700`）在非全屏下恒返回 true，
+  `keyInput` 在 PRESSED 吞掉、RELEASED 才转 `soft1()/soft2()`，游戏的 `keyPressed` 收不到 SOFT1/SOFT2
+  （Vita 圆圈=SOFT1、方块=SOFT2，`vita_input.c:113-114`）。
+- 真 Nokia 的 `FullCanvas` 构造即全屏。桩改为构造里 `setFullScreenMode(true)`，并补 Nokia `KEY_*` 常量。
+- `lfjport_set_fullscreen_mode` 是空函数（`vita_display.c:457`，"Always fullscreen on Vita"），所以屏幕尺寸不变，
+  只有 Chameleon 层的布局随模式变化。
+
+### 提示音（响声）来源
+- `audio_debug.log` 里 `play_tone note=72 dur=1000 vol=80` 两次。`playAlertSound` 的音符 = `9 + 3*type`
+  （`Display.jpp:2121`），再加 `ToneControl.C4`(60) ⇒ 72 = `9+3*1`+60 → type 1 = `AlertType.INFO`
+  （`AlertTypeConstants.LCDUI_ALERT_TYPE_INFO=1`）。所以是一个 INFO 类 Alert 被显示（`AlertLFImpl.lCallShow` 调
+  `playAlertSound`）。UC 复制/粘贴弹出的"异常界面"很可能就是这个 Alert。
+- 该 Alert 的文字没在日志里：Alert 由 UC 自己构造，内容不走任何我们记录的通道。**未证实**它是 UC 的"剪贴板不可用"类提示。
+- log116 也有 3 次 note=72，不是本版引入。
+
+### 未解决（诚实记录）
+- 口袋灵兽无文字/贴图、喜羊羊黑屏、魂斗罗4 声音提示处按键无反应：日志里没有异常也没有线索。
+  FullCanvas 修复可能解决其中与软键相关的部分（魂斗罗4 的"声音开关"通常是 SOFT1/SOFT2 选择），
+  但**无法证明**，口袋灵兽/喜羊羊更像是绘制问题（文字/贴图缺失）。
+- 没有这几个游戏的 jar，无法反编译确认它们的 `paint`/按键处理；本机找不到 `game.jar`。
+- `crumb.log` 里每个游戏的 `runMidlet enter` 之后紧跟下一个 `launcher start`，没有 `runMidlet returned`：
+  这是用户手动退出重开（进程被杀），不是崩溃。
+
+### 改动
+| 文件 | 内容 |
+|---|---|
+| `vita-port/nokia_src/FullCanvas.java` | 构造里 `setFullScreenMode(true)`；补 `KEY_SOFTKEY1/2/3`、方向键、`KEY_SEND/END` 常量 |
+| `vita-port/CMakeLists.txt` | 版本块 **02.76**（置于 02.75 之后，last-wins 已核对） |
+
+### 验证
+- `build.sh` 成功（exit 0）；`out/vpk/midp_vita_v02.76.vpk`（11653934 B），ELF 版本串 `J2ME Player v02.76 b330 (8611588)`，
+  `midp_vita.vpk` 与其逐字节相同。
+- VPK 内 `FullCanvas.class` 用 `javap -c` 核对：构造器 `invokevirtual setFullScreenMode(Z)V` 且参数为 1，
+  `KEY_SOFTKEY1=-6` 等常量在。
+- **未在真机运行。**
+
+### 下一轮怎么看
+- 宠物王国4：底部蓝条应消失。魂斗罗4：声音提示处圆圈/方块应有反应。
+- UC 复制/粘贴：要知道 Alert 的文字，需要在 `AlertLFImpl.lCallShow` 加一行 `System.out` 打印标题和内容
+  （Java 侧只有 `System.out` 能落盘，`Logging.*` 被编译期剥掉）。
+
+## 2026-10-22 log117 续：拿到游戏 jar，找到真根因 → v02.77
+
+用户提供了 `debug/game/*.jar`（口袋灵兽/喜羊羊与灰太狼/宠物王国4-白金/魂斗罗4中文版）。上一节"未解决"里
+"日志没有线索"的根因就在这里。
+
+### 方法
+- jar 的类名全被混淆（`a.class`…），没有反编译器可用，用 `javap -c` 抽出每个 jar 的**全部**外部引用
+  （Method/InterfaceMethod/Field/class），逐条对 `midp_system.jar`（= CLDC+MIDP+Nokia 桩，即游戏运行时的启动类路径）
+  解析。脚本 `/tmp/apicheck.py`（临时文件，未入库）：读 `javap -s` 的描述符，沿 extends/implements 向上查父类/接口。
+  标准 MIDP/CLDC 的调用**全部能解析**，缺的只有 Nokia 扩展。
+- 脚本一度误报（`Form.addCommand`、`Display.getDisplay` 等标准 API）：原因是构造器判定用了 `endswith`，
+  把 `getDisplay` 当成 `<init>`；父类行解析也取错了行。修后误报消失。**教训：先让工具对已知存在的 API 不误报，再信它报的缺失。**
+
+### 缺失项（修复前 → 修复后）
+| 游戏 | 缺失 | 修后 |
+|---|---|---|
+| 口袋灵兽 | `DirectUtils.getDirectGraphics`、`DirectGraphics.drawImage` | 0 |
+| 喜羊羊与灰太狼 | 同上 + `com.nokia.mid.sound.Sound`（`<init>([BI)`/setGain/getState/play/stop） | 0 |
+| 宠物王国4 | 同上 + `DirectGraphics.fillPolygon` | 0 |
+| 魂斗罗4 | `getDirectGraphics`、`DirectGraphics.drawImage`（manipulation=8192/16384，即水平/垂直翻转） | 0 |
+
+### 为什么 log117 没有任何异常
+`CanvasLFImpl.uCallPaint`（`CanvasLFImpl.java:262`）和 `uCallKeyPressed`（`:284`）把应用代码包在
+`catch (Throwable) → Display.handleThrowable(t)`；`handleThrowable` 只在 `if (Logging.TRACE_ENABLED)` 里记，
+而 `Logging.TRACE_ENABLED` 是**编译期常量 false**（`Logging.java:94`）→ 整段被 javac 删掉 →
+`paint()` 抛出的 `NoSuchMethodError`/`NoClassDefFoundError` **无声消失**，屏幕停在上一帧
+（空白 / 蓝条）。这同时解释了四个看似无关的症状：
+- 口袋灵兽（无文字贴图）、喜羊羊（黑屏）、宠物王国4（只有蓝条）：每一帧 `paint()` 一进 Nokia 绘制调用就抛，画面永远空。
+- 魂斗罗4：声音开关界面的 UI 是用 `DirectGraphics.drawImage` 画的，画不出；`keyPressed` 逻辑本身也读
+  `getAppProperty("SOFTKEY_LEFT"/"SOFTKEY_RIGHT")`（`q.a(int)`，缺省回落到静态数组 -6/-7），
+  软键被 Chameleon 软键栏吞掉（02.76 已修）后才到得了这里。
+  **注意：魂斗罗4"按键无反应"有多少是 02.76 的全屏问题、多少是 02.77 的绘制问题，无法分开，需要真机验证。**
+
+### 改动（v02.77）
+| 文件 | 内容 |
+|---|---|
+| `vita-port/nokia_src/DirectGraphics.java`（新） | Nokia UI API 1.1 接口：常量 `FLIP_HORIZONTAL=8192`、`FLIP_VERTICAL=16384`、`ROTATE_90/180/270`、`TYPE_*`；方法 `drawImage/fillTriangle/drawTriangle/fillPolygon/drawPolygon/setARGBColor/getAlphaComponent/getNativePixelFormat` |
+| `vita-port/nokia_src/DirectGraphicsImpl.java`（新） | 委托实现：同一个 MIDP `Graphics`，用 `drawRegion`/`fillTriangle`/`drawLine`。Nokia 翻转/旋转 → `Sprite.TRANS_*`；`ROTATE_n` 是**逆时针**；`anchor==0` 当 `TOP\|LEFT`（`drawRegion` 对 0 抛 `IllegalArgumentException`）|
+| `vita-port/nokia_src/DirectUtils.java` | 新增 `getDirectGraphics(Graphics)`，同一 `Graphics` 复用包装对象（游戏每画一个精灵就调一次） |
+| `vita-port/nokia_src/Sound.java`（新） | 静默桩；`getState()` 恒返回 `SOUND_STOPPED`，防止"轮询到播完"的循环永远等 |
+| `phoneme-midp/.../lcdui/Display.jpp` | `handleThrowable` 增加 `System.out.println("[APPEXC] "+t)` + `printStackTrace()`，让 `paint`/`keyPressed` 里被吞的异常进 `vm_output.log` |
+| `vita-port/build_nokia_stubs.sh` | 安装 `com/nokia/mid/*` 下**所有**包（原来只拷 `ui`，`sound` 会漏） |
+| `vita-port/CMakeLists.txt` | 版本块 **02.77**（置于 02.76 之后） |
+
+### 验证
+- **变换代数**（**此条结论已被 v02.78 更正，见下文"log117 续二"**）：当时用像素模型对 `toTransform` 比对 16 种组合
+  全部一致——但那个模型就是我自己"先翻转再旋转"的假设，只证明了代码与假设自洽，不是与真机一致。
+  魂斗罗4 实际用的 8192、16384 无旋转，不受影响。
+- **构建**：`build.sh midp` 之后按时间戳链核对（项目记忆里 `build.sh` 会谎报成功）：
+  `Display.java` 02:38:32 → `Display.class` 02:38:33 → `classes.zip` 02:38:33 → `ROMImage_05.cpp` 02:38:39 →
+  `ROMImage.o` 02:38:45 → `libobj.a` 02:38:46 → ELF 02:39:00，逐级递增；生成的 `Display.java` 含 `[APPEXC]`。
+- **产物**：`out/vpk/midp_vita_v02.77.vpk`（11658978 B），ELF 版本串 `J2ME Player v02.77 b330 (8611588)`，
+  `midp_system.jar` 1226 条，Nokia 类 5 个：`DirectGraphics`、`DirectGraphicsImpl`、`DirectUtils`、`FullCanvas`、`Sound`。
+- **复扫**：用 v02.77 的 `midp_system.jar` 重跑四个 jar：`refs checked 144/154/140/143，missing 0/0/0/0`。
+- **未在真机运行。**
+
+### 已知限制（不是已验证的行为）
+- `DirectGraphicsImpl`：不做 alpha 混合（alpha=0 不画，其余当不透明）；`fillPolygon` 是从点 0 出发的三角扇，
+  只对凸多边形正确；`fillXxx/drawXxx` 的颜色参数不改变 `Graphics` 的当前色（画完恢复）。
+  宠物王国4 的 `fillPolygon` 颜色是 `-15104`（= 0xFFFFC580，alpha 满），在此范围内。
+- `Sound` 不发声。喜羊羊的 Nokia 音乐/音效没有。
+- `Player.getControl(String)`（宠物王国4 的一处调用）在第一次扫描里报缺，修脚本后没再出现——说明那是误报，
+  不是真缺失。
+
+### 下一轮怎么看
+- `vm_output.log` 里搜 `[APPEXC]`：任何被 `paint`/`keyPressed`/`serviceRepaints` 吞掉的异常现在都会出现，
+  带完整堆栈。**如果游戏仍黑屏，这里就是下一条线索。**
+- 宠物王国4：蓝条应消失（02.76），画面应出现（02.77）。魂斗罗4：声音开关界面应出现，圆圈/方块应有反应。
+- UC 复制/粘贴弹的 Alert 同样走 `handleThrowable` 之外的路径（Alert 不是异常），仍需在 `AlertLFImpl.lCallShow` 打点才能看到文字。
+
+## 2026-10-23 log117 续二：按 J2ME-Loader 清单一次补全厂商 API → v02.78
+
+用户的要求：目标是兼容性，这些迟早要加，不能等逐个游戏报错。方法：把 J2ME-Loader 当"API/行为清单"，
+按本树的 CLDC/MIDP **重写**（Loader 源码依赖 `android.*`、`ContextHolder`、Java 17 的 switch 表达式/`instanceof` 模式，
+不能原样搬）。
+
+### 许可证（已核实）
+- J2ME-Loader 整体 Apache-2.0（GitHub API）。`Sound.java`/`Clipboard.java`/`SoftNotification*.java` 是 Apache-2.0 单许可；
+  `DirectGraphicsImp.java`/`DirectUtils.java`/`DirectGraphics.java`/`DeviceControl.java`/`FullCanvas.java` 沿用 MicroEmulator 的
+  Nokia API（Copyright (C) 2003 Markus Heberling），**LGPL-2.1 与 Apache-2.0 二选一**，本树按 Apache-2.0 使用。
+- 做法是参考行为与成员列表后重写，文件头已注明来源与许可；**没有逐字复制 Loader 代码**（频率表 `FREQ_TABLE` 是事实数据，已逐项核对与 Loader 一致）。
+
+### 本轮更正：上一节"16 种组合全部一致"是自证
+- 对比 J2ME-Loader 的 `MANIPULATION2TRANSFORM`（4×4 表）与 02.77 的 `toTransform`：**4 格相反**，全部是"单翻转 + ROTATE_90/270"：
+  | manipulation | 02.77（先翻转后旋转） | Loader（先旋转后翻转） |
+  |---|---|---|
+  | 8192\|90 | MIRROR_ROT270 | MIRROR_ROT90 |
+  | 8192\|270 | MIRROR_ROT90 | MIRROR_ROT270 |
+  | 16384\|90 | MIRROR_ROT90 | MIRROR_ROT270 |
+  | 16384\|270 | MIRROR_ROT270 | MIRROR_ROT90 |
+- 暴力验证：Loader 表与"先旋转(逆时针)后翻转"16/16 吻合，与"先翻转后旋转"只 12/16。
+- 三方对同一格的说法不一致：Loader 表（2018 年起多次改，2023 年 `29f0d43` 重写成现表）、FreeJ2ME（`H90` = 先镜像再 ROT270）、
+  MicroEmulator 原版（只实现单项，注释写"manipulations are not supported"）。**没有找到规范原文**，三个接口文件都没有 Javadoc。
+- 决策：采用 Loader 的表（有 8 年用户反馈修订史、覆盖面最广），v02.78 起 `DirectGraphicsImpl.toTransform` 改为查表。
+  **仍标记未验证**；四个已知游戏用到的组合（8192、16384、90、180、270 单独值）不在这 4 格内，不受影响。
+  遇到"翻转+旋转"画面方向不对的游戏，先查这 4 格。
+
+### 本轮新增（v02.78，27 个类，全部 `javac -source 1.3` + preverify 通过）
+| 包 | 类 | 说明 |
+|---|---|---|
+| `com.nokia.mid.ui` | `DirectGraphics`（完整接口）、`DirectGraphicsImpl` | 补全 `drawPixels`×3、`getPixels`×3、多边形/三角形、像素格式、参数校验（`anchor & -64`）|
+| | `DirectUtils` | 新增 `createImage(w,h,argb)`、`getFont(int)`、`getFont(face,style,h)`、`setHeader`；`getDirectGraphics` 加同步 |
+| | `FullCanvas` | 改 `abstract`（与 Loader 一致），保留构造里 `setFullScreenMode(true)` |
+| | `DeviceControl`、`Clipboard`、`SoftNotification`(+`Exception`/`Listener`) | 无硬件的调用接受后忽略；`Clipboard` 是进程内缓冲 |
+| `com.nokia.mid.sound` | `Sound`、`SoundListener` | 真实现：MIDI/WAV 走 MMAPI；**按数据头 `MThd`/`RIFF` 判格式，不信 type 参数**（喜羊羊把标准 MIDI 当 `FORMAT_TONE` 传）；Nokia 铃声格式不可播 → `SOUND_UNINITIALIZED` |
+| `com.samsung.util` | `Vibration`、`LCDLight`、`SM`、`SMS` | `isSupported()` 一律 false（Loader 返回 true，会让游戏以为付费短信发出了）|
+| `com.mot.iden.multimedia` | `Vibrator`、`Lighting` | 校验参数，其余忽略 |
+| `com.motorola.funlight` | `FunLight`、`Region`、`FunLightException` | 控制请求返回 QUEUED |
+| `com.siemens.mp.game` | `Light`、`Vibrator`、`Sound`；`com.siemens.mp.NotAllowedException` | `Sound.playTone` 用 16.16 定点逐半音找最近音符 |
+
+### 踩到的坑
+1. **CLDC 1.1 没有 `Math.pow`/`log`**（只有 `sin/cos/tan/asin/acos/atan`）：`Siemens Sound` 第一版用了 `Math.pow` → 重写为定点；
+   定点算法对 MIDI 8–127 全范围（≥40Hz）与十二平均律 **0 误差**。
+2. **Loader 的 `FREQ_TABLE` 比十二平均律高约 3%**（A4=453 而非 440），所以必须查表，不能算。
+3. `build_nokia_stubs.sh` 改为：递归编译 `nokia_src/**`（`vendor/` 放非 Nokia 包）、**每次清空输出目录**（否则删掉的源文件的旧 .class 会被打进包）、
+   安装所有 `com/*`，并**拒绝**覆盖 `com/sun`（MIDP 自身代码；脚本拒绝而不是删除）。验证：`com/sun` 681 → 681。
+4. 编辑工具不允许覆盖已存在的文件，且单次 >6000 字符会拒收：大文件按 `//@@PARTn@@` 占位符分段写入，写完 `grep -c '@@'` 确认 0 残留。
+
+### 验证
+- `build.sh` 成功（exit 0）；`out/vpk/midp_vita_v02.78.vpk`（11675699 B），ELF 版本串 `J2ME Player v02.78 b330 (8611588)`，
+  `midp_vita.vpk` 逐字节相同。
+- VPK 内 `midp_system.jar` 1258 条，厂商类 27 个（清单见上），`com/sun` 681 个（无变化）。
+- 用 v02.78 的 `midp_system.jar` 复扫四个游戏 jar：`144/154/140/143` 条引用，缺失 `0/0/0/0`（无回归）。
+- **未在真机运行。**
+
+### 没做、以及为什么
+- **没有整体移植 Loader 的全部厂商包**（共约 190 个文件）：`com.jblend.graphics`(32KB)、`com.mascotcapsule.micro3d`(38KB)、
+  `com.mexa.opgl`(47KB)、`com.nokia.mid.m3d`、`com.motorola.graphics/iden`(90KB)、`com.vodafone.v10`、`com.siemens.mp` 的
+  `color_game`/`ui.Image`/`io.File` 等，要么依赖本机没有的 3D/文件/网络原生能力，要么需要对应的 KNI。每个都要有游戏验证才算"补全"，
+  否则只是占位。**这些是下一批**，需要你确认优先级（我倾向 `com.siemens.mp.color_game`/`game` 的纯 Java 精灵类，
+  和 `com.vodafone.v10`/`com.j_phone` 这些日系常见的）。
+- **`getPixels` 的适用范围比"Image 的 Graphics"更窄**：`Image.getGraphics()` 每次返回**新**的 `Graphics`，而 `Graphics` 里指向 Image 的
+  `img` 字段是包私有的，`GraphicsAccess` 也没有"由 Graphics 反查 Image"的接口。所以 `DirectGraphicsImpl` 只认
+  经 `DirectUtils.getGraphics(img)` / `createImage(...)` 登记过的那一个 `Graphics`（只记最近一个）；游戏自己调
+  `Image.getGraphics()` 再 `getDirectGraphics(g).getPixels(...)` 会抛带说明的 `IllegalStateException`，屏幕 Graphics 同样。
+  要真正支持，得在 `Graphics` 里加一个包私有 getter 并经 `GraphicsAccess` 暴露（改 MIDP 本体，影响面更大，本轮没做）。
+- **`DirectGraphics` 不做 alpha 混合**（`Graphics` 没有 alpha 状态）：alpha=0 不画，其余当不透明。
+- **`createImage(w,h,argb)` 的 alpha 被忽略**（本树的可变图无 alpha 通道），alpha=0 时填白而不是透明。
+- **Nokia 铃声格式（`FORMAT_TONE` 真铃声）不可播**；要播得写 Nokia ringtone → MIDI 转换（Loader 的 `ToneVerifier` 只做修复，不转换）。
+- **`Clipboard` 是进程内缓冲**，与系统无关；UC 的复制/粘贴异常仍是另一件事（它走 `javax.microedition.lcdui` 的 TextBox/IME，不走这里）。
+
+- 之后做 JSR-239 的 KNI 层，再做 M3G。
+
+## 2026-10-23 厂商 API 第二批：Siemens 与日系纯 Java 类 → v02.79
+
+用户决定：`SMS.isSupported()` 返回 **true**（有游戏依赖）；先做 Siemens 的精灵/系统类和日系（Vodafone/J-Phone/JBlend）的纯 Java 类，其余留日志后续做。
+
+### 关键修改记录（vita-port/nokia_src/vendor/，全部新增文件，未改共享源码）
+- `com/samsung/util/SMS.java`：`isSupported()` 改 true，`send()` 只打印 `[VENDOR] ... SMS.send ignored: dest=`，不真发。
+- `com/siemens/mp/color_game/{Layer,LayerManager,GameCanvas,Sprite,TiledLayer}`：Siemens 自己一套层级，和 `javax.microedition.lcdui.game.Layer`
+  无继承关系（后者构造器包私有，无法继承）。`Sprite`/`TiledLayer` **包装**标准类（每次操作前把位置/可见性同步过去），不复制碰撞/平铺代码。
+  `Layer.java` 在 Loader 里**没有版权头**，所以没有参照其文本，按 MIDP 2.0 公共行为自行写。
+- `com/siemens/mp/game/*`、`ui/Image`、`lcdui/{Image,Command,Form,Canvas,KeyDispatcher}`、`media/*`、`io/{Connection,ConnectionListener}`、`m55`、`resource`、`misc/NativeMem`。
+- `com/j_phone/**`、`com/vodafone/**`、`com/jblend/**` 共 44 个文件：其中 **39 个与 Loader 逐字节相同**（无 android 依赖、`-source 1.3` 能直接过；
+  `cmp` 核对过，Apache-2.0 头齐全），**5 个改写**：`j_phone.util.FixedPoint`、`j_phone.system.DeviceControl`、
+  `vodafone.v10.system.device.DeviceControl`、`vodafone.v10.sound.{Sound,SoundTrack}`。（`mmpp` 的 2 个文件虽能编译，但未拷入，因同包的 `MediaPlayer` 不行。）
+
+### 与 Loader 的有意差异（都未在真机验证）
+1. **`FixedPoint`**：本 CLDC 的 `java.lang.Math` 只有 sin/cos/tan/sqrt/ceil/floor/abs/max/min，没有 `atan/asin/acos/pow`。自行实现 `atanD`
+   （折半两次 + 泰勒级数），`asin/acos` 由它导出，`pow()` 就是平方。宿主 JVM 对 `java.lang.Math` 比对：atan/asin/acos 最大误差 ≤1.7e-15
+   （范围 ±40 与 1e-300…MAX_VALUE、±1 端点），越界/NaN 返回 NaN。
+   - **更正**：本轮开头我曾用 `javap`（无 `-bootclasspath`）查 `Math`，读到的是宿主 JDK 的 `Math`（含 `addExact` 等），那个结果不可信；
+     用 `javap -bootclasspath cldc_classes.zip` 才得到上面这份真实成员表。
+2. **`DeviceControl.getDeviceState(KEY_STATE)` 返回 0**（打印一次 `[VENDOR]`）：Loader 读虚拟键盘位掩码，Java 侧没有等价物，按键状态在原生输入层。
+   靠轮询它取输入的游戏会看不到按键（普通 `keyPressed` 回调不受影响）。
+3. **`vodafone.v10.sound.Sound`**：Loader 把数据按 `audio/xmf` 交给 MMAPI；这里的 MMAPI 只认 MIDI/WAV，所以按数据头分流（同 `nokia.mid.sound.Sound`）；
+   其他格式（XMF/MFi/SMAF）不建 player，播放无声但不抛异常。`SoundTrack.setSound` 后状态置 `READY`（Loader 留在 `NO_DATA`；依据是 Vodafone 文档，**未验证**）。
+4. **`GraphicObjectManager.paint(Image, x, y)` 应用了 x/y 偏移**（Loader 忽略这两个参数）。这是和 Loader 不一致的一处，注释里写明了回退办法（删两个 `translate`）。
+5. **`GameCanvas`**：离屏 `Graphics` 只建一次并复用（Loader 每次 `getGraphics()` 返回新对象）；缓冲尺寸用 `getWidth()/getHeight()`；
+   `suppressKeyEvents` 同 Loader 一样不起作用（已在注释写明，起初我的注释写成了"honoured"，已更正）。
+6. **`siemens.mp.game.Sprite(byte[]...mask...)`**：不再另建一张 mask 图再合成，直接用带 alpha 的位图。已用脚本在 40216 个随机像素上和 Loader 的"两图合成"路径比对，
+   可见像素 **0 差异**；`isBitSet` 的重写在 2304 种 (byte,pos) 组合上与 Loader 一致。
+
+### 没做、以及原因（留给后续批次）
+- **3D**：`vodafone.v10.graphics.j3d`、`mascotcapsule`、`nokia.m3d`（需原生/渲染）。
+- **`vodafone.v10.graphics.sprite.SpriteCanvas`、`ExtendedImage.blitToScreen`**：依赖 Loader 的 `Canvas.flushBuffer` 扩展，本 MIDP 没有；`blitToScreen` 现在只打印一次日志、不画。
+- **`siemens.mp.io.File` 与 `io.file.*`**：要接 JSR-75；没有已知游戏需要。
+- **`siemens.mp.lcdui.Displayable`**：`javax.microedition.lcdui.Displayable` 构造器包私有，无法继承。
+- **`com.kddi`、`com.sprintpcs`、`mmpp`、`vodafone.util.ImageEncoder`**：需要 Java 5 语法（泛型/注解/try-with-resources）、`ContextHolder`、`android.graphics`，
+  或 `MediaException(Exception)` 构造（本 MMAPI 的 `MediaException` 只有 `String` 构造）。
+- 已有的 Nokia/Samsung/Motorola/Siemens 桩与上一批同。
+
+### 验证
+- 全部 `nokia_src/**` 用 `javac -source 1.3 -target 1.3` 编译通过（101 个类）+ preverify。
+- `build.sh` 成功（exit 0）；`out/vpk/midp_vita_v02.79.vpk`（11715446 B），`build/cmake/midp_vita` 里的版本串 `J2ME Player v02.79 b330 (8611588)`，
+  两份 VPK 逐字节同大小；VPK 内 `midp_system.jar` 1033 个类、`com/sun` 681（无变化），抽查 7 个新类均在。
+- `git status` 里 `debug/log/log100…` 等大量显示为已删除，**不是本轮操作**，未处理。
+- **未在真机运行；这批类没有任何游戏实际调用过，只证明了能编译、能打包。**
+
+
+## 2026-10-23 UC 复制/粘贴 Alert 打点 → v02.80
+
+此前"日志加了吗"——02.79 之前**没加**，只是写在下一步里；这一版才真正加上。
+
+### 关键文件修改记录
+- `phoneme-midp/src/highlevelui/lcdlf/lfjava/classes/javax/microedition/lcdui/AlertLFImpl.java`（`lCallShow`，`super.lCallShow()` 之后）：
+  `System.out.println("[ALERT] title=.. text=.. type=.. timeout=..")`。只读诊断，不改行为。
+  - 实际编译的是 **lfjava** 这份（`lcdlf/lib.gmk`：`SUBSYSTEM_LCDUI_MODULES == platform_widget` 才用 lfplatform，本工程不是）；`lfplatform` 那份未动。
+  - `AlertType` 无 `toString`、字段私有，所以用 `==` 比对常量打印 INFO/WARNING/ERROR/ALARM/CONFIRMATION。
+  - `getTitle()/getTimeout()` 内部是 `synchronized (Display.LCDUILock)`，`lCallShow` 本就在持锁状态调用，同线程可重入，无死锁风险（读源码得出，未实测）。
+- `vita-port/CMakeLists.txt`：`VITA_VERSION` → 02.80。
+
+### 验证
+- `./build.sh midp` exit 0；时间戳链 源码 06:36:32 → classes.zip 06:36:47 → VPK 06:37:28；
+  `classes.zip` 与 VPK 内 `midp_system.jar` 的 `AlertLFImpl.class` 均含 `[ALERT]`；`com/sun` 仍 681；ELF 版本串 `v02.80`。
+- 产物 `out/vpk/midp_vita_v02.80.vpk`。**未在真机运行。**
+
+### 下一轮怎么看
+- 在 UC 里点复制/粘贴后，`vm_output.log` 搜 `[ALERT]`：标题/正文能说明它是"剪贴板不可用"还是别的提示。
+- 注意：只有走 `Alert` 的提示才会出现；若 UC 的异常界面不是 Alert（如自绘 Canvas），这里不会有输出，那时应再看 `[APPEXC]`。
+
+
+## 2026-10-23 对标主流 J2ME 模拟器：差距分析 + 开发路线图（文档，无代码）
+
+新增 `COMPATIBILITY_ROADMAP.md`，`README.md` 增加索引。对标 J2ME Loader / FreeJ2ME /
+KEmulator nnmod / PSPKVM / MicroEmulator / SquirrelJME，只做分析与规划，**未改任何源码或构建**。
+
+### 结论（详见路线图 §0）
+- **P0 兼容性**：可变虚拟屏幕 + 每游戏配置、设备画像（platform/manufacturer/model）、JAD/多 MIDlet、
+  虚拟键盘 + 触屏映射、MP3/AMR + 振动、JPEG、权限默认策略、HTTPS。
+- **P1 性能**：JIT 二次启动根因（当前默认 `-int`）、启动白屏、444MHz、渲染 NEON/GPU 缩放、
+  32MB 堆扩容、音频并发、每游戏设置 UI。
+- **P2 长尾**：JSR-256/179/82、server socket、PushRegistry、JSR-226/234/172/280、PIM、截图/加速。
+
+### 现状证据（写进路线图的）
+- JIT 后端在 `phoneme-cldc/src/vm/share/compiler/` 与 `src/vm/cpu/arm/CodeGenerator_arm.cpp`，
+  `vita_arm.cfg` 已 `ENABLE_JIT := true`，但 `vita_main.c` 的 `VITA_JIT_DEFAULT 0` 注入 `-int`。
+- 虚拟屏固定 240×320/320×240、静态缓冲上限 320×320（`vita_display.c:38/104`）。
+- 输入只有 12 个物理键重映射（`vita_input.c:96`），无虚拟键盘。
+- 音频 caps 只有 TONE / MS_PCM / MIDI（`vita_audio_javacall.c:247`）；振动 `anc_*_vibrate` 未实现。
+- `Settings.gmk`：`USE_SSL=false`、`USE_JSR_75=false`（JSR-75 走独立 `jsr75/` 子系统）。
+- 无 `scePowerSetClockFrequency` 调用；Java 堆硬编码 32MB（`vita_pcsl.c:2224`）。
+
+### 建议下一轮（可直接开工）
+1. 每游戏 `game.cfg` + 动态虚拟屏（4 个预设 + 自定义）。
+2. 虚拟数字键盘覆盖层（新 `vita_vkey.c/.h`，注入现有 `KEYMAP_KEY_*` ring）。
+3. MP3（minimp3→PCM 复用 WAV 管线）+ 振动（`sceCtrlSetActuator`）。
+- 零成本项：启动设 444MHz、加 FPS/帧耗时浮层（为 JIT/渲染优化建立基线）。
+
+## 2026-10-23 log118 分析：游戏都能开了；喜羊羊无声 + 进游戏卡死 → v02.81（仅诊断）
+
+### 用户现象
+游戏都能正常打开；喜羊羊没有声音、进游戏后卡死不动；其他游戏帧率感觉变低；UC 在输入框里测了复制/粘贴。
+
+### 实测事实（log118，按会话拆开）
+- `input_debug.log` 的 HEARTBEAT 分 4 段会话：事件泵速率中位数 **98 / 78 / 84 / 90 CE/s**（每 64 CE 耗时 652 / 824 / 764 / 713 ms）。
+  对照 log111/log112 记录的 774–835 ms/64 CE，**没有变慢**。所以\"其他游戏帧率低\"**不能由这个指标证实**（它只量事件泵，不量渲染耗时）。
+  - 有两次长停顿：第 2 段 +566 s 处 **12137 ms**，第 3 段 +145 s 处 **8040 ms**（正常 ~700 ms）。当时的 INPUT 事件正常，停顿原因**未查明**。
+- **喜羊羊的 NPE（`vm_output.log` 第 170 行，整份日志里 `[APPEXC]` 只出现 1 次）**：
+  ```
+  NullPointerException  - java.io.DataInputStream.read()  - g.a() bci=1  - g.a() bci=136  - g.a() bci=6  - g.z() bci=4313
+  ```
+  反汇编（`javap -c`）定位：`g.z()` 4313 处调 `g.a(5,1,200,25,"N")` → `g.a(String,int,String)` 第 4–14 行
+  `new DataInputStream("a".getClass().getResourceAsStream("/dialog.txt"))`，随后 `g.a(DataInputStream)` 的 `read()` 对 null 抛 NPE。
+  即 **`getResourceAsStream("/dialog.txt")` 在运行时返回了 null**。
+  - 该资源在 jar 里**是好的**：deflate、3062 字节、CRC 正常、能被 Python 读出（UTF-16LE 带 BOM 的对话文本）。同一个 jar 里别的资源（`.ani`/`.jmp`）能读。
+  - 我读了 `Class.getResourceAsStream` → `ResourceInputStream.open`（Natives.cpp:1462）→ `ClassPathAccess::open_entry` → `JarFileParser::find_entry`，
+    **静态读代码没找出 null 的原因**。没有结论，只排除了\"jar 损坏\"和\"路径写错\"。
+  - 怀疑方向（**均未证实**）：v02.75 的 `OsFile_vita.cpp` 把 jar 常驻内存、`refs==0` 时复用/回收槽位，与 `JarFileParser` 的 4 个解析器缓存交互；
+    `find_entry` 的 256 项条目缓存（`MaxJarCacheEntryCount=256`，该 jar 有 181 项，不会溢出）。需要运行时日志才能判断，**这一轮没有加**。
+  - 卡死与该 NPE 的关系：NPE 发生在 `paint` 里，被 `Display.handleThrowable` 吞掉；之后 `startmusic` 再无下文，也没有新的 `[MIDLET]`。
+    `paint` 每帧都会重新进同一路径的话会反复抛，但日志里只有 1 次 `[APPEXC]`，所以\"每帧抛异常\"**不成立**；卡死的机制**未查明**。
+- **喜羊羊无声——这次查清了，并更正 v02.78 的一个错误结论**：
+  - 游戏里唯一构造 `com.nokia.mid.sound.Sound` 的地方（`g.h(int)`）用的是 `new Sound(D[i], FORMAT_TONE)`，`D` 是 `<clinit>` 里手写的 `byte[3][]`，
+    我用脚本从字节码重建：`D[0..2]` 长度 **58 / 326 / 389**，开头都是 `02 4a 3a 40`，**是 Nokia 铃声二进制，不是 MIDI**。
+  - `music01..06.mid` 这 5 个文件名只在 `g.<init>` 里被放进一个 `String[]`，整个 jar 里只有 `g.class` 引用 `music0`，**没有任何地方打开它们**。
+  - 所以 v02.78 的结论\"喜羊羊把标准 MIDI 当 FORMAT_TONE 传\"是**错的**（当时是从 `FORMAT_TONE` 与 `.mid` 文件名推测，没看到数据本身）。
+    `Sound.init` 对这种数据走 `mime == null` 分支，对象保持 `SOUND_UNINITIALIZED`，`play()` 直接返回，且之前**没有任何日志**，所以看起来\"没响应\"。
+  - `audio_debug.log` 里出现的 `midi done`（14 次）来自**别的游戏**（口袋灵兽等的 MMAPI 播放），与喜羊羊无关；末尾两次 `play_tone note=72` 是 UC 的 INFO Alert 提示音。
+  - 要让喜羊羊有声，需要 **Nokia 铃声 → MIDI（或直接合成）转换**，现在没有。这是一个独立功能，**本轮没做**。
+- **UC**：两个 Alert 的文字被打成 `??`（`title=?? text=???????! type=INFO timeout=3000` 和 `title=?? text=???? type=INFO timeout=3000`）——
+  `System.out` 不输出非 ASCII，所以仍看不到内容；但能确定是**两个 INFO 类 Alert，3 秒超时**。
+  同一会话的 `midp_stderr.log`：3 次 `[IME] show`，用户都没输入就结束（`result=1/2 button=0 text=0 chars`，2 次 CLOSE、1 次 abort），**没有出现任何复制/粘贴相关的 IME 结果**。
+  所以\"UC 复制粘贴\"这次**没有拿到可分析的数据**。
+
+### 本轮改动（v02.81，只加日志，不改行为）
+| 文件 | 改动 |
+| --- | --- |
+| `phoneme-midp/.../lcdlf/lfjava/classes/javax/microedition/lcdui/AlertLFImpl.java` | `[ALERT]` 行里 title/text 经新方法 `vitaEsc` 把非 ASCII 写成 `\uXXXX` |
+| `vita-port/nokia_src/Sound.java` | 数据不可播时打印 `[VENDOR] nokia Sound: unplayable data, <n> bytes, type=.., first bytes=..`；`play()` 的 `catch` 打印 `[VENDOR] nokia Sound.play failed: <e>`；更正文件头里关于喜羊羊的错误注释 |
+| `vita-port/CMakeLists.txt` | 版本块 02.81 |
+
+### 验证
+- `./build.sh midp` exit 0；时间戳链 源码 15:29:53/15:30:00 → classes.zip 15:30:43 → VPK 15:31:23；
+  VPK 内 `midp_system.jar` 的 `AlertLFImpl.class` 含 `[ALERT]` 与 `vitaEsc`，`Sound.class` 含两条新消息；`com/sun` 仍 681；ELF 版本串 `v02.81`。
+- 产物 `out/vpk/midp_vita_v02.81.vpk`。**未在真机运行。**
+
+### 没做、以及下一步
+1. **喜羊羊 `getResourceAsStream` 返回 null**：下一步应在 `ResourceInputStream` / `Class.getResourceAsStream` 失败时，经 `System.out` 打印失败的资源名（Java 侧可行，`catch IOException` 处），
+   并在 `Natives.cpp` 的 `open` 返回 NULL 时记录是否走到 `ClassPathAccess`、jar 路径、条目名。这能区分\"根本没找到\"和\"找到了但打开失败\"。
+2. **卡死**：目前只有\"之后 `startmusic` 无下文\"。需要看卡死时 VM 线程在哪（`watchdog.log` 该段只有 `STORM ... pump starved but progressing`，没有 `WD-STALL` 卡死栈），
+   或让用户在卡死时触发 coredump 用 `psp2dmp` skill 分析。
+3. **帧率**：需要渲染耗时数据；`COMPATIBILITY_ROADMAP` 一节已提到浮层，但尚未做。
+4. **12 s / 8 s 长停顿**：原因未知，可能是 GC、IO 或 JIT；`watchdog.log` 里与之对应的是 `[WD-STALL] ... age_ms=0 ... io_read since_ms=760`/`io_write since_ms=1023` 样的条目，没有细查。
+5. Nokia 铃声 → MIDI 转换（喜羊羊无声的根本修复）。
+
+
+## 2026-10-23 资源打开失败日志 → v02.82（仅诊断）
+
+目的：查清 log118 里喜羊羊 `getResourceAsStream("/dialog.txt")` 为什么返回 null（jar 里条目是好的，之前没有任何记录）。
+
+### 关键文件修改记录
+- `phoneme-cldc/src/vm/share/natives/Natives.cpp`（共享文件，`#if defined(VITA)` 隔离，+35 行）：
+  - `Java_com_sun_cldc_io_ResourceInputStream_open` 末尾：`ClassPathAccess::open_entry` 返回 NULL 时，向 `vm_boot.log` 写
+    `[res] open FAILED name='<资源名>' len=N (k/64 logged)`。**只记失败，只记前 64 次**（防止游戏循环探测可选资源把日志灌满）；成功不记。
+  - 文件作用域（`extern "C" {` 之前）新增 `extern void vita_boot_log(const char*, ...);`。
+- `vita-port/CMakeLists.txt`：版本块 02.82。
+- **需要重建 VM 库**：`./rebuild_vm.sh`（改的是 `phoneme-cldc` 的 C++，`build.sh` 不会自己重编它）。
+
+### 这次踩的坑（写给下次）
+1. **`Natives.cpp` 的 `Java_*` 原生函数都在 `extern "C" { ... }` 里（212–1667 行）**。在函数体里写 `extern void vita_boot_log(...)` 会得到 **C 链接**，
+   而 `vita_boot_log` 在 `JVM_vita.cpp` 里是 **C++ 链接**（符号 `_Z13vita_boot_logPKcz`）→ 最终链接报 `undefined reference to 'vita_boot_log'`。
+   `JVM.cpp` 同样的写法没事，因为它不在 `extern "C"` 里。修法：声明放到 `extern "C" {` 之前。`extern "C++"` 不能写在函数体内（我试过，编译失败）。
+2. **`rebuild_vm.sh` 编译失败时仍然 `exit=0`**：第二次重建时 `Natives.cpp` 有编译错误，脚本照样打印 `library packed` 并返回 0，库里留的是旧对象。
+   我是靠 `grep error:` 和 `nm` 看到 `vita_boot_log` 仍是 C 符号才发现的。**以后必须看日志里的 `error:`，并用 `nm`/`strings` 核对库成员，不能只看 exit code。**
+3. 日志里恒有一条 `collect2: error: ld returned 1 exit status`（`fast_memclear`/`shared_entry` 未定义）——这是 `VM_BUILD.md` 记的**预期现象**（最后链 `cldc_vm_g` 缺 crt0），
+   与 `undefined reference to 'vita_boot_log'` 不是一回事，要分开看。
+4. `Symbol::string_copy(buf, size)` 的第二个参数是**缓冲区大小**，最多拷 size-1 个字符并补 NUL；`GUARANTEE(length() < size)` 在 PRODUCT 下被编译掉，所以超长名字会被截断而不是越界。
+
+### 验证
+- `libcldc_vm.a` 里 `_MergedSrc003.o` 含 `open FAILED name` 字符串，`vita_boot_log` 引用是 `_Z13vita_boot_logPKcz`（C++ 链接）。
+- `./build.sh` exit 0；`build/cmake/midp_vita` 的 `strings` 含 `open FAILED name`（1 处），版本串 `J2ME Player v02.82 b330`；`out/vpk/midp_vita_v02.82.vpk`（11761110 B）。
+- **未在真机运行。**
+
+### 下一轮怎么看
+- 重玩喜羊羊并进到会触发 NPE 的场景后，在 **`vm_boot.log`**（不是 vm_output.log）里搜 `[res] open FAILED`：
+  - 出现 `name='dialog.txt'`：资源名到了原生层、但没找到/没打开 → 再看是 `JarFileParser::get` 失败、`find_entry` 没找到还是 `open_entry` 失败（还需再加一层日志区分）。
+  - 完全没有 `[res]` 行但仍 NPE：说明 `ResourceInputStream.open` 返回的是**非 NULL**，null 出在更上层（Java 的 `Class.getResourceAsStream` 捕获了 `IOException`，
+    例如 `fixResourceName` 因 `..`/`.class` 后缀抛出，或 `fileDecoder == null` 抛 `IOException`）。这一点我在源码里**没有排除**。
+
+
+## 2026-10-23 v02.83：每游戏虚拟屏幕（路线图 P0-1）——动态尺寸 + 3 种缩放 + `game.cfg` key=value
+
+> `out/vpk/midp_vita_v02.83.vpk`（11761809 B），版本串 `J2ME Player v02.83 b330`。
+> **未在真机/Vita3K 运行。**
+
+### 为什么先做这项
+`COMPATIBILITY_ROADMAP.md` §0 排序第一：屏幕尺寸是"游戏按错误设备渲染"的总开关，
+同时是后续 profile/JIT/按键配置的载体。原实现固定 240x320 / 320x240，静态缓冲上限
+320x320，128x160、176x220、360x640 类游戏会出现布局错位、UI 出屏、触摸坐标错位。
+
+### 关键文件修改记录
+| 文件 | 改动 |
+| --- | --- |
+| `vita-port/src/vita_display.c` | `VITA_MAX_W/H` 320 → **800**（静态缓冲 1.9 MB .bss）；新增 `vita_display_set_size(w,h)`（越界按比例缩、再 clamp）、`vita_display_set_scale_mode(0 fit/1 stretch/2 integer)`、`vita_display_get_width/height()`；`compute_scaling()` 支持 stretch 与 integer（整数倍用 `scale &= ~0xFFF`，1x = 0x1000，与原 12.12 定点一致）；`vita_display_set_orientation()` 变成 `set_size` 的薄包装 |
+| `vita-port/src/vita_main.c` | 新增 `VitaGameDisplay` + `game_display_read()`（解析 `game.cfg`，兼容旧两行格式）+ `seed_internal_config(w,h)`（重写 `microedition.display.width/height`）；启动块改为 set_size/set_scale_mode 后按**实际生效尺寸**（`vita_display_get_*`，已被 clamp）生成 internal.config；`crumb_printf("display: WxH scale=N")` |
+| `vita-port/src/vita_menu.c` | `GameEntry` 加 `width/height/scale_mode`；`save_cfg()` 改写 key=value（remove+create，不用不可靠的 O_TRUNC）；新增 `game_cfg_load()` 统一新旧格式（替换 scan_games 里两处重复解析）；启动对话框加 `DLG_SCREEN`（auto + 7 预设循环）与 `DLG_SCALE`；列表右侧由 `P/L` 改为实际分辨率；切方向时若已有显式尺寸则交换宽高 |
+| `vita-port/CMakeLists.txt` | 版本块 02.83（02.82 已被 ResourceInputStream 诊断占用） |
+
+### `game.cfg` 新格式
+```
+class=com.example.Main        ('-' = auto)
+orient=portrait|landscape
+width=176                     (可选；0/缺省 = 跟随 orient)
+height=220
+scale=fit|stretch|integer     (可选，默认 fit)
+```
+旧格式（第 1 行 class、第 2 行 orient）仍可读；两者都由 host 测试覆盖。
+
+### 设计取舍
+- **静态缓冲而非 malloc**：`lfjport_ui_init()` 之前不能有分配失败路径；代价是 .bss
+  从约 3.9 MB 增到 5.8 MB，仍在 128 MB 应用分区预算内（newlib 池 64 MB 独立）。
+- **尺寸在 VM 启动前定死**：Java UI 只在该时机读一次；`internal.config` 与
+  `gxj_system_screen_buffer` 同时改，避免 `System.getProperty` 与 `Canvas.getWidth()` 不一致。
+- **未改 MIDP 共享源码**：全部落在 `vita-port/`。
+- `internal.landscape.config` 不再是主路径（任何尺寸都能生成），保留作模板回退。
+
+### 验证
+- `./build.sh` exit 0；`out/vpk/midp_vita_v02.83.vpk`；ELF 版本串 `v02.83 b330`。
+- 三个改动文件无**新增**编译告警（`vita_menu.c` 既有告警不变）。
+- VPK 内 `data/J2ME00001/lib/internal.config` 确认含 `microedition.display.width: 240` /
+  `height: 320`，`seed_internal_config` 的替换前缀长度（27/28）与之逐字核对。
+- **host 单测 25 个用例全过**（`/tmp/gdtest.c`，一次性、未入库）：空配置、旧两行格式、
+  key=value、`width=0` 视为未设、`#` 注释、CRLF、键/值前后空白、越界数值、
+  internal.config 重写的三条尺寸行与尾部保留。
+  - 测试先抓出 3 个真 bug 并已修：value **尾随空格**导致 `scale=stretch ` 不生效、
+    旧格式 `portrait` 不能覆盖 launch.cfg 方向、键前导空格。
+
+### 未做 / 下一步
+1. **真机验证**：`crumb.log` 的 `display: WxH scale=N`；选一个 176x220 或 360x640 游戏，
+   看布局与触摸；回归现有 4 个游戏（默认 auto 时应与 02.82 完全一致）。
+2. 每游戏设置还缺 **profile（设备画像）**、**locale**、**音量**——路线图 P0-2/P1-6。
+3. 大尺寸（480x800）下 chameleon 标题栏/软键区的布局未验证。
+4. 渲染仍为 CPU 逐像素缩放（路线图 P1-3），未做 GPU/NEON。
+
+### 教训
+- **版本号必须现场 grep**：本轮准备写 02.82 时发现它已被上一会话的资源诊断占用；
+  直接追加会覆盖别人的版本块（02.16 曾经踩过同类"后写覆盖先写"的坑）。
+
+
+## 2026-10-23 v02.84：设备画像 + JAD + 多 MIDlet（路线图 P0-2）
+
+> `out/vpk/midp_vita_v02.84.vpk`（11769117 B），版本串 `J2ME Player v02.84 b330`。
+> **未在真机/Vita3K 运行。**
+
+### 一个必须先说清的机制（本轮最重要的发现）
+
+`System.getProperty()` 在 phoneME 里走
+`Java_java_lang_System_getProperty0`（`phoneme-cldc/src/vm/share/natives/Natives.cpp:600`）
+→ `JVMSPI_GetSystemProperty`（`phoneme-midp/src/ams/ams_base_cldc/reference/native/midp_run.c:309`）
+→ `getSystemProperty()` → **只查 applicationProperties**，
+而 applicationProperties 只来自 **`lib/system.config`**。
+`getInternalProperty()`（会先查 internal.config）是另一条链，只给实现自己用。
+
+⟹ **`internal.config` 里的 `microedition.platform: PS Vita` / `device.manufacturer: Sony`
+从来不是游戏看到的值**；游戏看到的 `microedition.platform` 一直是 `system.config` 的
+`j2me`。所以"设备身份"必须写 `system.config`——这一条此前没有任何文档写对过。
+
+### 关键文件修改记录
+| 文件 | 改动 |
+| --- | --- |
+| `vita-port/src/vita_main.c` | `VitaGameDisplay` → `VitaGameConfig`（+ `profile`/`locale`/`use_jad`）；内建 `vita_profiles[]` 6 个画像（generic / nokia6230 / nokia_n95 / se_k800 / samsung_e250 / siemens_c65）；新增 `seed_system_config()` + `system_cfg_override()`（读 app0 模板逐行替换 6 个键，缺失则追加；模板读不到时退回原样 copy_file，**不写最小文件**，否则会丢掉 `Connector.protocolpath`）；`find_jad_for_jar()`；尺寸解析改为"显式 width/height > orient > profile 默认"，profile 也参与默认尺寸 |
+| `vita-port/src/vita_menu.c` | `GameEntry` + `profile[24]`/`locale[16]`/`midlet_idx`；`game_cfg_load()`/`save_cfg()` 读写新键；新增 `midlets_scan()`（JAD 优先，其次 `META-INF/MANIFEST.MF`）、`midlet_add()`、`midlet_cycle()`；对话框新增 `profile`（6 项循环，标签带分辨率）与 `midlet`（N 项循环，选中即改 `cls`）；列表分辨率改为 `effective_size()`（含 profile 默认值 + 方向交换） |
+| `vita-port/CMakeLists.txt` | 版本块 02.84 |
+
+### `game.cfg` 最终格式
+```
+class=com.example.Main        ('-' = auto)
+orient=portrait|landscape
+width=176                     (0/缺省 = 用 profile 默认尺寸)
+height=220
+scale=fit|stretch|integer
+profile=generic|nokia6230|nokia_n95|se_k800|samsung_e250|siemens_c65
+locale=zh-CN                  (可省略 = 保留模板的 en-US)
+midlet=2                      (1-based；>1 才写入)
+jad=auto|off                  (默认 auto)
+```
+旧两行格式仍然可读。
+
+### 画像取值（照真机字符串抄，游戏靠它分支）
+| profile | platform | 默认屏 |
+| --- | --- | --- |
+| generic | `j2me` | 240x320 |
+| nokia6230 | `Nokia6230/2.0 (03.15) Profile/MIDP-1.0 Configuration/CLDC-1.0` | 128x128 |
+| nokia_n95 | `NokiaN95/11.0.026; Series60/3.1 Profile/MIDP-2.0 Configuration/CLDC-1.1` | 240x320 |
+| se_k800 | `SonyEricssonK800i/R1CB Browser/NetFront/3.3 ...` | 240x320 |
+| samsung_e250 | `SAMSUNG-SGH-E250/1.0 Profile/MIDP-2.0 Configuration/CLDC-1.1` | 128x160 |
+| siemens_c65 | `SIE-C65/00 Profile/MIDP-1.0 Configuration/CLDC-1.0` | 130x130 |
+
+`generic` 完全保持旧行为（platform 仍是 `j2me`），所以不选 profile 的游戏无回归。
+
+### JAD 接法
+`CldcMIDletSuiteLoader`（`phoneme-midp/src/ams/ams_base_cldc/reference/classes/com/sun/midp/main/CldcMIDletSuiteLoader.java:187`）
+只看 **arg0 后缀**：`.jad` → 读 JAD 属性，`.jar` → 读 MANIFEST。所以启动器发现有
+`<dir>/game.jad` 或 `<dir>/<jarbase>.jad` 时把 JAD 路径当 arg0 传下去，`jad=off` 或
+文件不存在则仍传 jar。菜单侧也用同一优先级解析 `MIDlet-1..N`。
+
+### 验证
+- `./build.sh` exit 0；`out/vpk/midp_vita_v02.84.vpk`；ELF 版本串 `v02.84 b330`；
+  `strings` 里 5 条真机 platform 字符串齐全。
+- VPK 内 `data/J2ME00001/lib/system.config` 确认含 profile 要覆盖的全部 3 个键
+  （profiles/locale/platform）；manufacturer/model/version 由代码追加。
+- **host 单测 45 个断言全过**（`/tmp/p2test.c`，一次性、未入库）：
+  profile→默认尺寸（含 landscape 交换）、显式尺寸优先、只给 width 时 height 取 profile、
+  未知 profile 回落 generic、`jad=off`/`locale`/`scale` 解析、
+  system.config 重写（替换/追加/去重/保留 security 与 Connector 行）、
+  `MIDlet-N` 解析（中文名、缺 icon、`, ,class` 空字段、无逗号行忽略、JAD 与 MANIFEST 两种源）。
+
+### 没做 / 下一步
+1. **真机验证**：`crumb.log` 应出现 `profile: <name> locale=.. jad=..`；选 Nokia 画像后
+   在游戏里 `System.getProperty("microedition.platform")` 应变成 N95 串。
+2. 画像目前只有 6 个且是编进二进制的 C 表（不做 VPK 数据文件，避免改构建）；
+   若要"用户自定义画像"，下一步改成读 `ux0:/data/J2ME00001/profiles/*.cfg`。
+3. `microedition.locale` 改了但 i18n 资源（chameleon 中文标题）是否跟随未验证。
+4. JAD 只当作属性源；`MIDlet-Jar-URL`/签名/`MIDlet-Jar-Size` 不校验（不安装，直接跑）。
+5. 每个游戏的"推荐配置"数据库（按 jar 名/SHA1 自动套用）——路线图 P1-6，未做。
+
+
+## 2026-10-23 v02.85：屏幕虚拟键盘（路线图 P0-3 第一片）
+
+> `out/vpk/midp_vita_v02.85.vpk`（11774771 B），版本串 `J2ME Player v02.85 b330`。
+> **未在真机/Vita3K 运行。**
+
+### 为什么
+Vita 只有 12 个可用按键，全被方向/软键/游戏键占满；要按 `7` 只能重映射，然后
+就失去原来那个键的功能。国产 RPG/菜单类游戏大量用数字键，这是"按键不够用"的
+硬缺口。
+
+### 设计
+- **键位放在信箱边栏**：虚拟屏几乎都不是 16:9。240x320 竖屏在 960x544 上显示为
+  407x543，两侧各约 276 px；数字键盘放左栏、动作键放右栏，**不占游戏像素**。
+  只有游戏铺满面板（stretch / 宽屏）时才叠加在画面上。
+- **叠加时用 CPU 混合**：显示忽略 alpha（`vita_display.c` 的 `clear_letterbox`
+  注释已说明），所以"半透明"= 读回后缓冲像素再按权重混色，不是硬件 alpha。
+- **触摸→按键走原路径**：命中虚拟键就 `emit_key_event(KEYMAP_KEY_*, PRESSED/
+  RELEASED)`，下游（VM 事件泵 / Java）完全不知道键盘存在。
+
+### 关键文件修改记录
+| 文件 | 改动 |
+| --- | --- |
+| `vita-port/src/vita_vkey.c`（新增） | 5x7 位图字库（0-9 `*` `#` A B C D K O S）、面板/按钮绘制、`build_layout()`、`vita_vkey_hit()`、`vita_vkey_load/save`（`vkey.cfg`：`on=` / `mode=`） |
+| `vita-port/src/vita_vkey.h`（新增） | 公开 API |
+| `vita-port/src/vita_display.c` | blit 之后调用 `vita_vkey_draw(vita_fb, dst_x, dst_y, dst_w, dst_h)`（IME 活跃时跳过）；`lfjport_ui_init` 里 `vita_vkey_set_geometry()`；新增 `vita_display_get_rect()`；`dst_*` 声明提前 |
+| `vita-port/src/vita_input.c` | 触摸先过 `vkey_touch()`（**必须在 `vita_display_map_touch()` 之前**——键盘在游戏矩形之外的边栏，后者会直接拒绝）；命中则不产生指针事件；`vkey_release()` 覆盖抬手/滑出/IME 抢占三条路径 |
+| `vita-port/src/vita_menu.c` | 设置页新增"虚拟键盘"开关（存 `vkey.cfg`，与启动器同一数据源） |
+| `vita-port/src/vita_main.c` | 每轮 `vita_vkey_load(NULL)`，`game.cfg` 的 `vkey=on\|off` 可逐游戏覆盖；`crumb` 打 `vkey: N mode=M` |
+| `vita-port/CMakeLists.txt` | 源文件列表 + 版本块 02.85 + **链接参数 `--defsym=__sce_headroom=0x10000`** |
+
+### 一个必须记住的构建陷阱（本轮实弹）
+新增代码让 segment 0 越过 0x813a0000（RW 段的 64 KiB 对齐边界），
+`vita-elf-create` 报
+```
+Cannot allocate 4040 bytes for SCE data at end of segment 0; segment 1 overlaps
+```
+然后**直接段错误**。vitasdk 的 `armvita.x` 里有
+` . = DATA_SEGMENT_ALIGN(0x10000,0x10000); . += DEFINED(__sce_headroom) ? __sce_headroom : 0;`
+所以只要 `-Wl,--defsym=__sce_headroom=0x10000` 就能把 RW 段推后一页，为 SCE 元数据
+腾出空间（同时给后续增长留约 60 KB）。ELD 段布局验证：RW 从 `0x813a0000` →
+`0x813b0000`。
+
+### 布局/命中验证
+- **host 单测**（`/tmp/vkeytest.c`，一次性、未入库）复制 layout 算法，对
+  240x320 / 320x240 / 176x220 / 128x160 / 360x640 / 480x800 六种虚拟屏验证：
+  1. 所有按钮在屏幕内；2. 任意两按钮不重叠；3. 每个按钮中心命中回同一个 key；
+  4. 数字 0-9/`*`/`#` 12 个键全部可达；5. 竖屏时数字面板完全落在左侧边栏
+  （不盖住游戏）；6. `mode=1` 时确实叠加在游戏矩形内；7. `mode=2` 对铺满屏
+  游戏不画任何按钮。
+- 测试抓出 2 个真 bug 并已修：
+  1. **动作块宽度算错**：dpad 是 3x3 十字，宽 `3*unit+2*gap`，原来按 `2*unit+gap`
+     居中 → 320x240 那档右臂 x=957..991 **出屏**；
+  2. 叠加模式原来固定贴屏幕左下/右下，`mode=1` 并不可控；改为锚定游戏矩形
+     （左下/右下），并夹到屏幕内。
+- 另外 `p2test`（v02.84 的 45 个断言）与 `vkeytest` 均 **ALL PASS**。
+
+### 没做 / 下一步
+1. **真机验证**：`设置 > 虚拟键盘` 打开后，`crumb.log` 应有 `vkey: 1 mode=0`；
+   游戏里点 5 应触发 `KEYMAP_KEY_5`（可在 `input_debug.log` 看 `[VKEY] touch`）。
+2. 目前一次只能按一个虚拟键（面板只报一个主手指）。**组合键/多点**需要遍历
+   `SceTouchData.reportNum`，并把 `vkey_down` 改成数组。
+3. 没有"按键按下高亮"（绘制时不知道按下状态）。要做的话把按下索引传进
+   `vita_vkey_draw`。
+4. 布局是写死的两套（边栏/叠加），没有用户自定义位置/大小/透明度。
+5. `mode=1` 目前只能改文件，菜单里没有入口。
+6. 触摸→指针 与 触摸→按键 的切换（P0-3 剩余项）未做。
+
+---
+
+## 2026-10-23 v02.86：设置页开关 + `defaults.cfg` 全局默认（用户补充需求）
+
+> 产物 `out/vpk/midp_vita_v02.86.vpk`，版本串 `J2ME Player v02.86 b330`。
+
+### 背景
+用户问"有些开关配置可以加在设置里面，有处理吗"。在此之前所有兼容性开关都只能
+手改文件（`game.cfg` / `vkey.cfg` / `launch.cfg`），普通用户根本找不到。于是把
+v02.83~v02.85 新增的开关全部搬进原生菜单的「设置」页，并引入**全局默认层**。
+
+### 三层配置优先级（重要，后续加开关照这个走）
+```
+game.cfg（单游戏）  >  defaults.cfg（全局默认）  >  编译期内置默认
+```
+- `defaults.cfg` 路径 `ux0:/data/J2ME00001/defaults.cfg`（`vita_main.c` 的
+  `defaults_read()` 与本文件的 `defaults_save()/defaults_load()` 共用同一路径）。
+- 写入的键：`profile=` / `scale=` / `vkey=` / `vibrate=` / `locale=`。
+- `VitaGameConfig` 里 `width/height` 保持 0（"未指定"），`vkey`/`vibrate` 用
+  **-1 表示未声明**，这样"未声明"才能与"显式 off"区分开。
+
+### 关键文件修改记录
+- `vita-port/src/vita_menu.c`
+  - `enum { SET_VIEW, SET_PROFILE, SET_SCALE, SET_VKEY, SET_VIBRATE, SET_KEYMAP, SET_JIT, SET_N }`
+    —— 设置页从 2 行扩到 7 行，中文标签：游戏视图 / 默认机型 / 默认缩放 /
+    虚拟键盘 / 振动 / 按键映射 / JIT 编译。
+  - `set_profile/set_scale/set_vkey/set_vibrate` 四个循环选择项。
+  - `defaults_save()` / `defaults_load()`：先写临时内容再 `sceIoRemove` +
+    重写（复用 `save_cfg()` 的"删后建"写法，避免残留旧内容）。
+  - `settings_load()` 顺序：先 `set_vkey = vita_vkey_load(NULL);` 读 vkey.cfg，
+    再 `defaults_load()` 覆盖，最后 `menu.cfg` 里的 UI 状态。
+- `vita-port/src/vita_main.c`
+  - `VitaGameConfig` 增 `int vibrate;`；`defaults_read()` 解析 `vibrate=`；
+    `game_config_read()` 同样解析（覆盖全局）。
+  - 启动处 `if (gc.vibrate >= 0) vita_vibrate_set_allowed(gc.vibrate);`
+    + `crumb_printf("vibrate: %d", gc.vibrate);`
+
+### 验证
+- `./build.sh` exit 0，VPK 正常生成；host 单测 `gdtest`/`p2test`/`vkeytest`
+  全部 ALL PASS（defaults 解析逻辑复用了 `game_config_read` 的同一段代码）。
+
+### 踩到的坑：`multi_replace_string_in_file` 的 "Multiple matches found"
+- `vita_main.c` 里 `defaults_read()` 与 `game_config_read()` 的 `vkey=` 解析块
+  **文本完全相同**，导致一次多替换里两条同时命中两处 → 整批失败。
+- 教训：给这类替换器写 `oldString` 时，**上下文必须外扩到两侧不同的行**
+  （比如后一条多带 `class=/midlet=` 那段注释），否则靠行内内容去歧义是不可靠的。
+
+### 没做 / 下一步
+1. 真机验证设置项是否真的写进 `defaults.cfg`、重启后是否保持。
+2. 设置页没有"恢复默认"，也没有把 `vkey.cfg` 的 `mode` 暴露出来。
+3. 「按键映射」/「JIT 编译」两行目前只是**显示当前状态**，还不能在菜单里改。
+
+---
+
+## 2026-10-23 v02.87：MP3 播放 + 振动可用（路线图 P0-4）
+
+> 产物 `out/vpk/midp_vita_v02.87.vpk`（11796040 B），版本串
+> `J2ME Player v02.87 b330`。ELF 段：TEXT `0x81000000+0x3a7634`，
+> RW `0x813d0000+0x59992c`（`__sce_headroom=0x10000` 生效，无重叠）。
+
+### MP3：为什么自带解码器
+- MIDP 的 `Manager.createPlayer()` 对 `audio/mpeg` 原本直接抛
+  `MediaException`，很多游戏（尤其 2005 年后的 S40/S60 移植）BGM 全是 MP3，
+  于是**进游戏就没声音**，是最影响"能不能玩"的一个缺口。
+- Vita 的 `SceAudio` 只输出 PCM，没有系统解码器可用；`SceAvPlayer` 依赖
+  `sceAvPlayerInit` + 视频/文件句柄，用在几百 KB 的短 BGM 上过重且流式定位
+  麻烦。所以选**编译进固件的 minimp3**。
+
+### 关键文件修改记录
+- `vita-port/src/minimp3.h`（新增，1865 行，**CC0/public domain**，无需分发
+  额外许可文本）。头文件式单文件库，只在 `vita_mp3.c` 里以
+  `#define MINIMP3_IMPLEMENTATION / MINIMP3_ONLY_MP3 / MINIMP3_NO_STDIO` 引入，
+  避免多 TU 重复定义。
+- `vita-port/src/vita_mp3.c` / `.h`（新增）
+  - `struct VitaMp3`：整段 MP3 一次性读进内存（J2ME 的 BGM 通常几十 KB~几百
+    KB，比边播边读简单得多），只做**顺序播放 + rewind**，不 seek。
+  - `skip_id3v2()`：处理 ID3v2 的 syncsafe size 与 footer 标志位（0x10）——
+    很多老游戏 MP3 前面挂着 2~10 KB 的专辑封面，不跳过会一开始就解不出帧。
+  - `mp3_next_frame()`：逐帧解码；`vita_mp3_read()` **最近邻重采样到 48 kHz
+    立体声**并乘音量，EOF 后补 0，保证 `javacall_media_read` 永远拿到满块。
+  - 重采样选最近邻而不是线性插值：J2ME 的 BGM 多为 22.05/44.1 kHz，倍率是
+    整数关系（48/24=2、48/44.1≈1.088），最近的音质损失在这类素材上听不出来，
+    却省掉每个采样一次插值乘加——Vita 的 CPU 在 444 MHz 下这点很值。
+- `vita-port/src/vita_audio_javacall.c`
+  - caps 表新增 `{JAVACALL_MEDIA_FORMAT_MS_PCM, "audio/mpeg", MEMORY|FILE_LOCAL, 0}`
+    （content type 声明成 MS_PCM 是因为**我们吐给 Java 层的就是 PCM**，
+    `get_format()` 对 MP3 同样返回 MS_PCM）。
+  - `realize()` 接受 `audio/mpeg`/`audio/mp3`/`audio/x-mp3`/`audio/mpeg3`/
+    `audio/x-mpeg` 五种写法（不同游戏的 JAD 写得不一致）。
+  - `do_buffering()`：MP3 也复用 WAV 的累加缓冲（`wav_acc`），靠
+    `pl->wav.valid || pl->mp3` 判定；读到结束标记（NULL）时才建解码器，
+    这样才能拿到 `duration_ms`。
+  - 新增 `mp3_render_player()` + 线程分支（**放在 MIDI 分支之前**，否则
+    MP3 玩家的 `midi` 判定先命中会走错路径）；单独一组序号
+    `g_mp3_req/g_mp3_seq/g_mp3_done`，与 WAV/MIDI/JTS 互不干扰。
+  - 静音（`volume=0`）时走"睡一块的时间"而不是解码，省 CPU。
+- `vita-port/CMakeLists.txt`
+  - `add_executable` 增 `src/vita_mp3.c`、`src/vita_vkey.c`、`src/vita_vibrate.c`。
+
+### 振动：为什么能"修好"
+- `Display.vibrate()` 原来完全无效：`annunciator/stubs/native/anc_st_vibrate.c`
+  的 `anc_start_vibrate()` 永远 `return KNI_FALSE`。
+- 关键发现（**改任何 anc_* 之前先读这里**）：Java 层
+  `DisplayDeviceAccess.vibrate()` 自己用 `TimerService` 排了停止任务，
+  `vibrate0(displayId, onoff)` 只负责开关；而且 `vibrate0` 的**第一句**就是
+  `anc_stop_vibrate()` 当能力探测——它返回 `KNI_FALSE` 就直接整体返回 false。
+  所以 `anc_stop_vibrate()` 必须"即使当前没在振动也要返回 TRUE"，否则功能
+  永远起不来。
+- `vita-port/src/vita_vibrate.c` / `.h`（新增）：用 CMake 的
+  `arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} anc_st_vibrate.o` 把旧 stub 从
+  `libobj.a` 里删掉，再链本文件（与 `lfjport_fb_export.o`、
+  `mastermode_export.o` 同一套机制）。
+- 能力退化：`sceCtrlSetActuator()` 返回 <0 时（**掌机 Vita 根本没有马达**，
+  Vita3K 也不模拟）把 `g_supported` 锁成 0 并只打印一次
+  `[VIB] SetActuator rc=0x... (no actuator)`，此后两个 `anc_*` 都返回
+  `KNI_FALSE`，游戏会干净地认为"本机不支持振动"而不是每帧白调。
+
+### 编译期踩到的坑
+1. **`SCE_CTRL_PORT_1` 不存在**。vitaSDK 的 `sceCtrlSetActuator(int port, ...)`
+   直接收 `int`，文档写"1 = 第一个配对手柄"，头文件里没有任何
+   `SCE_CTRL_PORT_*`。改成自己 `#define VIB_PORT 1`。
+   （`SceCtrlActuator.small/.large` 字段名是对的，8 字节，有
+   `VITASDK_BUILD_ASSERT_EQ(8, ...)` 兜底。）
+2. **CMake 版本块顺序被打乱**：追加 02.86/02.87 时把两个新块插到了 02.85 的
+   注释之前，并且**把 02.85 的 `set(VITA_VERSION "02.85")` 整行挤掉了**，
+   直接导致版本串回退。用脚本把 02.86/02.87 移到 02.85 块之后并补回 02.85，
+   再用 `grep -n 'set(VITA_VERSION  "02.8[4-7]"'` 验证是
+   1898/1916/1939/1949 递增。
+   **教训（已升级为硬规则）：每次加版本块前先
+   `grep -n 'set(VITA_VERSION' vita-port/CMakeLists.txt | tail -3`，
+   加完必须再 grep 一遍确认递增，且旧版本块的 `set()` 不能被删。**
+3. **`get_player_controls` 必须给 MP3 返回"既不是 TONE 也不是 MIDI"**（关键，
+   差点又踩一次 MIDI 的老坑）。`HighLevelPlayer.getPlayerFromType()` 是
+   `else if` 链：TONE → DirectTone、MIDI → DirectMIDI、都没有 → DirectPlayer。
+   如果 MP3 报 TONE，就会落到 `DirectTone`，而
+   `DirectTone.doRealize()` 会**再读一遍 stream 并跑 JTS 校验器**；当源长度未知
+   （`Manager.createPlayer(InputStream, "audio/mpeg")` 很常见）时读回的是**空
+   数组**，于是抛
+   `Tone sequence check failed at offset 0: missing version information`
+   ——与 v02.60 MIDI 的失败一模一样（见 log109 记录）。
+   所以 MP3 分支返回 `JAVACALL_MEDIA_CTRL_VOLUME` 单一位，落到 `DirectPlayer`
+   （基类）——它的 `doRealize()` 什么都不读，`doPrefetch()` 只做
+   `nPrefetch + acquireDevice`，全程走我们的 javacall 实现，没有任何序列校验。
+   **注意**：WAV 目前仍报 TONE 并靠 `DirectTone` 工作（因为 `nRealize` 已经把
+   MIME 识别出来、`mediaDownload.fgDownload()` 又把流读到了 EOF，
+   `DirectTone.doRealize()` 里 `contLength == tell()` 直接 early-return 才没炸）。
+   这属于"侥幸没坏"，**本次没动它**（最小 diff）；若以后 WAV 出现同样的
+   checkSequence 报错，按 MP3 的写法分流即可。
+
+### 验证
+- `cmake --build build/cmake` 通过（vibrate.c 的端口错误修完后）；
+  `strings build/cmake/midp_vita` 能查到 `audio/mpeg`、
+  `mp3 buffered: %d Hz %d ch, %ld ms, %lu bytes`、`[VIB] start`、
+  `[VIB] SetActuator rc=0x%08x (no actuator)`。
+- `arm-vita-eabi-readelf -l`：3 个 program header，LOAD(TEXT) 与 LOAD(RW)
+  不重叠，`vita-elf-create` 不再报 "segment 1 overlaps"。
+- host 单测 `gdtest`（25 断言）/ `p2test`（45 断言）/ `vkeytest` 全部
+  **ALL PASS**，确认 P0-1/P0-2/P0-3 无回归。
+
+### 没做 / 下一步
+1. **全部未上真机**。MP3 首播延迟（要先整段读进内存）与振动都需要实机确认。
+2. 只支持 **MP3(CBR/VBR 都可以，但必须能逐帧同步)**；AMR-NB/AMR-WB、AAC、
+   XMF/SMF 变体、Nokia 单音铃声（RTTTL/OTA）仍未支持 —— P0-4 剩余项。
+3. 内存：整段 MP3 常驻堆，一首 3 MB 的 BGM 会吃掉 3 MB Java 堆外内存。
+   后续若遇到大文件要走"边播边读 + 环形缓冲"。
+4. 没有 seek/loop 语义以外的定位；`set_media_time` 目前对 MP3 无效。
+5. 振动强度/时长不可调（固定 255），也没做 `Display.flashBacklight`。
+
+---
+
+## 2026-10-23 v02.88：补齐 P0-4 剩余项（AMR-NB / AAC / seek / 内存 / 铃声）
+
+> 产物 `out/vpk/midp_vita_v02.88.vpk`（11872235 B），版本串
+> `J2ME Player v02.88 b330`。ELF 段：TEXT `0x81000000+0x3c0bb4`，
+> RW `0x813f0000+0x59af2c`（TEXT 距 RW 起始还有 ~190 KB 余量，见文末）。
+
+### 架构：一个 vtable 顶三种格式
+v02.87 的 MP3 是独立一套 `g_mp3_req/seq/done` + `mp3_render_player()`。再加
+AMR/AAC 就是三份几乎相同的渲染循环，所以先抽了一层：
+
+- `src/vita_pcm_dec.h/.c`（新）：`vita_pcm_dec` 函数表
+  （`open/close/channels/rate/duration_ms/rewind/seek_ms/read`）+
+  `vita_src` 滑动窗口读 + 内存源适配器（`vita_mem_src` / `vita_dec_read_mem`）。
+- `vita_audio_javacall.c`：`pl->mp3/mp3_len/mp3_dec` → 泛化为
+  `pcm/pcm_dec/pcm_len/pcm_mem/pcm_fd/pcm_tmp/pcm_seek_ms`；`g_mp3_*` →
+  `g_pcm_*`；`mp3_render_player()` → `pcm_render_player()`。播放线程现在只有
+  一个"压缩 PCM"分支，MP3/AMR/AAC 共用。
+- `get_player_controls()` 对三者都只报 `VOLUME`（落到 `DirectPlayer`），原因
+  与 v02.87 MP3 那段注释一致——报 TONE 会进 `DirectTone`，其 `doRealize()`
+  会重读流并跑 JTS 校验器，对压缩音频必然抛
+  `Tone sequence check failed at offset 0`。
+
+### AMR-NB（`src/vita_amr.c` + `src/amr3gpp/`）
+- 解码器用 **3GPP TS 26.104 浮点参考实现**（7 个文件，~350 KB），从
+  `unjello/foo_input_amr`（Unlicense/public domain）取来放进 `src/amr3gpp/`。
+  选它的原因：vitaSDK 的 `sceAudiodec` 只有 AT9/MP3/AAC/CELP，**没有 AMR**；
+  写一个 ACELP 解码器不现实；浮点在 Vita 的 VFP 上完全够用（AMR-NB 是
+  50 帧/秒的 8 kHz 语音）。
+- 容器：`#!AMR\n` 存储格式，每帧 ToC + payload，帧长表
+  `{13,14,16,18,20,21,27,32,6, 0×6, 1}`（0 = 保留，跳 1 字节重新同步）。
+  `#!AMR-WB\n` 直接拒绝（不同编解码器）。
+- 输出：160 样本/帧 ×6 就近升采样到 48 kHz、单声道复制成立体声。
+- duration = 帧数 × 20 ms（开文件时扫一遍帧头，不解码）。
+
+**对 vendor 代码打了 4 个补丁（都在文件注释里写明）**：
+1. `malloc` → `calloc`（15 处）：3GPP 参考码会读到 `Decoder_amr_reset()`
+   没有初始化的状态，用 malloc 时是 **0xBEBE... 垃圾**，ASan 直接报
+   "signed integer overflow: -4702111234474983746 * 21299"。
+2. 一处**重叠 memcpy → memmove**（`Decoder_amr` 里 `old_exc` 左移
+   148 个字，源在目标 +40 处）：ASan `memcpy-param-overlap`。
+3. `Lsf_lsp()` 里 `ind` 钳到 [0,63]（`cos_table` 只有 65 项）：
+   损坏帧会把 3GPP 代码带到表外几百 MB 处 → 整个模拟器段错误。
+   这是"畸形文件不能崩模拟器"的兜底。
+4. `typedef.h` 的 `Word32` 从 `long` 改成 `int32_t`（其余同理用 stdint）：
+   原文件注释写着 "valid for PC"，64 位宿主上 `long` 是 8 字节，
+   宿主机单测会算错。
+
+### AAC（`src/vita_aac.c`）
+- 用 **sceAudiodec**（主机自带硬件解码块，`SCE_AUDIODEC_TYPE_AAC`）。
+  理由：AAC-LC 解码器自己写不现实，faad2 是 GPL、helix 是 RPSL，
+  而主机已经有现成的。
+- **一次性探针** `aac_probe()`：`sceSysmoduleLoadModule(SCE_SYSMODULE_AUDIOCODEC)`
+  → `sceAudiodecInitLibrary`，任一失败就永久标记不支持并只打一行日志。
+  这样 Vita3K 若没有 SceAudiodec，行为退回 v02.87（无声），**不会崩**。
+- 容器：ADTS（`0xFFF` 同步字 + profile/采样率/声道/帧长），逐帧喂
+  `sceAudiodecDecode`；单帧坏掉只跳过该帧。
+- 整个 ES 一次性读进内存（J2ME 里的 AAC 只有几十~几百 KB），seek 因此是
+  字节级的。
+
+### seek（三个格式都支持）
+- `javacall_media_set_time()` 不再无条件返回 0：压缩播放器把请求
+  `pl->pcm_seek_ms = want` **排队**，由播放线程在块边界应用
+  （`pcm_render_player` 开头），保证解码器状态只被一个线程碰。
+- `start()` 里如果存在待处理 seek 就**不** rewind，否则会覆盖它。
+- MP3/AAC 的 seek 是"从头发解码到目标"（3 分钟 BGM ≈ 7000 帧，几十 ms，
+  setMediaTime 不是热路径；建索引要额外占内存）；AMR 有固定 20 ms 栅格，
+  seek 精确到帧。
+
+### 内存：512 KB 内存 + 溢写到文件（"环形缓冲"）
+- MMAPI 的时序决定了**没法真正流式**：`nPrefetch()` 要等下载循环读到 EOF
+  才返回，所以播放开始前整个流已经收完了。能做的只有"不让它常驻堆"。
+- 做法：每个压缩流前 `PCM_MEM_KEEP`(512 KB) 留在 `wav_acc`，其余
+  `sceIoWrite` 到 `ux0:/data/J2ME00001/.pcm<player_id>.tmp`
+  （**路径含 player_id**：两个播放器同时放 BGM/SFX 时不能共用一个文件）。
+- 解码器通过 `pcm_src_read()` 把"内存段 + 文件段"拼成一个连续源，
+  再经 `vita_src` 的 32 KB 窗口读出。常驻内存 = 512 KB + 窗口 + 一帧 PCM，
+  与文件大小无关（3 MB 的 BGM 原来会占 3 MB 堆）。
+- ux0: 不可写时**自动退回全内存**（旧行为），满卡不该让游戏变哑。
+- `pcm_src_read()` 的文件段用 `sceIoPread`（显式偏移），不会和顺序写
+  抢文件位置。
+
+### 铃声：RTTTL / Nokia OTA（`nokia_src/RingTone.java`）
+- 这是 log118 里那个真实案例：`com.nokia.mid.sound.Sound(byte[],
+  FORMAT_TONE)` 拿到的是真 OTA 铃声，v02.81 起它只会被识别成"不可播放"
+  然后 `SOUND_UNINITIALIZED`，也就是**音乐全场静音**。
+- 转换目标选 **8 kHz / 8-bit / 单声道 WAV**（8 KB/秒），走 v01.96 起就
+  验证过的 RIFF→PCM→sceAudioOut 路径，再由 native 侧 ×6 升到 48 kHz。
+  没有走 `audio/x-tone-seq`：那条路依赖 `DirectTone` 的 JTS 校验器，
+  从 stream 建 tone player 时 `get_format()` 返回 UNKNOWN 会直接抛
+  "Unknown Media Format"（见 `HighLevelPlayer.realize()`）。
+- **OTA 语法**（照 Sonivox/EAS `eas_ota.c` 对齐，J2ME-Loader 用的就是它）：
+  `长度字节 + 命令字节（>>1 = id：0x25 铃声编程 / 0x1d sound / 0x22
+  unicode）`，之后是 **MSB-first 位流**的 3-bit 指令：
+  `0x01` 音符(4b 音高 + 3b 时值指数 + 2b 附点/三连音)、`0x02` 音阶(2b)、
+  `0x03` 风格(2b)、`0x04` 速度(5b 查 32 项 tick 表)、`0x05` 音量(4b)、
+  `0x00` 模式（**当作结束**：真文件的字节对齐填充全是 0，EAS 也是这么收尾）。
+  时值 = `tick * (32 >> exp) / 256` ms。
+- RTTTL 走标准三段式 `name:d=4,o=5,b=63:notes`，支持 `#`、附点、
+  `p` 休止、前缀时值（`8d`）、后缀八度（`c6`）。
+- 音高用 `Sound.FREQ_TABLE`（把 `private` 放开成包内可见 + `freqForNote()`）：
+  CLDC 没有 `Math.pow`，而这张表正是 Nokia 自己的音准。
+- 转换失败（不认识的数据）仍然返回 null → 保持 `SOUND_UNINITIALIZED`，
+  行为和以前一致，但会打一行 `unplayable data`。
+
+### 验证
+- **宿主机单测 `/tmp/dectest.c`（21 断言，ALL PASS）**：`vita_src` 的
+  前向跳读/回读/倒退拒绝/失效重启/尾部短读/越界；合成 AMR 文件
+  （100 个 12.2k + 5 个 no-data 帧）验证 rate/channels/duration=2100 ms、
+  总输出 105×160×6=100800 帧、EOF 返回 0、rewind 可重放、seek(1000)
+  剩 55 帧、seek 越界返回 0、volume=0 静音；垃圾流被 mp3/amr 双双拒绝。
+- **Java 单测 `/tmp/rt/RingToneTest.java`（13 断言，ALL PASS）**：
+  RIFF/WAVE 头、8000 Hz、8 bit、data 长度自洽、7 个四分音符 @120 BPM
+  ≈3500 ms、带休止/附点/升号的 RTTTL、手工构造的 OTA 位流（tempo 15 +
+  scale 4 + 4 个音符 → 4×428 ms = 1712 ms，和 tick 表算出来完全一致）、
+  垃圾输入被拒。OTA 的位序还与 EAS 的 `OTA_FetchBitField`（MSB-first）
+  逐字段核对过。
+- `build_nokia_stubs.sh` 用 `-source 1.3` 编译 **RingTone 通过并预校验**，
+  `midp_system.jar` 里已含 `com/nokia/mid/sound/RingTone{,$Bits}.class`。
+- `./build.sh` exit 0；`out/vpk/midp_vita_v02.88.vpk`；
+  `strings` 可见 `pcm buffered: %s %d Hz %d ch...`、`pcm seek -> %ld ms`、
+  `[AAC] sceAudiodec AAC ready`、`audio/amr`、`audio/aac`。
+- 旧单测 `gdtest`(25) / `p2test`(45) / `vkeytest` 全部 **ALL PASS**。
+
+### 踩到的坑
+1. **`read()` 不要自己补零**。三个解码器原来在 EOF 时把返回块填满再
+   返回，结果 `cur_time_ms` 多算、测试里"105 帧"变成 105.07 帧。
+   统一改成"返回真实帧数，短返回即 EOF"，由 `pcm_render_player()` 补零
+   （它本来就有这段）。`vita_pcm_dec.h` 的注释也写明了这个契约。
+2. **AMR seek 差一帧**：`for (i<want) next_frame()` 之后停在 want-1 帧；
+   要显式 `m->have_frame = 0` 把最后一帧也"消费掉"，才能落在 want 帧。
+3. **`struct X` 没有 typedef**：删掉 `vita_mp3.h` 后 `VitaMp3` 变成未知类型，
+   三个文件都要 `typedef struct X X;`。
+4. **TEXT 段在长**：加了 ~230 KB AMR 后 TEXT 从 `0x3a7634` 涨到
+   `0x3c0bb4`，链接器把 RW 从 `0x813d0000` 推到 `0x813f0000`。目前还有
+   ~190 KB 余量；**下次再加静态表/大库前先看
+   `arm-vita-eabi-readelf -l`**，TEXT 一旦越过 RW 起始就会
+   "segment 1 overlaps"（v02.85 踩过，见那条 `__sce_headroom`）。
+5. **溢写文件必须按 player 命名**：一开始固定
+   `.pcmtmp.bin`，两个播放器并发（BGM + 音效）会互相覆盖。
+
+### 没做 / 下一步
+1. **全部未上真机**。AMR/AAC/铃声/RW 溢写都只在宿主机与编译层面验证过：
+   `midp_stderr.log` 应出现 `pcm buffered: amr 8000 Hz 1 ch, ...`；
+   `audio_debug.log` 出现 `pcm seek -> ...`。
+2. **OTA 的 pattern 指令（0x00）不支持**：遇到就当结束，会丢掉重复段
+   （旋律还在）。真要用得把 pattern 位置栈补上。
+3. AAC 依赖 `SceAudiodec`；Vita3K 上多半直接"不支持"。
+   没有做 AAC-HE/SBR（`isSbr=0`）、没有 ADIF、没有 MP4 容器。
+4. WAV 仍然整段常驻内存（32 MB 上限）+ 一次性 `nBuffering`；没做溢写。
+5. `get_java_buffer_size()` 的 `first_chunk_size` 仍是 4096，没按格式细化。
+6. MIDI 没有 seek（`vita_midi_play` 是一次性渲染）。
+7. XMF/MMF/SMAF 仍然只有"干净失败"，没有解码。
+
+---
+
+## 2026-10-23 v02.89：虚拟键软键 + 按下反馈，JPEG 解码（路线图 P0-5）
+
+> 产物 `out/vpk/midp_vita_v02.89.vpk`（11893618 B），版本串
+> `J2ME Player v02.89 b330`。ELF：TEXT `0x81000000+0x3c9b34`，
+> RW `0x813f0000`（余量约 195 KB，stb_image 只用了 ~35 KB）。
+
+### 1. 虚拟键盘：左右软键 + 按下反馈
+用户反馈"没有左右功能键，最好加个焦点反馈"。
+
+**软键位置重做（`vita_vkey.c`）**
+- 原来 S1/S2 是动作块底部两个 `unit x (unit/2+6)` 的小格子，只在动作块
+  被绘制时才有，全屏游戏时 34x23 像素基本看不见 → 视为"没有"。
+- 现在由 `layout_soft_keys()` 单独放在**游戏矩形（或信箱边栏）的左上角和
+  右上角**，这是功能机的经典位置，且在**所有布局与缩放模式下都不与任何面板
+  重叠**：数字面板占左下（边栏模式则垂直居中于左栏），动作块占右下
+  （边栏模式从 y=60 起）。尺寸 96x44（边栏）/ 96x40（叠加），标签用新增的
+  `L`/`R` 5x7 字形。
+- `layout_actions()` 不再产生软键，叠加模式的 `block_h` 公式相应缩短。
+
+**按下高亮**
+- 新增 `static volatile int pressed_btn` + `vita_vkey_set_pressed(int)` /
+  `vita_vkey_pressed()`。`vita_input.c` 在 PRESS 时写入下标、`vkey_release()`
+  时清 -1。
+- 绘制：按下时填充 `C_DOWN`（琥珀 ABGR `0xFF30A0F0`）、白边、再套一圈
+  内嵌白框、字形下沉 1 px 且用深色；叠加模式下把 alpha 从 150 提到 225，
+  保证在花哨的游戏画面上也看得出来。
+- 两处安全处理：`vita_vkey_set_enabled(0)` 时清空下标；
+  `build_layout()` 因分辨率变化重建时也清空（按钮编号会变，否则会高亮错键）。
+- 字号**不**放大：`scale+1` 会溢出按钮盖到邻居上（第一版犯过）。
+
+**验证**：`/tmp/vkeytest.c` 同步了新算法，新增断言"两个软键必须存在且至少
+44x20"，6 种分辨率 + overlay + mode=1/2 全部 **ALL PASS**（每屏 22 个按钮
+不重叠、全部在屏内、中心命中一致）。
+
+### 2. JPEG 解码（P0-5）
+- 关键发现：`ENABLE_JPEG` 只在 `imgdcd_image_util.c` 里有三个 `#if` 块，
+  调用 `JPEG_To_RGB_*`；接口声明在上游 `phoneme/jpeg/jpegdecoder.h`。
+  上游那套 IJG libjpeg 有 30+ 个 GPL 文件，只挂在 phoneME 自己的 make 体系里，
+  本移植没有接。
+- 选择：**stb_image v2.30**（public domain，单头文件，
+  与 minimp3/tsf/tml 同一套路），`vita-port/src/vita_jpeg.c` 实现 phoneME 的
+  接口，于是**上游 C 代码一行都不用改**，只把 `ENABLE_JPEG` 打开。
+  `STBI_ONLY_JPEG` 去掉 PNG/BMP/TGA/GIF/PSD/HDR，TEXT 只涨 ~35 KB。
+- 构建接线（3 个文件）：
+  - `phoneme-midp/build_vita.sh`：`USE_JPEG=true` + `JPEG_DIR=.../phoneME/jpeg`
+    （`JPEG_DIR` 只为 `Subsystems.gmk` 的 include 存在，不参与编译）。
+  - `phoneme-midp/build/vita_arm/Settings.gmk`：同样改为 `USE_JPEG=true`
+    （Defs.gmk 由此产生 `-DENABLE_JPEG=1`）。
+  - `phoneme-midp/build/vita_arm/vita_overlay.mk`：`EXTRA_INCLUDES +=
+    -I$(VITA_PORT_SRC_DIR)`（供 `#include <jpegdecoder.h>`）+
+    `JTWI_NATIVE_FILES += vita_jpeg.c`。vita-port/src 里没有与 phoneME 同名的
+    头文件，不会遮蔽。
+- `vita-port/src/jpegdecoder.h`（新增）：自写的同名接口声明，注明输出是
+  MIDP 的 RGB565 `b | (g<<5) | (r<<11)`。
+- `vita_jpeg.c` 实现要点：
+  - `decodeHeader()` **一次性解码**并缓存 RGB（MIDP 总是连着调
+    header→data，解两次纯属浪费）；
+  - `decodeData2()` 支持 2 字节(RGB565)/4 字节(32 位，alpha 置 0xFF)输出，
+    目标矩形与图像尺寸不一致时用最近邻缩放（`DirectUtils.createImage` 会用到）；
+  - `STBI_ASSERT(x)` 置空：坏图不能 `abort()` 整个模拟器；
+  - stb 的告警用 `#pragma GCC diagnostic` 局部关掉（MIDP 构建带 `-Werror`）。
+- **JPEG 识别放宽**：上游写死 `FF D8 FF E0`（SOI+JFIF），会拒绝 EXIF(FFE1)
+  或直接 DQT 起头的合法 JPEG。改为 `FF D8 FF`（SOI+任意标记起始），
+  两处同步改：
+  - `ImageDataFactory.java`（img_putpixel/classes）的 `jpegHeader`；
+  - `imgdcd_image.c` 的 `imgdcd_jpeg_header` 与长度（3）+
+    `imgdcd_image_util.h` 的 extern 声明（**必须一起改，否则 conflicting
+    types**——第一次编译就撞上了）。
+
+### 验证
+- **宿主机 JPEG 单测 `/tmp/jpegtest.c`（20 断言，ALL PASS）**：用真实
+  239x178 JPEG（35 KB），验证 SOF 解析尺寸与解码器一致、几乎每个像素都被
+  写入、内容有方差（不是纯色填充）、目标矩形缩放到一半时输出被填满、
+  32 位模式 alpha=0xFF、垃圾数据/NULL/未调 header 时全部返回 0 不崩。
+- **交叉验证颜色正确性**：用 JDK 的 ImageIO（独立的 IJG 实现）解同一张图，
+  按同样的 RGB565 打包后逐通道比较 —— **127626 个通道里只有 401 个相差 1**
+  （0.3%，IDCT 舍入差异），证明通道顺序与 565 packing 都没错。
+- `bash phoneme-midp/build_vita.sh` 通过（`vita_jpeg.o` 37 KB）；
+  `./build.sh` 通过；`arm-vita-eabi-nm` 可见 `JPEG_To_RGB_*` 与
+  `stbi__jpeg_*` 符号，说明 `ENABLE_JPEG=1` 的分支真的被链接了。
+- 回归：`gdtest` / `p2test` / `vkeytest` / `dectest` / `jpegtest`
+  全部 **ALL PASS**。
+
+### 踩到的坑
+1. **`imgdcd_jpeg_header` 声明与定义长度必须一致**：只改 .c 会
+   "conflicting types for 'imgdcd_jpeg_header'"。
+2. **软键字号放大溢出**：按下时 `scale+1` 会画到邻居按钮上，改用颜色 +
+   内嵌边框 + 1 px 偏移。
+3. **布局重建后按钮编号会变**：`pressed_btn` 必须清零，否则高亮错键。
+4. **MIDP 构建带 `-Werror`**：第三方单头文件（stb）的
+   `-Wunused-parameter` 会直接编译失败，必须用 pragma 局部屏蔽。
+5. **`vita_overlay.mk` 是 gitignore 的构建胶水**（`phoneme-midp/build/vita_arm/*`
+   整体被忽略），历史上多次"重建后丢失"。JPEG 依赖它的 `-I` 与
+   `vita_jpeg.c`，所以这次**改成由 `build_vita.sh` 用 heredoc 每次生成**
+   （已验证：删掉该文件后 `build_vita.sh` 仍能完整构建）。以后往 overlay 里
+   加东西，改 `build_vita.sh` 而不是那个 .mk。
+
+### 没做 / 下一步
+1. **仍未上真机**。JPEG 需要在游戏里放一张 `.jpg` 验证
+   （`Image.createImage` 不再抛 IllegalArgumentException）。
+2. stb_image 每次 `createImage` 都重新解码，没有图片缓存
+   （`USE_IMAGE_CACHE=false`）；同一张图反复创建会有 CPU 开销。
+3. 没有 JPEG 编码（MIDP 只需解码；`Image.getRGB` 路径不受影响）。
+4. 软键只有一对（SOFT1/SOFT2），没有 SEND/END/CLEAR 三个键；
+   长按连发、多点触控仍未做（P0-3 剩余项）。
+5. 触摸命中只有"主手指"，同时按软键 + d-pad 不支持。
+
+6. 设置页的「振动」行只控制"允不允许"，没有"强度"选项。
+
+
+## 2026-10-23 log119 分析（实际跑的是 v02.87）：喜羊羊不再卡死但仍无声；UC 复制/粘贴；JIT 实际没生效
+
+> `boot_log.txt` 版本串是 **v02.87**，不是 v02.88。铃声转换（`RingTone`）是 v02.88 才加的，**log119 里还没有它**。
+
+### 1. UC 复制/粘贴——机制已清楚，不是 bug
+`[ALERT]` 现在能读（v02.81 的 `\uXXXX` 转义生效），解码后：
+| 序 | 标题 | 正文 | 超时 |
+| --- | --- | --- | --- |
+| 1、2 | 提示 | 已成功复制到剪贴板 | 3000 |
+| 3 | 提示 | 确定清空复制内容? | -2（FOREVER，有确认键） |
+| 4 | 提示 | **剪贴板内容为空!** | 3000 |
+
+- 用户描述\"先点复制，再点粘贴就不会报错\"与日志吻合：**没复制过就粘贴 → UC 自己提示\"剪贴板内容为空!\"**。
+  这是 UC 应用层的缓冲区（日志里没有任何 `[VENDOR]`/Clipboard 调用，说明它不走 `com.nokia.mid.ui.Clipboard`），行为是**正确的**。
+- 此前我把 log118 的 UC 现象叫\"异常界面 + 蜂鸣\"：蜂鸣 = INFO Alert 提示音（`play_tone note=72`，log119 里 4 次与 4 个 Alert 对应——3 次 3 秒提示 + 1 次确认框），
+  \"异常界面\"= 这个 Alert。**结论：UC 复制/粘贴没有 bug，可以关掉这个待办。**
+- 未做：Alert 弹出时的蜂鸣是 phoneME 的默认行为（`playAlertSound`），真机 UC 也会响，不动。
+
+### 2. JIT——**实际没有生效**（用户的怀疑成立）
+crumb.log 逐轮对照（脚本 `/tmp/jitrounds.py`）：
+```
+round cfg policy pre post  launch
+0     0   0      1   0     app/UC
+1     0   0      0   0     fengshenbang
+2     1   0      0   0     app(1)         (jit=1 的第 2 轮起降为 0，设计如此)
+3     1   0      0   0     app(1)
+4     2   2      0   0     app/UC         ← policy=2 要求开 JIT，post 仍是 0
+```
+- `post` 是 `runMidlet` 返回后读到的 `UseCompiler`，**policy=2 的那轮它是 0**，即 JIT 没开。
+- 原因（读源码确认）：`UseCompiler` 是进程全局；`runMidlet.c` 在 `policy==0` 时调 `JVM_ParseOneArg("-int")` → `Arguments.cpp:129 UseCompiler=false`。
+  **整个源码里没有任何地方把它再置回 true**（只有 `-comp` 会置 true，且没人传；`JVM.cpp:657` 是 romizer 路径）。
+  `runMidlet.c` 里的注释写\"jit=2 needs no argument at all (UseCompiler already defaults to true)\"——这个前提**在同一进程里先跑过 policy=0 的轮次后不成立**。
+  本次日志里 round 0 就是 policy=0，之后 `UseCompiler` 一直是 0，所以后面所有轮次（含 policy=2）都是解释器。
+- 同样要注意：就算 round 0 就是 `jit=2`（`pre=1`），`post` 是否为 1 本次**没有数据**（本次没有这种启动）；所以\"JIT 在全新进程第一轮能否真的开\"也**没有被验证**。
+- 还有一个更根本的问题**没有查清**：`GlobalDefinitions_c.hpp:35-41` 在 `arch=c` 且非 `CROSS_GENERATOR` 时会 `#define ENABLE_COMPILER 0`。
+  `libcldc_vm.a` 里有 248 个 `Compiler::/CodeGenerator::/VirtualStackFrame::` 符号，说明目标对象是 `arch=arm` 编的、带编译器，
+  但**我没有验证编译器在运行时真的会产出并执行机器码**。`ARM 的 icache flush` 在 PROJECT_MEMORY 6631 行记过\"零调用者\"，也没确认是否已修。
+- 所以对\"测试 JIT 没有异常，不知是否真的生效\"的回答：**没有异常是因为它根本没开；不是 JIT 稳定。**
+- 修法（**本轮未做**）：每轮开头若 `policy != 0` 就把 `UseCompiler` 置回 1（`vita_main.c` 已经有 `extern unsigned char UseCompiler` 弱符号，可直接写）；
+  并且先修/确认 icache flush，再在 `jit=2` 的**首轮**做一次有数据的对照（`post=1` + 帧耗时）。
+
+### 3. 喜羊羊
+- **不再卡死**：log119 里没有 `[APPEXC]`，没有 `[res] open FAILED`，关卡正常进入（`map_load_end` → `qqqqq`/`wwwww` → 反复 `startmusic`/`stopMusic`）。
+  **但不能归功于 v02.82 的日志**——那只是日志。02.83–02.87 动了屏幕尺寸/设备画像/JAD/虚拟键盘/MP3，其中哪一项让 `dialog.txt` 读成功了，**没有证据**。
+  log118 的 null 根因仍未查明，只是这次没复现。
+- **仍然无声**：log119 是 v02.87，`Sound.init` 对 Nokia OTA 铃声走 `mime == null` 分支，应当打 `[VENDOR] nokia Sound: unplayable data`。
+  **但 log119 的 `vm_output.log` 里一条 `[VENDOR]` 都没有**，这与代码矛盾，我**没有解释清楚**：
+  - 已核实：设备上的喜羊羊 jar 是 303117 字节（与 `debug/game` 里分析的那份同大小，181 项，11 个 class）；`g.h(int)` 的 `new Sound(D[i], 1)` 在 `cv`（音乐开关，默认 true）为真时必执行；
+    v02.87 的 `Sound.class` 确实含该字符串；`System.out` 的其他输出（`startmusic`）能进 `vm_output.log`。
+  - 可能性（**都未证实**）：(a) `h()` 在 `cv==false` 时直接 return，`startmusic` 来自 `ae()` 而不是 `h()`——但 `ae()` 在 `C==null` 时也 return，不会打印 `startmusic`；
+    (b) `Sound` 走了别的路径；(c) 打印被吞。下一次需要**直接证据**：在 `Sound` 构造入口无条件打印一行（长度、前 3 字节、type）。
+  - `audio_debug.log` 里只有 3 个 player（其中 1 个 MIDI 来自风神榜类游戏的 `[MIDI] play: 11 ch...`），**没有喜羊羊的 player**，与\"Sound 未初始化\"一致。
+- v02.88 的 `RingTone`（OTA→WAV）理论上能让它出声，**未上真机**，且 `RingTone.toWav` 里 OTA 的 `0x00`（pattern）被当作结束，可能截断旋律。
+
+### 4. 长停顿
+- 第 3 段（UC）有 4 次停顿：**23.2 s、12.5 s、16.1 s、13.4 s**。watchdog 的 STORM 行显示 `preload` 计数在涨（1304→2185→3165→4119），
+  `gc` 3→10，`clinit` 114→284：期间 VM 在**类预加载/初始化**，不是死锁；\"pump starved but progressing\"。
+  与 UC 在网络/页面切换时加载大量类吻合。**原因不确定**（没有逐类耗时），但不是卡死。
+- 喜羊羊、风神榜会话没有 >3 s 的停顿（最大 1.9 s / 1.4 s）。
+
+### 下一步建议（需要用户选）
+1. **修 `UseCompiler` 复位**（几行 C，`vita_main.c`），然后在 `jit=2` 首轮拿一份有 `post=1` 的 crumb + 帧耗时对照。风险：之前 JIT 在第 2 轮崩过（`PROJECT_MEMORY` 6631 行 icache 问题）。
+2. **喜羊羊声音**：先在 `Sound` 构造入口无条件打印（解释上面的矛盾），再看 v02.88 的 RingTone 是否出声。
+3. UC 复制/粘贴：关闭待办。
+
+---
+
+## 2026-10-24 v02.90：MIDP 权限默认策略（路线图 P0-6）
+
+> 产物 `out/vpk/midp_vita_v02.90.vpk`（11893291 B），版本串
+> `J2ME Player v02.90 b330`。ELF：TEXT `0x81000000+0x3c8cb4`，
+> RW `0x813f0000`（余量约 210 KB）。
+
+### 现状（改之前）
+`system.config` 里写着 `security.policyfile: _policy.txt` /
+`security.messagefile: _function_groups.txt`，但**这两个文件根本不在 VPK 里**，
+而且没有任何代码读这两条属性——这个构建用的是
+`generic_policy_load.c` 的**硬编码表**。所以属性纯属误导（路线图里就把它标成
+"未验证"的疑点）。
+
+硬编码表对**未签名 jar**（`unidentified_third_party` 域）给出的默认值是：
+
+| 组 | default | max |
+| --- | --- | --- |
+| `net_access` | ONESHOT(16) | SESSION(8) |
+| `read_user_data_access` | ONESHOT(16) | ONESHOT(16) |
+| `write_user_data_access` | ONESHOT(16) | ONESHOT(16) |
+| `multimedia_recording` | ONESHOT(16) | SESSION(8) |
+| `low_level_net_access` | ONESHOT(16) | SESSION(8) |
+| `payment` / `satsa` | NEVER | NEVER |
+
+ONESHOT/SESSION 在 `SecurityHandler.checkPermission()` 里返回 **-1
+（unknown）**，`checkForPermission()` 于是弹一个**模态对话框**并**阻塞 MIDlet
+线程**直到用户回答。本移植只有一个 MIDlet、没有 AMS，游戏第一次联网/读文件就
+卡在那个对话框上——正是路线图担心的"权限弹窗卡住游戏"。
+
+### 做法（不改任何上游文件）
+- 新增 `vita-port/src/vita_permissions.c/.h`，实现
+  `generic_policy_load.o` 的**全部 8 个符号**：
+  `permissions_load_domain_list` / `_group_list` / `_group_permissions` /
+  `_group_messages` / `_get_default_value` / `_get_max_value` /
+  `_dealloc` / `_loading_finished`。
+- CMake 用 `arm-vita-eabi-ar d ${LIBOBJ_NO_MAIN} generic_policy_load.o` 把它从
+  `libobj.a` 里删掉（与 `anc_st_vibrate.o`、
+  `lfjport_fb_export.o` 同一套机制），零上游改动。
+- **域的 domain/group/member 三张表逐字复制上游**——它们定义的是权限**标识符**
+  （`Permissions.getId("javax.microedition.io.Connector.http")` 等），改一个名
+  字就会让查询抛 `SecurityException("Unknown permission")`。只有**值**变了。
+- 值：默认 **RELAXED** → 除 `minimum` 域外，所有域所有组一律 `ALLOW(1)`。
+  `SecurityHandler.checkPermission()` 对 `ALLOW` 直接返回 1（不弹窗），
+  `checkForPermission()` 直接通过。
+  `minimum` 域仍保持 NEVER（TCK/自检路径要靠它）。
+- **STRICT** 模式**逐值复现上游两张表**（identified/unidentified），
+  在 `设置 > 权限` 里切换，写 `defaults.cfg` 的 `perms=strict`；
+  `game.cfg` 也能写 `perms=strict` 做逐游戏覆盖。
+  两个来源都读：启动器（`vita_main.c`）在 VM 启动前
+  `vita_permissions_set_mode()`，而 `vita_permissions.c` 自己也会懒读
+  `defaults.cfg` 兜底——所以即使将来有人绕过启动器，默认也不会变回"弹窗"。
+- `permissions_load_group_messages()` 返回 0 条。这是**安全的**：
+  `Permissions.java` 在 `getGroupMessages` 返回 null 时走
+  `messages[0] = list[i1]`（用组名当标题），所以严格模式下真弹窗也不会 NPE，
+  只是没有本地化文案（省下 16 组 × 6 条中英文字符串）。
+- 顺手删掉 `system.config` 里那两条指向不存在文件的 `security.*` 属性。
+
+### 取证：怎么判断 jar 到底算不算签名
+`vita_permissions.c` 写 `ux0:/data/J2ME00001/permissions_debug.log`：
+```
+[PERM] mode=relaxed (set by launcher)
+[PERM] domain "unidentified_third_party" first query: mode=relaxed
+[PERM] policy loaded, mode=relaxed
+```
+**域名字就是答案**：`identified_third_party` = 证书校验通过（签名 jar），
+`unidentified_third_party` = 未签名/证书无效。每个域只记第一次，最多 6 行，
+不会像 `ALOG` 那样每帧同步写盘。`crumb.log` 里也有一行
+`perms: relaxed|strict`。
+
+### 关于"测试签名 jar"
+本项的**行为**已经明确并可控，但**没有**做证书链/过期证书的实测：
+在 RELAXED 下签名与不签名走同一条路（全 ALLOW），签名只影响日志里的域名；
+在 STRICT 下完全交给上游的 `identified/unidentified` 表，与 phoneME 一致。
+要真正验证"过期证书"需要一份带过期证书的 jar + 上游 `USE_SSL`/PKI 的
+证书路径，那是另一项工作（P0-7 之后）。这里如实记录为未验证。
+
+### 验证
+- **宿主机单测 `/tmp/permtest.c`（43 断言，ALL PASS）**：测的是**真实源文件**
+  （只把 4 个 `sceIo*` 换成 `/tmp/psp2shim/shim.c` 里的 `FILE*` 实现）：
+  1. 6 个域、16 个组、组名与顺序与上游逐一相等；`net_access` 4 个成员且首个
+     是 `Connector.http`；`read/write_user_data_access` 成员数 4/5 且含
+     `Connector.file.read/write`；未知组返回 0。
+  2. 无 `defaults.cfg` → relaxed；relaxed 下未签名 net/file/socket/recording
+     全 = ALLOW；`minimum` 仍 NEVER。
+  3. strict：**把上游两张表逐字抄进测试**，对 16 组 × 2 域 × 2 级 = **64 个值
+     全量比对**；另测 manufacturer/operator/maximum 恒 ALLOW、minimum 恒 NEVER。
+  4. 配置解析：`perms=strict` / `perms=relaxed` / 缺键 / 空文件 / 文件不存在 /
+     CRLF / 带注释；`perms = strict`（等号带空格）**故意不识别**并把这条写成
+     断言，防止以后有人"顺手放宽"解析导致意外进入严格模式。
+  5. `set_mode()` 双向切换后值立即改变。
+- 交叉验证数值常量：`Permissions.java` 里
+  `NEVER=0 / ALLOW=1 / BLANKET=4 / SESSION=8 / ONESHOT=16`，
+  与 `vita_permissions.c` 的 `P_*` 一致；`SecurityHandler.checkPermission()`
+  对 `ALLOW` 返回 1（已读源码确认，不是猜的）。
+- `cmake --build` 通过；`arm-vita-eabi-nm` 只剩**一份**
+  `permissions_*` 符号（8 个，都在我们的文件里），`libobj_no_main.a` 里
+  `generic_policy_load` 计数为 0。
+- 二进制内含 `[PERM] mode=%s` / `[PERM] domain "%s" first query` /
+  `perms: %s`，以及菜单用的 `权限` / `宽松` / `严格` 中文字符串。
+- 回归：`gdtest` / `p2test` / `vkeytest` / `dectest` / `jpegtest` /
+  `permtest` 全部 **ALL PASS**。
+
+### 踩到的坑
+1. **`P_BLANKET` 在使用之后才定义**：严格表里用了 BLANKET，但宏写在表后面，
+   第一次编译就报未定义。等级宏必须在最上面。
+2. **我自己的测试断言先写错了**：`unidentified/multimedia_recording` 的
+   upstream default 是 ONESHOT 不是 SESSION（我看错了表行），**代码是对的、
+   测试是错的**。于是把测试改成"把上游两张表抄进去做 64 项全量比对"，
+   这样以后抄表抄错一行会立刻暴露，而不是靠人工核对。
+3. 由此得到的规则：**改任何权限表，同步改 `/tmp/permtest.c` 里的对照表**，
+   两者必须逐字相同。
+
+### 没做 / 下一步
+1. **未上真机**。真机验收方式：随便一个联网游戏（UC / 文件管理器），
+   首次联网应当**没有**权限对话框；`permissions_debug.log` 出现
+   `[PERM] mode=relaxed` + 一行域名字。
+2. 签名/过期证书未实测（见上）。
+3. 严格模式下的弹窗**文案**没有本地化（用组名当标题）。
+4. `perms` 只能从 `设置` 或手改文件切换，**没有逐游戏的 UI 入口**
+   （`game.cfg` 手写 `perms=strict` 有效）。
+5. RMS 不需要权限（不在任何组里），所以本项对存档没有影响。
+
+## 2026-10-24 Alert 静音 + 喜羊羊声音诊断 + Alert 绘制诊断 → v02.91
+
+> 版本号说明：我准备用 02.90，但开工时 02.89（虚拟键盘/JPEG）、02.90（权限策略）已被别的会话占用，所以这批是 **02.91**。
+> `out/vpk/midp_vita_v02.91.vpk`。**未在真机运行。**
+
+### 用户要求与决定
+- 顺序：先 2（喜羊羊声音诊断）后 1（JIT 复位，**本轮未做**）；其次 UC 输入框/UI。
+- UC 空剪贴板提示：用户描述\"**中间花屏，左下角一个确定按钮**，还发出声音\"。希望不响应或给提示而不是花屏+响，并参考其他 J2ME 模拟器。
+- 提示音：用户选择**全局静音**。
+
+### 参考 J2ME-Loader（Apache-2.0，只看行为）
+- `AlertType.playSound(Display)` 直接 `return false`——**任何 Alert 都不出声**。
+- Alert 用系统 `AlertDialog`（标题、文字、按钮），不是自绘。我们的是 Chameleon 皮肤自绘的 9 宫格浮层，没有对等物。
+- 所以\"空剪贴板时不响应\"属于 UC 应用层逻辑（它自己弹的 Alert），模拟器不该改它；我们能做的是**不响**和**画对**。
+
+### 关键文件修改记录
+| 文件 | 改动 |
+| --- | --- |
+| `phoneme-midp/.../lcdui/reference/classes/javax/microedition/lcdui/Display.jpp`（**共享文件**） | `playAlertSound()` 开头 `if (true) { return false; }`，其后原代码保留（便于回退）。javac 会把后面的 `playTone` 调用整个消掉：产物 `Display.class` 里已无 `playTone` 引用 |
+| `phoneme-midp/.../lcdlf/lfjava/classes/javax/microedition/lcdui/AlertLFImpl.java` | `uCallPaint` 里每个 Alert 实例打一行 `[ALERT-PAINT] clip=.. skin=WxH titleH margin viewable maxScroll disp bgImg bgColor`；新增字段 `vitaPaintLogged` |
+| `vita-port/nokia_src/Sound.java` | `init()` 入口无条件打印 `[SOUND] init len= type= head=a,b,c this=`；铃声转换结果、`wav player created`、`createPlayer` 失败、`play()` 入口（`loop player tone state`）都打印 |
+| `vita-port/CMakeLists.txt` | 版本块 02.91 |
+
+### 静音的影响面（读源码确认）
+`playAlertSound` 的调用方：`AlertLFImpl.lCallShow`、`AlertType.playSound()`（应用可直接调，现在返回 `false` = \"未播放\"，API 允许）、
+`TextFieldLFImpl:1243`（TextField 拒绝输入时的 WARNING 嘟声，**也静音了**）。游戏自己的声音走 MMAPI，不受影响。
+`lfplatform/AlertLFImpl.java:180` 也调用它，但本工程不编译 lfplatform。
+
+### 花屏——**没有找到原因，只加了诊断**
+我读了：`AlertLFImpl.uCallPaint/lPaintTitleBar/lPaintContent/layout`、`AlertLayer`（`BodyLayer`→`CLayer.paintBackground`）、`CGraphicsUtil.draw9pcsBackground`、
+`MIDPWindow.showDisplayable`、皮肤配置。排除项（有证据）：
+- 背景 9 张 PNG（`alert.image_bg0..8`，11x3 / 2x3 / 2x12）我用脚本解码了像素：只有 `FAFDFE`（近白）和 `A0A3A5`（灰边）两种颜色，**图片本身没问题**；
+  PNG 带 `iCCP/gAMA/cHRM` 色彩块，但解码器忽略它们，这是推测，未验证。
+- `skin.xml`：`ALERT_WIDTH=-1`（运行时取 95% 屏宽）、`ALERT_HEIGHT=125`、`ALERT_COLOR_BG=0xFFCC33`（橙黄），`TITLE_HEIGHT=32`。
+- `[ALERT]` 日志证明这条 Alert 只显示一次、3000 ms 超时、type=INFO。
+
+**可疑但未证实**（都只是读代码得到的怀疑）：
+1. `uCallPaint` 在标题栏之后 `g.setClip(clipx, TITLE_HEIGHT, clipw, cliph - TITLE_HEIGHT)` 并 `g.translate(0, TITLE_HEIGHT)`，随后 `Text.paint(...)` 的 `viewable[HEIGHT]` 来自 `layout()`。
+   `skin.xml` 的 `ALERT_HEIGHT=125` 是为 240x320 以下的屏幕设计的；`AlertLayer.setAnchor()` 只在 `HEIGHT==-1` 时才按 75% 屏高计算，**所以 Alert 高度固定 125 px**，
+   而 UC 的文字区域要放进 125-32=93 px。这会导致**需要滚动**（`maxScroll>0`），不是花屏。
+2. 虚拟屏幕尺寸从 v02.83 起可变（`VITA_MAX_W/H` 320→800）。如果 UC 的显示尺寸与 Alert 皮肤的假设不一致，布局可能越界。
+3. v02.85 的屏幕虚拟键盘/软键层与 Alert 的软键（`buttonLayer.toggleAlert`）叠画——用户说\"左下角一个确定按钮\"，这与 `SoftButtonLayer` 的 Alert 模式一致。
+   **我没有核实 v02.85 的虚拟键盘是否改了 `SoftButtonLayer`/Alert 的绘制**（这些改动是别的会话做的）。
+
+→ 下一轮请在 `vm_output.log` 里看 `[ALERT-PAINT]`：若 `skin=` 的宽高、`viewable=`、`disp=` 与屏幕不匹配，就是布局问题；
+  若数字都正常而画面仍花，则问题在更底层（Graphics 裁剪/9 宫格拼接/脏区），需要截图。
+
+### 喜羊羊声音（第 2 项）
+- 目的：解释\"v02.87 的 `Sound.init` 应打 `[VENDOR] ... unplayable data` 却一条都没有\"。现在 `init` 入口无条件打印，下一份日志会直接说明：
+  - 没有任何 `[SOUND] init`：`Sound` 构造根本没被执行（`g.h(int)` 没走到，或异常被吞）；
+  - 有 `[SOUND] init len=58/326/389 head=2,74,58`：数据确是 Nokia OTA，随后看 `ringtone->wav ok N bytes` / `FAILED`；
+  - `wav player created` 之后有无 `[SOUND] play ...` 与 `audio_debug.log` 的 `pcm`/`wav` 播放记录。
+- v02.88 的 `RingTone`（OTA→WAV）在这一版里仍在（`midp_system.jar` 含 `RingTone`）。**能否出声仍未验证。**
+
+### 没做（按用户顺序）
+1. **JIT `UseCompiler` 复位**——下一轮做（用户顺序：先 2 后 1）。
+2. **输入框（sceImeDialog）UI 优化**——这个是 Sony 系统对话框，外观我们改不了；能改的是传给它的参数（标题、模式、类型）。
+   目前 `vita_ime.c` 的标题是固定英文 `Text Input`、`SCE_IME_TYPE_DEFAULT`、`WITH_CANCEL`、`WITH_CLEAR`。
+   可做：标题按 TextField 的 label 显示、按 `TextField.constraints`（NUMERIC/PHONENUMBER/URL/EMAILADDR/PASSWORD）选 `SCE_IME_TYPE_*`、
+   多行用 `SCE_IME_OPTION_MULTILINE`。需要用户确认优先级后再做；**没有动 `vita_ime.c`**。
+
+### 验证
+- `./build.sh midp` exit 0；时间戳链 源码 03:28:39/03:29:30/02:50:56 → classes.zip 03:30:51 → VPK 03:31:44；
+  VPK 内 `midp_system.jar`：`AlertLFImpl` 含 `[ALERT-PAINT]`，`Sound` 含 `[SOUND] init`/`[SOUND] play`/`wav player created`，`Display.class` 不再含 `playTone`；
+  `com/sun` 681；ELF 版本串 `v02.91`。
+
+
+---
+
+## 2026-10-24 v02.92：截屏（SELECT+START / 屏幕相机按钮 → PNG）
+
+> 产物 `out/vpk/midp_vita_v02.92.vpk`（11899421 B），版本串
+> `J2ME Player v02.92 b330`。用途：白屏 / Alert 花屏 / 精灵缺失 / VM 冻结时，
+> 直接拿到"当时屏幕上到底是什么"的图片，而不是再靠日志描述。
+
+### 设计要点
+- **抓帧时机**：`vita_display.c::flip_to_display()` 在 blit + 虚拟键盘 + 相机
+  按钮之后、`sceDisplaySetFrameBuf` 之前调用 `vita_shot_service()`，所以 PNG
+  就是提交给屏幕的那一帧（含虚拟键），不是虚拟屏 240x320 的中间结果。
+- **冻结兜底（关键）**：VM 卡死时事件泵不再跑，任何"在输入回调里触发"的方案都
+  失效。因此新增独立低优先级线程 `j2me_shot`（0x10000100 / 16K 栈 / 50 ms），
+  自己 `sceCtrlPeekBufferPositive` + `sceTouchPeek`；请求发出 500 ms 仍无人
+  处理（没有新的 flip），就抓 `vita_fb_front`（最后提交、正显示在面板上的帧）。
+  这也是本功能对卡死取证有意义的原因。
+- **按键冲突**：SELECT+START 组合被识别期间，两个键的 press 全部吞掉（否则游戏
+  会收到 `#` / `*`），release 仍放行以免已经发出的 press 卡住。组合检测同时存在
+  于 `vita_input_poll()`（快速路径）与 `j2me_shot` 线程（冻结路径），用
+  `vita_shot_request()` 内 300 ms 去抖合并。
+- **触摸**：相机按钮命中由 `j2me_shot` 线程负责触发；`vita_touch_poll()` 只把
+  该区域的触摸消费掉（并补齐 PEN release），避免它变成 `pointerPressed`。
+- **PNG 编码**：自写（zlib `compress2`/`crc32` 已因 jar 读取链在链接里），
+  `Z_BEST_SPEED`；整帧 malloc ≈1.5 MB，编码几十 ms。没有引入 libpng 的
+  `FILE*` I/O（本移植所有文件操作都走 sceIo）。
+- **退出安全**：`lfjport_ui_finalize()` 先 `vita_shot_quiesce()`（清 pending +
+  等 busy 归零），再解映射/释放 CDRAM 帧缓冲，避免轮询线程读到已释放内存。
+
+### 关键文件修改记录
+- `vita-port/src/vita_shot.c` / `vita_shot.h`（新增）
+  - `shot_write_png()`：IHDR(RGB8) + 单个 IDAT + IEND；逐块 CRC；失败删半截文件。
+  - `shot_make_path()`：`shot_YYYYMMDD_HHMMSS.png`，RTC 不可用时退化为
+    `shot_seq_NNNNNN.png`，同名自动加 `_2..`。
+  - `vita_shot_draw_button()`：56x36 相机图标，位于 (6,56)，即左侧黑边、左软键
+    下方（各种缩放/布局下都不与 vkey 面板或软键重叠）；保存成功后 700 ms 高亮。
+  - 配置 `shot.cfg`：`on=` / `button=` / `combo=`；日志 `shot.log`。
+- `vita-port/src/vita_display.c`
+  - 新增 `vita_display_get_front()`（给冻结兜底用）。
+  - `flip_to_display()`：vkey 之后画相机按钮 → `vita_shot_service()`。
+  - `lfjport_ui_init()`：`vita_shot_init()`；`lfjport_ui_finalize()`：
+    `vita_shot_quiesce()`。
+- `vita-port/src/vita_input.c`
+  - `vita_input_poll()`：SELECT+START 组合检测/状态机 + 键循环内吞掉这两个键。
+  - `vita_touch_poll()`：相机按钮区域的触摸消费（`dbg_down=4`）。
+- `vita-port/CMakeLists.txt`：`add_executable` 增 `src/vita_shot.c`；
+  `VITA_VERSION` 02.91 → 02.92。
+
+### 验证
+- `cmake + make -j4` exit 0；`out/vpk/midp_vita_v02.92.vpk` 与 `.sym` 生成；
+  ELF 版本串 `v02.92`。三个改动文件单独重编无 warning/error。
+- **PNG 正确性用主机离线验证**（不依赖真机）：把 `vita_shot.c` 原文件配 psp2
+  桩头 + host zlib 编成测试程序，生成 960x544 PNG，再用 Python 逐块校验
+  签名 / CRC / IHDR(960x544,8bit,RGB) / IDAT 解压长度 / 抽样像素——全部 PASS。
+- 真机行为（按钮位置、SELECT+START 是否被游戏感知、冻结时兜底是否生效）**尚未
+  验证**，需下一轮带日志确认 `shot.log`。
+
+---
+
+## 2026-10-24 v02.93：HTTPS（路线图 P0-7）
+
+> 产物 `out/vpk/midp_vita_v02.93.vpk`（11919469 B），版本串
+> `J2ME Player v02.93 b330`。ELF：TEXT `0x81000000+0x3cc1b4`，
+> RW `0x813e0000`（TEXT 到 RW 还有 ~81 KB，见文末"段空间"）。
+
+### 为什么不能照路线图写的"优先接 SceSsl"
+先做了一次可行性核查，两条路都堵：
+
+1. **SceSsl 没有记录层**。`arm-vita-eabi-nm libSceSsl_stub.a` 只有：
+   `sceSslInit/Term`、`sceSslGet{SerialNumber,NotBefore,NotAfter,SubjectName,
+   IssuerName,NameEntryCount,NameEntryInfo,MemoryPoolStats}`、
+   `sceSslFreeSslCertName`，外加三个 internal。**没有 open/read/write/close**，
+   所以它根本无法当 TLS 传输用（只能用来查看证书字段）。
+2. **上游自带 TLS 不能用**。`com.sun.midp.ssl.*`（Handshake 1544 行 / Record
+   1288 / In / Out）在 `restricted_crypto` 里，且只协商 **SSLv3 / TLS 1.0**。
+   2024 年之后公网服务器全部拒绝这两个版本，编译进来等于加 3600 行 GPL 代码
+   却连不上任何站点。
+
+### 实际采用：SceHttp + "假 TLS 流"
+`sceHttp` 是**完整导出**的（54 个函数：Init/CreateTemplate/CreateConnection/
+CreateRequest/SendRequest/ReadData/GetAllResponseHeaders/GetStatusCode/
+GetResponseContentLength/AutoRedirect/Cookie/超时/证书回调…），它就是浏览器
+用的那套栈，做 TLS 1.2/1.3 + 系统信任库校验。但它工作在**整笔 HTTP 事务**
+粒度，不给你解密的 socket。
+
+于是：**保留上游 2500 行的 `https/Protocol.java` 原样不动**（chunked、重定向、
+keep-alive、header 解析、HttpConnection API 全部继续生效），只把
+`com.sun.midp.ssl.SSLStreamConnection` 换成我们自己的实现——它接受
+"写入请求字节 / 读出响应字节"的流式调用，底下用 SceHttp 完成事务。
+
+**为什么这个替换点是对的**：上游 `https/Protocol.connect()` 里唯一的 SDK 接缝
+就是 `new SSLStreamConnection(host, port, tcpIn, tcpOut, keystore)` +
+`getServerCertificate()` + `getSecurityInfo()`。上游对响应报文的所有处理都在
+这个流之上，所以隧道方案零改动复用。
+
+### 文件与职责划分
+- `vita-port/src/vita_https.c`（native，350 行）：SceHttp 句柄管理、
+  请求头写入（`sceHttpAddRequestHeader`）、发请求、取状态码/长度/原始响应头、
+  逐块读 body。**只搬字节，不做协议推理。**
+- `vita-port/src/vita_https_kni.c`（native，200 行）：KNI 胶水。
+  函数名由 MIDP 构建从 Java 侧生成到 `nativeFunctionTable.cpp`，
+  不是自由命名。
+- `vita-port/vendor_src/com/sun/midp/ssl/`（Java，5 个文件）：
+  - `VitaTunnel.java`：**协议推理全在这里**——请求头解析、逐跳头过滤、
+    chunked 请求体解码、响应头重建（去 Transfer-Encoding/Content-Encoding、
+    补 Content-Length、加 `Connection: close`）。放 Java 里的唯一原因是
+    **可在 PC 上单测**。
+  - `SSLStreamConnection.java`：上游要求的公开 API（含 `openDataInputStream`
+    /`openDataOutputStream`，StreamConnection 要求）。
+  - `VitaServerCert.java`：继承 `X509Certificate`，`getSubjectAltNames()`
+    返回一条 DNS SAN = 实际连接的主机名。
+  - `VitaHttpBackend.java` / `VitaHttpNative.java`：后端接口 + 生产实现
+    （接口存在的目的就是单测能注入假后端）。
+
+### 证书：为什么是"合成"的
+`https/Protocol.connect()` 拿到 `serverCert` 后做站点名校验：有 SAN 就比对
+DNS SAN，没有才回退 `CN=`。而 **SceSsl 只暴露证书的名字字段，拿不到 DER**
+（`sceSslGetSubjectName`/`IssuerName` + `GetNameEntryInfo` 给 OID/值，
+没有 `sceSslGetCertificate`）。现代证书又经常**没有 CN**（只有 SAN）。
+
+所以 `getServerCertificate()` 返回一个 `VitaServerCert`，其
+`getSubjectAltNames()` 里放的就是本次真正连上的主机名。这**不是安全漏洞**：
+连接能建立是因为 SceHttp 已经完成了一次验证过的握手（系统信任库），
+主机名检查此时已无信息可证，纯粹是上游路径上的一道形式检查。
+`getSubject()` 仍尽量返回真实 subject（`SecurityInfo` 输出用）。
+
+### 已知限制（写在代码注释里，不是遗漏）
+- **一个事务一个隧道**，不做 pipeline；MIDP 本来也不 pipeline。
+- **请求体必须写完才读响应**——MIDP 的"边写边读"流式模式不支持
+  （SceHttp 无法表达，且样本游戏都没用到）。
+- **`ssl://` 原样 TLS socket 协议不可用**：它会走同一个隧道，但写的是原始
+  TLS 字节，会被当成畸形 HTTP 请求 → IOException。**明确失败**而不是垃圾数据。
+  游戏语料里没有用 `ssl://` 的，用 `https://` 的正常工作。
+- 协议版本/CipherSuite 是常量（SceHttp 不报告），`SecurityInfo` 显示为
+  `TLSv1.2` / `UNKNOWN`。
+
+### 构建接线（这次踩了一串坑，都记下来）
+1. `USE_SSL=true`（`build_vita.sh` + `Settings.gmk`）。这会启用上游
+   `protocol/ssl` + `protocol/https` 两个模块（`SUBSYSTEM_PROTOCOL_MODULES
+   = https ssl sms cbs`）。保持 `USE_RESTRICTED_CRYPTO=false`，
+   于是 `com.sun.midp.ssl` 这个包**只由我们提供**。
+2. **Java 源必须进入同一次 javac**：`https/Protocol.java` 编译期就要
+   `com.sun.midp.ssl.SSLStreamConnection`。写成"先编 MIDP、后编 vendor"就是
+   死循环。做法：在 **变量 overlay**（`MAKEFILES` 预加载，早于所有 lib.gmk）
+   里 `SUBSYSTEM_HTTPS_JAVA_FILES += $(wildcard ../vita-port/vendor_src/
+   com/sun/midp/ssl/*.java)`——因为 `protocol/subsystem.gmk` 用 `=` 把
+   `SUBSYSTEM_HTTPS_JAVA_FILES` 折进 `SUBSYSTEM_PROTOCOL_JAVA_FILES`，
+   早加晚加都能进最终列表，但**只有"早加"能进同一次编译**。
+   （先试过用 rules overlay 里再加一条 `$(MIDP_CLASSES_ZIP)::` 规则——不行，
+   规则按定义顺序执行，我们的追加跑在 javac 之后。）
+3. **make 会在读到时立即展开规则的目标**，所以 `$(OBJ_DIR)/...` 这种规则
+   不能放 `MAKEFILES`（那时 `OBJ_DIR` 还是空）。新增
+   `build/vita_arm/vita_overlay_rules.mk`，由 `phoneme-midp/GNUmakefile`
+   在 `include Top.gmk` **之后** `-include`。
+4. **`libmidp.so` 从来就链不起来**：`MIDP.gmk`（本树既有改动）让它依赖
+   `$(OBJ_DIR)/vita_stubs.o`，但没有任何地方把 `src/vita_stubs.c` 加进对象
+   列表——规则不存在。这个坑一直没暴露，只因为 `libmidp.so` 一直是"已最新"，
+   make 从不重链；**改 USE_SSL 变了它的文件列表 → 强制重链 → 暴露**。
+   两个修法：给 `vita_stubs.o` 补一条规则（放 rules overlay），以及
+   `CREATE_MIDP_SHARED_LIB=false`（`libmidp.so` 还需要 `vita_ime_*`、
+   `lfjport_*`，那些在 eboot 里；本移植只消费 `libobj.a`，从不加载这个 .so）。
+   `vita_stubs.c` **没有**加进 `JTWI_NATIVE_FILES`：它里面的
+   `pcsl_file_*`/`javacall_*` 桩会和 `vita_pcsl.c` 的实现撞车，而
+   `--whole-archive` 下谁赢取决于归档顺序。
+5. **`alljavalist.txt` / `classes.zip` 会挡住新模块**：构建打印
+   "no need to recompile .java files"，新模块永远不进编译。改 USE_SSL 后必须
+   删掉 `classes.zip`（或 `alljavalist.txt`）才能让列表重生成。
+6. **UAF 风险自查**：`vita_https_kni.c` 里 `KNI_EndHandles()` 展开就是
+   `KNI_StartHandles()` 那个 `{` 的闭合大括号，所以**它不能出现在任何嵌套
+   块里**（第一版在 `if` 里调用，编译器报一堆 `__handle_info__ undeclared`）。
+   所有函数改成单出口。
+
+### 验证
+- **宿主机单测 `/tmp/tt/VitaTunnelTest.java`（41 断言，ALL PASS）**，
+  测的是**真实源文件**（只有后端换成 Fake）：
+  请求头过滤（Host/Connection/Accept-Encoding/Content-Length 去掉，
+  UA/Cookie 保留，请求行丢弃）、`findHeadEnd`、chunked 解码（含 `;ext=1`）、
+  响应头重建（保留状态行/普通头，去掉 Transfer-Encoding/Content-Encoding/
+  keep-alive，补 Content-Length，加 `Connection: close`，未知长度不加）；
+  合成状态行、空输入返回 null；端到端 GET（begin 被调用、方法/路径正确、
+  body 为空、响应头+块体完整、close 调后端）；POST 实体原样透传；
+  chunked 上传被解码；后端不可用 → IOException；`VitaServerCert` 的
+  SAN 类型/内容/CN。
+- 交叉核对：`nativeFunctionTable.cpp` 里的 10 个函数名与
+  `vita_https_kni.c` 里 `KNIDECL(...)` 的名字逐一相符（构建自动生成，
+  改动 Java 侧 native 列表后必须重新 grep 一次）。
+- `arm-vita-eabi-nm build/cmake/midp_vita` 有 10 个
+  `Java_com_sun_midp_ssl_VitaHttpNative_*` 符号；
+  `midp_system.jar` 里有 `com/sun/midp/io/j2me/{https,ssl}/Protocol.class`
+  与 `com/sun/midp/ssl/*.class`（9 个）。
+- 段布局：TEXT `+0x3cc1b4` → 对齐 0x813d0000 → `+__sce_headroom` →
+  RW `0x813e0000`。**TEXT 距 RW 只剩 ~81 KB**，下次加静态库前先看
+  `readelf -l`。
+- 回归：`gdtest`/`p2test`/`vkeytest`/`dectest`/`jpegtest`/`permtest`
+  全部 **ALL PASS**。
+
+### 没做 / 下一步
+1. **未上真机**。验收方式：`Connector.open("https://httpbin.org/get")` 能
+   `getResponseCode()==200`；日志里 `[HTTPS] SceHttp ready`。
+2. **Vita3K 大概率不可用**（没有 SceHttp/HTTPS 模块）→
+   `vita_https_available()` 返回 0 → `SSLStreamConnection` 构造抛
+   `IOException("HTTPS not supported on this system")`，游戏看到的是网络错误
+   而不是崩溃。这是刻意的降级。
+3. 没有做证书固定/自定义 CA（`sceHttpsLoadCert` 可以，但本移植用系统库）。
+4. 没有做 HTTP 代理（`Configuration.getProperty("com.sun.midp.io.http.proxy")`
+   分支保留了，但隧道的 `begin(host,port)` 直接连目标）。
+5. 请求体上限 4 MB（`VitaTunnel.MAX_REQUEST`），响应体按 Content-Length
+   流式读出，未设上限（由 SceHttp 池与超时约束）。
+6. `ssl://` 协议、客户端证书、AAC 之外的其他 HTTPS 特性均未做。
+
+## 2026-10-24 JIT：每轮复位 + 探针（用户选 1）→ v02.94
+
+> 版本号：开工时 02.92（截图）、02.93（HTTPS）已被别的会话占用，所以是 **02.94**。`out/vpk/midp_vita_v02.94.vpk`（11919992 B）。
+> **未在真机运行。默认 `jit=0` 行为不变。**
+
+### 用户选择
+三个方案里选了 **1：先做 `UseCompiler` 复位 + 诊断**（不做可执行内存/icache 的大改）。
+
+### 复位为什么必须连 `CompilerAreaPercentage` 一起恢复（比上一轮我说的更深一层）
+上一轮只说\"`UseCompiler` 没人置回 true\"。读 `ObjectHeap.cpp:1177` 发现还有第二处：
+`ObjectHeap::initialize()` 在 `!UseCompiler && !GenerateROMImage` 时把 **`CompilerAreaPercentage` 和 `CompilerAreaSlack` 永久写成 0**。
+这两个也是进程全局，所以只复位 `UseCompiler` 仍然没有 JIT 代码区。`vita_jit.c` 在首次调用时（任何 `-int` 之前）抓取
+`UseCompiler / MixedMode / CompilerAreaPercentage / CompilerAreaSlack` 的 VM 默认值，对 `policy != 0` 的轮次逐一写回；`policy == 0` 不动（`runMidlet.c` 自己传 `-int`）。
+
+### 关键文件修改记录
+| 文件 | 改动 |
+| --- | --- |
+| `vita-port/src/vita_jit.c`、`vita_jit.h`（**新**） | `vita_jit_round_begin(round, policy)`：首次抓默认值，`policy!=0` 时写回；`vita_jit_round_end(round)`：`crumb.log` 写 `jit: round N done: UseCompiler= compile-requests= produced-code=`、`compiler area size/used`，并用 `sceKernelGetMemBlockInfoByAddr` 查**首个编译产物所在内存块**的 `access`（X=1 W=2 R=4）/`type`/`base`/`size` |
+| `phoneme-cldc/src/vm/share/compiler/Compiler.cpp`（**共享 VM 文件**，`#if defined(VITA)`） | `try_to_compile` 前加 C 链接的 `vita_jit_try_count/ok_count/first_code` 与 `vita_jit_area_size/used()`；调用后计数（+27 行） |
+| `vita-port/src/vita_main.c` | 3 处：`#include "vita_jit.h"`；每轮 JIT 策略块后调 `vita_jit_round_begin`；`runMidlet` 返回后调 `vita_jit_round_end` |
+| `vita-port/CMakeLists.txt` | 源文件 `src/vita_jit.c`；**`LINK_DEPENDS`（见下）**；版本块 02.94 |
+| 需要 | `./rebuild_vm.sh`（`Compiler.cpp` 是 VM 代码） |
+
+### 又一个\"假成功\"：改了 VM 库不会触发重链接（已修）
+- 现象：`build.sh` exit 0、\"Build successful\"，但 ELF 里**没有**我的计数器——`nm` 显示 `vita_jit_try_count` 是 **weak-undefined**，
+  `try_to_compile` 仍是旧大小 `0xb4`；而 `libcldc_vm.a` 里的成员 `_MergedSrc002.o` 已经有它（`B vita_jit_try_count`，函数 `0xe0`）。
+- 时间戳证据：ELF `03:53:50` < `libcldc_vm.a` `03:54:07`；再跑一次 `build.sh` ELF 时间戳**不变**。
+- 根因：VM 是以 `-lcldc_vm` 等形式链接的，CMake 看不到它们是文件依赖，库变了不重链接。
+- 修法：给目标加 `LINK_DEPENDS`（`libcldc_vm.a / _ani / _anix / _vmtest / libpcsl_multimedia.a`，五个文件我都确认存在）。
+  验证：再 `build.sh` 后 ELF `03:56:41`（新于库），`try_to_compile` 变成 `0xe0`，三个计数器成为真 `B` 符号。
+- **意义**：这影响所有之前\"只改了 `phoneme-cldc` 然后 `build.sh`\"的轮次。v02.82 那次我是靠 `strings` 看到了日志字符串才放心的；
+  但**凡是只跑了 `build.sh`（没带 `midp`）、且依赖刚重编的 VM 的构建，都可能带着旧 VM**。以后核对 VM 改动必须 `nm`/`strings` ELF，不能只看库。
+
+### 验证
+- `rebuild_vm.sh`：日志 `grep error:` 只有预期的 `collect2: error: ld returned 1`（crt0）；库成员含 `vita_jit_*` 符号。
+- `build.sh` exit 0；ELF 含 `vita_jit_round_begin/end`（`bl` 调用点在 `0x81000cf4`、`0x81001918`），`strings` 含全部 4 条 `jit:` 日志格式串；版本串 `v02.94`。
+- **没有做的验证**：没有在任何设备/模拟器上执行；`vita_jit_round_*` 的逻辑只靠读代码，没有宿主机单测（它依赖 VM 全局和 Sce 接口）。
+
+### 下一轮怎么用（需要用户操作）
+1. 设置 > JIT 编译 选 **2**（或 `launch.cfg` 里 `jit=2`），启动一个**小游戏**（先别用 UC），看 `crumb.log`：
+   - `jit: captured defaults UseCompiler=1 ... CompilerAreaPercentage=20` → 抓到了 VM 默认值；
+   - `vm UseCompiler(post)=1`（上次是 0）→ 复位生效；
+   - `jit: round N done: compile-requests=K produced-code=M`：**K=0** 说明 JIT 开了但从没尝试编译（阈值没到/被 tick 门挡了）；
+     **K>0, M>0** 说明编译器产出了代码；
+   - `jit: first code @0x... block-info rc=0x.. access=0x..`：`access` 含 `1`(X) 才可能执行；**不含 X 就是上一轮说的\"不可执行内存\"，这时通常会紧跟着崩溃**。
+2. 若崩溃：把 `psp2core` 交给 `psp2dmp-analysis` skill；PC 若落在 `first code` 附近 ⇒ 证实是可执行内存/缓存问题，下一步才是 VM 域内存 + `OsMisc_flush_icache`。
+3. 若 `jit=2` 在第 1 轮就 K=0：看 `tickgate`/`tick_compile.cfg`（`OS_vita.cpp`），v02.11 起 tick 编译可被关掉。
+
+### 仍然没解决（写明，避免误以为 JIT 可用）
+- `OsMisc_flush_icache` 仍是 `bx lr`（上一轮反汇编验证）；`arm_flush_icache` 走 Linux 的 `swi 0x9F0002`。
+- 生成代码仍在 `malloc` 的 Java 堆里，未使用 `sceKernelAllocMemBlockForVM`。
+- 这版**没有让 JIT 变得可用**，只是让\"jit=2 是否真的开了 JIT、开了会发生什么\"第一次变得**可观察**。
+
+
+---
+
+## 2026-10-24 v02.97：P1-3 第一刀——444MHz + 帧耗时统计
+
+> 产物 `out/vpk/midp_vita_v02.97.vpk`（11858498 B），版本串
+> `J2ME Player v02.97 b330`。P0 全部代码完成，开始 P1。这一版是 P1-9 杠杆表
+> 最上面一行（"1 行代码 / +25–33% / 低风险"）加上"先量再优化"的前置条件。
+
+### 为什么先做这两件
+- `grep -rn 'scePowerSet\w*ClockFrequency' vita-port/src` 之前是 **0 命中**：
+  移植从来没请求过高性能频率，VM 一直跑在启动时给的时钟上（通常是 333MHz）。
+  这是整份路线图里性价比最高的一行代码。
+- 路线图 P1-3 第 2 项写的是"先加帧耗时统计，再决定优化点"。NEON blit 和
+  GPU 缩放都是 1 周量级的工作，没有 `perf.log` 数据就是猜。所以两者同版本落地。
+
+### 时钟策略
+- VitaSDK **不导出** `scePowerSetClockFrequency(arm,bus,gpu)`，只导出分项
+  setter：`scePowerSetArmClockFrequency` / `...BusClock...` / `...GpuClock...`
+  （`psp2/power.h`），所以分三次调用。
+- 默认 **arm=444 / bus=222 / gpu=不动**。GPU 故意不动：本移植是软件 blit，
+  GPU 只有 IME 对话框在用，升到 166 只增加发热不带来收益。想开就写 `gpu=166`。
+- 顺序：先记 **boot 时钟**，再请求，再用 getter 读回 **实际生效值** 记录。
+  这样日志既能看出"原来是多少"，也能看出"内核是否真的接受了"。
+- 请求被拒绝（Vita3K / 受限 CFW）**不是致命错误**：记一行
+  `arm: request 444 MHz failed rc=0x…, staying at 333 MHz` 后继续跑；bus/gpu
+  仍会尝试，三个键彼此独立。
+- 开关 `ux0:/data/J2ME00001/clock.cfg`：`arm=` / `bus=` / `gpu=`，
+  **`0` = 完全不动**（省电/发热/做 A-B 对比）。解析器是"文件不存在/键不存在/
+  值不是数字 → 用默认值"，不分配内存、不会在启动早期失败。
+
+### 帧耗时策略（这是决定 NEON 还是 GPU 缩放的关键）
+`flip_to_display()` 现在打三个时间点：入口 `t0`、提交前 `t_prep`、返回
+（复用已有的 `g_last_flip_us`）。`perf.log` 每 `stats_gap` 帧（默认 300 ≈ 5 s）
+一行：
+
+| 字段 | 含义 | 用途 |
+| --- | --- | --- |
+| `prepare` | 清边框 + 缩放 blit + 覆盖层 | **我们自己的 CPU 成本** |
+| `flip` | 入口到返回（再加提交 + vblank 等待） | 一次 flip 的总占用 |
+| `period` | 相邻两帧间隔 | 真实 fps |
+
+判读规则（写进 `vita_perf.h`，避免以后又来猜）：
+- `period≈16.67ms` 且 `prepare` 很小 → **受 vsync 限制**，优化 blit 没有收益；
+- `period≈30ms` 且 `prepare≈20ms` → **blit 就是瓶颈**，NEON 值得做。
+
+### 几个必须记住的细节
+1. **窗口第一帧没有 period**（窗口内没有上一帧）。所以 period 的平均用
+   `period_samples` 而不是 `samples` 做分母，否则每个窗口都会低估
+   1/N，`stats_gap` 越小偏差越大（gap=60 时是 1.6%）。这一点是单测抓出来的。
+2. **`total_us > 60000` 或帧间隔 > 4 s 视为卡顿**（换轮/jar 加载），
+   不并入平均，而是**重置窗口**。否则一次 5 s 停顿会让接下来两个窗口的
+   fps 都变成个位数，把真正的性能问题掩盖掉（也把日志变成噪声）。
+3. **日志有上限**：`stats_gap` 最小钳到 60（一帧一行正是过去把移植卡死的
+   log storm），`stats_max` 默认 200 行后停止写 `perf.log`。长时间运行不会
+   写满 ux0。
+4. `vita_perf_init()` 可重入，第二次是 no-op——启动路径可能被重新走到，
+   不能重复改时钟、也不能写两条 session 头。
+5. 路径用 `#ifndef PERF_CFG_PATH` 包起来，宿主单测用 `-D` 指到 `/tmp`，
+   控制台侧不需要定义。
+
+### 关键文件修改记录
+- `vita-port/src/vita_perf.h` / `vita_perf.c`（新增）：`vita_perf_init()`、
+  `vita_perf_frame()`、`vita_perf_get()`、`vita_perf_clock_{arm,bus,gpu}()`。
+  `perf.log` 走 `sceIoOpen/Write/Close`（不碰 stdio，与 `vita_crumb.c` 同理由）。
+- `vita-port/src/vita_main.c`：`#include "vita_perf.h"`；
+  在 **stderr 重定向之后、`dlog` 之前** 调 `vita_perf_init()`（放在重定向
+  之前的话时钟日志只会进 tty，不会进 `midp_stderr.log`）。
+- `vita-port/src/vita_display.c`：`#include "vita_perf.h"`；
+  `flip_to_display()` 开头 `t0`、提交前 `t_prep`、末尾用 `g_last_flip_us`
+  当 `t_end` 调 `vita_perf_frame()`。IME 帧和普通帧都经过同一个末尾，
+  所以两类帧的数字可比。
+- `vita-port/CMakeLists.txt`：新增 `src/vita_perf.c`；**新增 `ScePower_stub`**
+  （之前没链过，`scePowerGetArmClockFrequency` 虽然头文件里有但从未调用）；
+  `VITA_VERSION` 02.96 → **02.97**。
+- `COMPATIBILITY_ROADMAP.md`：P1-3 第 1、2 项标记完成，写上判读规则；
+  P0 段落补"P0 全部代码完成"和 P1 进度一行。
+
+### 验证
+- **主机离线单测** `/tmp/perfshim`（13 个场景，全 PASS，走 fork 每场景一个
+  干净进程，因为状态是 static）：
+  无配置 → 444/222/gpu 不动（且 `gpu` setter **从未被调用**）；
+  显式值 + CRLF + 行尾空格 → 正确；
+  `arm=0` → arm setter 未被调用、bus 仍升；
+  拒绝 arm → 值仍 333、日志含 `staying at 333 MHz`、bus 仍升；
+  垃圾配置 → 回落默认；
+  60 帧周期 16667us / prepare 3000 → 恰一行 `f=60 fps=59.9 period=16.66(…)`；
+  `vita_perf_get` 镜像最后一帧；
+  `stats_gap=1` 被钳到 60（10 帧不出行）；`stats_max=2`（600 帧只出 2 行）；
+  `stats=0` 完全不出帧行；70000us 的"帧"重置窗口；5 s 空档重置窗口；
+  帧前 `vita_perf_get` 返回 0 且 `vita_perf_get(NULL,…)` 不崩；
+  `vita_perf_init()` 两次只写一条 session 头。
+- 既有 6 个 C 单测回归：`gdtest` / `p2test` / `vkeytest` / `dectest` /
+  `jpegtest` / `permtest` 全 ALL PASS。
+- `./build.sh` exit 0，`out/vpk/midp_vita_v02.97.vpk`（11858498 B），
+  `strings` 含 `J2ME Player v02.97 b330`，`nm` 含
+  `scePowerSetArmClockFrequency`。
+- `readelf -l`：TEXT `0x81000000+0x3b4e74`，RW 起 `0x813e0000`
+  → 段间余量约 **172 KB**（比上一版还宽了，因为同期其他改动）。
+- **真机/Vita3K 未验证**：444MHz 是否被接受、发热、`perf.log` 的实际数字都
+  要真机。
+
+### 没做
+- 逻辑耗时 / 音频耗时统计（P1-3 第 2 项只做了渲染侧）；判读时只能看到
+  "剩下的时间"而不是它花在哪。
+- 屏幕上的 FPS 浮层（数据已在 `vita_perf_get()` 里，接 P1-8 诊断浮层时直接用）。
+- NEON blit / GPU 缩放：**故意等 `perf.log` 数据**。
+
+### 下一步
+1. 真机跑一轮，取 `perf.log`：若 `period≈16.67` → 直接跳 P1-2（启动白屏）；
+   若 `prepare` 占大头 → 做 NEON 化 RGB565→ABGR。
+2. P1-2 第 1 项：启动 splash（`splash` 在 src 里 0 命中，仍是白屏）。
+3. P1-2 第 2 项：`setvbuf(stderr, NULL, _IONBF, 0)` 改行缓冲。
+4. P1-1（JIT）不要重开：v02.94 的探针在另一条线推进。
+
+---
+
+## 2026-10-24 v02.96：截屏结果提示条（v02.92 截屏的用户反馈）
+
+> 产物 `out/vpk/midp_vita_v02.96.vpk`（11923178 B），版本串
+> `J2ME Player v02.96 b330`。用户反馈：截屏没提示，"不知道有没有成功"。
+
+### 行为
+- 每次尝试后屏幕**顶部正中**显示 3 秒提示条：
+  - 成功：绿色勾 + `已保存截图  shot_YYYYMMDD_HHMMSS.png`
+  - 失败：红叉 + `截图失败  rc=N`
+- 提示条在 `vita_shot_service()` **之后**绘制，所以 PNG 本身不含提示；
+  这也保证文件名提示与实际保存的文件一致。
+
+### 必须解决的两个"看不到提示"的场景
+1. **Java 不重绘**（菜单/暂停画面）：`flip_to_display()` 只在 Java 调用
+   `lfjport_refresh()` 时运行，画面不动就永远没人画提示。
+   → `j2me_shot` 轮询线程在保存后比较 `g_saved_us` 与
+   `vita_display_last_flip_us()`；200 ms 内没有更新的帧就调用
+   `vita_display_toast_flip()` 自己提交一帧。
+2. **VM 已冻结**（本移植的常见故障）：同上路径覆盖；`toast_flip()` 只写
+   **front buffer** 并重新提交同一地址，不参与 VM 的 blit/swap，因此不会
+   破坏双缓冲（最坏情况是 VM 恰好恢复时看到一帧半绘制的提示）。
+- 正常路径中，保存发生在 flip 内部，flip 结束时 `g_last_flip_us` 已不小于
+  `g_saved_us`，轮询线程检测到"VM 已画"就不再重复提交。
+
+### 残影处理（重要细节）
+- 提示条横跨**黑边**（letterbox），而缩放 blit 从不写黑边，`clear_letterbox()`
+  平时也只在键盘关闭后的两帧里调用。若不处理，提示条过期后会在黑边里永久
+  留下文字/边框残影。
+- 现在 `flip_to_display()` 记录 `g_toast_was`：提示从"有"变"无"的第一帧先在
+  blit 之后、虚拟键盘之前 `clear_letterbox()`，再让 vkey/相机按钮照常画回去。
+  `vita_display_toast_flip()` 也会置 `g_toast_was = 1`，覆盖冻结路径的同样问题。
+
+### 关键文件修改记录
+- `vita-port/src/vita_shot.c`
+  - `toast_text[112]` / `toast_until_us` / `toast_err` / `toast_flip_done`；
+    `shot_save()` 成功与失败分支都 arm 提示（release-store 发布字符串）。
+  - `vita_shot_draw_toast()`：CPU 混合的半透明深底（显示控制器忽略 alpha）、
+    2 px 彩色边框、勾/叉图标、`vita_menu_draw_utf8()` 画中文与文件名；
+    字体缺失时仍能看到彩色条 + 图标。
+  - `vita_shot_toast_active()`、`utf8_width_est()`（CJK 全宽 / ASCII 半宽，
+    与 `vita_font.c` 的 `fb_default_advance` 一致）用于居中。
+- `vita-port/src/vita_display.c`
+  - 新增 `vita_display_toast_flip()`、`vita_display_last_flip_us()`。
+  - `flip_to_display()`：提示残影清理 + `vita_shot_draw_toast()`（提交前）。
+  - `g_last_flip_us` 改用 `__atomic_store_n/load`（跨线程读，32 位 ARM 上
+    64 位普通读会撕裂）。
+- `vita-port/CMakeLists.txt`：`VITA_VERSION` 02.95 → **02.96**。
+- `vita-port/README.md`：截屏章节补提示条说明。
+
+### 验证
+- `make -j4` exit 0，`out/vpk/midp_vita_v02.96.vpk` 生成，ELF 含
+  `vita_shot_draw_toast` / `vita_shot_toast_active` / `vita_display_toast_flip` /
+  `vita_display_last_flip_us`。
+- **主机离线单测**（同一份 `vita_shot.c` + psp2 桩 + 桩字体）：
+  未激活→0 像素变化；激活→顶部带内 9520 像素变化、水平中心 479（面板 480）；
+  过期→0 变化；失败分支→6800 像素且用红色；相机按钮 bbox (6,56)-(61,91)
+  与提示条（y=8..41，x 从 340 起）不重叠。全部 PASS。
+- 真机/模拟器尚未验证（提示条位置、中文字体是否已加载、冻结兜底是否如期）。
+
+---
+
+## 2026-10-24 v02.95：虚拟键"按下反馈"真正可见
+
+> 用户反馈："虚拟按键，点击之后没有任何焦点变化，最好做个反馈效果"。
+> 产物随 02.96 一起出（`out/vpk/midp_vita_v02.96.vpk`，11855797 B），
+> 符号 `vita_vkey_flash_active` / `vita_display_vkey_tick` 已在 ELF 中。
+
+### v02.89 的高亮为什么完全看不见
+v02.89 只在**手指按住期间**给按钮上色，而虚拟键盘是画在
+`flip_to_display()` 里面的，那个函数**只有 Java 调 `lfjport_refresh()`
+（即游戏自己重绘）时才跑**。
+
+菜单类游戏的典型时序是：
+```
+touch down -> emit KEYMAP_STATE_PRESSED -> 游戏收到事件开始处理
+touch up   -> emit RELEASED               -> 高亮已被清掉
+游戏处理完 -> Display.flip()              -> 这一帧画出来时，pressed_btn 已经是 -1
+```
+所以**一帧高亮都不会出现**——按键事件本身一直是好的（游戏有反应），
+纯粹是视觉反馈的时序错了。
+
+### 修法（两层）
+1. **锁存一个 260 ms 的闪一下**（`VKEY_FLASH_MS`）。
+   `vita_vkey_set_pressed(btn>=0)` 记下 `flash_btn` 和按下时刻；
+   抬手（`btn<0`）**不清 flash**，让它自然过期。
+   绘制时 `down = (i == pressed_btn) || (flash 有效 && i == flash_btn)`。
+2. **倒计时从"真正画出来的那一帧"开始**，不是从按下开始
+   （`flash_deadline_us == 0` 表示"还没画过"，draw 里首次画到高亮时才
+   `= now + 260ms`）。这样即使游戏在按键处理里耽搁 600 ms 才重绘，
+   玩家仍然能看到完整 260 ms 的高亮。
+3. **硬上限 `VKEY_FLASH_MAX_MS`(1200 ms)**：万一真的什么都不画（游戏卡在
+   按键处理里），flash 也不能让事件泵无限重绘。
+4. **由事件泵强制重绘**：`vita_display_vkey_tick()`（在
+   `checkForSystemSignal()` 里、紧跟 `vita_display_ime_tick()` 之后）在
+   flash 有效期间**最多每 33 ms** 重跑一次"正常 blit + 键盘叠加 + 提交"。
+   因为 CLDC 是绿色线程，VM 线程是唯一碰虚拟屏和后缓冲的 OS 线程，
+   所以从泵里重绘是安全的。IME 打开时跳过（对话框拥有屏幕）。
+
+### 视觉设计
+按下态 = 琥珀底（ABGR `0xFF30A0F0`）+ 白边 + **内嵌一圈亮框**
+（"凹陷"感）+ 字形下沉 1 px 且用深色；叠加模式下 alpha 从 150 提到 225，
+在花哨画面上也看得清。字形**不**放大（`scale+1` 会溢出到邻居按钮，
+v02.89 犯过）。
+
+### 验证
+- `/tmp/vkeytest.c` 新增 **11 条 flash 状态机断言**（用假时钟镜像
+  `vita_vkey.c` 的逻辑）：按下即亮、30 ms 短按不丢高亮、**画出来的那帧**
+  启动倒计时、170 ms 后仍亮、260 ms 后过期、**600 ms 迟到重绘仍拿到完整
+  窗口**、什么都不画时 1200 ms 硬停、按住一直亮、换键重定向、
+  布局重建清零。全部 **ALL PASS**。
+- 布局断言（6 种分辨率 + overlay + mode=1/2）与之前一样全过；
+  `gdtest`/`p2test`/`dectest`/`jpegtest`/`permtest`/`RingToneTest`/
+  `VitaTunnelTest` 全部 **ALL PASS**。
+
+### 踩到的坑
+1. **一开始只做"按住才亮"** —— 这是设计错误，不是实现 bug。判断"有没有
+   反馈"必须从**帧的时间轴**出发：先问"这一帧什么时候被画出来"，
+   再问"那时状态还在不在"。
+2. 倒计时起点也必须是**首次绘制**而不是按下，否则忙碌的游戏仍然看不到。
+3. 加硬上限，否则"永不重绘"的场景会让事件泵一直重绘（CPU 白烧）。
+
+### 没做 / 下一步
+1. **未上真机**。验收：开虚拟键盘，点任意键应看到该键变琥珀色约 0.25 s；
+   游戏静止不动时也应看到（这是本项的核心）。
+2. 还没有按键音（振动/音效反馈可以后续加，振动已有 `vita_vibrate`）。
+3. 多点触控仍未做（一次一个按钮高亮），组合键同理。
+
+## 2026-10-24 log120 分析 + 诺基亚 OTA 铃声修复 → v02.98
+
+> 产物 `out/vpk/midp_vita_v02.98.vpk`（11859963 B），ELF 版本串 `J2ME Player v02.98 b330`。
+> **未在真机运行。** log120 实际跑的是 v02.94。
+
+### log120 事实（v02.94，jit=2 对 round 3/4 生效）
+| 轮 | 游戏 | JIT | 结果 |
+| --- | --- | --- | --- |
+| 0–2 | 喜羊羊 / UC / 封神榜 | policy=0（`-int`） | 正常退出（vmStatus=2001） |
+| 3 | 口袋灵兽 | policy=2，`UseCompiler(post)=1` | `JVM::start()` **0.14 s 即返回 -1**，vm_output 末行 `Could not allocate VM heap` |
+| 4 | 魂斗罗4 | policy=2 | 进入 `JVM::start()` 后 coredump，之后无任何输出 |
+
+- **v02.94 的复位逻辑生效了**：`UseCompiler(post)=1` 首次真实出现（此前 jit=2 从未真正跑过）。
+- 两款 jit=2 的游戏都挂了。**根因没找到**，只有下面这些硬事实：
+  - 魂斗罗4 dump：主线程 `pc=lr=0x83a5f52c`，落在 MEM_BLK_INFO 里 `Newlib heap`
+    （base `0x81c00000`，64 MiB，type `0x0c20d060`=USER_RW 非可执行）内偏移 30.4 MiB。
+    即 **CPU 跳进了 malloc 堆里的 JIT 代码并因不可执行而取指失败**——与 v02.94 之前
+    "无可执行内存" 的推断一致，但**这是推断**：dump 里没有 JIT 编译计数（crumb 在
+    `runMidlet returned` 之后才写，崩溃时没写出来）。
+  - 口袋灵兽：消息是 `adjust_heap_size` 失败（不是 `HeapCapacity too low`），所以最小堆
+    检查已通过、是 chunk 的 `malloc` 失败。**为什么失败不知道**——算术上 32 MiB 堆 + 1 MiB
+    位图放进 64 MiB arena 本应够（jit=0 的前 3 轮同样大小都成功）。
+- v02.98 加了 `[heap] chunk alloc FAILED …`（见下），下次真机直接给出请求大小和 `mallinfo`。
+
+### 喜羊羊没声音——真根因（纠正 v02.88/v02.91 的判断）
+- log120：`[SOUND] init len=58 type=1 head=2,74,58` → `ringtone->wav FAILED (null)`。
+  数据确实是 OTA 铃声，**是我写的 `RingTone.parseOta` 解析错了**，不是 Sound 流程问题。
+- 位流格式（J2ME-Loader `ToneVerifier` 的注释 + 三段真实数据反推）：
+  `[cmdLen:8][RTP:7+filler:1][sound:7][songType:3]` → songType==1 时 `[titleLen:4][title:8×n]`
+  → `[sequenceLength:8]` → 每个 pattern `[hdr:3][id:2][loop:4][count:8]` + count 条指令
+  （note=4+3+2、scale=2、style=2、tempo=5、volume=4）。
+- 旧代码从第一个歌曲字节（byte 3）直接当指令读：第一个 3 位是 songType→被当成"SCALE"，
+  下一个 id=0 → `break` → 0 个音符 → null。三段数据全中。
+- 验证：`/tmp/ota_decode.py` 按新格式解三段真实数据，指令数 34 / 255 / 255，
+  解完恰好剩零填充（旧假设"头先全部给出再给 pattern"解不通，已排除）。
+  宿主 JVM 跑 `RingTone.toWav`：修复前 `NULL ×3`，修复后 **9.0 s / 33.8 s / 20.6 s**
+  的 8 kHz 单声道 WAV，非静音样本 72% / 100% / 57%，幅值 84..172（方波）。
+- 局限：`loop` 与 `patternId` 被读取但**未展开**（只播一遍）；这三段数据 loop=0、
+  只有 1 个 pattern，所以不影响它们。别的游戏如果用多 pattern + 循环会少播重复。
+- 内层 `for ins` 里的所有 `break` 都改成了 `break seqLoop`，否则截断后会继续读下一个
+  pattern 的垃圾位。
+
+### UC 空剪贴板 Alert 花屏——截图判读（只有证据，没有定案）
+- 截图 `shot_20261024_134937.png`：中间 240×320 区域只有 5 种颜色，是黑色 + 蓝白棋盘抖动；
+  底部是橙色软键条（"取消 / 确定"）。**整幅截图里 0xFFCC33 像素数为 0**（Alert 的底色没画出来）。
+- `screen.image_wash.png` 是 8×8、一半黑一半透明的棋盘，正是 WashLayer 的遮罩。
+  所以"花屏" = **遮罩画了，Alert 框没画**。
+- `[ALERT-PAINT] skin=0x125 clip=0,-177 0x0 viewable=-10x3`：Alert 层宽度 0、`clip` 的
+  y 是 -177。皮肤 xml 里 `ALERT_WIDTH=-1`（merged_pass1.xml），运行时写成 0 的唯一代码路径是
+  `AlertLayer.setAnchor`（`AlertSkin.WIDTH = (int)(.95 * owner.bounds[W])`）。
+- **没证实的部分**：我查不出 `owner.bounds[W]` 怎么会是 0——`MIDPWindow` 构造时传入
+  `tunnel.getDisplayWidth()`，而 `Display` 先设了 `width`。所以"窗口当时还没尺寸"只是**假设**。
+- v02.98：`setAnchor` 在 owner 尺寸 ≤0 时直接返回（不再固化 0），并打 `[ALERT-LAYER]` 日志
+  （`owner has no size yet …` / `resolve skin=… owner=…`）。**这是防御 + 取证，不是确认的修复。**
+  下次日志：若出现 `owner has no size yet` → 假设成立；若一条都没有而 skin 仍是 0 →
+  0 来自别处（例如皮肤载入值）。
+
+### 改动文件
+- `vita-port/nokia_src/RingTone.java`：`parseOta` 重写头部解析 + 多层循环（`seqLoop`）。
+- `phoneme-midp/.../chameleon/layers/AlertLayer.java`：`setAnchor` 守卫 + 日志。
+- `phoneme-cldc/src/vm/share/memory/ObjectHeap.cpp`：`#if defined(VITA)` 下 chunk malloc
+  失败时打印 `[heap] chunk alloc FAILED heap_chunk=…/max … bitv_chunk=… heap/min/cap UseCompiler comp%`
+  和 `[heap]   got heap_chunk=%p bitv_chunk=%p | newlib arena/inuse/free/top`。
+  `#include <malloc.h>` 放在 `#include "incls/_precompiled.incl"` **之后**（该文件开头的
+  `#include <stdio.h>` 在 `#if defined(LINUX) && !defined(VITA)` 里，Vita 构建会跳过，
+  第一次放进去等于没放）。
+- `vita-port/CMakeLists.txt`：`set(VITA_VERSION "02.98")` + 说明。
+
+### 验证
+- `rebuild_vm.sh` exit 0，日志里唯一的 `error:` 是文档记录的预期 `collect2: ld returned 1`
+  （最后链 `cldc_vm_g`）。**库本身**：解包 `_MergedSrc003.o` 含 `chunk alloc FAILED`，
+  引用 `mallinfo`。
+- `./build.sh` exit 0，但**没有**重编 MIDP Java 类：VPK 里 `AlertLayer.class` 仍是旧的
+  （2170 B，无 `[ALERT-LAYER]`）。必须 `./build.sh midp`。重跑后 2817 B，三条标记字符串都在。
+- 最终 ELF：版本串 `v02.98`，`chunk alloc FAILED` 1 处，`mallinfo` 符号 1 个；
+  VPK 内 `midp_system.jar` 1381 类（com/sun 696），`RingTone` 9721 B。
+
+### 踩到的坑
+1. **`/tmp` 里有旧会话的同名脚本**：`query_edi03` 拒绝覆盖，而我紧接着运行了同名脚本，
+   读到的是旧的 v02.78 检查——输出看着像在验证 v02.98，其实不是。
+   规则：每轮脚本用带版本号的新文件名，运行前 `rm` 旧的 `.out`。
+2. **终端里留着一条没结束的 here-doc**，后面的命令被拼进去、输出被污染。
+   长输出一律写文件再读；不要在同一条命令里混 `python3 - <<EOF` 与后续命令。
+3. **`build.sh`（无参数）≠ 重编 MIDP Java**。VPK 里 class 的时间戳是唯一可信的证据。
+4. 一开始我在 `AlertLayer` 的注释里把"owner 宽度为 0"写成了结论；复查发现 `Display`
+   先于 `MIDPWindow` 设了宽度，站不住，已改成明确标注为假设。
+
+### 没做 / 下一步
+1. **未上真机。** 验收项：
+   - 喜羊羊：`[SOUND] init …` 之后应出现 `ringtone->wav` 成功（不是 FAILED）并有声。
+     若 Alert 全局静音（v02.91）影响菜单音，那是另一回事——游戏自己的声音走 MMAPI。
+   - UC 空剪贴板：看 `[ALERT-LAYER]` 与 `[ALERT-PAINT] skin=`。
+2. **JIT**：jit=2 在 v02.94 下两款游戏都挂。下一次跑 jit=2 要拿到 `[heap] …` 行；
+   魂斗罗4 的崩溃指向"在非可执行的 malloc 堆里执行 JIT 代码"，修法见上轮计划
+   （编译区改用 `sceKernelAllocMemBlockForVM` + 实现 `OsMisc_flush_icache`），但在
+   没有 `compile-requests` 计数前不要动手。**建议用户在没有明确需要时把 launch.cfg 的
+   `jit=` 保持 0**——jit=2 目前只会让游戏闪退。
+3. 魂斗罗4 dump 里 TTY 是空的，没法确认它是否也打了 `Could not allocate VM heap`。
+4. `RingTone` 的 pattern 循环展开（见上"局限"）。
+
+
+---
+
+## 2026-10-24 v02.99：P1-2 第 1 项——启动加载画面（取代白屏）
+
+> 产物 `out/vpk/midp_vita_v02.99.vpk`（11862476 B），版本串
+> `J2ME Player v02.99 b330`。**未在真机/Vita3K 运行。**
+
+### 白屏到底在哪一行
+`vita_display.c` 的 `lfjport_ui_init()` 末尾原本是：
+
+```c
+/* Show something immediately (white virtual screen). */
+memset(vita_screen_pixels, 0xFF, sizeof(vita_screen_pixels));
+flip_to_display();
+```
+
+`0xFF` 填进 RGB565 就是纯白。菜单退出后显示层才分配自己的 CDRAM 帧缓冲并提交这
+一帧，于是从这一刻到 Java 画出第一帧之间（log120 实测 5.9–7.3 s 的 preload + VM
+启动）用户看到的就是这块白。**不是"没画东西"，是"故意画了白的"。**
+
+### 设计取舍（为什么不是新开一条提交路径）
+1. **覆盖层而不是独立 flip**。splash 画在 `flip_to_display()` 里，和虚拟键盘、
+   截图提示条同一层，因此复用它唯一的那条 `sceDisplaySetFrameBuf(NEXTFRAME)` +
+   `sceDisplayWaitVblankStart` + 双缓冲交换。log109（v02.63）的教训就是
+   "两条提交路径不能混用"。
+2. **只写物理帧缓冲，绝不写 `vita_screen_pixels`**。`frame_has_content()` 是靠
+   采样虚拟屏"是否有像素不等于 0xFFFF"来判断白屏何时结束的。splash 若写虚拟屏，
+   就会自己宣布"已有内容"、在第一帧就把自己关掉。
+3. **白色 memset 故意保留**。它现在被覆盖层完全盖住看不见，而它是白屏度量的
+   基准值；改成黑色会让每一个空帧都被判成"有内容"。
+4. **重绘由预载循环驱动**（`Universe::load_jar_entry` → `vita_splash_tick()`），
+   限流 250 ms。不开新线程、不加锁：跑重绘的就是正在干活的 VM 线程。
+5. **结束条件 = 第一帧真实内容**（`frame_has_content()` 首次为真）。另外 30 s 硬
+   停，避免"应用永不绘制"时留一块假的载入画面。
+6. 字体用菜单已经在用的 CJK bank（`vita_menu_draw_utf8`，菜单画中文游戏名时已
+   载入，4.8 MB 不会二次读盘）。字体缺失时面板与进度条仍画，退化但不空白。
+
+### 进度模型（诚实优先）
+预载开始前**不知道**会访问多少个类（log120：两个 jar 共 3302 个 entry），所以：
+- 进度条按时间缓动、**封顶 900‰**，永不显示"完成"；
+- 真正的证据是「已载入 N 个类」，由 `vita_preload_entries` 直接喂进去（单调，
+  后来的小 jar 不会让它倒退）；
+- 阶段行按真实阶段切换：`JVM.cpp` 在 `load_all_in_classpath` 前后写
+  「解压游戏资源…」/「初始化虚拟机…」，`vita_splash_begin()` 默认「读取游戏…」。
+
+### 顺带核实：P1-2 第 2 项（stderr 行缓冲）**不需要做**
+路线图里"`_IONBF` 约 0.7 s"是 v01.92 之前的估计。log120 自己的
+`[preload] sys(VM thread, delta)` 给出 **`io_write n=5 us=31831`**（全程 5 次、
+32 ms）。v01.92 已经把每常量池项的 CP dump 删掉，日志早已不是瓶颈；改成 `_IOLBF`
+只会牺牲崩溃日志的最后一截（本项目多次靠 stderr 尾部定案）。**已从目标里划掉。**
+
+同一个 delta 还指出了真正的大头：**`io_read n=4121 us=4778581` /
+`n=4462 us=6420633`**（约 1.2 ms 一次，逐 entry 读 jar），`io_open 2.1–6.3 s`。
+这就是 P1-2 第 3 项（预载 A/B）的着手点：整 jar 一次读入再在内存里切 entry。
+
+### 关键文件修改记录
+- `vita-port/src/vita_splash.c` / `.h`（新）：`begin/stage/entries/tick/end/active/
+  draw`。`SPLASH_MIN_MS 250`、`SPLASH_HARD_MS 30000`、标题截断 96 B、阶段 48 B。
+- `vita-port/src/vita_display.c`：include；`flip_to_display()` 在截图提示条之后
+  调 `vita_splash_draw()`；`first_content_flip` 分支里 `vita_splash_end()`；新增
+  `vita_display_splash_repaint()`（`display_ready` 时才 `flip_to_display()`）；
+  `lfjport_ui_finalize()` 里 `vita_splash_end()`；`lfjport_ui_init()` 的白色 memset
+  加注释说明为什么保留。
+- `vita-port/src/vita_main.c`：新增 `splash_name_from_jar()`（取
+  `games/<名字>/game.jar` 的目录名当标题，退化到文件名再退化到 "J2ME"）；
+  `round begin` 处 `vita_splash_begin()`；`runMidlet exit` 处 `vita_splash_end()`。
+- `phoneme-cldc/src/vm/share/handles/Universe.cpp`：`load_jar_entry()` 里
+  `vita_preload_entries++` 之后加 `vita_splash_entries()` + `vita_splash_tick()`。
+- `phoneme-cldc/src/vm/share/runtime/JVM.cpp`：预载前后 `vita_splash_stage()`。
+- `phoneme-cldc/src/vm/os/vita/Globals_vita.hpp`：三个 `extern "C"` 声明。
+- `vita-port/CMakeLists.txt`：`src/vita_splash.c` + `set(VITA_VERSION "02.99")`。
+- `COMPATIBILITY_ROADMAP.md` / `vita-port/README.md`：P1-2 结论与使用说明。
+
+### 验证
+- **主机离线单测** `/tmp/splashtest`（**38 条断言，全 PASS**）：
+  生命周期与 `end()` 幂等；250 ms 限流（首次 tick 立即画、同一时刻不重画、
+  +100 ms 不画、+250 ms 画）；stage 变更**绕过**限流；entries 单调（后写的
+  10 不会覆盖 500）；无 entries 时只画 2 行文字（标题+阶段）；30 s 硬停
+  （29 s 仍活跃、31 s 自动退出且不画最后一帧）；绘制覆盖全屏无空洞（逐像素
+  只允许 4 种颜色）、四角是背景色、进度条几何 480×10 居中、900‰ 时填充 432 px、
+  头部 6 px、条外是背景、`C_BAR` 总面积 < 满条；`end()` 后 `draw()` 一个字节都
+  不写；`draw(NULL/0/h)` 不崩；超长标题截断后仍不越界。
+- VM 库：`rebuild_vm.sh` exit 0，日志里仍只有那条文档记录的预期
+  `collect2: ld returned 1`；`arm-vita-eabi-nm libcldc_vm.a` 里出现
+  `U vita_splash_entries / tick / stage`，说明 hook 真的进了 VM。
+- `./build.sh` exit 0，`out/vpk/midp_vita_v02.99.vpk` 生成，`nm` 里有
+  `vita_splash_begin/draw/tick/entries/end` + `vita_display_splash_repaint`。
+- 既有 6 套 C 单测（`gdtest`/`p2test`/`vkeytest`/`dectest`/`jpegtest`/`permtest`）
+  与 `perfshim`（13 场景）全部 **ALL PASS**。
+- `readelf -l`：TEXT `0x81000000+0x3b5b34`，RW 起 `0x813e0000`
+  → 段间余量约 **169 KB**。
+- **真机未验证**：中文标题能否正确显示、进度条节奏、以及"首帧即消失"是否
+  真的在游戏第一帧（而不是某个中间帧）触发。
+
+### 踩到的坑
+1. 一开始把 `lfjport_ui_init()` 的白色 memset 改成黑色，以为"顺手去掉白屏"。
+   **这会让 splash 在第一帧就关掉自己**：`frame_has_content()` 判的是
+   "不等于 0xFFFF"，黑屏同样算内容。已回退，并在注释里写明这是度量基准。
+2. `replace_in_terminal` 这个工具不存在（手滑），改文件只能走编辑工具。
+
+### 没做 / 下一步
+1. **真机验证**（验收：从点选游戏起就没有白屏；标题正确；进度条在动）。
+2. P1-2 第 3 项：合并逐 entry 的 `sceIoRead`。已知数字：4121/4462 次、
+   4.8/6.4 s，占 preload 的 60–90%。
+3. 第 2 项不要做（理由见上），若以后要再动日志，先量 `io_write`。
+4. P1-3 第 3 项（NEON / GPU 缩放）仍在等真机 `perf.log`。
+5. JIT 仍保持 `jit=0`；log120 的崩溃结论见下一节（v02.98）。
+
+## 2026-10-24 log121 分析：v02.98 的 Java 修复其实没上机（libobj.a 陈旧）→ 构建修复
+
+> 本节**更正**上一节（v02.98）的"验证"部分。当前 ELF 版本串是 v02.99（另一会话在
+> 同一棵树里推进了版本；本节没有再改版本号）。**未在真机运行。**
+
+### log121 事实
+- 日志实际版本 v02.98。喜羊羊（jit=2 一轮）和魂斗罗4（jit=2）两个 coredump；
+  jit=0 的所有轮次都正常返回。
+- 两个 dump 的主线程都是 `pc == lr == 0x83xxxxxx`（`0x8395e4ac`、`0x8398e22c`），
+  和 log120 魂斗罗4 同一模式（落在 Newlib 堆里）。**没有任何 `[heap]` 行**：
+  这次不是 chunk malloc 失败，是**跳进堆里执行 JIT 代码后崩**。log120 口袋灵兽的
+  `Could not allocate VM heap` 没有复现。
+- **喜羊羊仍然 `ringtone->wav FAILED (null)`；UC 的 `[ALERT-PAINT]` 仍是 `skin=0x125`，
+  且没有一条 `[ALERT-LAYER]`。** 这是 v02.98 的两个 Java 修复"什么都没解决"的原因。
+
+### 真根因：设备上跑的是旧 ROM
+- `com.sun.midp.*` 和厂商类是 ROM 化的，**从 ELF 里的 ROM 加载，不是从 `midp_system.jar`**。
+  上一节我只核对了 VPK 里 jar 的 `AlertLayer.class`（有 `[ALERT-LAYER]`）——核对错了地方。
+- 证据（ELF 里的 UTF-16 字符串）：`ALERT-PAINT`/`ringtone->wav` 各 1 处，
+  v02.98 新增的 `ALERT-LAYER`/`owner has no size yet`/`resolve skin=` **0 处**。
+- 时间戳链断在最后一环：`classes.zip 06:35:21 → ROMImage_00.cpp 06:35:28 →
+  ROMImage.o 06:35:35 → libobj.a **03:31:14** → ELF 06:35:41`。`libobj.a` 里的
+  `ROMImage.o`（1926676 B）≠ 新的（1949668 B）。
+- 为什么：`build_vita.sh` 跑 `make` 不带目标，默认 `all = verify display midp varexport`，
+  而 `midp` **不依赖 `libobj.a`**（只有本移植从不链接的 `bin/arm/runMidlet` 依赖）。
+  实验：`touch ROMImage.o` 后连跑 3 次 `build_vita.sh`，`libobj.a` 一次都没动；
+  把 `libobj.a` 当作目标传给 make → 刷新。（`build_vita.sh` 退出码一直是 0。）
+- 这是第三次踩 `libobj.a` 陈旧（PM 4264、10003 行都记过），而且这次的后果是
+  **一个版本的 Java 修复全部落空**。
+
+### 修复
+- `phoneme-midp/build_vita.sh`：`eval $CMD $MIDP_EXTRA_GOAL`（默认空，行为不变）。
+- `vita-port/build.sh`：`midp` 模式下比较 `libobj.a` 里的 `ROMImage.o` 与
+  `obj/arm/ROMImage.o`，不一致就以 `libobj.a` 为目标再 make 一次，仍不一致则 `exit 1`。
+  （我最初写的"再跑一次"是错的——上面的实验证明它不管用——改成显式目标。）
+- 验证：强制 `touch ROMImage.o` 后 `./build.sh midp` exit 0，
+  `libobj.a 08:24:44 < ROMImage.o 08:25:16` 之后 `libobj_no_main.a 08:25:20`、
+  ELF `08:25:21`；`libobj_no_main.a` 里的 `ROMImage.o` 与 `obj/arm/ROMImage.o`
+  逐字节相同；ELF 里 `ALERT-LAYER` 2 处、`owner has no size yet` 1 处、`resolve skin=` 1 处。
+
+### 现在设备上应该看到什么（v02.99 构建，**未验证**）
+1. 喜羊羊：`[SOUND] ringtone->wav ok N bytes`，不再有 `[VENDOR] … unplayable data`。
+2. UC 空剪贴板：出现 `[ALERT-LAYER] …` 行。若是 `owner has no size yet` → 假设成立；
+   若是 `resolve skin=-1x-1 owner=240x320` 且之后 `skin=228x240` → 守卫没起作用但值正常了；
+   若一条都没有且仍 `skin=0x125` → 0 来自别处。
+3. 之前"未验证"的所有 Java 侧改动（v02.88 `RingTone`、v02.91 `[SOUND]`、v02.98 `AlertLayer`）
+   此前都**没有真正上过机**，除非当时的 `libobj.a` 恰好被别的原因刷新过——
+   log118/119 里能看到 `[ALERT]`/`[SOUND]` 说明那几次是更新了的，具体哪一版断的未查。
+
+### JIT（没有进展，只有更多证据）
+- 三个 jit=2 的 dump（log120 魂斗罗4、log121 喜羊羊、魂斗罗4）pc 全部在
+  `0x83xxxxxx`（Newlib 堆 `0x81b00000 + 0x4000000` 之内、USER_RW 不可执行）。
+  崩溃一致、可复现，jit=0 全部正常。
+- 仍然**没有** `compile-requests` 计数（崩溃时 crumb 不写），所以"跳进堆里执行生成的代码"
+  依旧是推断。要拿证据只能让 `vita_jit` 在**每次编译产出代码时**就写 crumb，而不是等
+  `runMidlet` 返回。下一步若继续 JIT 就做这个；否则 `launch.cfg` 保持 `jit=0`。
+- 用户的 `launch.cfg` 当前是 `jit=2`（crumb：`round 0: jit cfg=2`，首轮就崩）。
+
+### 踩到的坑
+1. **核对错了产物**：上一轮我检查"VPK 里的 jar 含新类"，但 ROM 化的类不从 jar 加载。
+   以后验证 Java 侧改动必须看**ELF 里的 UTF-16 字符串**（或 `libobj_no_main.a` 的成员），
+   不是 jar。
+2. **没有量化就写了"再跑一次"的守卫**，实验证明无效才改。先实验再写守卫。
+3. 终端残留未结束的命令会污染后续输出；长输出一律写文件再读。
+
+
+---
+
+## 2026-10-24 v03.00：修 splash 残影（用户反馈"进度条那些 UI 没有清除"）
+
+> 产物 `out/vpk/midp_vita_v03.00.vpk`（11871567 B），版本串
+> `J2ME Player v03.00 b330`。**未在真机/Vita3K 运行。** 同轮还修了一个更危险的
+> 隐性 bug（白底应用被挡）。
+
+### 根因（结构性，不是坐标算错）
+splash 覆盖**整个面板**，但缩放 blit 只写**游戏矩形**。`clear_letterbox()` 只在
+两种时机跑：IME 关闭后（v02.65）和截图提示条消失后（v02.93）。于是 splash 停止
+绘制的那一帧起，黑边里就永久留着它的最后一帧：标题、阶段行、以及进度条的**两侧
+尾巴**（进度条 480 px 居中，而竖屏游戏区只有 407 px 宽，两侧必然伸进黑边）。
+
+### 修复（照 v02.93 `g_toast_was` 的配方）
+1. `vita_display.c` 新增 `g_splash_was`，在 `flip_to_display()` 里与 toast 同一处
+   （blit 之后、虚拟键盘/相机按钮之前）做边沿检测，`g_splash_was && !active`
+   就 `clear_letterbox()`。放在键盘之前是关键：否则会把键盘像素一起擦掉。
+2. 30 s 硬停现在会**补一次重绘**：以前超时只是把 `active=0`，若那个应用本来就
+   不重绘，面板上会永远挂着"载入中"。
+
+### 顺带修掉一个更危险的隐性 bug：白底应用被挡 30 秒
+原来的结束条件是 `frame_has_content()`（虚拟屏出现非 0xFFFF 像素）。**白底应用
+永远不满足**，于是它会在加载画面背后跑起来，用户盯 30 秒"载入中"。现在加了正确
+的结束触发：
+
+- `vita_splash_on_foreign_flip()`：**不是 splash 自己请求的**帧 ⇒ MIDlet 在画。
+- 但必须等 `vita_splash_preload_done()`（`JVM.cpp` 在 `load_all_in_classpath`
+  之后调用）。门槛不能是"预载开始"，因为 `lfjport_ui_init()` 的那次 flip 发生在
+  预载**之前**，而它正是**把 splash 画上去**的那一帧——用它做门槛会让 splash
+  立刻自己关掉。
+- 返回 1 表示"这一帧就是结束帧"，显示层拿这个边沿去擦黑边（只返回一次，否则每帧
+  都会擦）。
+- `vita_display_vkey_tick()` / `vita_display_toast_flip()` 在 splash 拥有屏幕时
+  直接返回：它们自己的重绘既会画到加载画面上，也会被误判成"外来帧"。
+
+### 关键文件修改记录
+- `vita-port/src/vita_splash.c` / `.h`：`spl_preload_done`、`vita_splash_preload_done()`、
+  `vita_splash_on_foreign_flip()`（返回边沿）、`vita_splash_owns_screen()`、
+  `vita_splash_preload_started()`；超时分支补 `vita_display_splash_repaint()`。
+- `vita-port/src/vita_display.c`：`g_splash_was` / `g_splash_own_flip`；
+  `flip_to_display()` 开头的 `vita_splash_on_foreign_flip()`；
+  toast/splash 合并的黑边清理块；`vita_display_splash_repaint()` 用
+  `g_splash_own_flip` 包住调用；`vkey_tick` / `toast_flip` 加 splash 守卫。
+- `phoneme-cldc/src/vm/share/runtime/JVM.cpp`、`os/vita/Globals_vita.hpp`：
+  `vita_splash_preload_done()` 声明与调用。
+- `vita-port/CMakeLists.txt`：`set(VITA_VERSION "03.00")`。
+
+### 验证
+- `/tmp/splashtest` 扩到 **9 个场景 / 55 条断言，全 PASS**：
+  新增 `foreign_flip`（预载前的首帧不结束、预载中的 MIDP 刷新不结束、预载完成后
+  第一个外来帧结束且只返回一次边沿）与 `repaint_on_timeout`（超时后恰好补画一帧、
+  之后不再画）；`hard_cap` 的期望值随之更新为"超时会多画一帧"。
+- VM 库：`rebuild_vm.sh` exit 0，`nm` 里出现 `U vita_splash_preload_done`。
+- `./build.sh` exit 0，`out/vpk/midp_vita_v03.00.vpk`，`nm` 含
+  `vita_splash_on_foreign_flip` / `vita_splash_preload_done` / `vita_splash_owns_screen`。
+- 既有 7 套单测（gdtest/p2test/vkeytest/dectest/jpegtest/permtest/perfshim）全 PASS。
+- `readelf -l`：TEXT `+0x3b9634`，RW 起 `0x813e0000` → 余量约 **166 KB**。
+- **真机未验证**：残影是否消失、白底应用是否在第一帧就露出。
+
+### 教训（值得记住）
+- **"覆盖层"必须自己负责撤销**。blit 只写游戏矩形，所以任何画到黑边的东西
+  （提示条 v02.93、splash v03.00）都要自带"离开时擦一次"的边沿逻辑。以后再加
+  覆盖层，先问这句。
+- **结束条件要比"没有像素"更可靠**。`frame_has_content()` 是为白屏测量设计的
+  启发式，拿它当"应用已就绪"用会在白底应用上失效。真正可靠的信号是
+  "这一帧是谁请求的"。
+- 门槛取"预载**完成**"而不是"开始"：`lfjport_ui_init()` 的 flip 在预载之前，
+  它就是画 splash 的那一帧。
+
+### 没做 / 下一步
+1. 真机验证 v03.00：① 进游戏后黑边是否干净；② 白底应用（如某些 Form 启动的
+   应用）是否立刻露出；③ 30 s 硬停是否只在"应用不画"时出现。
+2. P1-2 第 3 项（合并逐 entry `sceIoRead`）仍是启动时间的大头。
+
+---
+
+## 2026-10-24 v03.01：截屏提示条的清除（用户反馈"有时候还能看到绿色框"）
+
+> 产物 `out/vpk/midp_vita_v03.01.vpk`，版本串 `J2ME Player v03.01 b330`。
+
+### 根因（不是"没写 clear"，而是"clear 只在一个不会到来的帧里执行"）
+- v02.93 的清理写在 `flip_to_display()` 里：`g_toast_was && !toast_now`
+  时 `clear_letterbox()`。**这依赖"提示过期后还会有一帧"**。
+- 静态画面（暂停菜单）或 VM 冻结时没有后续帧，最后一帧就永久留着绿色框；
+  而"让提示可见"的 200 ms 兜底恰好制造了这种最后一帧。
+- 另外 `clear_letterbox()` 只清黑边，提示条也压在**游戏区**上，所以仅仅
+  清黑边并不完整（游戏区靠 blit 覆盖，静止时同样不会发生）。
+
+### 修复
+1. `vita_shot_draw_toast()` 改为返回"是否真的画了"。
+2. `vita_display.c` 记录 `g_toast_on_panel`：每次提交（正常 flip 与
+   `toast_flip` 冻结路径）都把它设成"这一帧是否带提示条"。
+3. 新增 `vita_display_toast_clear()`：**原地重绘可见缓冲**——黑边清零 →
+   `blit_scaled()` 重画游戏区 → 虚拟键 → 相机按钮（无提示条）→ 重新提交同一
+   地址。只写 front buffer，不参与 VM 的 blit/swap，因此不会破坏双缓冲。
+4. `j2me_shot` 轮询线程在"提示已过期 + 面板仍带提示 + 200 ms 内没有 flip"时
+   调用一次（`shot_toast_needs_clear()` 抽成可测函数）。游戏在刷帧时保持不管，
+   由它自己的下一帧完成清理。
+5. 把缩放 blit 抽成 `blit_scaled(uint32_t *dst)`，flip 与清除共用同一份代码。
+
+### 关键文件修改记录
+- `vita-port/src/vita_shot.c/.h`
+  - `vita_shot_draw_toast()` 返回 int；`vita_shot.h` 同步。
+  - 新增 `toast_clear_done`、`TOAST_CLEAR_IDLE_US`(200 ms)、
+    `shot_toast_needs_clear()`；`shot_save()` 里 `toast_clear_done = 0`。
+- `vita-port/src/vita_display.c`
+  - 新增 `g_toast_on_panel`、`vita_display_toast_on_panel()`、
+    `vita_display_toast_clear()`、`blit_scaled()`。
+  - `flip_to_display()` 提交后记录 `g_toast_on_panel = toast_drawn`。
+- `vita-port/CMakeLists.txt`：`VITA_VERSION` 03.00 → **03.01**。
+- `vita-port/README.md`：补"自动清除"。
+
+### 验证（主机离线，同一份 vita_shot.c + 桩）
+- 提示条绘制/居中/过期/失败色/相机按钮位置：全部 PASS（与上一轮一致）。
+- 新增：`draw_toast` 返回 1（有效）/0（过期）；清除判定 6 种组合
+  （有活动提示→不删；面板干净→不删；刚 flip 过→不删；静止 300 ms 且面板
+  带提示→删且只删一次；删过→不再删）全部 PASS。
+- `make -j4` exit 0，产物 `out/vpk/midp_vita_v03.01.vpk`。
+- 真机/模拟器尚未验证。
+
+## 2026-10-24 log122 分析：v02.98 的 Java 改动第一次真正上机 → 暴露两个真 bug → v03.02
+
+> 产物 `out/vpk/midp_vita_v03.02.vpk`（11872287 B），ELF 版本串 `J2ME Player v03.02`。
+> **未在真机运行。** log122 跑的是 v02.99（含 libobj.a 修复之后的 ROM）。
+
+### 先说清楚：之前几版为什么"什么都没变"
+log118–log121 里看到的 `ringtone->wav FAILED`、`skin=0x125` 都是**旧 ROM**（见上一节，
+`libobj.a` 陈旧）。log122 是第一份**真正跑了 v02.98 Java 改动**的日志——所以这一轮才第一次
+看到修复的真实效果，也才暴露出被旧 ROM 遮住的下一层问题。不是同一个问题没修好，
+是同一条路径上又有两个。
+
+### log122 事实
+- **喜羊羊（RingTone 修复生效）**：
+  `[SOUND] ringtone->wav ok 72036 bytes` → `[SOUND] wav player created`
+  （audio_debug：`wav buffered: 8000 Hz 1 ch 8 bit, 8999 ms, 71992 bytes`）——与宿主 JVM 的
+  72036 B 逐字节吻合。**但随后** `[SOUND] play … player=true` →
+  `[VENDOR] nokia Sound.play failed: MediaException: unable to realize: Tone sequence
+  check failed at offset 0: missing version information`。
+- **UC（守卫生效）**：`[ALERT-LAYER] resolve skin=-1x125 owner=240x320`，**紧接着**
+  `[ALERT-PAINT] … skin=0x125`。owner 是 240×320，**不是 0**（v02.98 的假设被推翻）。
+  `AlertSkin.WIDTH = (int)(.95 * 240)` 应为 228，实际变成 0。
+- 本轮没有 coredump（`*.psp2dmp` 不存在）。crumb 里首轮是 `jit cfg=2 -> policy=2`
+  的 FileManager，之后 jit=0；没有崩溃证据，**不能据此说 JIT 好了**（只跑了一个很小的 midlet）。
+
+### 根因 1（音频，**已定位、已改，未上机**）
+- `javacall_media_get_player_controls()` 只给 `midi` 和 `pcm`（MP3/AMR）分支，
+  **WAV 掉进最后的 else → 返回 `CTRL_TONE`**。`HighLevelPlayer.getPlayerFromType()`
+  是 `nIsToneControlSupported → DirectTone`，DirectTone 的 JTS 校验器读到 RIFF 字节，
+  报 "missing version information"。这与 v02.61（MIDI）、v02.87（MP3）修过的是同一个坑，
+  WAV 一直没人走到这里（Manager.playTone 走的是别的路径）。
+- 修复：`pl->wav.valid` 分支返回 `VOLUME`（反汇编核对：`ldr r3,[r4,#72]` 分支 `movs #129`
+  = MIDI|VOLUME，WAV 与 pcm 共用 `movs #1` = VOLUME，其余 `movs #65` = TONE|VOLUME）。
+
+### 根因 2（UC Alert，**只确定到"表达式结果是 0"，原因未知**）
+- 事实链：skin=-1×125 → 执行 `(int)(.95 * owner.bounds[W])`（owner=240）→ skin=0×125。
+  高度 125 没有被改（它不是 -1），所以**只有这一个 double→int 的表达式**出了问题。
+  可能：这台 VM 的 `dmul`/`d2i` 在解释器里对常量 `.95` 给出 0；也可能别处把它清零。
+  **没有证据区分这两种**。
+- 做了两件事：①把 `AlertLayer.setAnchor`、`MIDPWindow.getDefaultAlertWidth/Height` 都改成
+  整数算术（`w * 95 / 100`，228）——不管 double 为什么坏，这条路径不再依赖它；
+  ②加一行探针 `[ALERT-LAYER] double probe (int)(.95*240)=… (int)(.95*owner)=… int-math=…`，
+  下次日志直接告诉我们 VM 的 double→int 到底算出什么。
+- **风险提示**：如果 `(int)(.95*240)` 真的返回 0，那么**所有**用 double 做布局/动画的游戏都会
+  受影响（喜羊羊的 `getPositionYForMap` 就是 int，没事；但其它游戏不一定）。这是比 Alert 严重得多的
+  问题，探针的结果值得优先看。我没有去改 VM 的浮点实现——没证据就不动。
+
+### 验证（只验证到"进了 ELF"）
+- `./build.sh midp`：守卫触发（`libobj.a holds a stale ROMImage.o; building the archive goal`），
+  exit 0，0 error。
+- ELF：版本串 v03.02；`double probe`/`int-math=`/`resolve skin=` 各 1 处 UTF-16；
+  `libobj.a 09:34:17 ≥ ROMImage.o 09:34:15`，ELF 09:34:35。
+- 反汇编核对了 WAV 分支。
+
+### 没做 / 下一步
+1. **未上真机。** 验收：喜羊羊 `[SOUND] play` 之后**没有** `[VENDOR] … Sound.play failed`，并且有声；
+   UC 空剪贴板 `[ALERT-LAYER] double probe …` 的三个数、`skin=228x125`，Alert 框能画出来。
+2. 若 `double probe` 的第一项是 0：转去查 `jvm_dmul`/`jvm_d2i` 在解释器里的实现
+   （`FloatSupport_arm.cpp`、`ENABLE_ARM_VFP`）。
+3. JIT 仍无进展（见上一节），`launch.cfg` 里仍是 `jit=2`——建议改回 0。
+
+### 踩到的坑
+1. 我在上一轮把 `[ALERT-LAYER]` 的 "owner has no size" 当成了结论写进注释，这次被日志直接推翻
+   （owner=240×320）。**没有日志证据的因果关系只能写成假设**——这条在 v02.98 的 PM 里已经写了，
+   但代码注释里一度写成了事实。
+2. 每次修复只验证到"下一层暴露"，而不是端到端放出声音——因为没有真机。要减少这种来回，
+   下一次凡是涉及"一条链上多个环节"的修复（解析 → 创建 player → 实例化 → 播放），
+   应当在**宿主侧把整条链跑通**再交付（本轮 RingTone 只测了第一环）。
+
+
+---
+
+## 2026-10-24 v03.03：jarmem 取证（P1-2 第 3 项，前半）
+
+> 产物 `out/vpk/midp_vita_v03.03.vpk`（11873202 B），版本串
+> `J2ME Player v03.03 b330`。**未在真机/Vita3K 运行。本版只加计数，行为不变。**
+
+### 为什么先取证而不是先优化
+路线图 P1-2 第 3 项原本写的是"把约 4100 次逐 entry 的 `sceIoRead` 合并成整 jar
+一次读入"。**那个功能 v02.70 就有了**（`OsFile_vita.cpp` 的 jarmem，v02.75 还加了
+常驻复用）。但 log120 说：
+
+```
+[jarmem] enabled=1
+[jarmem] loaded midp_system.jar size=1384191 us=140622 total=1384191
+[jarmem] loaded games/喜羊羊与灰太狼/game.jar size=303117 us=38873 total=1687308
+```
+
+**整个会话只有这一次加载**，round 1–4（UC / 封神榜 / 口袋灵兽 / 魂斗罗4）一个
+`[jarmem] loaded` 都没有。而那几轮 preload 的 `io_read` 是 `n=4121 us=4.78 s`、
+`n=4462 us=6.42 s`。
+
+关键点：这个文件的所有失败路径**要么打日志**（`skip` / `short read` /
+`malloc failed`），**要么静默 `return NULL`**。log120 里一条前者都没有 ⇒ 要么这段
+代码根本没被走到，要么命中了静默路径：
+
+| 静默路径 | 触发条件 | 后果 |
+| --- | --- | --- |
+| `vita_jar_open` | 8 个句柄槽全占（有 open 没 close 就永久泄漏） | 之后每个 jar 都退回 stdio |
+| `vita_jar_acquire` | `open()` 失败 | 同上 |
+| `vita_jar_acquire` | 8 个图像槽全被 `refs>0` 钉住 | 同上 |
+| `OsFile_open` | mode 不是精确 `"rb"` | 静默跳过 |
+| `OsFile_open` | 文件名不是 `*.jar` | 静默跳过 |
+| `OsFile_open` | `jar_mem.cfg` 关掉 | 静默跳过 |
+
+**如果猜错方向，就会去"优化"一段本来就在内存里的 I/O。** 所以这一版只加取证。
+
+### 加了什么
+`OsFile_vita.cpp` 新增 `struct VitaJarStat`（10 个计数器）与
+`vita_jarmem_report(tag)`；`JVM.cpp` 的 `load_main_class` 在
+`load_all_in_classpath` 前后各调一次（`"pre"` / `"post"`）——**两次之差 = 这一轮干了
+什么**，沿用 `vita_trace_preload_report()` 的 delta 手法。
+
+输出形态：
+
+```
+[jarmem] pre enabled=1 hit=0 loaded=2 bypass=0 no_slot=0 no_img=0 open_fail=0 \
+         skip=0 malloc=0 short=0 | handles=0/8 images=2/8 total=1687308
+[jarmem]   [0] refs=0 size=1384191 midp_system.jar
+[jarmem]   [1] refs=0 size=303117 games/喜羊羊与灰太狼/game.jar
+...
+[jarmem] post ...（同上，数字是累计值）
+```
+
+逐槽一行带 `refs` 是关键：`handles=8/8` + `images=8/8` 且 `refs>0` 就说明句柄或
+图像被钉死；空槽位下标还能看出"哪个槽被回收了"。
+
+`open()` 失败现在带 `errno`：`EMFILE` = fd 泄漏（launcher 永不退出，任何一轮泄漏的
+fd 都不会回收，这条最符合当前症状），`ENOENT` = 路径形态变了。
+
+顺带：报告时先调一次 `vita_jarmem_enabled()`，避免打出 `enabled=-1`（读者无法区分
+"还没决定"和 bug）。
+
+### 关键文件修改记录
+- `phoneme-cldc/src/vm/os/vita/OsFile_vita.cpp`：`#include <stdio.h>`（snprintf）、
+  `<errno.h>`；`VitaJarStat g_jar_stat`；`reuse/loaded/no_slot/no_image/open_fail/
+  skip_size/malloc_fail/short_read/bypass/open_call` 各打点；`vita_jarmem_report()`
+  定义在 `#if defined(VITA) && !ENABLE_PCSL` 段内、`extern "C"`；`skip` 日志补上
+  `max=%ld/%ld`（每文件 4 MB / 总量 8 MB）。
+- `phoneme-cldc/src/vm/os/vita/Globals_vita.hpp`：`void vita_jarmem_report(const char*)`
+  放进已有的 `extern "C"` 块。
+- `phoneme-cldc/src/vm/share/runtime/JVM.cpp`：`load_main_class` 里两处调用。
+- `vita-port/CMakeLists.txt`：`set(VITA_VERSION "03.03")`（03.01/03.02 是并行会话
+  占了，本版顺延）。
+
+### 验证
+- `rebuild_vm.sh` exit 0，唯一 error 仍是预期的 `collect2: ld returned 1`
+  （最终测试 exe 链接，文档已记录）。
+- 最终 ELF：`nm` 有 `T vita_jarmem_report`；`objdump -d` 里恰好 **2 处
+  `bl vita_jarmem_report`**（pre/post 各一次，第三处是函数内 `ble` 不算）；
+  `strings` 含全部 7 条 `[jarmem] …` 格式串。
+- `./build.sh` exit 0，`out/vpk/midp_vita_v03.03.vpk`（11873202 B），
+  版本串 `J2ME Player v03.03 b330`。
+- 既有 8 套单测（gdtest/p2test/vkeytest/dectest/jpegtest/permtest/perfshim/
+  splashtest）全 PASS。
+- `readelf -l`：TEXT `+0x3b9bf4`，RW 起 `0x813e0000` → 余量约 **165 KB**。
+- **真机未验证**（本版就是给真机取证用的）。
+
+### 踩到的坑
+- 在 `JVM.cpp` 里用块内的 `extern void vita_jarmem_report(const char*)` 声明会得到
+  **C++ 链接**（`vita_jarmem_report(char const*)` 未定义），因为该名字没有先在任何
+  `extern "C"` 块里出现过。`vita_splash_*` 之所以没事，是因为它们已经在
+  `Globals_vita.hpp` 的 `extern "C"` 块里声明过，局部重复声明会继承 C 链接。
+  **规则：给 VM 加 C 侧的 hook，声明必须放 `Globals_vita.hpp`，不要只在调用点写
+  `extern`。**
+
+### 没做 / 下一步
+1. 真机跑一轮多游戏，看 `vm_boot.log` 里每轮 `pre`/`post` 的 delta：
+   - `no_slot` 增长 ⇒ 句柄泄漏，查谁 open 不 close（`JarFileParser::dispose` 路径）；
+   - `open_fail` 带 `EMFILE` ⇒ fd 泄漏，同样思路；
+   - `skip` 增长 ⇒ 总量/单文件上限（8 MB/4 MB）打成，需要提高或改 LRU；
+   - 全是 `hit` ⇒ 那 4.8 s 不在读盘，回到原计划去找 resolve/verify。
+2. 定位到之后才是真优化（提高上限 / 修泄漏 / LRU），预期能吃掉 preload 的一半以上。
+3. P1-6 剩余设置项、P1-8 诊断浮层仍待做；P1-3 NEON/GPU 仍等真机 `perf.log`。
+
+---
+
+## 2026-10-24 v03.05：修"进游戏后加载动画一闪一闪"
+
+> 产物 `out/vpk/midp_vita_v03.05.vpk`（11879917 B），版本串
+> `J2ME Player v03.05 b330`。**未在真机运行。**
+
+### 症状与正确解读
+用户："进入游戏后进度条那些 UI 还在显示，一闪一闪的。"
+
+先把两种可能分开：
+- **如果 splash 没结束** → 它每帧都覆盖整块面板，游戏应该根本看不见（只能看到加载画面）。
+  用户看到的是游戏 + 闪烁的残留 ⇒ **splash 确实结束了**。
+- 那闪烁就是"一半帧干净、一半帧有残留"，交替出现。
+
+### 根因：两个 CDRAM 缓冲，只清了一个
+v03.00 加的清理是**单帧**边沿：
+
+```c
+if (g_splash_was && !splash_now) clear_letterbox(vita_fb);   /* 只清一次 */
+```
+
+但显示层是**双缓冲**（`vita_fb_front` 在扫描输出、`vita_fb` 在绘制，每次 flip 交换）。
+`clear_letterbox(vita_fb)` 清的是**当前 back**；提交后交换，下一帧画进**另一个**缓冲，
+而那个缓冲的黑边里还留着 splash 的最后一帧（标题 / 阶段行 / 进度条两端 /
+「已载入 N 个类」——竖屏时进度条 480 px 宽、游戏区只有 407 px，两端必然落在黑边里，
+文字起点 `bar_x=240` 也在黑边内）。于是轮到它上屏时残留又回来了。
+
+⇒ **干净 / 残留 / 干净 / 残留**，按游戏帧率一直闪。而缩放 blit 永远只写游戏矩形，
+没有任何东西会覆盖黑边，所以它自己不会消失。
+
+**这个坑仓库里早有答案**：v02.65 的 `g_post_ime_clear` 注释写得很清楚
+"one per CDRAM buffer"，值就是 **2**。splash 和截图提示条只是没照搬。
+
+### 修复
+- `g_splash_was`（布尔边沿）→ 保留用于检测，新增 **`g_splash_clear = 2`** 倒计数；
+  `clear_letterbox()` 在计数非零时执行并递减。
+- 截图提示条同源同病：`g_toast_was` 边沿也改成 `g_toast_clear = 2`。
+  另外 `vita_display_toast_clear()`（v03.01 加的）是**原地重画 front**，
+  back 仍带着横幅，所以它清完也要置 `g_toast_clear = 2`。
+- `lfjport_ui_init()` 在 memset 两个缓冲之后把四个标志全部清零
+  （`g_splash_was/g_splash_clear/g_toast_was/g_toast_clear`），避免跨轮次残留。
+
+### 关键文件修改记录
+- `vita-port/src/vita_display.c`：新增 `g_splash_clear` / `g_toast_clear`；
+  `flip_to_display()` 里把两块清理合并成一个倒计数块（清边框必须在虚拟键盘/相机
+  按钮绘制**之前**）；`vita_display_toast_clear()` 末尾置 `g_toast_clear = 2`；
+  `lfjport_ui_init()` 复位四个标志。
+- `vita-port/CMakeLists.txt`：`set(VITA_VERSION "03.05")`。
+
+### 验证
+- **新增模型单测** `/tmp/bartest`（22 条断言，全 PASS）。`flip_to_display()` 本身
+  在宿主上跑不了（要 sceDisplay/CDRAM/blit），但这个 bug 是纯记账问题，所以用模型
+  复刻：两个缓冲 + 交换 + 边沿检测 + 倒计数。断言：
+  1. **对照组**：单帧清理下 8 帧里有 **4 帧**黑边还脏 —— 证明旧实现真的会闪
+     （这条让"简化回布尔"直接失败）；
+  2. 倒计数 2 之后 8 帧全干净、两个缓冲都干净、计数归零（不卡住）；
+  3. splash 还活着时不许擦（否则擦掉加载画面本身）；
+  4. 只出现一帧的覆盖层同样需要倒计数（它落在某个缓冲里，两帧后还会上屏）；
+  5. 换轮复位后不会误擦新游戏的头几帧。
+- 既有 9 套单测（gdtest/p2test/vkeytest/dectest/jpegtest/permtest/perfshim/
+  splashtest/bartest）全 PASS。
+- `./build.sh` exit 0，`out/vpk/midp_vita_v03.05.vpk`，版本串
+  `J2ME Player v03.05 b330`。
+- `readelf -l`：TEXT `0x81000000+0x3bb6b4`，RW 起 **0x813d0000**
+  → 余量约 **84 KB**（并行会话把 RW 起点从 0x813e0000 前移了一段，
+  以后加静态数据前必须先量）。
+- **真机未验证**。
+
+### 教训（重要，写进仓库记忆）
+- **任何画进帧缓冲的覆盖层，离开时都要按"缓冲个数"擦，不是按"帧"。**
+  双缓冲 ⇒ 至少 2 帧；三缓冲就要 3。判据：`clear_letterbox()` 只作用于一帧的
+  back buffer，而 blit 不写黑边，所以残留一旦留下就只能靠这些清理帧洗掉。
+- 反过来：这一条也解释了为什么"静态残影"（v03.00 报告）和"闪烁"（v03.05 报告）
+  是同一个 bug 的两个阶段——清 0 次是永久残留，清 1 次是闪烁，清 2 次才正确。
+
+### 没做 / 下一步
+1. 真机验证：进游戏后黑边应始终干净、不闪。
+2. 若还有极短暂的闪（1–2 帧），说明有第三条提交路径（例如 `toast_flip` 直接提交
+   front），先把那个路径纳入同一套倒计数再谈。
+3. jarmem 取证（v03.03）的日志仍待真机回传。
+
+---
+
+## 2026-10-24 v03.06：444 MHz 从未生效（log123），改为三假设取证
+
+> 产物 `out/vpk/midp_vita_v03.06.vpk`（11881653 B），版本串
+> `J2ME Player v03.06 b330`。**未在真机运行。**
+
+### 证据：内核接受了请求，频率没动
+log123 四次启动的 perf.log 完全一致：
+
+```
+[PERF] boot clock arm=333 bus=222 gpu=0 MHz
+[PERF] arm: set 444 MHz, now 333 MHz (rc=0)
+[PERF] bus: set 222 MHz, now 222 MHz (rc=0)
+[PERF] final arm=333 bus=222 gpu=0 MHz
+```
+
+`rc=0` 说明调用进到了 ScePower，但读回值仍是 333 ⇒ **不是"没调"，是"调了没用"**。
+
+另外注意 `bus=222` **本来就已经是 222**，所以那行 `bus: set 222 now 222` 什么也没证明；
+`gpu=0` 则说明 GPU 域此时根本没被时钟化（还没碰 GXM）。
+
+### 一个自己造成的取证盲区
+`perf.log` 里所有帧行都写 `arm=333MHz`，看着像"运行时也是 333"——**其实那列是
+`vita_perf.c` 的进程内缓存 `g_arm`**，从 init 之后就没再更新过。所以那份日志既证明不了
+"设完就变回 333"，也证明不了"一直是 333"。v03.06 把帧行改成**实时 getter**。
+
+### 三条假设，全部埋点，一次真机日志定案
+| 假设 | 依据 | 做法 |
+| --- | --- | --- |
+| A 配置模式（功耗预算） | SDK 里唯一"我可以跑更快吗"的开关是 `scePowerSetConfigurationMode()`（VitaSDK 注释就一句 "Set configuration mode ?"）；App 不调它就留在默认功耗预算里，时钟被夹到上限 —— 正好是 "rc=0 但值不变" | 依次试 `mode=1`、`mode=0`，每次之后**重发** ARM 请求并读回 |
+| B 耦合时钟域 | ARM 与 GPU/XBAR 共享 PLL 组，单独抬 ARM 可能被静默夹住 | 先把 BUS=222、GPU=arm/2、GPU-XBAR=166 设好，再重试 ARM |
+| C 实时值本来就是 333（初值读回过期） | 无法排除，因为原日志是缓存值 | 帧行实时读 → 若运行时读到 444 就说明 C 成立 |
+
+**关键节流**：升级链**只在明文请求确实没生效时**才跑（`rc` 为 0 但读回值没到目标）。
+正常机器一遍过，不会被多打几次配置模式。
+
+### 输出（下次真机要看的）
+```
+[PERF] boot clock arm=333 bus=222 gpu=0 xbar=0 MHz ac=1 wireless=0
+[PERF] arm: set 444 MHz, now 333 MHz (rc=0)
+[PERF] configmode(1) rc=0x00000000 arm_before=333
+[PERF] arm: set 444 MHz, now 333 MHz (rc=0)          ← 或 now 444
+[PERF] configmode(0) rc=0x00000000 arm_before=333
+[PERF] bus: set 222 ... gpu: set 222 ... gpuXbar: set 166 ...
+[PERF] arm(retry): set 444 MHz, now ??? MHz (rc=0)
+[PERF] final arm=??? bus=??? gpu=??? xbar=??? MHz (want arm=444)
+[PERF] VERDICT: arm=444 MHz (boost applied)     ← 或
+[PERF] VERDICT: arm stuck at 333 MHz (asked 444, all strategies failed) -
+       try clock.cfg mode=0 or mode=1, or run with Wi-Fi off / on AC
+```
+
+判读：哪一行之后 `now` 变成 444，就是那条策略有效。`ac=`/`wireless=` 用来排除
+"电池 + Wi-Fi 时系统降频"这个外部因素。
+
+### 关键文件修改记录
+- `vita-port/src/vita_perf.c`：
+  - `g_xbar` 新增；`set_clock()` 保持不变（就是"请求 + 读回 + 记录 rc"）。
+  - boot 行扩为 `arm/bus/gpu/xbar + ac + wireless`。
+  - `vita_perf_init()` 末尾加升级链（A/B），每次尝试独立记日志；`mode=` 来自
+    clock.cfg，`-1`（默认）= 试 1 再试 0；显式值则跳过循环。
+  - `final` 行改用**实时 getter** 重读四个频率，并带 `(want arm=N)`。
+  - 新增 `VERDICT` 单行结论。
+  - 帧行 `arm=%dMHz` 改为**实时 getter**（每 stats_gap 帧一次，可忽略）。
+- `vita-port/src/vita_perf.h`：`vita_perf_clock_xbar()`；注释补 `mode=` 键。
+- `vita-port/CMakeLists.txt`：`set(VITA_VERSION "03.06")`。
+
+### 验证
+- 主机单测 `/tmp/perfshim` 扩到 **21 场景全 PASS**，新增 8 条针对本版：
+  1. 明文成功 → **不**调用 configmode、**不**动 xbar（不能对好机器白折腾）；
+  2. log123 原样（rc=0 但不动）→ 两个 mode 都试、xbar 被抬、`arm(retry)` 出现、
+     VERDICT 明确写 "stuck at 333 ... mode=0 or mode=1"；
+  3. 只有 mode=1 能解锁 → 解锁后**立刻停**，不再走耦合重试；
+  4. 只有耦合能解锁 → gpu=222/xbar=166/ARM=444，VERDICT applied；
+  5. `mode=0` 强制 → 只调一次 configmode 且值为 0；
+  6. `arm=0` → 一次 setter 都不调，VERDICT 说 "not requested"（不能把"没要求"
+     误报成"失败"）；
+  7. boot 行字段齐全；
+  8. **帧行实时读**：中途把时钟从 333 改成 444，第 2 行必须变成 `arm=444MHz`
+     （旧代码这一条必失败，因为它读缓存）。
+- 既有 9 套单测全 PASS。
+- `./build.sh` exit 0，VPK 生成；`nm` 含 `scePowerSetConfigurationMode` /
+  `scePowerSetGpuXbarClockFrequency` / `scePowerGetGpuXbarClockFrequency`；
+  `strings` 含全部新格式串。
+- `readelf -l`：TEXT `+0x3bbb74`，RW 起 `0x813d0000` → 余量约 **83 KB**。
+- **真机未验证**（本版就是给真机定案用的）。
+
+### 教训
+- **缓存值当证据 = 自欺**：`perf.log` 的 `arm=` 列一直是进程内缓存，看起来像
+  "运行时 333"，实际只是"init 时 333"。凡是"这个值后来变了吗"的问题，必须每行
+  现场读。
+- **`rc=0` 不等于生效**。Vita 的电源 API 会"接受并夹住"，和 v02.97 里
+  `scePowerSetArmClockFrequency` 的文档语义（0 = success）不符 —— 记录下来，
+  以后对所有 `scePowerSet*` 都要读回校验。
+- **升级策略必须带门闩**：只在明文路径失败时才折腾配置模式，否则等于给每台好
+  机器都加副作用。
+
+### 没做 / 下一步
+1. 真机跑一次，看 `VERDICT` 与 `arm(retry)` 那几行：哪种策略生效就把它固化成默认，
+   删掉其余尝试（减少副作用）。
+2. 若三种都失败且 `ac=0 wireless=1`，先让用户插电/关 Wi-Fi 复测，排除外部降频。
+3. 若 `rc` 变成负数（例如 `0x8002xxxx`），说明 ScePower 在受限环境（Vita3K）
+   直接拒绝，那就记录为"该环境不支持"而不是我们的 bug。
+
+## 2026-10-24 log123 分析：UC 好了；喜羊羊声音"不对"+ 暂停卡几秒 → v03.07
+
+> 产物 `out/vpk/midp_vita_v03.07.vpk`（11882780 B），ELF 版本串 `J2ME Player v03.07`。
+> **未在真机运行。** log123 跑的是 v03.04（含 v03.02 的 WAV/Alert 修复）。
+
+### log123 事实
+- **UC Alert 好了**：`[ALERT-PAINT] clip=0,0 228x125 skin=228x125 viewable=218x28`
+  （此前 `skin=0x125`、`clip=0,-177 0x0`）。v03.02 的整数算术生效。
+- **喜羊羊链路通了**：`[SOUND] ringtone->wav ok` → `wav player created` → `play`，
+  之后**没有** `[VENDOR] … Sound.play failed`；`audio_debug`：`wav buffered … 8999 ms` →
+  `wav done`。WAV 修复（v03.02）生效。
+- **VM 的 double→int 确有问题（重要，未解决）**：探针 `(int)(.95*240)=228` 但
+  `(int)(.95*owner)=0`。前者是 javac 常量折叠（不经过 VM），后者经 VM 的
+  `i2d → dmul → d2i`。**所以 VM 的运行期浮点转换会丢值**，Alert 只是碰巧暴露。
+  反汇编（当前 ELF）：
+  - `jvm_dmul` = `vmul.f64 d0,d0,d1; bx lr`，`jvm_i2d` = `vmov s0,r0; vcvt.f64.s32 d0,s0; bx lr`
+    （硬浮点 ABI，参数/结果在 d0/d1）——来自 `FloatSupport_arm.o` 的 C 版本；
+  - 解释器 `bc_impl_dmul_internal`：`ldr r1,[r6],#4 … ldr r3,[r6],#4; bl jvm_dmul;`
+    随后 `str r1,[r6,#-4]!`——参数从栈取进 **r0–r3**、结果从 **r0/r1** 取；
+  - `jvm_d2i` 来自 `Interpreter_arm.o`，是手写整数寄存器版（读 r0:r1）。
+  **这是调用约定不一致的强烈嫌疑，但我没有证实它就是 0 的原因**。v03.07 的探针
+  逐步打印 `i2d / dmul*2 / dadd / dmul.95 / d2l / float / cmp`，下一份日志能直接定位是哪一步。
+  **我没有改 VM 的浮点实现**——没有证据，且这是整个 VM 的算术。
+- **暂停/恢复卡几秒**：日志里**没有**暂停事件，所以"暂停时卡"没法直接对应。能确认的：
+  perf.log 最长一帧 3553 ms；`input_debug` 心跳有 15.6 s 缺口（一次 CROSS 之后）和
+  628 s 缺口（设备休眠/会话边界，不是卡顿）；`vm_output` 里 **同一首 326 字节的曲子在
+  一次菜单操作内被 `init` 五次**（每次都重新合成 + 重新创建 player）。
+  15.6 s 缺口内 audio_debug 没有对应的逐条时间戳，**我无法证明它就是这五次合成**。
+
+### 做了什么（都是针对上面的证据，不是猜）
+1. **音高（"声音不太对"，**部分有证据**）**：`RingTone.synth` 用整数半周期
+   `RATE/(2*freq)`，8 kHz 下 270 Hz 变成 285.7 Hz、340→363.6、404→444.4。
+   用真实曲子算：58 字节那首 22 个音里 **14 个**偏差 > 50 音分（半个半音），326 字节那首
+   181 个里 **151 个**，最差 **+284 音分**。改成 16.16 定点相位累加器；宿主测第一个音
+   269.3 Hz（目标 270）。这确实是"不太对"的一个客观原因，但**用户说的"不太对"是否就是这个，
+   我不知道**——也可能是方波音色本身，或者节奏。
+2. **卡顿（**合理但未证实**）**：`RingTone` 加了 4 槽按内容缓存（宿主：首次 3–8 ms，
+   第二次 5–14 µs，返回同一对象）；`synth` 从 `ByteArrayOutputStream.write(int)`（每个采样一次
+   同步方法调用，270776 次）改成预分配数组。注意：缓存只省掉**合成**，不省 player 创建、
+   68 次 KNI `do_buffering`、153 行同步 `audio_debug` 写盘（实测 `io_write` 平均
+   8.8 ms → 每次约 1.3 s）。那部分**没动**。
+3. **探针**：`AlertLayer` 的 FP 探针见上。
+
+### 构建缺陷（第四次"改了没上机"）
+- 发现：`./build.sh midp` 里 **ROM 在 16:04:11 从 `classes.zip` 生成，而厂商类
+  `build_nokia_stubs.sh` 在 16:04:29 才写进 `classes/`**。所以 ROM 里的厂商类永远是上一次
+  构建的。证据：本轮第一次构建后 `classes.zip` 里的 `RingTone.class` 是 9721 B（旧，无
+  `cacheKey`），`classes/` 里是 11256 B（新）。
+- 修复（`vita-port/build.sh`）：`midp` 模式下**先**编厂商类、用 `jar uf` 把 `com/*`
+  （除 `com/sun`）更新进 `classes.zip`，**再**跑 `build_vita.sh` 生成 ROM。
+- 验证：重跑后 `classes.zip` 里 `RingTone.class` 11256 B 且含 `cacheKey`；
+  时间戳链 `classes.zip 16:09:07 → ROMImage_00.cpp 16:09:14 → ROMImage.o 16:09:21 →
+  libobj.a 16:09:23 → libobj_no_main.a 16:09:26 → ELF 16:09:28`，逐级递增；
+  `ROMLog` 里 `RingTone.sameBytes`（新方法）出现。ELF 里搜不到 ASCII `sameBytes`
+  是正常的（ROM 存的是字节码+内部符号表，不是明文），**不能**用 `strings` 当证据。
+- **之前"v02.98/v03.02 的 Java 改动已进 ROM"的结论里，厂商类（RingTone、Sound）那部分
+  其实可能一直是旧的**：`Sound.java` 的改动（`[SOUND]` 日志、WAV player）能在 log122/123
+  里看到，说明那几次碰巧生效了（因为那几次连续构建了两遍）。
+
+### 没做 / 下一步
+1. **未上真机**。验收：喜羊羊的曲子音高是否更准、切歌时的卡顿是否减轻；
+   `[ALERT-LAYER] fp i2d=… dmul*2=… dadd=… dmul.95=… d2l=… f=… cmp.95<w=… int-math=…`
+   这一行（尤其 `dmul*2` 应为 480，`dmul.95` 应为 228）。
+2. **请你告诉我"暂停恢复卡几秒"具体是按哪个键、在哪个画面**：log 里没有对应事件，
+   我不会再猜。如果是游戏自己的暂停菜单（`hideNotify`/`showNotify` 触发它重建音乐），
+   那么下次日志里会看到一串 `[SOUND] init`；如果是 Vita 的 PS 键，那是另一条路径
+   （`sceAppMgr` 事件），代码里目前没有对它的处理。
+3. 如果 `dmul*2 != 480`：这是 VM 算术的根本问题，所有用 double 的游戏都受影响，
+   优先级高于 Alert、声音。方向：`CodeGenerator_arm`/解释器与 `FloatSupport_arm.o`
+   的调用约定（`-mfloat-abi=hard` vs 解释器的 r0–r3）。
+4. JIT 仍无进展，`launch.cfg` 仍是 `jit=0`（本轮 crumb 里 `jit cfg=0`）。
+
+### 踩到的坑
+1. 对"声音不对"我一开始只有一个**可量化**的原因（音高量化），其余是猜测——我把它们分开写了。
+   用户的描述没有对应日志证据时，应当先问清楚再动手，而不是一次改三样。
+2. 我在 log122 的总结里说"WAV 修复是第二层问题"，没有预见到第三层（音高、卡顿）。
+   链上每个环节都要在宿主侧跑通，已记入上一节，这次 RingTone 做到了（宿主跑了 3 条真实曲子）。
+3. `unzip`/`zip` 在这台机器上都没有；要改 zip 用 `jar uf` 或 Python `zipfile`。
+
+
+## 2026-10-24 3D 后端能力扩展(纹理 / 剔除 / 混合)
+
+### 背景
+`debug/3d_game` 扫描结论:
+- 极品飞车13、生化危机3D 用 **M3G(JSR-184)**(生化危机带 15 个 `.m3g` 资源,含 SkinnedMesh/Light/Loader)
+- 鬼泣3D 用 **Mascot Capsule v3**(`.mbac`/`.mtra` 资源)
+- CS反恐特警、都市赛车3 不引用任何 3D 类(游戏自带软件 3D,走普通 Graphics)
+
+### 改动
+| 文件 | 内容 |
+| --- | --- |
+| `vita-port/src/vita_sw3d.{c,h}` | 纹理(64 槽,ARGB 入参,最近邻采样)、`set_state(cull,blend)`、`draw_uv` |
+| `vita-port/src/vita_gl3d.{c,h}` | 同接口:glGenTextures/glTexImage2D、GL_CULL_FACE、GL_BLEND、TexCoordPointer |
+| `vita-port/src/vita_3d.{c,h}` | 选择层转发新接口 |
+
+### 两条重要语义(踩过坑)
+1. **纹理原点**:M3G/Image2D 用**左上角原点**,与桌面 GL 相反。软件采样按 `v=0 → 数据第 0 行`(不翻转)。
+2. **ARGB 通道**:Java `int` 是 `0xAARRGGBB`,R 在高位。软件调制与硬件上传都必须 `R=(v>>16)`,B=(v&0xFF)。写反会让红蓝互换(本轮实际发生过)。
+
+### 混合语义
+blend 开启时**不写深度**(只比较),否则同深度的半透明层会被自己挡住。GL 默认会写,这里有意偏离;后续 M3G 的 depthWrite 标志接管时再细分。
+
+### 验证(宿主机,非 Vita)
+- 2x2 纹理四角:TL 红 / TR 绿 / BL 蓝 / BR 白 ✓(左上原点)
+- 剔除:同一三角形 CW 绘制 0 像素、CCW 1352 像素 ✓(与 GL 逆时针为正面一致)
+- 混合:50% 红叠在不透明绿上 → R=128 G=127 ✓
+- `vita-port/build.sh` 通过,产物 `out/vpk/midp_vita_v03.08.vpk`;未在真机运行
+
+### 下一步(未做)
+- M3G:Java 类 + KNI + `.m3g` Loader;可先做不依赖 Loader 的极品飞车13
+- Mascot v3:Java 类 + `.mbac`/`.mtra` 解析(格式需反推,无公开文档)
+- 后端还缺:每顶点光照(计划在 Java 层算,用顶点色传)、雾、多纹理、法线
+
+---
+
+## 2026-10-24 v03.08：jar 内存镜像从 round 1 起就失效（句柄泄漏 8 个）
+
+> 产物 `out/vpk/midp_vita_v03.08.vpk`（11887799 B），版本串
+> `J2ME Player v03.08 b330`。**未在真机运行。**
+
+### v03.03 的取证在 log123 里一句话给出答案
+```
+round 0 pre : handles=0/8  total=0
+round 0 post: handles=0/8  refs=0/0
+round 1 pre : handles=8/8  refs=4/4  no_slot=30
+round 2 pre : handles=8/8  refs=4/4  no_slot=38
+round 3 pre : handles=8/8  refs=4/4  no_slot=41
+```
+
+**8 个 jar 句柄在 round 0 泄漏、永不归还**，8 槽表随即打满；从 round 1 起每次
+`OsFile_open("*.jar","rb")` 都静默退回 stdio。其他计数器全是 0
+（`bypass=0 open_fail=0 skip=0 malloc=0 no_img=0`）⇒ **不是配额、不是 malloc、
+不是 mode/路径问题，就是句柄表被占死**。
+
+这条正好闭合了 log120 的谜：round 1–4 的 preload 里
+`io_read n=4121..4462 us=4.8..6.4 s`（每次 ~1.2 ms）。`BufferedFile` 的缓冲只有
+256 B，且 `find_entry`（jar 尾部）与 `open_entry`（jar 头部）在同一个 `FILE` 上
+交替 ⇒ 每个类约 8 次真实 `sceIoRead`。round 0 的 `io_read` 只有 0.43–0.60 s，
+因为那两个 jar 真的在内存里。
+
+### 泄漏在哪（已定位到机制，未盲改）
+- `JarFileParser` 用 `ObjectHeap::WEAK` 全局引用持有 parser。
+- 弱引用被 GC 回收时，`save_parser_in_cache`/`dispose(i)` 只
+  `unregister_global_ref_object(ref)`，**不会**调用 `parser().dispose()`（因为
+  `get_global_ref_object()` 已经返回 NULL）。
+- 于是 `FileDescriptor`（持有 `OsFile_Handle`）只能等 **Java finalizer**
+  （`Java_com_sun_cldchi_jvm_FileDescriptor_finalize` → `dispose()` →
+  `OsFile_close()`）才释放。32 MB 堆 + 单 VM 线程下这可能是很久。
+- 证据支持：`refs=4/4` 恒定不变、`handles=8/8` 恒定不变，跨 4 个 round 一次都没
+  回落 ⇒ finalizer 从未跑过。
+
+改成"弱引用回收时就 dispose"属于上游 VM 语义改动，**故意没做**——先让日志点名。
+
+### 改动
+1. **句柄槽与镜像槽拆分**：`VITA_JARMEM_HANDLES 32`（原 `SLOTS 8` 现专指镜像）。
+   一个 handle 是 `{img*, long pos}` = 8 B，32 个共 **256 B**；内存上界仍由
+   `VITA_JARMEM_MAX_TOTAL 8 MB` 与 8 个镜像槽决定，没变。
+   `vita_jar_is_handle()` 的范围判断改用 `VITA_JARMEM_HANDLES`
+   （这一点很关键：`OsFile_close` 靠它区分 jarmem handle 与真实 `FILE*`，
+   用错上界会把不相干的指针当成 handle）。
+2. **泄漏归因**：槽满时记录 `__builtin_return_address(0)`，按地址去重，
+   最多 4 条（`VITA_JARMEM_LEAKSITES`），报告里打
+   `[jarmem]   leak caller[0] ra=0x8103xxxx hits=41`。这是本模块内偏移，
+   `addr2line -e midp_vita_v03.08.sym (ra - 基址)` 就能命名调用者。
+3. **`closed=` 计数**：`vita_jar_close()` 里 `g_jar_stat.close_call++`。
+   判据：`loaded/open_call` 上升而 `closed` 恒为 0 ⇒ 进程内**没有任何东西**
+   会关 jar 句柄，槽表就是单向计数器。
+4. **修 `JarFileParser::get()` 的重试时序**（真 bug）：
+   ```c
+   pass0: open -> NULL
+   pass1: open -> NULL, THEN flush_caches();   // 太晚，循环结束了
+   ```
+   `flush_caches()` 原本排在**最后一次尝试之后**，永远救不了当次调用，调用方直接
+   吃到 NULL（退 stdio）。现在 flush 放在两次尝试**之间**。
+5. 报告里 `handles=%d/%d` 的分母改用 `VITA_JARMEM_HANDLES`（原来错用镜像槽数）。
+
+### 关键文件修改记录
+- `phoneme-cldc/src/vm/os/vita/OsFile_vita.cpp`：
+  `VITA_JARMEM_HANDLES 32` / `VITA_JARMEM_LEAKSITES 4`；`g_jar_h[HANDLES]`；
+  `g_jar_leaksite[]`/`g_jar_leaksite_hits[]`/`g_jar_leaksite_n` + `vita_jar_note_leaksite()`；
+  `vita_jar_is_handle()` 上界；`vita_jar_open()` 的 `no_slot` 分支记录返回地址；
+  `vita_jar_close()` 计数；`vita_jarmem_report()` 输出 `closed=` 与 leak caller 行、
+  句柄分母修正。
+- `phoneme-cldc/src/vm/share/runtime/JarFileParser.cpp`：`get()` 的 flush 时序。
+- `vita-port/CMakeLists.txt`：`set(VITA_VERSION "03.08")`。
+
+### 验证
+- **新增模型单测** `/tmp/jartest`（7 场景 / **247 条断言，全 PASS**）。
+  `OsFile_vita.cpp` 依赖 `incls/_precompiled.incl` 无法在宿主编译，所以复刻两张表的
+  记账逻辑：
+  1. **对照组**：8 槽 + log123 的泄漏形态（两个 jar 各 open 4 次不 close）→
+     round 1 起 10 次 open **全部**退 stdio、`no_slot=10`、leak caller 去重成 1 条
+     —— 用测试证明诊断本身，而不只是证明修复；
+  2. 32 槽 → 同样形态能撑 **4 轮**（40 > 32 才耗尽，`no_slot=8` 而非 40）；
+  3. 正常 close 的进程 200 次开关不增长表、镜像保持常驻（refs=0）；
+  4. 重开同一 jar 命中 strcmp、不新建镜像；
+  5. `is_jar_handle()` 边界：`&h[31]` 是、`&h[32]` 不是、栈上指针不是、
+     `NULL` 不是（`OsFile_close` 每次都用它，误判会破坏无关 `FILE*`）；
+  6. 泄漏点去重：4 个不同调用者够用，第 5 个被丢弃但 `no_slot` 不丢计数；
+  7. 镜像槽仍受 8 个上限约束（第 9 个 jar 靠回收 refs==0 的槽进来）。
+- 既有 10 套单测（gdtest/p2test/vkeytest/dectest/jpegtest/permtest/perfshim/
+  splashtest/bartest/jartest）全 PASS。
+- `rebuild_vm.sh` exit 0（唯一 error 仍是文档记录的 `collect2`）；
+  `./build.sh` exit 0，`out/vpk/midp_vita_v03.08.vpk`，版本串
+  `J2ME Player v03.08 b330`；`strings` 含新格式串
+  `[jarmem] %s enabled=%d hit=%u loaded=%u closed=%u ...` 与
+  `[jarmem]   leak caller[%d] ra=0x%08x hits=%u`。
+- `readelf -l`：TEXT `+0x3bdab4`，RW 起 `0x813d0000` → 余量约 **81 KB**。
+- **真机未验证**。
+
+### 教训
+- **"功能已经做了"不等于"功能在生效"**。整 jar 内存镜像 v02.70 就写了，v02.75 还
+  优化过，但一条静默的 `return NULL` 让它在 round 0 之后形同虚设，而所有性能数据
+  都在解释"为什么还是慢"。**先证伪"优化已生效"，再谈新优化。**
+- **静默失败路径是取证黑洞**。这个文件有 6 条静默返回，正是它们让 log120 的谜题
+  拖了两轮。加计数器（而不是加日志）成本最低、上限最高。
+- **表容量不能等于典型用量**。句柄槽是 8，而实际稳态就是 8（2 jar × 4 引用），
+  等于"零余量"，任何一点泄漏立刻全盘失效。容量应留余量并显式给出用量。
+
+### 没做 / 下一步
+1. 真机验证：看 round 1 的 `[jarmem] pre` 是否 `handles=8/32`（而不是 8/8）、
+   `no_slot` 是否停止增长、`loaded` 是否只增 0；同时 `preload io_read` 应从
+   4.8–6.4 s 掉到 1 s 量级。
+2. 若 `closed=0` 且 `leak caller` 指向唯一地址 → 去上游修"弱引用回收时不 dispose"，
+   那才是根治；本版只是把容量提到泄漏不再是致命的。
+3. P1-3 第 3 项（NEON / GPU 缩放）仍等 `perf.log`；v03.06 的时钟取证也等真机日志。
+
+## 2026-10-25 M3G(JSR-184)接入 + .m3g 容器解析
+
+### 参考实现(许可要点)
+- Android **J2ME-Loader**(nikita36078,J2ME-Loader)有完整 M3G(`javax/microedition/m3g/Loader.java`、`Defs.java`),
+  Mascot Capsule 由 **JL-Mod**(woesss)实现。**Apache-2.0 / 与 phoneME 的 GPLv2 不兼容**,
+  只从中确认"格式事实"(魔数、段结构、RTTI 编号、字段序),代码本仓库自行实现,不复制。
+- 其 M3G 对象反序列化在 native(C++)里;Java 层只做容器与 zlib 入口。
+
+### .m3g 容器格式(已用 15 个真实文件验证)
+- 12 字节魔数 `AB 'JSR184' BB 0D 0A 1A 0A`
+- 段:u8 compressionScheme | u32 LE totalSectionLength | u32 LE uncompressedLength | payload | u32 LE checksum
+  (`totalSectionLength` = 头部 9 + payload + 校验 4;即 payload = tot-13)
+- payload 内每个对象:u8 type | u32 LE bodyLength | body
+- body 首 4 字节 = objectID(type 255 除外,它是 UTF-8 资源名,用于外部引用)
+- 所有整数 little-endian;字符串 = NUL 结尾 UTF-8
+- **头部对象不含校验和**,长度只含 version(2)+extFlag(1)+totalFileSize(4)+approx(4)+author(N+1)
+  (踩坑:最初把段校验和当对象字段,导致 15 个文件全部 header length mismatch)
+- RTTI 编号(实测):9=Image2D 10=KeyframeSequence 11=Light 12=Material 13=Mesh 14=MorphingMesh
+  15=SkinnedMesh 16=Sprite3D 17=Transform 18=TriangleStripArray 19=Texture2D
+  20=VertexArray 21=VertexBuffer **22=World**
+- 真实文件全部 `compressionScheme=0`(未压缩);scheme=1 是 zlib,CLDC 无 java.util.zip,
+  需要自写 inflate 或 native,暂不支持并明确报错
+
+### 生化危机 3D 的 15 个模型实测
+- 均为 v1.0、作者 "Exported from Lightwave 3D"、1 个 World/Camera/Light/Sprite3D/VertexBuffer/3×VertexArray
+- 纹理是"逐帧 Image2D + Texture2D + AnimationTrack"做 UV 动画(hunter 46/46/45)
+- 没有 SkinnedMesh;missionmap 用 MorphingMesh
+- 每个文件都带 1 个外部引用(`en_all.png` / `jil_all.png` / `effects.png`)
+
+### 本轮改动
+| 文件 | 内容 |
+| --- | --- |
+| `jsr184/src/share/core/common/classes/com/sun/m3g/M3gFile.java` | 新增:容器解析(Object table、外部引用、strings、LE reader) |
+| `jsr184/.../javax/microedition/m3g/Loader.java` | PNG/JPEG → Image2D;.m3g 走 M3gFile 校验,反序列化未实现时抛带信息的 IOException |
+| `jsr184/build/subsystem.gmk` | 登记 M3gFile.java(漏登记导致 MIDP javac "cannot find symbol") |
+
+### 验证
+- 宿主 `javac`(CLDC/MIDP 类路径)编译通过
+- 宿主 Harness 解析 `debug/3d_game` 里全部 15 个 `.m3g`:**15 ok / 0 bad**
+- `build_vita.sh` + `vita-port/build.sh` 通过;VPK `out/vpk/midp_vita_v03.08.vpk`
+- **未在真机验证**;M3G 画面、性能仍未知
+
+### 下一步
+1. 逐对象反序列化(Mesh 内联 IndexBuffer、VertexArray 压缩格式、KeyframeSequence、AnimationTrack)
+2. 外部引用:同 jar 内的 png 需按 jar 相对路径解析(Loader.load(String) 目前走 Connector)
+3. scheme=1 zlib inflate
+
+### 反序列化:实测得到的布局证据(供后续继续)
+对 15 个真实文件共 ~2000 个对象做"同类型逐字节常量/变化"统计,结论:
+
+| type | 长度 | 证据 |
+| --- | --- | --- |
+| 1 AnimationController | 恒 36 | 仅 id 变化;prefix 12 字节后是 6×f32,前两个 = 1.0 (0x3f800000),其余 0 |
+| 2 AnimationTrack | 恒 24 | 三个 u32;off12 ∈{3..9}(KeyframeSequence 引用)、off16 ∈{10,12,34,36,49,51}(Controller 引用)、off20 首字节 ∈{12,14,19} |
+| 3 Appearance | 恒 37 | 仅 id 变化,其余字段是 4 个对象引用 |
+| 6 CompositingMode | 恒 26 | 仅 id 变化 |
+| 8 Group | 恒 18 | off12 ∈{0xA0,0xA2}, off15 ∈{0,1} |
+| 13 Mesh | 恒 30 | 仅 id 变化(VertexBuffer/IndexBuffer/Appearance 三个引用) |
+| 17 Transform | 恒 26 | 仅 id 变化 |
+| 21 VertexBuffer | 恒 68 | off16 变化(引用),其余常量 |
+| 22 World | 50/54 | 仅 off22 变化;尾部有 4 个连续引用 + 0 |
+| 20 VertexArray | 33..2717 | 公式已验证:prefix 12 + (componentSize, componentCount, encoding, vertexCount:u16) + vertexCount*componentCount*componentSize 字节 |
+| 255 ExternalRef | 11/12 | UTF-8 文件名 + NUL |
+
+**未解决**:每个类型的字段**顺序**(例如 Group 的 0xA0/0xA2 是什么、World 的引用顺序)无法仅靠统计确定,
+误差会直接变成渲染出错。需要 JSR-184 规范里"文件格式"一章的逐类型字段定义。
+
+**许可边界**:Nokia 参考实现(EPL-1.0)与 phoneME 的 GPLv2 不兼容,FSF 认定 EPL-1.0 与 GPL 不兼容,
+因此不能复制其代码;只能读规范自己写。J2ME-Loader 的对象反序列化在 native(C++),且为 Apache-2.0,同样不可复制。
+
+### 2026-10-25 修正:JSR-184 对象类型编号表(之前整表错位)
+用 15 个真实文件 + 独立开源 M3G 加载器的分派表交叉验证,**正确编号**:
+
+| 类型 | 含义 | 15 文件中的实例数 |
+| --- | --- | --- |
+| 0 | Header | 0(头部单独) |
+| 1 | AnimationController | 13 |
+| 2 | AnimationTrack | 590 |
+| 3 | Appearance | 36 |
+| 4 | Background | 0 |
+| 5 | Camera | 15(每文件 1) |
+| 6 | CompositingMode | 36 |
+| 7 | Fog | 0 |
+| 8 | **PolygonMode** | 36 |
+| 9 | **Group** | 533(骨骼) |
+| 10 | Image2D | 0(全部用外部 PNG) |
+| 11 | **TriangleStripArray** | 36 |
+| 12 | Light | 36(每文件 2) |
+| 13 | Material | 32 |
+| 14 | Mesh | 36 |
+| 15 | MorphingMesh | 1 |
+| 16 | **SkinnedMesh** | 14 |
+| 17 | **Texture2D** | 36 |
+| 18 | Sprite3D | 15 |
+| 19 | **KeyframeSequence** | 590 |
+| 20 | VertexArray | 45(每文件 3) |
+| 21 | VertexBuffer | 15(每文件 1) |
+| 22 | World | 15(每文件 1) |
+| 255 | ExternalRef | 15 |
+
+自洽性交叉验证:每文件 1 World + 1 Camera + 1 VertexBuffer(引用 3 个 VertexArray)
++ 1 SkinnedMesh + N Group(骨骼)+ N AnimationTrack = N KeyframeSequence。
+
+**重要更正**:这批模型**确实使用 SkinnedMesh**(14 个,3.6KB 级,带骨骼列表),
+之前"没有骨骼蒙皮"的结论是错的(基于错位的类型表)。骨骼变形必须做。
+
+### 已确认的逐类型字段布局(可直接实现)
+所有 u32 小端。引用是对象 userID,0 = 空。
+
+- **公共前缀(Object3D)**:userID u32 | animTrackCount u32 | refs(4n) | userParamCount u32
+  | 每个参数:id u32 + length u32 + data(length)
+- **Transformable**(接在公共前缀后):hasTRS u8;若 1 → translation(12) + scale(12) + orientation(16)
+  = 40;然后 hasGenericTransform u8;若 1 → 4×4 矩阵 64
+- **Node**(接在 Transformable 后):rendering u8 | picking u8 | alpha u8 | scope u32
+  | hasAlignment u8;若 1 → zTarget u8 + yTarget u8 + zRef u32 + yRef u32(共 10)
+- **AnimationController(1)**:speed f32 | weight f32 | activeStart u32 | activeEnd u32
+  | refSeqTime f32 | refWorldTime u32  —(已验证 13/13 精确消耗)
+- **AnimationTrack(2)**:sequence ref | controller ref | property u32 —(590/590 ✓)
+- **VertexArray(20)**:componentSize u8(**1=BYTE,2=SHORT,只有这两种**) | components u8
+  | encoding u8(0=绝对,1=差分) | vertexCount u16 | 数据 n*components*(1 或 2) —(45/45 ✓)
+- **VertexBuffer(21)**:defaultColor ARGB(4) | positions ref(4) + bias[3](12) + scale(4)
+  | normals ref(4) | colors ref(4) | texCoordCount u32 | 每项 ref(4)+bias[3](12)+scale(4)
+- **TriangleStripArray(11)**:encoding u8;按 encoding 读 startIndex(u32/u8/u16);
+  128/129/130 时再读 indexCount u32 + indices(4/1/2 字节/个);最后 lengthCount u32 + lengths u32×n
+- **KeyframeSequence(19)**:interpolation u8 | repeatMode u8 | encoding u8 | duration u32
+  | rangeFirst u32 | rangeLast u32 | components u32 | keyFrames u32
+  | encoding 0: n×(time u32 + components×f32);否则先 2×components×f32(bias/scale)
+  然后 n×(time u32 + components×(1 或 2) 字节)
+- **Appearance(3)**:layer u8 | compositingMode ref | fog ref | polygonMode ref | material ref
+  | textureCount u32 | texture refs(4n)
+- **CompositingMode(6)**:depthTest u8 | depthWrite u8 | colorWrite u8 | alphaWrite u8
+  | blending u8 | alphaThreshold u8 | depthOffset f32×2
+- **PolygonMode(8)**:culling u8 | shading u8 | winding u8 | twoSided u8 | localCamera u8
+  | perspectiveCorrection u8
+- **Group(9)**:Node 数据 + childCount u32 + child refs(4n)
+- **World(22)**:Group 数据 + activeCamera ref | background ref
+- **Camera(5)**:Node 数据 + projectionType u8;GENERIC→矩阵 64;PERSPECTIVE/PARALLEL→4×f32
+- **Light(12)**:Node 数据 + attenuation f32×3 | color RGB(3 字节) | mode u8 | intensity f32
+  | spotAngle f32 | spotExponent f32
+- **Material(13)**:ambient RGB(3) | diffuse ARGB(4) | emissive RGB(3) | specular RGB(3)
+  | shininess f32 | vertexColorTracking u8
+- **Texture2D(17)**:Transformable 数据 + image ref | blendColor RGB(3) | blending u8
+  | wrapping u8×2 | filtering u8×2
+- **Mesh(14)**:Node 数据 + vertexBuffer ref | submeshCount u32 | (indexBuffer ref + appearance ref)×n
+- **SkinnedMesh(16)**:同 Mesh + skeleton ref | transformRefCount u32
+  | 每项:bone ref + firstVertex u32 + vertexCount u32 + weight u32
+- **MorphingMesh(15)**:同 Mesh + targetCount u32 | (vertexBuffer ref + weight f32)×n
+- **Sprite3D(18)**:Node 数据 + image ref | appearance ref | scaled u8 | crop u32×4
+- **Background(4)**:backgroundColor ARGB | image ref | imageMode u8×2 | crop u32×4
+  | colorClear u8 | depthClear u8
+- **Image2D(10)**:format u8 | isMutable u8 | width u32 | height u32
+  | 可变则无数据;否则 paletteLength u32 + palette + pixelsLength u32 + pixels
+
+**颜色编码**:RGB 存 3 字节 (R,G,B);ARGB 存 4 字节且顺序是 **B,G,R,A**
+(`m3gLoadARGB`: v=data[3]<<24 | data[0]<<16 | data[1]<<8 | data[2] → A 来自 data[3])。
+
+## 2026-10-25 v03.10：Java 虚拟机的浮点运算整体错误（解释器与 FP 辅助函数 ABI 不一致）
+
+> 产物 `out/vpk/midp_vita_v03.10.vpk`（11967090 B），ELF `J2ME Player v03.10`。**未在真机运行。**
+> 起因：log123 的探针 `(int)(.95*240)=228`（javac 常量折叠）对 `(int)(.95*owner)=0`（VM 运行期）。
+
+### 根因（实测，不是推断）
+- `Interpreter_arm.o`（生成的汇编，`libcldc_vm.a` 的成员）调用所有 FP 辅助函数时，操作数放**整数寄存器**
+  （double = `r0=高字, r1=低字`；双目 `a=r0:r1, b=r2:r3`；float 单字），结果从 `r0/r1` 取。
+- 这些辅助函数（`jvm_dadd/dsub/dmul/ddiv/drem、fadd.. 、i2d/i2f/f2d/d2f/l2d/l2f/f2l/d2l、dcmpl.. 、sin/cos/tan/sqrt/ceil/floor`）
+  是 `libcldc_vm.a` 里的 C 函数，`rebuild_vm.sh` 用 `-mfloat-abi=hard` 编，**读 d0/d1、返回 d0**。
+  `kni.h` 的 `JVM_SOFTFP_LINKAGE` 只对 ARM 自家编译器（`__ARMCC_VERSION`）定义成 `__softfp`，GCC 下为空。
+- 只有 `jvm_d2i/jvm_f2i`（`Interpreter_arm.o` 自己手写、整数协议）是对的。
+- 反汇编证据：`jvm_dmul = vmul.f64 d0,d0,d1; bx lr`；`bc_impl_dmul_internal` 把 4 个字弹进 r0–r3 后 `bl jvm_dmul`，
+  再 `str r1,[r6,#-4]!`。所以 `dmul` 实际返回的是进来时 d0/d1 里残留的值（常是某个操作数）。
+
+### 怎么证明的（没有模拟器，所以自己写了一个）
+- `debug/tools/fpmodel/`：约 600 行的 ARM/VFP 解释器，**直接执行 ELF 里的 `bc_impl_*` 和 `jvm_*` 机器码**。
+  遇到没实现的指令一律 ABORT，不跳过。
+- **校准**：用 GCC 按 AAPCS 软浮点编译的参考函数（`pcs("aapcs")`）过同一个模型，与 Python 结果比对，0 失配。
+- 40 个用例（dadd/dsub/dmul/ddiv、fadd.. 、i2d/i2f/f2d/d2f、d2i/f2i/d2l、dcmpl/fcmpl，各 2–3 组输入）：
+  **修复前 6/40**（只有 d2i/f2i/dneg/fneg 对），**修复后 40/40**；对最终构建出的 ELF（不是覆盖层）重跑同样 40/40。
+- 结果举例（修复前）：`dmul(240,0.95)` 得 0.95，`dadd(3,4)` 得 4，`i2d(240)` 得 5.09e-312，`dcmpl(1,2)` 得 0。
+
+### 模型自己的 bug（必须记，差点冤枉 ELF）
+排查中模型先后给出 4 次"ELF 有 bug"的假阳性，**每一次都是模型缺指令/实现错**，用"GCC 编同一份 C 源码再过模型"才区分出来：
+1. 没实现 `movw/movt` → `jvm_d2l` 看起来返回 128 而不是 228；
+2. `rsbs` 没更新进位 → 负数 `d2l` 错；
+3. `vldr [pc,#x]` 读不到 `.text` 里的字面量池 → `l2d` 结果丢高位；
+4. 没实现 `ubfx` → `fmod(7.5,2)` 得 8.98e307。
+结论：**模型报错时先和 GCC 编译的同源参考比，不要直接怪 ELF。** 已写进 `debug/tools/fpmodel/README.md`。
+
+### 修复
+- 新增 `vita-port/src/vita_fp_shims.S`：28 个 `jvm_X_isoft` 适配函数（整数寄存器 → d0/s0 → 调原函数 → 结果回 r0/r1）。
+- `vita-port/CMakeLists.txt`：`project(... ASM)`；`add_executable` 加 `.S`；新规则 `vm_interp_fixed`：
+  从 `libcldc_vm.a` 取出 `Interpreter_arm.o`，`objcopy --redefine-sym jvm_X=jvm_X_isoft`，把这份**放在 `--start-group` 之前**链接
+  （`--allow-multiple-definition` 取第一个定义，所以补丁版的 `jvm_d2i/jvm_f2i/GP 表` 压过库里同名的原版）。
+  `LINK_DEPENDS` 追加该对象。
+- **不改 `libcldc_vm.a`、不改任何 phoneme 源码、不改 `rebuild_vm.sh`。** C++ 调用方（sin/cos 内核、JIT 常量折叠）仍用原来的硬浮点符号。
+- 选方案 A（汇编适配）而不是 B（纯 C 适配）：模型里两者都 40/40，A 每次 `dmul` 18 条指令、B 24 条；`(int)(w*0.95)` A=50、B=57。
+
+### 在最终 ELF 里核对过的
+- 28 个 `_isoft` 符号存在；`bc_impl_{dadd,dsub,dmul,ddiv,dcmpl,i2d,d2f,f2d,fadd,fmul,d2l,l2d}_internal` 现在 `bl` 到 `*_isoft`；
+  `bc_impl_d2i/f2i_internal` 仍是 `jvm_d2i/jvm_f2i`（`jvm_fast_globals`、`jvm_d2i`、`jvm_f2i` 各只有一个定义）；
+  `cosine_kernel/sine_kernel/tangent_kernel/ieee754_*` 仍调原 `jvm_dmul/jvm_dadd/jvm_i2d`。
+- `ieee754_fmod`（`%` / `drem` 走它）：模型里 ELF 版与 GCC 编译的同源版对 4 组输入结果一致且正确。
+
+### 没验证的（如实写）
+1. **未上真机。** 这是改整个 VM 算术的变更，风险高于任何之前的改动；验收要看 `[ALERT-LAYER] fp …` 一行：
+   `i2d=240 dmul*2=480 dadd=241 dmul.95=228 d2l=228 f=228 cmp.95<w=true`。
+2. `jvm_l2d / jvm_l2f`：最终 ELF 里调用 libgcc 的 Thumb 代码，模型不支持 Thumb → ABORT。
+   适配层的寄存器搬运用"符合硬浮点约定的参考实现"替身验证过（10/10），**libgcc 那部分没跑**。
+3. `sin/cos/tan/sqrt/floor/ceil` 的入口适配（`native_math_*_entry`）：只验证了接线（反汇编）和适配函数的搬运逻辑；
+   `ieee754_sqrt` 等用了模型没实现的 VFP 指令，没跑通完整数值。
+4. 没有评估 **JIT** 生成的浮点代码是否有同类问题——JIT 目前整体关闭（`jit=0`）。
+5. `Float.intBitsToFloat / Double.longBitsToDouble` 等 KNI 原生方法：反汇编里它们返回 `s0/d0`（硬浮点），而 KNI 调用者的
+   期望没有查——**可能还有同类问题，未处理**。
+6. 一个旁证：`AlertLayer` 的整数算术（v03.02）仍保留，不依赖这次修复；这次修复不会让它回退。
+
+### 影响面（为什么这条值得）
+所有走 VM 浮点的 Java 代码：UI/动画/物理、`Math.sqrt/sin/cos`、`float`/`double` 计算、`Float.toString` 等。
+此前 log118–123 里一些"游戏逻辑不对"的现象（比如声音节奏、布局偏差）有可能和它有关，**但我没有证据把某个具体现象归到它头上**。
+
+### 踩到的坑
+1. **用模型找到的结论要先怀疑模型**：4 次假阳性。校准 + 同源 GCC 参考是必须的，不是可选项。
+2. 终端里 `/usr/bin/gcc` 被 vitasdk 的 PATH 污染（交叉汇编器拒绝 `--64`）；宿主程序要用干净 `PATH` 编。
+3. 编辑器不能覆盖已存在文件、单次写入超 6000 字符会被拒——大文件分段 `cat >>`。
+4. 版本号被别的会话连推三次（03.08/03.09 都不是我的），写版本块前先 grep 最后一个。
+
+
+### 2026-10-25 .m3g 反序列化完成(15/15 文件通过)
+
+新增 `javax/microedition/m3g/M3gReader.java`(包内私有):两遍扫描,先按对象表建壳,
+再逐对象解析并按引用填充。**每个对象都要求字节精确消耗**,不一致就抛异常(带类型名与 userID)。
+
+实现覆盖类型:1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22(+255 占位)。
+
+### 三个关键格式事实(本轮用真实文件逐个证伪/证实)
+
+1. **引用不是 userID,而是对象数组下标**:`ref = objects[value - 2]`
+   (参考实现保留 0 与 1 两个槽)。用 590 条 AnimationTrack→KeyframeSequence 引用
+   和 590 条 →AnimationController 引用验证,全部命中。
+2. **外部引用(类型 255)必须占一个对象槽**。它没有 objectID 字段,但后续引用按数组下标
+   计数;第一版把它从对象表剔除,导致所有索引整体错位 1 位(表现为 Group 被当成
+   KeyframeSequence)。
+3. **对象体里已含 4 字节 objectID**;`M3gFile` 把它剥离存成 `Obj.id`,reader 不能再读一次,
+   否则所有字段偏移 +4(表现为 `implausible count ... at 128`)。
+
+### 其他确认
+- ARGB 在文件里是 **B,G,R,A** 字节序(`argb()` 已按此解);RGB 是 R,G,B。
+- VertexBuffer 的 position/texcoord 采用 `value*scale + bias` 编码,Renderer 已应用。
+- VertexArray 的 encoding:0=绝对值,1=差分累加;分量仅 1 字节(BYTE)或 2 字节(SHORT)。
+- TriangleStripArray 支持 encoding 0/1/2(隐式起始索引)与 128/129/130(显式索引)。
+- KeyframeSequence 支持 encoding 0(全 float)与 1/2(bias+scale + 8/16 位量化)。
+
+### 验证
+宿主 `javac` + 自写 Dump 程序,对 `debug/3d_game` 的 15 个 `.m3g` 全部解析成功:
+`ok=15 bad=0`,每个文件都有 World/相机,子节点 4~5 个。
+`build_vita.sh` 与 `vita-port/build.sh` 均通过,产物 `out/vpk/midp_vita_v03.10.vpk`。
+**未在真机运行**。
+
+### 仍缺
+- 外部贴图:类型 255 目前解析成 null,纹理为空 → 模型会是顶点色/材质色。下一步按 jar 内
+  相对路径(`Image.createImage("/" + name)`)解析。
+- 骨骼变形:SkinnedMesh 的骨骼表已加载,渲染仍是刚体。
+- 动画采样:KeyframeSequence/AnimationTrack 已加载,尚未参与渲染(UV 动画/骨骼动画都需要)。
+- zlib 压缩段(scheme 1):未支持(测试集全部未压缩)。
+
+### 2026-10-25 外部贴图 + 动画采样(骨骼变形仍未做)
+
+**外部贴图**:类型 255 的槽位现在解析成真实 `Image2D`:
+- `Loader.load(String)` 把 .m3g 的目录前缀传给 `M3gReader.readAll(..., base, log)`
+- 资源名按 `base + name` 通过 `Image.createImage(String)` 读取(jar 内相对路径可用)
+- 读不到时**不失败**,降级成 1x1 白图,子网格退化为无贴图着色 —— 缺资源的游戏仍可跑
+- 回归:15 个文件全部 ok,对象数 +1(外部引用槽变成 Image2D)
+
+**动画采样**已接入渲染循环:
+- `AnimationTrack` 补齐 JSR-184 属性码(ALPHA 256 … VISIBILITY 276)
+- `Renderer.animate(node)` 每帧对节点的每条轨道采样并写回节点
+- 支持属性:TRANSLATION / SCALE / ORIENTATION / ALPHA / PICKABILITY / VISIBILITY /
+  MORPH_WEIGHTS
+- 世界时间由 `Graphics3D.releaseTarget()` 按**实测帧间隔**推进(>500ms 的间隔丢弃,
+  避免切后台回来时动画跳一大段)
+- 未支持:材质色、雾、相机 FOV、光源强度等属性动画(格式已能读,渲染未用)
+
+**仍缺:骨骼变形**。SkinnedMesh 的骨骼表(skeleton / bone / firstVertex / vertexCount /
+weight)已完整加载,但 JSR-184 的逐顶点权重存放在 VertexBuffer 的 weights 属性里,
+而这批文件的 VertexBuffer 只带 position/normal/color/texcoord —— 没有权重就无从混合。
+因此当前按刚体渲染:骨骼节点的动画会让肢节整体移动,但顶点不会蒙皮变形。
+
+### 累计验证状态
+- `.m3g` 容器 + 反序列化:15/15 文件、约 2100 个对象、每个对象字节精确消耗 ✓(宿主)
+- 3D 后端(硬件 vitaGL / 软件光栅)自检:三种模式均在真机跑出 31% 覆盖率 ✓
+- 外部贴图 / 动画采样:**仅宿主编译与解析验证,未在真机看画面**
+
+## 2026-10-25 v03.11：FP 修补挪进 CLDC 层 + 修掉 sin/cos/tan 大参数错误（C++ 侧的 d2i）
+
+> 产物 `out/vpk/midp_vita_v03.11.vpk`（11984488 B），ELF `J2ME Player v03.11`。**未在真机运行。**
+> 起因：用户问"能不能在 cldc 里加 overlay、只动构建层"，同时我用模型把 Math 原生方法完整跑了一遍，
+> 发现 v03.10 没覆盖的另一半问题。
+
+### 1. 新发现：Math.sin/cos/tan 对 |x| > π/4 仍然是错的（v03.10 的结论"C++ 调用方不受影响"对 d2i 不成立）
+- `jvm_d2i`/`jvm_f2i` 只有一份定义——`Interpreter_arm.o` 里手写的**整数协议**版本（double 在 r0:r1，float 在 r0）。
+  `FloatSupport_arm.cpp:2673` 的 C 版本被 `USE_SUN_JVM_D2I` 屏蔽了。
+- C++ 调用方（`ieee754_rem_pio2`、`remainder_pio2_kernel`、`sine/cosine/tangent_kernel`、`JVMCodeGenerator::d2i`）
+  按**硬浮点**调用（double 在 d0）。模型直接这样调：`d2i(3.0)`、`d2i(6.0)`、`d2i(15.9)` 全部返回 0。
+- `ieee754_rem_pio2` 里 `n = jvm_d2i(x·2/π)` 恒为 0，约化角度没减对。只有 |x| > π/4 才走这条路，小参数不受影响。
+- 最终 v03.10 ELF 上的实测（真实 `native_math_*_entry`，42 项）：32 对、**7 错**、3 中止（模型缺指令）。
+  `sin(10)=532.9`（应 -0.544）、`cos(100)=-1.1e17`（应 0.862）、`tan(10)=19.4`（应 0.648）。
+  sqrt/floor/ceil 和小参数三角函数是对的。
+
+### 2. 新做法：overlay 在 cldc，CMake 回到原样
+cd /workspace/psvita/phoneme-vita/phoneme-cldc/src/vm && grep --color=auto -rn UseCompiler *= *\(false\|0\)\|UseCompiler =  --include=*.cpp --include=*.hpp . | head -15; sed -n 120,140p share/runtime/Arguments.cpp; grep --color=auto -n ENABLE_COMPILER\|ENABLE_JIT /workspace/psvita/phoneme-vita/phoneme-cldc/build/vita_arm/vita_arm.cfg | `phoneme_source` 未动）：
+- `phoneme-cldc/src/vm/os/vita/vita_fp_overlay.S`：28 个 `jvm_X_isoft` 适配器（v03.10 的 `vita_fp_shims.S` 搬来），
+  外加**硬浮点入口** `jvm_d2i`/`jvm_f2i`（`vmov r1,r0,d0` / `vmov r0,s0` 后直接 `b jvm_d2i_isoft`/`jvm_f2i_isoft`，
+  不重复转换逻辑）。
+- `phoneme-cldc/src/vm/os/vita/patch_interp.sh`：`objcopy --redefine-sym jvm_X=jvm_X_isoft`（28 个 + d2i + f2i，
+  解释器自带的整数版和它在 GP 表里的指针一起被改名），再 `ld -r` 把汇编目标合进同一个成员。幂等（输入里已有
+  `jvm_d2i_isoft` 就原样复制），并检查每个符号恰好定义一次。
+- `rebuild_vm.sh` `pack_lib`：从 `.bak` 取出 `Interpreter_arm.o` 后调用 `patch_interp.sh`，再 `ar r`。
+  `libcldc_vm.a` 里就已经是修好的成员。
+- `vita-port/CMakeLists.txt`：**撤掉** v03.10 的全部改动（`ASM` 语言、`.S` 源文件、`vm_interp_fixed` 规则、
+  链接顺序、`LINK_DEPENDS`），只剩版本号和注释。`vita_fp_shims.S` 已删除（搬走）。
+- `phoneme-cldc/.gitignore` 对 `src/vm/os/vita/` 没有屏蔽，新文件会正常入库。
+
+### 3. 验证（最终 v03.11 ELF，`debug/tools/fpmodel/run.sh`）
+- 校准：0 不一致。
+- 解释器 FP 字节码：**40/40**。
+- Math 原生方法（`mathfull.py`，新增）：**42/42**，含 `sin(10)=-0.5440211108893698`、`cos(100)=0.8623188722876839`、
+  `tan(10)=0.6483608274590866`、sqrt(2)/sqrt(240)。
+- 硬浮点 d2i/f2i（`d2ihf.py`，新增）：**50/50**，含 NaN→0、±inf/溢出饱和、-0.0、2147483646.5 等边界。
+- ELF 符号：`jvm_d2i`/`jvm_f2i`（硬浮点入口）与 `jvm_d2i_isoft`/`jvm_f2i_isoft`（整数版）各自独立，无 multiple definition。
+- 模型补了指令：`vmov.f64 Dd,Dm`/`#imm`、`vabs/vsqrt.f64`、`vmov.f32`、`strd/ldrd`、`cmn`、`teq`。
+  （仍是模型缺什么就补什么；中止≠通过。）
+
+### 4. 对旧结论的更正
+- v03.10 注释和 PROJECT_MEMORY 里"C++ 调用方（sin/cos 内核、JIT 常量折叠）不受影响"：对 dadd/dmul 等成立，
+  **对 d2i/f2i 不成立**，已在 v03.11 修掉。
+- 用 `rebuild_vm.sh` 日志里的 `ld returned 1`（host loopgen 链接缺 `vita_splash_*`/`_current_thread`/`fast_memclear`）
+  是脚本注释里已说明的"最终可执行文件链接失败，预期内"，与本次改动无关。
+
+### 5. 仍未验证（如实）
+- 真机：v03.10 起整个 VM 的算术都变了，v03.11 又改了库。要看 `[ALERT-LAYER] fp i2d=240 dmul*2=480 dadd=241 dmul.95=228 d2l=228 f=228 cmp.95<w=true`，
+  以及 xiyangyang 音高、UC Alert。
+- `jvm_l2d`/`jvm_l2f`（libgcc 是 Thumb，模型跑不了）、`jvm_d2l`/`jvm_f2l`（软件实现）未经模型验证。
+- `Float.intBitsToFloat`/`Double.longBitsToDouble` 的 KNI 原生方法返回 s0/d0，调用方预期未核对。
+- JIT 生成代码里的 FP 路径未验证；`jit=0` 保持。
+- "暂停后恢复卡几秒"仍无对应日志事件，已问用户按哪个键/哪个画面，未收到回复。
+
+### 关键文件修改记录
+- 新增 `phoneme-cldc/src/vm/os/vita/vita_fp_overlay.S`、`patch_interp.sh`
+- 改 `rebuild_vm.sh`（pack_lib 里 +8 行）
+- 改 `vita-port/CMakeLists.txt`（撤掉 v03.10 的 FP 构建逻辑，版本 03.11）
+- 删 `vita-port/src/vita_fp_shims.S`（从未入库，已搬走）
+- 新增/改 `debug/tools/fpmodel/`：`mathfull.py`、`d2ihf.py`、`armsim2.py`/`armsim3.py`（补指令）、`run.sh`、`README.md`
+
+### 经验
+1. 同名符号被两种调用约定共用时，改名要连"定义本身"一起改；只改调用方的引用会让另一类调用方继续吃错约定。
+2. "不受影响"必须有测量支持。上一版我没跑 sin/cos 大参数，就写下了这句话。
+3. 模型的 ABORT 是"不知道"，不是"通过"；每次补指令后重新做校准。
+
+### 2026-10-25 补记:规则更新 + 更正"Interpreter_arm.o 不能重新生成"
+- 我之前对用户说"Interpreter_arm.o 是生成物、不能重新生成(VM_BUILD.md 记过会丢浮点桩),只能当黑盒"。用户指出
+  "之前不是确认过了吗",PROJECT_MEMORY(条件 BL 一节)确有反向记录。**重新实测,结论:我说错了。**
+- 实测(隔离副本 `/tmp/lgv`,先删 `loopgen/ romgen/ target/ dist/`,日志里 2955 处源码路径全是副本、0 处指向工作区):
+  1. 宿主 `loopgen` 用 `g++-13 -B/usr/bin -m32` 编出,exit=0。
+  2. `loopgen -generateoptimized +GenerateGNUCode -outputdir <dir>` → `Interpreter_arm.s` 441533 B,md5 `cbeb0157…`,
+     与冻结的 `target/release/Interpreter_arm.s` **逐字节一致**,含 `jvm_f2i/jvm_d2i`(8 处引用)。
+  3. 汇编后 `.o` 97528 B,`.text`/`.data` 的 md5 与冻结 `.o` 相同,反汇编 9816 行完全一致。
+  4. 第一次不带 `+GenerateGNUCode` 得到 `;` 注释风格、443179 B 的 `.asm`——是参数少了,不是丢桩。
+- "丢桩"的真正来源:`+GenerateGPTableOnly`(`jvm.make:979/1734`)产物 `loopgen/app/Interpreter_arm.s`,17758 B,无 `jvm_f2i`。
+- 后果:`rebuild_vm.sh` 仍从旧库取成员只是省一次宿主 loopgen 构建的捷径,**不是必须**。v03.11 的 overlay 依然成立
+  (是否重新生成与"要不要改调用约定"是两件事),但"生成物只能当黑盒"这个理由作废;若将来要改生成器本身
+  (如 `InterpreterStubs_arm.cpp`),路线是通的,代价见条件 BL 一节(`-DVITA` 不传宿主 loopgen、探针偏移要同步)。
+- 规则更新:`AGENTS.md` 第 4 条与 `.github/agents/jvm-dev.agent.md` 第 9、10 条——允许 overlay 覆盖/替换(幂等、`objcopy --redefine-sym`、
+  `nm` 校验、文件头与 PROJECT_MEMORY 留痕、`.gitignore` 白名单、不放进 CMake);记录 `Interpreter_arm` 可重新生成。
+- 同步更正 `VM_BUILD.md` 第 7 条与 pack 注释、`rebuild_vm.sh` pack_lib 注释(只加更正说明,不删原文)。
+- 教训:引用"项目记录说过 X"之前要查有没有后来的反向记录,更要自己再测一次,尤其当它会成为方案的论据时。
+
+### 2026-10-25 补记:pack_lib 整理 + 编译速查(`BUILD_QUICKSTART.md`)
+- `rebuild_vm.sh` `pack_lib`:中间文件改用 `mktemp -d`(`$W`),`trap "rm -rf '$W'" EXIT`(双引号,让局部变量立刻展开),
+  `Interpreter_arm.o` 在 `$W` 里取出、打补丁、在补丁结果所在目录里 `ar r`。不再使用固定的 `/tmp/Interpreter_arm*.o`。
+- `pack_lib` 末尾新增**库级**校验:`jvm_d2i`/`jvm_f2i` 和 28 个 `jvm_*_isoft` 在整个 `libcldc_vm.a` 里各恰好一份,否则 `die`。
+- **修了一个潜伏的随机失败**:`patch_interp.sh` 的幂等检测用 `nm | grep -q`,在 `set -o pipefail` 下 `grep -q` 提前退出,
+  `nm` 被 SIGPIPE 杀掉(rc 141),判断随机为假 → 已打过补丁的输入被重复合并 → `multiple definition of jvm_l2f_isoft`。
+  实测同一条管道 6 次里 2 次 rc=141。改为 `grep -c … || true` 计数。上一轮能成功纯属运气(那时 `.bak` 恰好未打补丁)。
+- 验证:
+  1. 库里是**未打补丁**的成员 → 走打补丁分支,`patch_interp: OK`,符号表与上一版 0 行差异,打补丁后的成员与上一版**逐字节一致**。
+  2. 库里是**已打补丁**的成员(连跑两次)→ 走原样复制分支,exit 0。
+  3. `/tmp/pack_lib.*` 无残留。
+  4. `vita-port/build.sh clean` exit 0,无 multiple definition;`fpmodel/run.sh`:校准 0 不一致、40/40、42/42、50/50。
+- 新增 `BUILD_QUICKSTART.md`(改了什么跑什么、overlay 结构、12 条踩坑),并在 `AGENTS.md`、`jvm-dev.agent.md` 里挂入口,
+  让别的模型动手前先读。
+- 仍未做:真机验证;`rebuild_vm.sh` 继续从旧库取成员(重新生成是可选捷径,见上一节)。
+
+### 2026-10-25 log124 黑屏定位:`Object3D.getReferences` 未实现
+
+**现象**:进入生化危机 3D 后黑屏。
+
+**证据**(`log124/vm_output.log`):
+```
+[APPEXC] java.lang.Error: 137
+ - BioCtrl.setTexture(), bci=2
+ - BioCanvas.runMissionSel(), bci=417
+ - BioCanvas.run(), bci=302
+```
+137 = M3G `INVALID_OPERATION`。
+
+**根因**:`BioCtrl.setTexture()` 第一句就是
+`object.getReferences(null)`(M3G 1.1 API)。我们只实现了 JSR-184 1.0 的类面,
+没有 `getReferences` / `setUserObject` / `getUserObject`,所以 `NoSuchMethodError`
+被游戏吞掉转成 Error 137,换贴图失败后整个渲染流程中断 → 黑屏。
+
+**修复**:
+- `Object3D.getReferences(Object3D[])`:null 时返回引用数,否则填充数组(标准两段式用法)
+- `Object3D.setUserObject` / `getUserObject`(M3G 1.1,userObject 必须是 Hashtable)
+- 各类实现 `collectReferences`:Appearance(材质/纹理/合成/多边形/雾)、Group(子节点)、
+  World(相机/背景/光源)、Mesh(顶点缓冲/索引缓冲/外观)、SkinnedMesh(骨架+骨骼)、
+  MorphingMesh(目标)、VertexBuffer(四组数组)、Texture2D(图像)、Sprite3D、Background
+
+**顺带发现的独立问题**:贴图仍未解析成功。
+`jill_all.png` / `en_all.png` 等外部资源在 jar 根目录,`Image.createImage("/name")`
+在真机上是否按 jar 内资源解析还没验证。宿主验证里 `tex image=true w=1` 说明
+**当前必然走了降级路径(1x1 白图)**,所以即使不黑屏,模型也会是无贴图。
+已加诊断:`Loader` 在发生缺图时调用 `com.sun.m3g.M3gTrace.log()`,输出
+`xref miss <name> (<异常>)`,真机上可据此判断是路径问题还是 PNG 解码问题。
+
+**验证**:宿主编译通过,`getReferences` 遍历结构正确
+(World → Camera/Light/Light/SkinnedMesh → VB/IB/Appearance → Texture/Material/…)。
+VPK `midp_vita_v03.11.vpk`(12:35)构建通过。**黑屏是否消失需真机确认。**
+
+## 2026-10-25 v03.12:log124 分析(喜羊羊声音断续)+ 修复
+
+> 产物 `vita-port/out/vpk/midp_vita_v03.12.vpk`(11988685 B),ELF `J2ME Player v03.12`。**未上真机。**
+> 日志:`debug/log/log124/`(喜羊羊 → UC → 生化危机3D 三局,v03.11 构建)。
+
+### 真机确认的(log124)
+- **v03.11 的 FP 修复在真机生效**:`[ALERT-LAYER] fp i2d=240 dmul*2=480 dadd=241 dmul.95=228 d2l=228 f=228 cmp.95<w=true int-math=228`
+  ——每一步都对,与模型预测一致。UC 的 Alert 框正常画出(`skin=228x125`),用户也确认。
+- 启动、三个游戏都能进;`jit=0`;ARM 仍卡在 333 MHz(`[PERF] VERDICT: arm stuck at 333 MHz`,与本次无关,老问题)。
+- 喜羊羊的声音链路是通的:7 个 `[SOUND] init` → `ringtone->wav ok` → `wav player created`,`audio_debug` 里 7 次 `wav buffered`。
+
+### 根因 1(声音不连贯,已修):WAV 渲染里的 32 位整数溢出
+- `wav_render_player`(`vita_audio_javacall.c`)算源帧位置:`long src = rendered * frames / out_frames_total;`
+- Vita 上 `long` 是 32 位(`__SIZEOF_LONG__ 4`)。8 kHz→48 kHz,`out_frames_total = frames*6`。
+  `rendered * frames` 在输出 **0.17 s(270 KB 曲子)/ 0.62 s(72 KB 曲子)** 后越过 2^31。
+- 数值复现(按 C 的 32 位语义逐点算):
+  - 9 s 曲子:**93.1%** 的读取位置错、34794 个是**负数**;之后读指针只在 `[-4971..4971]`(1.24 s 音频)里扫,每 1.24 s 重复。
+  - 34 s 曲子:**99.5%** 错、134723 个负数;只在 `[-1321..1321]`(0.33 s)里扫,每 0.33 s 重复。
+  - 负数意味着读到 PCM 缓冲区**之前**的内存——一半的采样是脏数据。
+- 这与用户描述("和别的设备对比,不连贯、卡卡的")吻合:前不到 1 秒正常,然后 0.3~1.2 秒一段循环重复 + 杂音。
+- 修:`long src = (long)((long long)rendered * frames / out_frames_total);`
+- 验证:
+  1. 宿主上按同样表达式(int32 模拟)跑:新版 **0 个错**、单调、落在 `[0,frames)`、末尾 `src = frames-1`。
+  2. ELF:v03.12 的 `tone_player_thread`(内联了 `wav_render_player`)里出现 `smull` + `__aeabi_ldivmod`(64 位),
+     v03.11 里该函数只有 `__divsi3`(32 位)。
+- 同类排查:`vita_wav.c` 的时长计算、MIDI/PCM 的时间计算都已经用了 `long long`,只有这一处漏了。
+
+### 问题 2(暂停恢复卡几秒):**没有找到"暂停/恢复"事件,但找到了一个确定的卡顿来源**
+- 日志里**没有任何暂停/恢复记录**:`audio_debug` 里 `resume`/`stop` 为 0,`vita-port/src` 里没有 `sceAppMgrReceiveSystemEvent`/
+  `midp_suspend`/`midp_resume` 的调用(ELF 里只有库里的 `midp_suspend/midp_resume` 符号,没人调)。
+  即**这个端口根本不处理 PS 键切后台**,"暂停再恢复"在端口层面没有事件可查。用户说的"暂停"如果是游戏自己的暂停菜单,
+  那是游戏逻辑:它每次都 `stopMusic` 再新建 `Sound`(7 次 `[SOUND] init`、5 次是 270 KB 的曲子)。
+- 确定的卡顿来源:每个新建的 WAV player 在 VM 线程上做约 **60(小曲)~170(大曲)次同步 `sceIoWrite`** 写 `audio_debug.log`。
+  `get_buffer_address` + `do_buffering` 每 4 KB 一包各记一行,270 KB 曲子 68 包 → 136 行。
+  - 实测各 player 的日志行数:62 / 153 / 153 / 59 / 157 / 153 / 174。
+  - 喜羊羊那一局心跳里有 **7 个卡顿簇(共约 12.3 s 额外耗时)**,数量与 7 次 player 创建一致,
+    最长的一簇(CE 10945..11201)正好是连续创建 3 个大曲子的位置(约 4.7 s)。
+  - 用旧日志估算的单次写耗时 8.8~22 ms:一个大曲子 1.4~3.4 s。**这是估算,不是本次实测**。
+- **关声音就不卡**与这个吻合:不创建 player 就没有这些写。但这不是唯一可能(也可能是游戏自己的逻辑),所以见下面的探针。
+- 修(降低,不是消除):`get_buffer_address`、`do_buffering` 改 `ALOG_HOT`(64 次记 1 行)。一个大曲子的日志行数
+  从约 153 降到约 20。
+- **没有改**的:`Sound.init` 每次都新建 player 并重新下载整首曲子(游戏行为)。要彻底消除得在 `Sound`/`RingTone` 层缓存 player,
+  这改动较大,等探针数据再决定。
+
+### 新增探针(`[T]` 行,写入 `audio_debug.log`)
+- `[T] 64 log writes: avg N us max M us`:每 64 次 `alog` 一条,**实测**一次同步日志写在这台设备上多久。
+- `[T] close took N us, waited K x 4 ms for the render thread`:`javacall_media_close` 超过 20 ms 或需要等渲染线程时记录
+  (排除"渲染线程卡在 `sceAudioOutOutput` 里导致 close 阻塞")。
+- 下一份日志要看:avg 是多少(若 < 1 ms,则日志写不是主因,卡顿另有来源);有没有 `[T] close took`。
+
+### 心跳里的 27.4 s / 18.3 s 大间隔——**不是卡顿**
+- 它们出现在 t=283 s、t=377 s,分别是喜羊羊→UC、UC→生化危机的**换游戏**(VM 退出回菜单,心跳计数不推进),
+  watchdog 的 `[WD-STALL]` 正好落在这两处。别把它们当"暂停恢复卡顿"。
+- 历史对比:log118..log124 每份都有 12~35 s 的同类间隔(log123 的 628.7 s 是用户在菜单里停了很久)。
+
+### 其它观察(与本次修复无关,未处理)
+- `生化危机3D`:`[APPEXC] java.lang.Error: 137  - BioCtrl.setTexture(), bci=2`(`BioCanvas.runMissionSel`),游戏抛的 Error,
+  可能与 M3G/3D 贴图有关,下一个要查的问题。
+- fps 只有 10~12(arm 卡 333 MHz,`prepare` 17 ms + `flip` 25 ms),`period` 里偶有 2.5~3.5 s 的单帧峰值——
+  与上面的创建 player 卡顿同源的可能性大。
+
+### 修改记录
+- `vita-port/src/vita_audio_javacall.c`:渲染循环 64 位乘法;`get_buffer_address`/`do_buffering` 改 `ALOG_HOT`;
+  `alog` 加写耗时统计;`javacall_media_close` 加耗时探针;`#include <psp2/kernel/processmgr.h>`。
+- `vita-port/CMakeLists.txt`:版本 03.12 + 注释块。
+- 只动了端口层,**不需要** `rebuild_vm.sh`(`./build.sh` 即可)。
+
+### 验证(如实)
+- 溢出的数值复现 + 修复后 0 错:宿主 C 程序。
+- ELF 里 64 位除法:`objdump`。
+- `fpmodel/run.sh` 回归:校准 0 不一致、40/40、42/42、50/50(v03.12 ELF)。
+- **没有上真机**:声音是否连贯、卡顿是否减轻,都要真机确认。
+
+### 教训
+1. `long` 在这个平台是 32 位。凡是 `a * b / c` 里 a、b 都是"帧数/采样数"量级的,一律先转 `long long`。
+2. 宿主上跑验证程序时,PATH 前部的 vitasdk 会让 `gcc` 变成 ARM 编译器;宿主编译用 `/usr/bin/gcc -B/usr/bin`。
+3. 日志里最大的间隔不一定是卡顿:先对到时间线上(换游戏/菜单停留),再判断。
+
+### 2026-10-25 补记:v03.13 —— 更正"没有暂停事件",给暂停/恢复路径加监听
+- **更正**:上一节(v03.12)写"日志里没有任何暂停/恢复记录"——**错**。`audio_debug.log` 里有 **7 次 `[IN ] pause`**
+  (每个 player 一次,`start` 之后紧跟 `pause`)。我只数了 `resume`(0)和 `stop`(0),就下了"没有事件"的结论,
+  没有去查 Java 侧 `Player.stop()` 走哪条路。
+- 实际路径(`phoneme-midp/build/vita_arm/generated/.../DirectPlayer.java`,`phoneme_source/.../KNIDirectPlayer.c`):
+  - `Player.stop()` → `DirectPlayer.doStop()` → `nPause()` → `javacall_media_pause()`。
+  - 恢复:`doStart()` 里 `isFirstStart || getMediaTime()==0` → `nStart`(→ `javacall_media_start`),否则 `nResume`
+    (→ `javacall_media_resume`,本端口实现为"从头 start")。
+  - `JAVACALL_MM_ASYNC_EXEC` 只在返回 `JAVACALL_WOULD_BLOCK` 时才 `SNI_BlockThread()`;本端口 pause/resume 都返回 `JAVACALL_OK`,
+    所以**不会因等待事件而阻塞 VM 线程**。`LockAudioMutex()` 在 CLDC 配置下是空宏。
+  - 日志里 `resume=0` 的原因:`set_time(0)` 之后 `getMediaTime()==0`,`doStart` 总走 `nStart`。
+- 渲染线程只有**一个**(`tone_player_thread` 串行处理 JTS/WAV/PCM/MIDI/tone),pause 只置 `stop_flag`,线程在下一个
+  512 帧块(≈10.7 ms)检查时退出。理论上暂停很快;**没有实测**。
+- **缺的是时间**:`audio_debug.log` 没有时间戳,无法把某次 pause 放到心跳时间线上。所以"卡几秒"到底发生在 pause、
+  渲染线程退出、还是之后新建 player,日志无法回答。
+- v03.13 探针(时间用 `gettimeofday`,与 `input_debug.log` 的 `HEARTBEAT ms=` 同一时钟,可直接对齐):
+  - `[PR] t=.. pause#N ran=..ms playing=.. cur=..ms`:`pause()` 到达端口时,player 已播多久、渲染线程是否还在跑。
+  - `[PR] t=.. render stopped, Nms after the request, at out frame A of B`:渲染线程**真正**离开循环的时刻 → 暂停延迟 = 这一行 t 减上一行 t。
+  - `[PR] t=.. sceAudioOutOutput blocked N us at out frame F`:一个 10.7 ms 的块超过 50 ms 才返回(音频口卡住/欠载)。
+  - `[PR] t=.. resume (restarts from 0)` / `[PR] ... stop`:`resume()`、`stop()` 到达端口。
+  - `[T] t=.. close took N us, waited K x 4 ms`:`close()` 在 VM 线程上耗时。
+  - `[T] t=.. 64 log writes: avg N us max M us`:一次同步日志写的**实测**耗时。
+- 下一份日志的判读(用 t 对 `input_debug.log` 心跳的 `ms=`):
+  1. 卡顿窗口里有 `render stopped, 大数 ms after the request` → 渲染线程退出慢(`sceAudioOutOutput` 阻塞)→ 要改音频输出;
+  2. 窗口里有 `sceAudioOutOutput blocked` → 音频口本身卡;
+  3. 窗口里是密集的 `[IN ]`/`[T] close took` → VM 线程在 close/创建 player 上花时间 → 看 `avg` 判断日志写是不是主因;
+  4. 窗口里 `[PR]`/`[T]` 都空 → 不是音频原生层,是 Java 层(游戏自己的加载或 `RingTone.toWav`)。
+- 只加日志,**行为不变**(除 v03.12 的 64 位修复和 HOT 采样)。仅端口层,`./build.sh` 即可。产物 `midp_vita_v03.13.vpk`(11989779 B)。
+- 教训:判断"某事件不存在"之前,先查 Java 侧该操作实际调用的原生方法名,别只数我以为的那个名字(`resume`)的出现次数。
+
+## 2026-10-25 v03.14:log125 分析(音频正常、不卡了,但音质差/听不清)
+
+> 产物 `vita-port/out/vpk/midp_vita_v03.14.vpk`(11994351 B),ELF `J2ME Player v03.14`。**未上真机,也没有听过。**
+> 日志:`debug/log/log125/`(v03.13 构建)。
+
+### log125 的事实(v03.12/v03.13 的修复在真机上起作用)
+- 声音链路正常,**没有卡顿**(用户确认)。探针数据:暂停延迟 0 / 6 / 10 ms(`render stopped, N ms after the request`),
+  没有 `sceAudioOutOutput blocked`,没有 `[T] close took`;`[T] 64 log writes: avg 4710..5877 us max 7.4..12.7 ms`
+  (**实测**单次同步日志写 ≈ 5 ms,比之前估的 8.8~22 ms 小)。所以暂停/恢复卡顿的来源是 v03.12 去掉的那批同步日志写,
+  暂停路径本身没问题。
+- log125 里**没有任何音质信号**(日志只记事件和耗时),所以音质只能用游戏里那三段真实铃声在宿主上量化分析,
+  **不能说已经找到"音质差"的全部原因**,只能说找到了两处可测量的缺陷。
+
+### 方法
+'EOF' JVM(`/usr/lib/jvm/java-8-openjdk-amd64`)跑真实的 `RingTone.toWav`,输入是游戏里的三段 OTA(`/tmp/rt/D0/D1/D2.bin`,
+58/326/389 字节),`Sound` 用只含真实 `FREQ_TABLE` 的桩。对生成的 WAV 逐音符统计;重采样部分用真实头文件在宿主 C 里测。
+
+### 缺陷 1(已修):`RingTone` 的 `style` 默认值是 1(连奏,音符间零间隙),参考实现是 0
+- 参考实现 `eas_ota.c:895`:`pData->style = 0`;`style 0` 每个音末尾 1/16 静音,`1` 不留间隙,`2` 留一半。
+  `RingTone.java` 初值写成了 1,而**三段曲子都没有 style 指令**(宿主上打印确认:没有任何 `STYLE instruction`)。
+- 实测(旧 WAV vs style=0 的 WAV,同一批音符):
+
+  | 曲子 | 音符数 | 相同音高相邻对 | 音符间隙中位数 旧 → 新 |
+  |---|---|---|---|
+  | D0 (9 s) | 22 | 2 | 0.1 ms → 18.1 ms |
+  | D1 (34 s) | 181 | **46** | **0.1 ms → 11.1 ms**(180/181 个边界旧版是零间隙) |
+  | D2 (21 s) | 127 | 118 | 139 ms → 144 ms(本来就有休止符) |
+- 零间隙的后果:同一个音连奏两次就是**一个长音**,节奏丢了——旋律里重复音很多(D1 有 46 对),听起来就是糊的。
+- 修:`int style = 0;`。验证:宿主上重新生成 WAV(上表);ROM 里 `parseOta` 的初始化字节码
+  (`10 6B 36 0D 03|04 36 0E 10 07 36 0F`)v03.11 是 `04`(style=1),v03.14 是 `03`(style=0)。
+
+### 缺陷 2(已修):`wav_render_player` 用整数比值做重采样,且是最近邻
+- 旧:`out = frames * (48000 / rate)`(整数除法)+ 最近采样。
+  - 11025/22050/44100 Hz:乘数被截成 4/2/1 → **快 8.8%、音高 +147 cents**;32000 Hz:乘数 1 → **快 50%**(+702 cents);
+    > 48000 Hz:乘数 0 → **静音**(`out_frames_total = 0`)。只有 8000/12000/16000/24000/48000 是对的。
+    这对喜羊羊(8000 Hz)无影响,但对**其他游戏的 22.05/44.1 kHz 音效/BGM** 直接是错调、变速。
+  - 最近邻(零阶保持)不滤波,所有镜像音都留在输出里。1 kHz 正弦的 SNR:8 kHz 源 **8.2 dB**,11.025 k 9.7,16 k 15.5,
+    22.05 k 15.7,44.1 k 21.7;线性插值分别是 **25.1 / 30.6 / 37.1 / 42.6 / 54.6 dB**。
+- 新:`vita-port/src/vita_wav_resample.h`(只含 `<stdint.h>`,宿主可直接编译):
+  `vwr_out_frames`(精确长度)、`vwr_step_q32`(每输出帧加一次 32.32 步长,避免每帧 64 位除法)、`vwr_lerp`(线性插值)。
+  渲染循环按位置做相邻两帧线性插值,**音量在插值之后**乘。
+- 宿主测试 `debug/tools/wavq/test_resample.c`(用的就是要出货的头文件):10 个采样率 × 时长、位置单调且不越界、
+  增量位置对精确公式的误差(90 s,8k..96k:最坏 0.0008 个源帧)、线性 vs 最近邻 SNR、lerp 边界。ALL PASS。
+- **测试抓到我自己的一个 bug**:第一版 `vwr_pos_q32` 写成 `((n*rate)<<32)/out_rate`,`n*rate ≥ 2^32` 就溢出 uint64
+  (34 秒的 8 kHz 曲子就已经溢出,末尾位置算成 2340 而不是 270775)。改成整数部分/余数分开算。
+- ELF:`tone_player_thread`(内联了 `wav_render_player`)里只剩 1 次 `__aeabi_uldivmod`(步长)、1 次 `__aeabi_ldivmod`
+  (输出长度),渲染循环里没有每帧的 64 位除法。
+
+### 刻意**没改**的:音色(8 kHz / 8 位 / 方波)
+- 数字上更干净的是 16 kHz/16 位的软音色:非谐波能量相对基频 -49 dB(现在 -15 dB,340 Hz 音),但样本数翻倍、
+  解释执行的字节码翻倍,而 **`RingTone.toWav` 在设备上首次调用的耗时没有测过**——卡顿刚消失,不想用猜的把它请回来。
+- 我之前草稿里写过"解释器每秒 3~6 百万字节码"——**那是我随手估的,没有测量依据**,所以不拿它做决定。
+- 为此加了探针:`[SOUND] ringtone->wav ok N bytes in X ms`(`Sound.init`,首次=合成,重复=缓存命中)。
+  下一份日志看 X:若首次 < 数百毫秒,可以放心加样本数和音色;若已经接近秒级,就不能。
+- 方波的 3 次谐波只比基频低 9.5 dB,听感就是"嗡嗡的哔声";模拟器用真合成器/音色库做 ADSR,这是主观差异的大头,
+  但这一点是**听感推断,没有测量**。
+
+### 验证(如实)
+- 宿主:`RingTone` 三段真实铃声的 WAV 统计(上表)、重采样头文件测试(ALL PASS)。
+- ROM:`classes.zip`(14:52:58)→ ELF(14:53:33)时间戳链;`Sound` 里有 `currentTimeMillis` ×2;
+  ELF 里 `parseOta` 字节码 style 由 1 变 0;`fpmodel/run.sh` 校准 0 不一致、40/40、42/42、50/50。
+- **没有上真机,没有听。** "音质是否改善、听得清不清楚"要真机确认。
+
+### 修改记录
+- `vita-port/nokia_src/RingTone.java`(style 默认 0 + 注释)、`vita-port/nokia_src/Sound.java`(toWav 耗时探针)
+- `vita-port/src/vita_wav_resample.h`(新增)、`vita-port/src/vita_audio_javacall.c`(`wav_sample_raw`/`wav_sample_interp`、渲染循环)
+- `debug/tools/wavq/test_resample.c`(新增)
+- `vita-port/CMakeLists.txt`:版本 03.14 + 注释块
+- 构建:`./build.sh midp`(`RingTone`/`Sound` 是 ROM 化的 Java,必须 `midp`)
+
+### 教训
+1. 日志里没有的信号,不能假装从日志里读出来:这次 log125 只能证明"不卡了",音质要另外量化。
+2. 修一个"理论上更好"的东西之前,先量它在设备上的代价。8 kHz → 16 kHz 听起来只是改个常数,但卡顿刚好和这条路径有关。
+3. 宿主测试要用**要出货的那个头文件**,这次它抓到了我自己写的溢出。
+4. 参考实现的默认值要逐个核对(`style`),只抄了公式、没抄初值,就会出这种"每个音都连在一起"的问题。
+
+## 2026-10-25 v03.15/03.16：log126 分析（生化危机黑屏 / 极品飞车13 异常）
+
+### log126 事实（v03.14）
+一个进程里跑了三个包：喜羊羊 → 生化危机3D(CAPCOM) → 极品飞车13。
+`vm_output.log` 只有 3 类应用异常：
+
+| 计数 | 异常 | 位置 |
+| --- | --- | --- |
+| 1 | `IllegalArgumentException: viewport outside the target` | `Graphics3D.setViewport bci=70` ← `BioCtrl.D_Game_JSR184 bci=24` ← `BioCtrl.Draw bci=484` |
+| 28 | `IllegalStateException: already bound` | `Graphics3D.bindTarget bci=26` ← 同一个 `D_Game_JSR184 bci=8` |
+| 20 | `NullPointerException` | `Graphics.drawImage bci=8` ← `BioCanvas.paintCapcomAdd bci=8` ← `paint bci=334` |
+
+外加 `java.io.IOException` ← `Image.createImage bci=8` ← `BioCanvas.runExitConfirm bci=33`，
+以及 `RecordStoreException: error opening record store file` ← `BioData.WriteRecord`。
+
+### 因果链（已确认的字节码）
+`BioCtrl.D_Game_JSR184()` 的调用序列是
+`bindTarget(Graphics)` → `setViewport(0, 40, 240, 180)` → `clear` → `setCamera` →
+`resetLights` → `addLight` → `Transform.postTranslate/postScale(0.012f)`。
+`setViewport` 里我们**抛异常**（视口大于画布 ⇒ 240 > 176），异常从 `paint` 里逃出去，
+`bound` 永远留在 true ⇒ 之后每一帧都在 `bindTarget` 抛 `already bound`，一帧都没画。
+⇒ 这就是黑屏。
+
+`BioCanvas.runExitConfirm bci=30` 是 `ldc "/imgAct/last.png"`，bci=33 就是
+`Image.createImage(String)`；`last` 字段只在那一处被赋值，加载失败 ⇒ `paintCapcomAdd`
+每帧 `drawImage(null,...)` NPE。
+
+### 修（v03.15）
+1. `setViewport`：**裁剪而不是抛异常**；完全落在目标外时把 `vpDrawW/H` 置 0 并返回，
+   不抛。`bindTarget` 遇到已绑定按**隐式 release** 处理（异常逃逸后不再永久锁死）。
+2. 视图矩形真正生效：`Renderer.frame` 在投影后**乘视口 scale/offset 矩阵**，投影
+   纵横比用 `vpDrawW/H`；`setScissor` 一路传到 `vita_gl3d`(`glScissor`) 与
+   `vita_sw3d`(矩形裁剪)；`present`/`drawRGB` 只回读视口矩形。
+3. 诊断：每个 target 打一次 `bind target WxH clip=x,y`；被裁剪时打 `viewport clamp ...`。
+
+### log126 里其它真实缺陷（本次只做诊断，未修）
+- **RMS 新建记录库失败**：`[rms] open name='0' suite=-1 exists=0 (new store)` 之后
+  `RecordStoreException: error opening record store file`，`BioData.SaveGameData`
+  的存档丢了。原来的 `catch (IOException)` 什么都不打印，v03.15 加了
+  `[rms] open FAILED ... cause=<exception>`，下次日志直接给原因。
+- **`Image.createImage("/imgAct/last.png")` 得到 null 流**：栈帧 bci=8 精确对应
+  `ImageDataFactory.createImageFromStream` 里的 `new IOException()`（即
+  `stream == null`），不是解码失败。**宿主实测否掉了解码假设**（见下）。
+  - ⚠️ **前导 `/` 不是问题，不要再往那个方向想**：`java.lang.Class.resolveName()`
+    开头就是 `startsWith("/")`，绝对形式，去掉前导斜杠后按 jar 根查找，这是 CLDC 规范
+    行为、实现里早就处理了。（v03.15 曾错误地把它当"厂商歧义"，加了一个"换一种写法
+    重试"的补丁，v03.16 已删除——那是基于错误理解的补丁。）
+  - 真正吃流的地方是 **`ClassLoader.getSystemResourceAsStream`**：
+    `getSystemResource(name)` → `URLClassPath.getResource` → `URL.openStream()`。
+    字节码里 `getSystemResource` 返回 null 时它就是 `aconst_null` 静默返回，
+    **不抛异常、也不经过 `ResourceInputStream`**，所以 `Natives.cpp` 里那条
+    `[res] open FAILED` 永远不会为它触发——log126 里没有该条目却出现 IOException，
+    正是这个静默 null。
+  - 因此 v03.16 只加**诊断**：`Image.createImage(String)` 失败时打
+    `[img] load failed: '<name>'`，`ImageDataFactory.createResourceImageData` 在
+    `getResourceAsStream` 返回 null 时打 `[img] resource NOT FOUND: '<name>'`；
+    `ResourceInputStream.open` 那条成功日志保留（它覆盖的是另一条路径，比如嵌套 jar）。
+- `[res] open FAILED` 实际只 16 条：嵌套 jar `BioData{1,2,3}.jar`、`pl_data{2..7,10,13}.jar`、
+  `tex_pl{1,2,3}.jar`、`en_all.bmp`、`mis_map.mbac`。后两个值得注意：**BMP 完全不支持**，
+  `.mbac` 是 Mascot Capsule v3 数据（鬼泣要它）。
+
+### 宿主取证（可复现）
+用真头文件把 `imgdcd_png_decode.c` + `imgdcd_image_util.c` + `jar.c` + `midpInflate.c`
+编到 PC 上（`env PATH=/usr/bin:/bin gcc ...`，必须绕开 PATH 里的 arm-vita-eabi）：
+- 直接打 dst 回调：**89/89 张 PNG 全部解码成功**（85 张是 color-type 3 调色板 8bit，
+  center 像素非零，`cmap=1`）。
+- 按设备 KNI 的调用形状（`width, width`）与修好后（`width, height`）各跑一次
+  `last.png`：**两次都 `err=0`**，像素一致。⇒ **高度那个 bug 不是本次失败的原因**，
+  但仍然是真 bug（见下），保留修复。
+
+### 顺手修掉的上游笔误
+`img_putpixel/native/imgj_imagedatafactory_kni.c:loadPNG` 把高度按宽度传
+（`midpImageData->width, midpImageData->width`），兄弟实现 `img_gci` 是
+`width, height`。后果：解码器内部 `p->height` 与真实高度不符（本次实测不致命），
+但对任何依赖 `dst->height` 的路径都是错的，改回 `height`。
+
+### 构建踩坑（务必记住）
+1. **`phoneme-midp/build_vita.sh` 会吞掉 make 的退出码**（`make | grep | tee | tail`，
+   返回的是 `tail` 的状态）。以后判成功必须看 `/tmp/midp_build.log` 里有没有
+   `Error 1`，不能看 `$?`。
+2. **增量编译以 `classes.zip` 时间戳为准**：先改 `.java`、再跑一次构建（哪怕失败），
+   第二次就会说 "no need to recompile .java files" 而**跳过你的改动**。
+   改完 Java 后 `touch` 源文件再构建；验证办法是拿 `classes.zip` 里的 `.class`
+   搜新字符串（`python3 -c "zipfile... b'retry ok' in d"`）。
+3. `imgj_imagedatafactory_kni.c` 重新编译会撞 `-Werror=stringop-overread`
+   （`rawBuffer->data` 是 `data[0]` 柔性数组，gcc -O2 判成"区域大小 0"）。这是误报，
+   已在该 `memcpy` 前后加 `#pragma GCC diagnostic push/ignored/pop`。
+4. CLDC 侧（`Natives.cpp`）改动必须跑 `./rebuild_vm.sh`；它结尾会报 host 工具
+   `loopgen` 链接失败，那是宿主工具、不影响 ARM 对象，看 `library packed: N members`。
+
+### 改动文件
+- `jsr184/.../Graphics3D.java`（视口裁剪、隐式 release、诊断）、`Renderer.java`（视口矩阵）
+- `com/sun/m3g/NativeBridge.java` + `jsr184/.../m3g_native.c`（`setScissor`）
+- `vita-port/src/vita_3d.{c,h}`、`vita_gl3d.{c,h}`、`vita_sw3d.{c,h}`（scissor）
+- `phoneme-midp/.../Image.java`（前导斜杠重试）、`RecordStoreImpl.java`（异常原因日志）
+- `phoneme-cldc/src/vm/share/natives/Natives.cpp`（图片类资源 open 成功日志）
+- `phoneme-midp/.../imgj_imagedatafactory_kni.c`（高度笔误 + pragma）
+- `vita-port/CMakeLists.txt`（03.15/03.16 注释块）
+
+### 没验证的部分（如实）
+- **v03.16 一次都没上真机**。黑屏是否消失、`[img] retry ok` / `[res] open OK` /
+  `[rms] open FAILED ... cause=` 会不会出现，全都要靠下一次真机日志。
+- M3G 的 Java 层到现在仍然**没有任何一帧在设备上被眼睛确认过**；只有宿主的容器/反序列化
+  15/15 与设备上的 3D 后端自检。
+- 蒙皮（SkinnedMesh）仍是刚体渲染；Mascot Capsule v3（鬼泣）未开工。
+
+## 2026-10-25 v03.16:log126 分析(音质仍有破音、暂停恢复卡约 3 秒)
+
+> 产物 `vita-port/out/vpk/midp_vita_v03.16.vpk`(11998528 B),ELF `J2ME Player v03.16`。**未上真机,没有听。**
+> 版本号:v03.15 被另一个会话在同一时段占用(CAPCOM 黑屏/PNG 高度 typo/Graphics3D 视口),所以本次是 03.16,
+> **包含两边的改动**;我的 03.14 注释块之前被它的 03.15 块覆盖了一部分,已补回 03.16 块。
+> 日志:`debug/log/log126/`(v03.14 构建)。
+
+### 先说明两个不确定的地方(不假装已解决)
+1. **"破音"的原因没有被确认**:log126 没有任何音质信号。我只能排除了几项并修了一个确定存在的 pop(见下),
+   但**不能说这就是你听到的破音**。另一个主要候选是 8 kHz/8 位**方波音色本身**(听感推断,没测)。
+2. **卡 3 秒的位置没有找到**:我把它精确地量出来了、排除了几个嫌疑,但剩下的 ~2.4 s 在 Java 层哪一步,日志里没有证据,
+   所以这一版**只加探针**,没有改行为。
+
+### 卡顿:现在能定量了(v03.13 的 `[PR]` 时间戳 + `ran=`)
+- 一首曲子开始时刻 = `pause.t - ran`。**暂停 → 下一首开始**的间隔(log126):
+  3041、2689、2778、2984、2967、2840、3187、3324 ms,**中位数 2984 ms**(最后一个 28015 ms 是换了游戏)。
+- **log125(v03.13)同样有这个间隔**:中位数 **2835 ms**(2727/2901/2602/5106/3184/2835/2295/2343/2583)。
+  我当时没算,所以"log125 不卡了"是我们对"暂停那一下"的判断,**这段间隔一直都在**,不是 v03.14 引入的。
+- **已排除**(每一项都有数据):
+  | 嫌疑 | 数据 |
+  |---|---|
+  | 渲染线程退出慢 | `render stopped, 1..10 ms after the request`(20 次) |
+  | `sceAudioOutOutput` 卡住 | 0 次 `blocked` |
+  | `RingTone.toWav` 合成 | `in 0 / 0 / 1 / 2 ms`(缓存命中);首次 530 ms(9 s 曲)、**2214 ms**(34 s 曲)——只在首次 |
+  | 同步 `audio_debug` 写 | 每个 player 在 VM 线程上 17 行;`[T]` 实测 avg 14.7~21.9 ms/次 → 最多 0.1~0.4 s |
+  | 看门狗 | 窗口内没有 `[WD-STALL]` |
+- **我自己的一次错误推断(更正)**:我先写过"`[T]` 块在暂停后 2322 ms 完成,所以日志写占了 2.3 s"——错。`[T]` 每 64 次
+  写入打一行,**计数跨多个 player**,那一行的时间戳不属于这一个周期。已删除这个结论。
+- 剩下的 ~2.4 s 在 `Manager.createPlayer`(realize + 270 KB 经 `MediaDownload` 的 `nBuffering`)或 `play()`
+  (`prefetch`/`setMediaTime`/`start`)里,**没有直接证据区分**。注意 `MediaDownload.bgDownloadAndWait` 里有 `wait(500)`,
+  下载线程和 VM 线程之间有固定 500 ms 的等待——是候选,**未证实**。
+- 探针(都用同一个墙钟 `gettimeofday` / `System.currentTimeMillis()`):
+  - `audio_debug.log`:`[NS] t=.. create` → `first packet (N bytes)` → `buffered (end marker, N bytes received)` →
+    `acquire_device` → `prefetch` → `start`
+  - `vm_output.log`:`[SOUND] t=.. init` → `ringtone->wav ok N bytes in X ms` → `wav player created createPlayer=N ms, listener+gain=M ms`
+    → `play loop=..` → `play steps stop=.. prefetch=.. setMediaTime=.. start=.. total=.. ms`
+  - 下一份日志里,相邻两行 `t` 相减就是各阶段耗时。
+
+### 破音:排除了什么、修了什么
+- **数据本身干净**(宿主上用真实 `RingTone.toWav` 的输出):没有超过方波摆幅的跳变(0 个),每首曲子从 0 开始淡入,音符起止电平中位数 2/44。
+- **端口音量**:`SCE_AUDIO_OUT_MAX_VOL`(0 dB),`vita_trace` 的 `__wrap_sceAudioOutOutput` 只是计时包装,不改数据。
+- **欠载**:`ran - cur`(墙钟 - 已提交音频)在 21 次暂停里是 -9..+3 ms,**没有累积**(欠载会让它随时间增大)。
+- **确定存在的 pop**:渲染循环在 `stop_flag` 时在块边界直接退出,后面什么都没有——DAC 在**一个采样内**从方波电平
+  (±11264 = 满量程的 34%)跳到 0。切在非淡入淡出段的概率约 91%(176 ms 音符、2 ms 淡变),log126 有 10 次暂停。
+- 修:`wav_render_player` 在 stop/被取代退出后,再输出一个 512 帧(10.7 ms)的线性淡出块(`vwr_fadeout`,
+  `vita_wav_resample.h`)。宿主测试(`debug/tools/wavq/test_resample.c`):首步 22(原来 11264)、末尾恰为 0、单调、不超过起始电平。
+- **但我不能说这就是你听到的破音**:暂停时的 pop 只在换曲子的瞬间出现;你说的"有破音"如果是**播放过程中**的,
+  就是别的原因(最可能的是方波音色本身,3 次谐波只比基频低 9.5 dB,又硬又尖)。
+
+### 构建时遇到的并行改动(如实)
+- 我的第一次构建(15:43)正好撞上另一个会话在改 `imgj_imagedatafactory_kni.c`:日志里有一条 `stringop-overread` 的 `-Werror`,
+  `make` 报 `Error 1`,但那是**它**的文件、它那时还没改完;我的 ELF 链接得比那个 `.o` 早 34 s,**不含**它的 PNG 修复。
+- 所以重新跑了一次 `build.sh midp`(03.16):0 个 `error:`,`.o` 比 ELF 早 158 s(已包含)。
+- 教训:`build.sh` 的 `exit=0` 不代表没有 `Error`(管道吞了 make 的非零码,见 BUILD 速查);必须 `grep -c 'error:'`,
+  并用 mtime 链确认**别人的改动是否进了我的包**。同一时段有别的会话在改同一棵树时,先看 `set(VITA_VERSION` 再选号。
+
+### 验证(如实)
+- 宿主:`test_resample.c` ALL PASS(新增 fadeout 5 组);`fpmodel/run.sh` 校准 0 不一致、40/40、42/42、50/50。
+- ELF:6 个 `[NS]` 原生探针字符串在;3 个 Java 探针常量在(UTF-16);版本串 `v03.16`;PNG 对象早于 ELF。
+- **没有上真机。**
+
+### 下一份日志怎么判读
+1. `[NS]` 相邻行 `t` 差:`create → first packet`、`first packet → buffered`、`buffered → prefetch`、`prefetch → start`,
+   哪段是 ~2.4 s,就是它。若 `first packet → buffered` ≈ 2 s 以上:`MediaDownload` 的 500 ms 等待(或 270 KB 的 Java 逐字节拷贝 `moveBuff`)。
+2. `[SOUND] ... createPlayer=N ms` 和 `play steps ...`:对照 `[NS]`,确认是 native 还是 Java 层。
+3. 破音:请告诉我是**换曲子的瞬间**响,还是**一首曲子播放中间**响;以及是"噼啪(click)"还是"沙沙/刺耳(buzz)"。
+
+### 修改记录
+- `vita-port/src/vita_wav_resample.h`(`vwr_fadeout`)、`vita-port/src/vita_audio_javacall.c`(淡出、`[NS]` 探针)
+- `vita-port/nokia_src/Sound.java`(`[SOUND] t=..` 与各步耗时)
+- `debug/tools/wavq/test_resample.c`(fadeout 测试)
+- `vita-port/CMakeLists.txt`:版本 03.16 + 注释块
+
+## 2026-10-25 v03.18：log127——黑屏与"所有资源加载失败"的真因是 jar 句柄表耗尽
+
+### 我在上一轮犯的错（先说清楚）
+1. 分析 log127 时第一次 `ls -la | head -20` 把 `vm_*.log` 截掉了，我据此误判"VM 日志没生成"。
+   这是工具用法错误，不是设备问题。
+2. 我把 `Image.createImage("/imgAct/last.png")` 的失败归因为"前导斜杠歧义"，还加了"换写法重试"
+   的补丁。**前导 `/` 完全正常**（`Class.resolveName()` 第一句就是 `startsWith("/")` → `substring(1)`），
+   那个补丁已在 v03.16 删除。
+3. 我花了两轮在"图片解码/名字查找"上，而证据一开始就在日志里：`[jarmem] ... no_slot=99,
+   handles=32/32`。**应该先搜 jarmem/句柄，而不是先猜资源名。**
+
+### log127 的三个事实（v03.17）
+| 现象 | 数据 |
+| --- | --- |
+| **v03.15 的视口/绑定修复生效了** | `already bound` = 0 条，`viewport outside` = 0 条；日志出现 `[m3g] viewport clamp 0,40 240x180 -> target 240x180` |
+| 43 个 NPE 全是同一处 | `Graphics.drawImage` ← `paintCapcomAdd` ← `paint bci=334`，图片为 null 的后果 |
+| **104 个图片/3D 资源里 63 个从未打开成功** | 含全部 `.m3g`、全部 `bg*.png`、`imgAct/last.png`、`jil_*.png` |
+
+### 真因：jar 句柄表耗尽
+```
+[jarmem] pre  ... no_slot=99 ... | handles=32/32 images=3/8
+[jarmem]   leak caller[0] ra=0x8116963c hits=99
+```
+log126 同样有 `no_slot=103`——**这个问题两轮前就存在，只是我把注意力放在了上层**。
+判据很硬：`[res] open FAILED` 的 16 条全是**真的不在 jar 里**的条目（嵌套 `BioData*.jar`、
+`pl_data*.jar`、`tex_pl*.jar`、`en_all.bmp`、`mis_map.mbac`），而 `imgAct/last.png` 这类
+**确实存在**的条目既不在 OK 也不在 FAILED 里 ⇒ 不是名字查找问题，而是 `open` 直接失败。
+
+### 泄漏的两条路径（都已修）
+1. **`FileDecoder::read_completely` / `Inflater::read_completely`**
+   "把整个条目读出来"——调用者拿走 `Buffer`、丢掉 decoder。但 `open_jar_entry()` 只设
+   `INCREMENTAL_INFLATE`，**从不设 `MUST_CLOSE_FILE`**，所以那个 `if (flags() & MUST_CLOSE_FILE)`
+   永远不成立，`OsFile_Handle` 就挂在那里。
+   修法：读完后无条件 close（`set_file_handle(NULL)` 后再 close，保证幂等）。
+   安全性：`read_completely` 的全部调用者（`JarFileParser::load_entry`、`SystemDictionary`、
+   `Universe`）都是读完即弃；`ResourceInputStream` 的流式路径**不经过**这里，仍由流自己持有。
+2. **`ResourceInputStream.close()` 只做 `fileDecoder = null`**，从不通知 VM。句柄只能等 Java
+   finalizer——而这版 VM 里 finalizer 实际上不跑（v03.08 已经记录过同样的现象）。
+   修法：新增 native `dispose(Object)`，close 时立即 `set_file_handle(NULL)` + `OsFile_close`，
+   并同时清 `savedDecoder`（mark/reset 与它共享同一个 handle）。
+   native 表是**自动生成**的（`CLDC_HI_Natives` writer 扫 classes.zip），已确认生成
+   `JVM_NATIVE("dispose", "(Ljava/lang/Object;)V", ...)`。
+
+### 顺带修的第三个 bug：M3G 目标尺寸取错了
+`[m3g] bind target 240x320 clip=0,0` 但随后 `viewport clamp ... -> target 240x180`。
+原因是游戏先 `g.setClip(0,40,240,180)` 再 `bindTarget(g)`，而我把 **clip** 当成了 M3G 的
+target 尺寸。M3G 规范里 target 是**整个绘制面**，viewport 坐标相对它的左上角。
+于是合法的 `setViewport(0,40,240,180)` 被裁成 140 高。
+修法：`Graphics` 没有尺寸 API，改从 `Display.getDisplay(null).getCurrent()` 取 `getWidth/Height`
+（拿不到时退回 clip）；同时把 `vpX/vpY` 固定为 0——否则 `drawRGB` 会把 clip 偏移**叠加两次**
+（y=40 且 clipY=40 ⇒ 落到 80）。
+
+### 改动文件
+- `phoneme-cldc/src/vm/share/runtime/FileDecoder.cpp`（读完即关，`#if defined(VITA)` 隔离）
+- `phoneme-cldc/src/vm/share/runtime/Inflate.cpp`（`Inflater::read_completely` 同上）
+- `phoneme-cldc/src/javaapi/share/com/sun/cldc/io/ResourceInputStream.java`（close → dispose）
+- `phoneme-cldc/src/vm/share/natives/Natives.cpp`（`dispose` 实现）
+- `phoneme-cldc/src/vm/os/vita/OsFile_vita.cpp`（`dispose_call` 计数 + 报告加 `dispose=%u`）
+- `jsr184/.../Graphics3D.java`（target 尺寸用 Displayable，`vpX/vpY`=0）
+- `vita-port/CMakeLists.txt`（03.18 注释块）
+
+### 验证（如实）
+- `rebuild_vm.sh`：34 ARM objects OK，library packed 21 members；仅有文档记录过的宿主
+  `loopgen` 链接错误（宿主工具，不影响 ARM）。
+- MIDP 构建 0 error；`nativeFunctionTable.cpp` 含 `dispose`；`classes.zip` 里
+  `Graphics3D` 含 `getCurrent`、`ResourceInputStream` 含 `dispose`。
+- `strings` 确认 ELF 里 `J2ME Player v03.18`、jarmem 报告含 `dispose=`；
+  `nm` 确认 `Java_com_sun_cldc_io_ResourceInputStream_dispose` 在 0x810d3cb8。
+- **v03.18 一次都没上真机。**
+
+### 下次看什么日志（判据）
+1. `[jarmem] ... handles=?/32`——**必须显著小于 32**，且 `no_slot` 停止增长。
+2. `dispose=` **必须 > 0**（证明 Java 流式路径真的在归还句柄）。
+3. `[img] resource NOT FOUND` 应该基本消失；`.m3g` 应该出现在 `[res] open OK` 里。
+4. `[m3g] viewport clamp` 应该不再出现（target 变成 240x320 后 40+180=220 < 320）。
+5. 若画面仍不对，下一步看 `paintCapcomAdd` 的 NPE 是否消失——它是"图片为 null"的果，不是因。
+
+### 教训
+- **先搜已经存在的计数器（jarmem/no_slot/handles），再猜上层语义**。这两个计数器是 v03.07
+  专门为这个泄漏加的，我却在两轮里没读到它们。
+- `grep -c` 命中多不等于对：`[res] open FAILED` 只覆盖"返回 NULL"的分支，
+  **抛异常/早退的分支不会留下任何痕迹**——`JVM_NO_CHECK_AT_BOTTOM_0` 会让控制流跳过日志。
+  判断"有没有被调用"不能只看日志。
+- 编辑代码时 `oldString` 必须覆盖完整的块。这次替换 `close()` 只带到第二行，
+  结果多留一个 `}` 提前闭合类；另一次在 `OsFile_vita.cpp` 把 `leaksite` 的声明和函数开头删掉了。
+  **改完必须立刻读回上下文**，不能只看工具返回 "success"。
+
+## 2026-10-26 v03.19:log127 分析(暂停恢复不卡了?、破音仍在、"兹拉的尾声")
+
+> 产物 `vita-port/out/vpk/midp_vita_v03.19.vpk`(11999323 B),ELF `J2ME Player v03.19`。**未上真机,没有听。**
+> 日志 `debug/log/log127/` 是 **v03.17** 构建(别的会话出的包,音频代码与我的 v03.16 完全相同)。
+> 版本号:03.17、03.18 是别的会话(图像资源/PNG),我用 03.19,没有覆盖它们的说明块。
+
+### 1. "暂停恢复没有卡顿了"——日志不支持这个说法,要如实记下来
+- 我的 `[PR]`/`[NS]`/`[SOUND] t=` 探针现在能把"暂停 → 下一首开始"拆开(同一个墙钟):
+  | 暂停 → 下一首开始 | log125 | log126 | log127 |
+  |---|---|---|---|
+  | 中位数(<10 s 的) | 2835 ms | 2984 ms | **2525 ms** |
+- **拆分**(log127,6 次):暂停 → `Sound.init` = 1875/1939/2088/2433/2007 ms(**游戏自己的代码**,在我们的 `new Sound()` **之前**),
+  `Sound.init` → `start` = 406~486 ms(**我们的**)。平均:游戏 2400 ms,我们 760 ms(含首次 2665 ms)。
+  所以这 ~2.4 s 是游戏在 `stopMusic` 和 `new Sound(...)` 之间自己做的事(它在换场景:`map_load_start1..6`),不在音频层。
+- 我们这一段的各阶段(`[NS]`):create→first packet ≈135 ms,first packet→buffered ≈64 ms,buffered→prefetch ≈48 ms,
+  prefetch→start ≈82 ms;`createPlayer=38 ms`,`prefetch=200 ms`,`setMediaTime=13 ms`,`start=61 ms`。
+  `MediaDownload` 的 `wait(500)` 嫌疑:**没有出现**(`first packet→buffered` 才 64 ms),排除。
+- 用户感觉"不卡了":可能是游戏那 2.4 s 本来就是它的场景加载,以前和我们的 0.3~0.8 s 叠在一起;现在我们的部分在 log127 里
+  是 ~0.4 s。也可能是别的会话的资源修复(`[img] load failed` 10 次,v03.17/18)改变了加载耗时。**我没有证据区分**。
+- 我对 log125 的"不卡了"结论(v03.13)同样没有算过这个间隔——那份结论只覆盖"暂停那一下",不是整段。
+
+### 2. 破音:用户澄清了——"整首曲子一直都有,尾声只是更明显"
+- 这排除了"换曲子瞬间的爆音"(v03.15/16 的淡出)作为**主因**:那只在切换瞬间出现。
+- 实测(真实 `RingTone.toWav` 在宿主 JVM 上输出,Hann 窗 DFT,"不在音符自己谐波线上的功率"):
+  **音符自身 8 kHz 方波的非谐波残留 -15.5 / -13.9 / -12.8 / -13.8 dB**(270 / 404 / 539 / 800 Hz),占功率 2.7~5.0%,**每个音符**都有。
+  原因:方波的奇次谐波 > 4 kHz 折回到可听频段,落在不是基频整数倍的位置——听起来是金属味的"兹拉"。
+  这是目前测得的、**唯一**贯穿整首曲子的缺陷。
+- 已**排除**(都有数据):
+  | 嫌疑 | 数据 |
+  |---|---|
+  | 音符数据有跳变/截断 | 无超过摆幅的跳变;每个淡变 16 个不同电平;起止电平 2/44 |
+  | 曲子结尾 | 渲染器补的是真零;最后 8 帧为 0;块内最大步长 0 |
+  | 端口音量/欠载 | 0 dB;`ran - cur` 在 -9..+3 ms |
+  | 重采样 | 线性插值的镜像 8k±f 在 -57..-68 dB(实测 DFT) |
+  | 暂停淡出(v03.15) | 能量在 <200 Hz,是"咚",不是"兹拉" |
+  | 每个音符末尾 2 ms 淡出的量化 | 幅度 ±44 → ±2 时 SNR 44 → 17 dB(8 位舍入),这解释"尾声更明显"的**一部分** |
+- **修**:`RingTone.synth` 里的方波换成整数 **PolyBLEP** 带限方波(`blepSquare`,无 float、无 sin()):
+  残留 **-29.9 / -30.1 / -31.0 / -31.7 dB**,峰值同为 44/127,音高不变。**改善 14~18 dB,不是消除**。
+- 回归(宿主 JVM,真实三段曲子):音符数不变(22/181/127),长度不变,峰值不变;变化的样本 48307 个(34 s 曲),
+  其中 48279 个在方波边沿 2 个采样以内,其余 28 个是淡变里的 ±1 舍入。
+- ROM:`blepSquare` 的无常量池操作数的字节码段在 v03.19 ELF 里 2 处、v03.11 里 0 处(`15 05 04 78 15 05 15 05 68 10 0f 7a 64`)。
+- **没有改**音色(8 kHz/8 位/方波)本身,也没有加采样率;残留的 -30 dB 来自 8 位舍入和 8 kHz 采样本身。
+  若用户仍嫌糊,下一步是 16 kHz/16 位 + 软音色(实测 -67 dB),代价是样本翻倍——**现在可以评估**:log127 的
+  `ringtone->wav ok 270820 bytes in 2206 ms`(首次合成 34 s 曲子 2.2 s,缓存命中 0~2 ms)。样本翻倍意味着首次 ~4.4 s,
+  所以要做的话得先把合成挪到加载阶段/后台,**不是改个常量**。
+
+### 3. 顺手修的:`RingToneTest` 的合成 OTA 用例一直是红的
+- `FAIL ota: converted` 在改动前后都有(我把 `blepSquare` 换回方块后重编验证过):测试数据用的是 v02.88 的位布局,
+  v02.89 的解析器(正确地)拒绝它。按解析器真正读的布局重写(cmdLen / RTP / sound / songType / sequenceLength /
+  pattern header / instrCount),13 项全过。放进了仓库:`debug/tools/wavq/{RingToneTest.java,SoundStub.java,run_ringtest.sh,README.md}`。
+
+### 4. 环境事故(记一下,别人会踩)
+- 终端被**另一个会话**占用:输出里混着别人敲的提示符,后来连 `echo` 都 300 s 不返回。
+  做法:把要跑的东西写成脚本(用编辑器写文件,不用 heredoc),`nohup bash x.sh &` 丢后台,输出重定向到文件,
+  再用读文件工具取结果。这次的构建、回归、ROM 校验都是这样跑的。
+- `sed -i` 多重替换写脚本太脆弱(我自己那条跑了 300 s),改用编辑器直接写最终内容。
+
+### 验证(如实)
+- 宿主:`run_ringtest.sh` ALL PASS(13 项);`test_resample.c` ALL PASS;`fpmodel/run.sh` 校准 0 不一致、40/40、42/42、50/50。
+- 构建:`build.sh midp` exit=0,日志 0 个 `error:`;ELF 里有别的会话的 `[img] load failed` 与我的 `[NS]` 探针。
+- **没有上真机,没有听。** "兹拉"是否减轻要真机确认。
+
+### 修改记录
+- `vita-port/nokia_src/RingTone.java`(`blepSquare`、`synth` 调用)
+- `vita-port/CMakeLists.txt`:版本 03.19 + 注释块
+- `debug/tools/wavq/`:`RingToneTest.java`、`SoundStub.java`、`run_ringtest.sh`、`README.md`(新增)
+
+### 下一份日志看什么
+1. "兹拉"有没有减轻——请再给一个对比描述(比 v03.17 好多少,还剩什么样的声音:沙沙/金属/嗡嗡)。
+2. 若还有:提供一段手机/模拟器的同一首曲子的录音对比,我们才能知道差在**音色**(方波 vs 乐器)还是**别的**。
+
+## 2026-10-26 v03.20:用户判断"这种类型音频的解码有问题"——重新从头核对,找到一个真实的错
+
+> 产物 `vita-port/out/vpk/midp_vita_v03.20.vpk`(11998993 B),ELF `J2ME Player v03.20`。**未上真机,没有听。**
+
+### 先说我上一轮的盲点
+v03.14~v03.19 我一直在改"合成端"(style 默认值、重采样、淡出、带限方波),验证"解码"只做过一次:
+"位流刚好吃完"。那只证明**读到了正确数量的比特**,没有逐条核对音符/时值/音高的**语义**。用户说"解码有问题",值得认真对待。
+
+### 做法:用参考实现独立再解一遍(不看 RingTone.java)
+`/tmp/rt/otadump.py`、`melody.py`、`pitchcheck.py`:严格按 Sonivox `eas_ota.c`(`OTA_Event`/`OTA_ParseHeader`)写的独立解码器,
+对游戏里的三段原始数据(58/326/389 字节)逐项输出。
+
+### 位流层:是对的(没有找到错)
+| 项 | D0 | D1 | D2 |
+|---|---|---|---|
+| 头 | cmdLen=2, RTP=0x25, sound=0x1d, songType=1, titleLen=0 | 同 | 同 |
+| 序列数 | 1 | 1 | 1 |
+| pattern 头 | id0 loop0 **instrCount=34** | **255** | **255** |
+| 指令 | tempo 1, scale 1, note 32 | tempo 1, scale **73**, note 181 | tempo 1, scale 1, note 253 |
+| 休止(note==0) | 10 | 0 | 126 |
+| 读完 | 452/464 bit | 2600/2608 | 3104/3112 |
+- 没有 pattern 重复头(`instrCount==0`)、loop 都是 0、没有未知指令、style/volume 指令都没有。
+- 旋律合理:D1 是低音线 `C C G C C A# C A ...`,八度在 oct1/oct2 之间来回(73 条 scale 指令),D0 是 C 大调小曲。
+- 与 `RingTone.parseOta` 的结果一致:音符数 32/181/253(含休止)对 22/181/127 个有声音符;时值表一致。
+- 注意:D1/D2 的 instrCount 恰好是 8 位上限 **255**,而 D1 实际有 255 条指令(1+73+181)。说明曲子刚好用满;
+  若原曲更长,就需要多个 pattern 头——这里 sequenceLength 只有 1,所以不是被截断。
+
+### 找到的真实错误:音高比标准音高半个半音
+- `RingTone` 用 `Sound.freqForNote(midi)` 取频率。那是 Nokia 为 `Sound(freq, duration)` 构造器准备的表
+  (输入是同一张表里的频率)。它整体高于十二平均律 **+50..+54 音分**:midi 60 → 270 Hz(应为 261.6),midi 69 → 453 Hz(应为 440)。
+- OTA 里的音符是 **MIDI 音符号**(`eas_ota.c`:`note += octave`,`octave = scale*12 + 59`),Sonivox 直接把它交给合成器,
+  按 **A4 = 440** 发声。J2ME-Loader(Android 的 Sonivox)也如此。
+- 实测(重新生成 WAV 后逐音测基频):旧 -46..-50 音分偏离音名,新 **-1.6..+0.8**。
+  整首曲子半音偏高 + 和模拟器的同曲相比音高对不上,听感上就是"不对劲"——这一条是**常数偏差**,和波形干净与否无关。
+- RTTTL 走同一段代码,一并修了。`Sound(freq, duration)` 仍用 Nokia 表(它的输入就是那张表里的频率)。
+- 修:`RingTone.stepForMidi(m)`:12 个八度内音高(milli-Hz)+ 整八度移位,无 `Math.pow`,16.16 相位步长;
+  ≥ Nyquist(4 kHz)或负数返回 0。
+- 宿主回归:`RingToneTest` 新增 11 个音高(36..93)误差 < 4 音分(实测 0.1~0.5 音分,最低音 65 Hz 是 2.6,受 16.16/8 kHz
+  的 0.12 Hz 分辨率限制)、midi 120 → 0、midi -1 → 0,全过。
+- ROM:`stepForMidi` 的无常量池字节码段(`1a 10 0c 6c 08 64 3e 1d 9e`)v03.20 ELF 里 1 处、上一版 0 处;
+  `synth` 不再调用 `Sound.freqForNote`。
+
+### 还没排除、还没验证的差异(如实)
+- **音色**:Sonivox 的 OTA 用 GM 程序 **80(Square Lead)** + 通道音量 127 + 力度 95,经合成器(有包络、有滤波),
+  不是裸 8 位方波。我们的是 8 kHz/8 位方波、固定幅度 44/127(-9 dBFS)。这是和模拟器听感差的**很可能**的另一个来源,
+  但"差多少"没有测量依据(没有同曲录音)。
+- **音量/力度**:参考实现默认力度 95/127,`volume` 指令是 `temp*4+67`;我们的 `amp = 96*vol/15`,默认 vol=7 → 44。没有对照数据。
+- 这一版仍然没有真机反馈;这次改的是**音高**(常数 -46..-50 音分),不保证"破音/兹拉"消失。
+
+### 下一步需要用户给的东西
+1. 对比描述:这一版和上一版比,**音高**是否对了(旋律是否"顺耳了")?
+2. 若还有"兹拉/破音":请录一小段手机/模拟器的**同一首曲子**。有了参考录音,才能量化音色差,
+   决定要不要做 GM 程序 80 的近似(例如方波 + 起音/衰减包络 + 低通)。
+
+### 修改记录
+- `vita-port/nokia_src/RingTone.java`(`stepForMidi`、`C4_MHZ`、`synth` 取频率改用它)
+- `vita-port/CMakeLists.txt`:版本 03.20 + 注释块
+- `debug/tools/wavq/RingToneTest.java`:音高用例
+
+## 2026-10-26 v03.21：log128——所有 MIDlet 都 NoClassDefFoundError，是我 03.18 改坏的
+
+### 症状（log128，v03.20）
+三个包全部死在类加载：
+```
+喜羊羊   java.lang.NoClassDefFoundError: g                        ← GameMidlet.<init> bci=8
+鬼泣     java.lang.NoClassDefFoundError: javay/microedition/lcdui/MIDhack
+极品13   java.lang.NoClassDefFoundError: com/ea/nfs10/MonkeyApp
+```
+特征：**主类能 new，同一个 jar 里后续的类全找不到**。
+
+### 先排除了"日志/名字损坏"这个诱人假设
+`javay/microedition/lcdui/MIDhack.class` 是***鬼泣 jar 里真实存在的条目***（游戏厂商自己把
+`javax` 拼成 `javay`）。`g.class` 同理（喜羊羊是混淆过的包，条目 0/1 就是 `a.class`/`b.class`）。
+所以**名字没错，是查不到**——不能当成字符串损坏去查。
+
+### 真因：03.18 关掉了"借来的"jar 句柄
+`JarFileParser::open_entry()` 是这样给 decoder 句柄的：
+```cpp
+OsFile_Handle handle = jar_buffer().file_pointer();   // ← parser 自己的那一个句柄
+result = FileDecoder::allocate(handle, pos, decompLen, flags);
+```
+**每个 FileDecoder / Inflater 借用的都是 parser 的同一个 jar 句柄**，这也正是它
+**从不设 `MUST_CLOSE_FILE`** 的原因。
+我在 03.18 里以"句柄泄漏"为名，在 `FileDecoder::read_completely` /
+`Inflater::read_completely` / 新增的 `ResourceInputStream.dispose()` 里无条件 close 它
+⇒ 读完第一个条目就把整个 jar 关闭了 ⇒ 主类之后全部 `NoClassDefFoundError`。
+
+### 真正的泄漏是另一回事（本次改正）
+`save_parser_in_cache()` 用 **`ObjectHeap::WEAK`** 注册 parser（`MAX_CACHED_PARSERS == 4`）。
+parser 一旦被 GC 回收：
+- 它的 `FileDescriptor` 一起死掉，唯一还能关句柄的路径只剩 Java finalizer
+  （`Java_com_sun_cldchi_jvm_FileDescriptor_finalize` → dispose → OsFile_close），
+  而这个 finalizer 在本移植里实际上不跑；
+- `dispose(i)` 也取不到对象了（`get_global_ref_object()` 返回 NULL），驱逐也关不掉。
+⇒ 每次 parser 被回收就漏一个句柄。log127 的量级完全对得上：**41 次 open / 9 次 close
+⇒ handles=32/32、no_slot=99**。
+
+修法（`#if defined(VITA)` 隔离）：缓存里改注册 **STRONG**。
+parser 常活 ⇒ `get_parser_from_cache()` 必然命中 ⇒ **根本不会再开第二个 OsFile_open**，
+驱逐时 `dispose(i)` 一定能拿到活对象并正确关闭。代价上限就是 4 个 parser 对象 + 它们的
+条目缓存（几十 KB），这正是缓存本来留给它们的量。
+
+### 教训（这次是我重复犯错，写死在这里）
+1. **关闭一个句柄之前，先确认它是不是你打开的。** decoder 的 `file_handle()` 是
+   **借用** parser 的；判据就在上游代码里——`MUST_CLOSE_FILE` 没设，说明"不该由你关"。
+   我把"没有 MUST_CLOSE_FILE ⇒ 忘了关"当成 bug，恰好理解反了。
+2. **`NoClassDefFoundError` 出现"只有主类能加载"时，第一个该查的是 jar 句柄/文件句柄，
+   不是类名、不是 classpath、不是解码器。** 主类 OK + 后续全挂 = 共享资源被中途关掉。
+3. **不要把"名字看起来像乱码"当成内存损坏。** 先 `unzip -l` 看 jar 里到底有没有那个条目：
+   这次 `javay/...MIDhack.class` 真的存在，直接否掉了整条错误路线。
+4. **日志里没有的计数不能当没有。** log128 的 `[res] open OK` 是 **0 条**、`hit` 只有 2~3，
+   这不是"游戏没加载资源"，而是"类都没加载起来"。反过来，`handles=0/32` 看着像修好了，
+   实际是我的错误 close 造成的假象。
+
+### 改动
+- **回退**：`phoneme-cldc/src/vm/share/runtime/FileDecoder.cpp`、
+  `src/vm/share/runtime/Inflate.cpp`、`src/javaapi/share/com/sun/cldc/io/ResourceInputStream.java`
+  → `git checkout` 回到 HEAD 原样（三者只有我 03.18 的改动）。
+- **删除**：`Natives.cpp` 里新增的 `ResourceInputStream.dispose` native 与 `vita_jar_dispose_note`
+  声明；`OsFile_vita.cpp` 里的 `dispose_call` 字段与报告里的 `dispose=%u`。
+- **修复**：`JarFileParser.cpp` `save_parser_in_cache()` 在 Vita 上用 `ObjectHeap::STRONG`。
+- `vita-port/CMakeLists.txt`：03.21 注释块。
+
+### 构建踩坑（新增，务必记住）
+`phoneme-midp/build_vita.sh` 的增量判断看 `classes.zip`，但 **CLDC 侧 javaapi 的 .class
+是由 CLDC 构建刷新后拷进来的**，MIDP 的 javac 不会因此重跑，于是 classes.zip 保持旧内容
+（本次它一直留着 2596 字节的旧 `ResourceInputStream.class`，新的 2532 字节已经拷到
+`classes/` 里了）。**改完 CLDC 的 .java，要 `rm phoneme-midp/build/vita_arm/classes.zip`
+再构建**，否则 ROM / nativeFunctionTable 里仍是旧类。
+判据：`python3 -c "zipfile... b'dispose' in d"`，别只信 `javap classes/...`。
+
+### 验证（如实）
+- CLDC 34 ARM objects OK / library packed 21；MIDP 0 error；`nativeFunctionTable.cpp` 里
+  `ResourceInputStream_dispose` 计数 = 0；`classes.zip` 里该类 2532 字节且不含 `dispose`；
+  ELF 里已无 `ResourceInputStream_dispose` 符号、版本串 `J2ME Player v03.21`。
+- **v03.21 未上真机。**
+
+### 下次看什么
+1. 三个包能否正常进游戏（`NoClassDefFoundError` 应全部消失）。
+2. `[jarmem] ... handles=N/32` —— **应稳定在"不同 jar 的个数"（3~4）**，不再爬到 32。
+   `no_slot` 应为 0。
+3. `hit` 应明显上升（缓存命中，而不是反复重开）。
+4. 若 `handles` 仍缓慢增长：下一个嫌疑是 `get()` 里 `find_end_of_central_header()` 失败
+   返回 NULL 时没 dispose 的分支（损坏 jar 才会走到）。
+
+## 2026-10-26 v03.22：log129——两个我们自己的 JSR-184 bug
+
+### 状态确认（先说好的部分）
+v03.21 的 jar 句柄修复**生效**：log129 里 `[jarmem] handles=0/32 no_slot=0`（前两轮是 32/32、99），
+`[res] open OK` 正常，`NoClassDefFoundError` 全部消失，图片不再为 null（43 个 NPE 也没了）。
+剩下两个都是 **JSR-184 层**的问题。
+
+### bug 1：极品飞车13 `bad projection parameters`（我们违规）
+栈：`java.lang.Error: Static initializer: IllegalArgumentException, bad projection parameters`
+← `Class.initialize` ← `MonkeyApp.<init> bci=23`。
+
+反编译定位到 `ab.<clinit>` 里 `new r()`，`r` 的构造里：
+```java
+camera.setParallel(90.0f, 1.0f, -1.0f, 1.0f);   // fovy=90, aspect=1, near=-1, far=1
+```
+我们的 `Camera.checkPlanes` 对 **`setParallel` 也套用了透视的规则**（要求 `near > 0`）。
+JSR-184 里 `setParallel` 只要求 `aspectRatio != 0` 且 `far > near`——正交相机的 near 为负是正常的
+（`Renderer` 的正交矩阵 `m[10]=-2/(far-near)`、`m[14]=-(far+near)/(far-near)` 本来就支持负 near，
+所以错的只是校验）。
+修：拆成两套校验；`setPerspective` 保留 `fovy>0 / aspect≠0 / near>0 / far>near`；
+两者都把**实际参数值**写进异常信息，下次一眼就能看出哪个参数不对。
+
+### bug 2：生化危机游戏内无画面（两个原因叠加）
+`BioCtrl.D_Game_JSR184(Graphics)` 的真实调用序列（javap 取证）：
+```
+bindTarget(g) → setViewport(0,40,240,180) → clear(bg)
+→ setCamera(camera, camTransform) → resetLights → addLight(light, camTransform)
+→ ... → drawM3GFigure(g,...) → g3d.render(SkinnedMesh, transform) / render(Mesh, transform)
+```
+即它用 **`render(Node, Transform)`**，相机只通过 **`setCamera(camera, transform)`** 传入。
+
+- **2a 目标尺寸取错**：JSR-184 的 viewport 是相对 **target** 的，而 Graphics 的 target 是**整个绘制面**，
+  不是调用方的 clip。游戏先 `setClip(0,40,240,180)` 再 `setViewport(0,40,240,180)`；
+  我们把 clip 当 target（240x180）⇒ 视口被裁成 140 高（log129 里 39 条
+  `viewport clamp 0,40 240x180 -> target 240x180`）。
+  v03.18 想用 `Display.getDisplay(null).getCurrent()` 取画布尺寸，**这条路根本不通**：
+  本 MIDP 的 `getDisplay` 需要 MIDlet 实例，null 会抛异常，于是永远回退到 clip。
+  修：新增 `NativeBridge.screenWidth()/screenHeight()` → `vita_display_get_width/height()`，
+  直接问真正拥有虚拟屏的显示层（本移植里 LCDUI 画布 == 虚拟屏）。
+- **2b 相机被完全忽略**：`Renderer.renderWorld` 只读 `world.getActiveCamera()`，
+  `frame()` 又永远用相机节点自己的矩阵，**`setCamera` 传进来的 transform 从未被使用**。
+  该游戏只调 `setCamera`，于是视点停在世界原点，`render(Node,Transform)` 全在视锥外 ⇒
+  **空白、无异常**。
+  修：`renderWorld` 优先用 `g.camera`（`world.getActiveCamera()` 只作兜底）；
+  `frame()` 在 `cameraFromTransform` 时用 `cameraTransform` 取代节点自身的世界矩阵。
+
+### 新增诊断（这次不靠猜）
+"黑屏且无异常"之前无法从日志区分，所以加了有界统计（每 30 帧一条，无逐帧开销）：
+```
+[m3g] render frames=N (+draws=D) verts=V noview=A nobuf=B noidx=C vp=x,y WxH target=WxH
+```
+下次日志可直接判定：渲染器没跑 / 跑了但所有 mesh 被跳过 / 视口或 target 不对。
+
+### 改动文件
+- `jsr184/.../Camera.java`（拆分 setParallel / setPerspective 校验 + 参数化异常信息）
+- `jsr184/.../Renderer.java`（renderWorld 用 g.camera；frame 支持 camera transform；帧统计）
+- `jsr184/.../Graphics3D.java`（`cameraInternal/cameraFromTransformInternal/cameraTransformInternal`；
+  target 尺寸改用 NativeBridge 屏幕尺寸；releaseTarget 调 reportFrameStats）
+- `jsr184/.../NativeBridge.java` + `jsr184/src/share/native/m3g_native.c`（screenWidth/Height）
+- `vita-port/CMakeLists.txt`（03.22 注释块）
+
+### 验证（如实）
+- `javac -source 1.4` 编 jsr184 全绿；`gcc -c -Wall -Wextra` 编 `m3g_native.c` 全绿
+  （用宿主编译器，显式 `env PATH=/usr/bin:/bin` 绕开 VitaSDK gcc）。
+- MIDP 构建 0 error；`classes.zip` 里 `Renderer` 含 `cameraInternal`、`Camera` 含
+  `bad parallel projection`、`NativeBridge` 含 `screenWidth`；
+  `nativeFunctionTable.cpp` 已注册 `NativeBridge_screenWidth/Height`。
+- ELF 里 `J2ME Player v03.22`、`render frames=`、`bad parallel projection`、
+  `bad perspective projection` 均存在。
+- **v03.22 未上真机。** M3G 的 Java 层到现在仍然没有任何一帧在设备上被人眼确认过。
+
+### 下次判据
+1. 极品飞车：`bad projection parameters` / `Static initializer` 应消失（换成
+   `bad parallel projection ...` 才能说明还有别的参数越界）。
+2. 生化危机：`[m3g] render frames=...` 应出现且 `+draws=` > 0；`target=` 应为 `240x320`；
+   `viewport clamp` 应完全消失。
+3. 若 `+draws=0` 且 `nobuf`/`noidx` 增长 → 卡在 VertexBuffer/IndexBuffer；
+   若 `noview` 增长 → 相机矩阵不可逆（`setCamera` 的 transform 有问题）。
+
+### 教训
+- **不要用"日志里没报错"当作"逻辑跑通了"。** 生化危机这两个 bug 都不抛异常：
+  一个是视口被悄悄裁剪，一个是相机被悄悄忽略。这类问题必须靠**计数器**暴露，
+  而不是等异常。
+- **`Display.getDisplay(null)` 在本 MIDP 不成立**（需要 MIDlet 实例）。上一轮我把它当兜底
+  却没验证它能不能用，等于白写。以后跨层取值要么真机日志证明，要么直接用自己控制的 native。
+- **反编译对手的反编译比对文档更可信**：`setParallel(90,1,-1,1)` 是直接读出来的，
+  不是我猜的。前两轮我把 3D 的失败归因在图片/解码/句柄上，浪费了时间。
+
+## 2026-10-26 v03.23:log129 + 用户"一直有噼啪(click)和沙沙(hiss),J2ME Loader 在手机上更好,可以 dump 出来分析"
+
+> 产物 `vita-port/out/vpk/midp_vita_v03.23.vpk`(12001340 B),ELF `J2ME Player v03.23`。**未上真机,没有听。**
+> 这一版**不改任何声音**,只加测量。版本号:03.22 是别的会话(3D:Camera/M3G 目标尺寸),我用 03.23,没动它的说明块。
+
+### 1. "怎么分析的"——如实复盘(用户问了这句)
+- v03.12~v03.20 每一轮:读 log 里的事件/时间戳 → log 没有音质信号 → 在**宿主**上用真实 `RingTone.toWav` 生成 WAV →
+  对**我自己生成的 WAV** 做频谱/音高测量 → 发现一个可测量缺陷就修一个。
+- 缺陷:**从没拿到设备实际送给声卡的数据**。"改善 14 dB"之类都是宿主上的数字。用户每次说"依然破音",
+  说明我修的项都不是根因,或不是全部。
+- log129 本身:v03.21;只放了喜羊羊开头一首 9 s 曲子(`wav done frames=71992`),然后换到生化危机;音频代码与 v03.20
+  **字节级相同**(`RingTone.java` 02:44、`Sound.java` 15:43、`vita_audio_javacall.c` 15:42、`vita_wav_resample.h` 15:42 之后没人动过)。
+  所以 log129 **不含新信息**,只能证明"v03.20 的修复没有解决"。
+
+### 2. 我之前一个站不住的证据——更正
+- v03.16 我写"无欠载:`ran - cur` 在 -9..+3 ms"。**这个数测不出欠载**:音频线程晚了,端口队列空,`sceAudioOutOutput`
+  立刻返回,线程追赶着连续提交,墙钟与已提交音频仍然相等。**欠载在这个数上不可见**。
+- 而用户描述的"噼啪(click)"恰好就是欠载/接缝的典型表现。所以"没有欠载"这个结论作废。
+
+### 3. v03.23 加的探针(`vita_pcm_probe.h`,头文件无 Vita 依赖,宿主测过)
+1. **相邻两次提交的间隔直方图**(`audio_debug.log`,每首曲子一行):
+   `[PCM] wav submissions=N intervals(ms): <9.0=.. 9-10=.. 10-10.5=.. 10.5-10.9=.. 10.9-11.5=.. 11.5-13=.. 13-16=.. 16-25=.. 25-50=.. >=50=.. max=.. us, quick-returns(<2ms)=..`
+   - 一块 512 帧 @48 kHz = 10.667 ms。`sceAudioOutOutput` 在队列满时阻塞,所以健康的流**全部落在 10.5-10.9**。
+   - 落在 ≥13 ms 的,或 `quick-returns`(调用 <2 ms 就返回 = 提交时硬件已经干了)都是欠载。
+2. **`ux0:/data/J2ME00001/pcm_dump.raw`**:交给 `sceAudioOutOutput` 的**最初 6.4 s**(600 块)原样转储,s16le 立体声 48 kHz。
+   每个进程只写一次,在该曲子**停止后**由音频线程写,不扰动它要测的时序。
+3. 分析:`debug/tools/wavq/analyze_dump.py <dump> [参考]`:削波、跳变、L≠R、**512 帧接缝**(接缝每 10.7 ms 一次 = 93.75 Hz 的嗡)、
+   声音中的零段(丢数据)、与宿主参考逐样本差。参考用 `render_ref.c`(同一个 `vita_wav_resample.h`)生成。
+4. 宿主自检(`test_pcm_probe.c`,出货的头文件):健康流 199 个间隔全在 10.5-10.9;人为每 10 块晚 40 ms 的流,
+   10 次落在 25-50 ms、10 次 quick-return、max=40000;两首曲子之间的 3 s 间隔经 `vpp_reset_run` 不会漏进 ≥50 桶;
+   捕获逐块逐样本一致且只收前 600 块。ALL PASS。
+5. 宿主参考自检:D0 前 6.4 s 参考流——无削波、L=R、无大于摆幅的跳变、接缝/块内步长比 0.93(无接缝)、
+   自己对自己 0 差。**完美的设备应该得到这个**。
+
+### 4. 拿到 dump 后的判读(预先写下,避免事后合理化)
+| 现象 | 说明 |
+|---|---|
+| 直方图有 ≥13 ms 的桶 / quick-returns > 0 | **欠载 = 噼啪**。音频线程被抢占或 CPU 不够;下一步:提优先级/绑核/加大端口缓冲(`OUT_CHUNK_FRAMES`)/预渲染 |
+| 直方图全在 10.5-10.9,dump 与参考一致(差 0) | **数据与时序都没问题**。则问题在声卡之后(喇叭对 8 kHz 方波的响应、系统均衡),或是**音色**本身 vs J2ME Loader 的 Sonivox 乐器 |
+| dump 与参考不一致 | 我的渲染代码在设备上和宿主不同(编译器/对齐/整数宽度):first mismatch 的位置会指出在哪 |
+| 接缝比 ≫ 1 | 每 10.7 ms 一次的断层(块边界处理有错) |
+| L≠R | 单声道复制出错 |
+| 声音中间有零段 | 丢数据 |
+
+### 5. 已知风险(如实)
+- 多了 **1.2 MB 的静态 `.bss`**(`g_pcm_probe`,6.4 s × 48 kHz × 立体声 × s16)。ELF 的 `.bss` 是 7.09 MB。
+  log129 里没有 `free user=` 行,我**没有可对比的内存余量数据**,不能说"没问题"。如果游戏因此在加载大资源时更易 OOM,
+  可把 `VPP_CAPTURE_CHUNKS` 调到 200(2.1 s)。
+- dump 只抓**第一首**被渲染的曲子的前 6.4 s(每进程一次),并在它停止/结束后才写入。喜羊羊一开始的那首 9 s 曲子够用。
+  如果它在不到 100 块(1 s)就被停掉,则不会写文件(条件 `cap_chunks >= 100` 或已满)。
+
+### 6. 验证(如实)
+- 宿主:`test_pcm_probe.c` ALL PASS;`test_resample.c` ALL PASS;`run_ringtest.sh` ALL PASS;`fpmodel/run.sh` 校准 0 不一致、40/40、42/42、50/50。
+- 构建:`build.sh`(只改了 C,没动 Java/CLDC,所以不需要 `midp`/`rebuild_vm.sh`)exit=0,0 个 `error:`,0 条与音频文件相关的警告;
+  `nm`:`g_pcm_probe` 在 .bss,大小 0x12c088。
+- **没有上真机。**
+
+### 7. 修改记录
+- `vita-port/src/vita_pcm_probe.h`(新增)、`vita-port/src/vita_audio_javacall.c`(提交前后打点、`pcm_probe_report`、`wav_render_player` 接入)
+- `vita-port/CMakeLists.txt`:版本 03.23 + 注释块
+- `debug/tools/wavq/`:`test_pcm_probe.c`、`render_ref.c`、`analyze_dump.py`(新增)
+
+### 8. 请用户做的
+1. 装 `midp_vita_v03.23.vpk`,启动喜羊羊,**让第一首曲子完整放一会儿(≥7 s)再退出/切换**。
+2. 把这三样发回来:`ux0:data/J2ME00001/pcm_dump.raw`、`audio_debug.log`(里面的 `[PCM]` 行)、`vm_output.log`。
+3. 若方便,同一首曲子在 J2ME Loader 里放的录音(手机录或系统内录),我可以和 dump 做频谱对比,看差在哪个频段。
+
+## 2026-10-27 v03.24：log130——3D 从来没被加载过,而且画出来是透明的
+
+### 症状
+- 生化危机:进入游戏,2D 菜单/退出按钮可见,**3D 完全没有**。
+- 极品飞车:不再抛异常,厂商图片放完后**蓝屏**。
+- 测试环境:**Vita3K**(真机不在手边),版本 v03.23。
+
+### 关键反证 / 取证(都可复核)
+1. log130 的 `vm_output.log` 里 **有** `[m3g] bind target 240x320 clip=0,0`,**没有** 任何
+   `viewport clamp`(说明 v03.22 的 target 尺寸修复生效),但**一条 `render frames=` 都没有**
+   ⇒ `Renderer.frame()` 连 30 次都没跑够 ⇒ 没有网格被送进渲染器。
+2. `vm_boot.log` 里图片打开 54 次(`jil_all.png`/`en_all.png`/`bg2.png`/`room_overlay_01.png`
+   全部 `open OK`),**`.m3g` 打开次数 = 0**。
+3. 反编译 `BioCtrl`:`meshFilenames = {"jill_kni","jill_han","jill_eag","jill_mag","jill_sho",
+   "jill_asa","jill_gat","simin","zombie","hunter","nemesis","aim","effect"}`,而 jar 里
+   这些 `.m3g` **都存在**(`jill_asa.m3g` 等)。
+   `loadSkinnedMesh` 拼出 `"/" + meshFilenames[i] + ".m3g"` 后调 `Loader.load(String)`。
+4. 极品飞车的模型名更直接:`o.a = {"/a","/b","/c",...}`,jar 里确实有无扩展名条目
+   `a`、`b`、`c`…;其中 `c` 是真正的 M3G(`AB JSR184 BB`),`a`/`b`/`aa` 是
+   Mascot Capsule 二进制(`00 28` / `01 00` 头)。
+
+### bug 1(决定性):`Loader.load(String)` 永远打不开模型
+我们的实现用 `Connector.openInputStream(name)`,而 CLDC 的 `Connector.openPrim()`:
+```java
+int colon = name.indexOf(':');
+if (colon < 1) throw new IllegalArgumentException("no ':' in URL");
+```
+`"/jill_asa.m3g"`、`"/c"` **都没有 scheme** ⇒ 必抛 `IllegalArgumentException`。
+两个游戏都写成 `catch (Exception) { return null; }`(极品飞车 `ac` 类的字节码就是
+`pop; aconst_null; areturn`),所以**失败没有任何日志**,模型数组保持 null,`render` 没被调用过。
+
+修:
+- 改为按 **jar 条目**读取:`Loader.class.getResourceAsStream(name)`
+  (`Class.resolveName()` 会把前导 `/` 去掉后从 jar 根查,这正是这两个游戏的意思);
+  只有名字里确实带 `:` 时才走 `Connector`。
+- 纹理基目录用 `slash >= 0`(原来是 `slash > 0`),根级模型 `/x.m3g` 现在得到基目录 `/`,
+  外部贴图按 **绝对路径** 解析;旧写法会退化成相对名,被加上 `javax/microedition/lcdui/` 前缀而 miss。
+- 加有界诊断(上限 64 条):`[m3g] load '<name>' ok objects=N` / `load FAILED '<name>' (<cause>)`。
+
+### bug 2(同样致命):清屏色 alpha=0 ⇒ 整块 3D 在 blit 时被跳过
+反编译 `BioCtrl` 的场景初始化:
+```java
+Background bg = new Background();
+bg.setColor(0);      // ARGB 0x00000000 —— 意思是"清成黑色"
+```
+我们把 alpha 原样传下去 ⇒ 整个视口 alpha=0 ⇒ `releaseTarget()` 用
+`Graphics.drawRGB(..., true)` 回贴,**drawRGB 会跳过透明像素** ⇒ 屏幕上看不到任何 3D,
+而之后直接画在 Graphics 上的 2D HUD 正常显示。两个症状完全吻合。
+
+修:
+- `Renderer.clear()` 把清屏色 **强制不透明**(`color |= 0xFF000000`)。
+  绘制面本身没有 alpha 通道,"透明背景"不可能表示"让 2D 透出来"。
+- 同时尊重 `Background.setColorClearEnable(false)`:新增 `clear_color` 参数,贯穿
+  `v3d_clear` / `vita_gl3d_clear` / `vita_sw3d_clear`(`KNI` 侧签名同步改为
+  `clear(int argb, boolean clearDepth, boolean clearColor)`)。
+
+### 顺带修的
+- `drawMesh` 在 `mesh.indexBuffer == null` 或 `appearances` 为空时会 NPE/越界,把整帧打断;
+  现在跳过并计入 `noidx`。
+- `bindTarget` 一次性打 `[m3g] backend init rc=N active=M target=WxH`。
+  log130 里完全没有 `3d: backend=` 面包屑,导致"后端究竟有没有起来"无法判断。
+
+### 改动文件
+- `jsr184/.../Loader.java`(jar 资源读取 + 基目录 + 诊断)
+- `jsr184/.../Renderer.java`(清屏色强制不透明、colorClear 开关、mesh 守卫)
+- `jsr184/.../Graphics3D.java`(backend 握手日志)
+- `jsr184/.../NativeBridge.java` + `jsr184/src/share/native/m3g_native.c`(clear 三参数)
+- `vita-port/src/vita_3d.{c,h}`、`vita_gl3d.{c,h}`、`vita_sw3d.{c,h}`(clear_color)
+- `vita-port/CMakeLists.txt`(03.24 注释块)
+
+### 验证(如实)
+- `javac -source 1.4` 编整个 jsr184:0 error;`gcc -c -Wall -Wextra` 编 `m3g_native.c`:0 error;
+  `vita_sw3d.c` 单独编:0 error。
+- MIDP 构建 0 error;`classes.zip` 里 `Loader` 含 `load FAILED`、`Renderer` 含 `cameraInternal`、
+  `NativeBridge.clear` 签名已是 `(int,boolean,boolean)`。
+- ELF:`J2ME Player v03.24`,`load FAILED '`、`backend init rc=`、`render frames=` 三个串都在。
+- **未上真机;也没有在 Vita3K 上跑过这一版。**
+
+### 仍然不支持的(必须说清楚)
+- 极品飞车的模型大多是无扩展名条目,其中 `a`/`b`/`aa`… 是 **Mascot Capsule v3** 二进制
+  (`00 28` / `01 00` 头),不是 M3G。这些即使 Loader 修好也**不会**被解析——
+  Mascot Capsule(`com.mascotcapsule.micro3d.v3` + `.mbac`/`.mtra`)尚未实现。
+  所以极品飞车这一版只可能显示出其中的 M3G 部分(`/c` 等),不要期待完整画面。
+- 蒙皮(SkinnedMesh)仍是刚体渲染。
+
+### 下次看什么
+1. `[m3g] backend init rc=?` —— rc>0 表示后端起来(1=硬件 2=软件),负数说明弱符号/内存有问题。
+2. `[m3g] load '/jill_asa.m3g' ok objects=N` —— 应出现;若 `load FAILED`,看括号里的原因。
+3. `[m3g] render frames=N (+draws=D)` —— `+draws` 必须 > 0。
+4. 若 `draws>0` 但仍看不见:下一个嫌疑是 `drawRGB` 的 alpha(已被本版强制不透明覆盖)
+   与 `v3d_present` 的回读格式。
+
+### 教训
+- **"没有异常"是最难查的一类报告。** 这两处都被游戏自己 `catch(Exception){return null}`
+  吞掉了;凡是给第三方用的入口(Loader),都必须自己记日志,不能指望调用方报错。
+- **先查"有没有被调用",再查"调用得对不对"。** log130 里 `.m3g` 打开数 = 0 这一个数字,
+  就足以把方向从"渲染管线"扳到"资源加载"。前几轮我在渲染细节上花的时间本可以用这个数字省掉。
+- 我上一轮加的 `render frames=` 统计和 `screenWidth()` 这次都起了作用(证明视口修好了、
+  证明渲染器没跑),**给静默路径加计数器是有回报的**。
+
+## 2026-10-27 v03.25：log131——JSR-184 的 KNI 参数传递整个是错的
+
+### 本轮进展（log131 里的两个新事实）
+1. **模型加载好了**：`[m3g] load '/hunter.m3g' ok objects=154`、`/zombie.m3g objects=109`、
+   `/nemesis.m3g objects=217`、`/missionmap.m3g objects=16` …… ⇒ v03.24 的 `Loader` 修复有效。
+2. **渲染阻塞点被日志点名了**：
+```
+[m3g] backend init rc=-1 active=0 target=240x320
+crumb.log: 3d: hardware init failed rc=-1, falling back to software
+           3d: software init failed rc=-1
+```
+
+### 真因：CLDC 的 KNI 不是"函数参数"风格
+`build/vita_arm/dist/include/kni.h:64` 是
+```c
+#define KNIDECLARGS
+#define KNIPASSARGS
+#define KNIDECL(methodname) Java_##methodname()
+```
+即 **`KNIDECLARGS` 展开为空**。所以我原来写的
+```c
+Java_com_sun_m3g_NativeBridge_init(KNIDECLARGS jint width, jint height)
+```
+编译成了一个**两参数 C 函数**，而 VM 调用 native 时**不传参数**——参数在 KNI 帧里，必须用
+`KNI_GetParameterAsInt(1)` / `AsObject(1,h)` / `AsBoolean(1)` 取。
+
+⇒ `width`/`height` 其实是 r0/r1 里的残留值（垃圾）。
+
+后果链条：
+- `g_frame = malloc(g_w*g_h*4)` 用垃圾尺寸 → 尺寸不对/失败；
+- `v3d_init(mode, 垃圾宽, 垃圾高)` → `vita_sw3d_init` 里 `malloc(w*h*4)` 失败 →
+  **`vita_sw3d_init` 返回 -1**（这是它唯一返回 -1 的路径）→ `g_backend` 永远是 0；
+- 没有后端 ⇒ 一帧都画不出来；
+- `textureCreate/textureFree/clear/setScissor/setMvp/setState/draw/present` **全都在读垃圾**
+  ⇒ 纹理从没创建成功、三角形从没送到后端。
+
+**9 个带参数的入口全部受影响**（`init/backend` 里的 backend 无参没事，其余全中）。
+
+### 修法
+- 全部改成 KNI 访问器：`KNI_GetParameterAsInt/AsBoolean/AsObject`。
+- 对象参数必须先 `KNI_StartHandles(n)` + `KNI_DeclareHandle(x)`。
+  **注意：`KNI_StartHandles` 宏自身带 `{`，`KNI_EndHandles` 带 `}`**，所以中途早退不能调
+  `KNI_EndHandles()`（句柄名会提前离开作用域——我第一次改就是这样，gcc 报
+  `'argb' undeclared` + `__handle_info__ undeclared`）。正确形状是
+  `KNI_StartHandles(n); ... do { ... break; ... } while(0); KNI_EndHandles(); KNI_ReturnX();`
+- 反汇编确认：`Java_com_sun_m3g_NativeBridge_init` 现在先 `bl KNI_GetParameterAsInt(#1)`、
+  再 `#2`；`draw` 里 4×`AsObject` + 2×`AsInt`（正好 6 个参数）。
+
+### 顺带修的
+- `Graphics3D.bindTarget` 原来**每帧**都调 `NativeBridge.init`；后端坏掉时就是
+  "每帧两次 malloc 尝试 + 两行面包屑"（log131 里成打的 failed 对）。
+  现在只在**目标尺寸变化或上次失败**时重试，并且每次都打
+  `[m3g] backend init rc=N active=M target=WxH`。
+- `ImageDataFactory` 现在把 "resource NOT FOUND" 和 "decode failed" 分开记
+  （log131 只有 `[img] load failed` 而没有 NOT FOUND ⇒ 流是打开成功的，是解码抛的）。
+  解码失败时把字节数带进异常消息：`decode failed, len=<N>`，
+  与 jar 里条目的真实大小一比就能判定"流被截断"还是"真的解码失败"。
+
+### 改动文件
+- `jsr184/src/share/native/m3g_native.c`（9 个入口改 KNI 访问器 + 句柄作用域）
+- `jsr184/.../Graphics3D.java`（init 节流 + 握手日志）
+- `phoneme-midp/.../img_putpixel/.../ImageDataFactory.java`（decode/NOT FOUND 区分 + 长度）
+- `vita-port/CMakeLists.txt`（03.25 注释块）
+
+### 验证（如实）
+- `gcc -c -O2 -Wall -Wextra` 编 `m3g_native.c`：0 error/0 warning。
+- `javac -source 1.4` 编整个 jsr184：0 error。
+- MIDP 构建 0 error；`classes.zip` 里 `Graphics3D` 含 `backend init rc=`、
+  `ImageDataFactory` 含 `decode failed`。
+- ELF：`J2ME Player v03.25`；12 个 `Java_com_sun_m3g_NativeBridge_*` 符号齐全；
+  反汇编确认参数走 `KNI_GetParameterAsInt/AsObject`。
+- **未上真机，也没在 Vita3K 上跑过这一版。**
+
+### 还没解释清楚的一件事（不装作已解决）
+`[img] load failed: '/effects.png'` 这类失败**不是"找不到"**（流打开成功，`[res] open OK`
+里有该条目），而是**解码抛异常**。可疑点是这三个失败条目和成功的 `imgAct/*.png`
+在 PNG 参数上没有任何区别（都是 ct=3/bd=8/il=0，tRNS 有有无都出现过），
+差别只在**加载时机**：失败的全部发生在 3D 场景启动之后。
+所以最可能是某种资源耗尽（v03.24 里垃圾尺寸的 `g_frame` 也是嫌疑之一）。
+`decode failed, len=N` 这条日志就是为它准备的——下次直接拿 N 和 jar 条目大小对比。
+
+### 下次看什么
+1. `[m3g] backend init rc=?` —— **必须是 1 或 2**（1=硬件，2=软件）。仍是负数就要看
+   `3d:` 面包屑里是哪一步失败。
+2. `[m3g] render frames=N (+draws=D) verts=V` —— `draws` 必须 > 0。
+3. `[img] decode failed: '<name>' (java.io.IOException: decode failed, len=N)` ——
+   拿 N 与 jar 条目大小对比：小了就是流被截断；一样大就是解码器/内存问题。
+4. Vita3K 里 `libshacccg.suprx` 默认不存在 ⇒ 硬件后端必然失败 ⇒ 会走软件后端（rc=2）。
+   这是预期的，不是错误。
+
+### 教训
+- **"返回值是 -1" 比"什么都没画"信息量大得多。** 上一轮加的 init 返回值日志，这一轮直接
+  指到了 KNI 参数上。给静默路径加计数器/日志，回报是复利的。
+- **移植层的胶水代码也要按目标平台的 ABI 规范写**。`KNIDECLARGS` 在 CDC 里是有内容的，
+  在 CLDC 里是空的；照抄一个"看起来对"的签名，编译能过、链接能过、运行时静默全错。
+  这类错误编译器帮不了，只能靠"返回值/计数器"暴露。
+- **早退路径会破坏宏作用域**：`KNI_StartHandles` 自己开 `{`。改这类代码要先读宏定义，
+  不要按直觉写 `if (...) { KNI_EndHandles(); return; }`。
+
+## 2026-10-27 v03.26：log131 里 vita3k.log 的 `EXCEPTION_ACCESS_VIOLATION` 是什么
+
+### 结论：原生堆被写坏，崩在 `_malloc_r`(不是 Java 异常，也不是 GPU 问题)
+用**与日志匹配的 `midp_vita_v03.24.sym`** 符号化日志里出现的全部 PC：
+
+| PC | 次数 | 符号 |
+| --- | --- | --- |
+| 0x811a9262 | **531** | `_malloc_r` |
+| 0x811a9476 | 2 | `_malloc_r` |
+| 0x811a937c / 0x811a93d0 / 0x811a9454 / 0x811a96ce | 各 1 | `_malloc_r` |
+
+合计 537 次非法访问（其中 4 次真的触发了 Windows `0xC0000005`）。**6 个不同 PC 全在
+`_malloc_r` 里**，特别是 531 次是同一条指令 —— 这是 newlib malloc 遍历 free-list 时
+反复解引用一个坏指针，不是随机噪声。
+
+典型寄存器（首故障）：
+```
+Write violation at 0x404AF620C          val=0x19df9   PC=0x811a93d0
+r2=0x04af6208  r3=r6=0x86846b80  r7=0  r12=0x80b10000
+```
+后面那批：
+```
+Invalid read of uint32_t at 0x82dc0004  PC=0x811a9262
+r3=r6=0x82dc0000  r7=0x84000001  r5=0x81404688
+```
+`0x04af620c` 与 `0x82dc0000` **都远在已加载段之外**（本 ELF：TEXT 0x81000000，
+RW 0x81400000 + 0x59c584 ⇒ 到 0x8199c584 为止）。所以是"把野值当指针用"。
+
+### 时序（关键，且与直觉相反）
+- 首次故障：`11:59:52.553`
+- 首次 `ur0:data/libshacccg.suprx`：`11:59:52.560`（即**第一次 `NativeBridge.init`
+  → `vita_gl3d_init`**），**晚 7 ms**
+⇒ 故障发生时**还没有任何 3D 初始化、没有 draw、没有 present**。
+⇒ **破坏性的写发生在更早、而且无声**（越界写若落在已映射内存里，dynarmic 不会回调）。
+
+破坏持续 `52.554 → 12:00:14.503`，**约 22 秒**：之后整个进程都在一个被砸坏的 malloc
+arena 上运行。这也解释了 `[img] decode failed: '/effects.png'`、`/jil_all.png` 这类
+"PNG 参数完全正常却解码失败"——解码路径要 malloc，堆坏了就失败。**比"PNG 格式不支持"
+这个假设合理得多。**
+
+### 首要嫌疑（诚实标注：未被这份日志证明）
+log131 是 **v03.24**，正是带 **KNI 参数 bug** 的那一版（v03.25 已修，见上一条）。
+在那一版里所有 native 入口拿到的都是垃圾参数，于是：
+- `init()` 用垃圾宽高 `malloc(g_w*g_h*4)` —— 乘积可溢出成一个小尺寸，
+  malloc 成功而后续按 w*h 像素使用；
+- `textureCreate()` / `draw()` / `present()` 把**垃圾 jobject 句柄**交给
+  `KNI_GetArrayLength` / `KNI_GetRawArrayRegion` / **`KNI_SetRawArrayRegion`**。
+
+`KNI_SetRawArrayRegion` 是**任意原生写**——正是砸烂 malloc arena 的形状。而 `.m3g`
+加载阶段确实会调 `textureCreate`（`Image2D` 懒创建纹理），时间窗吻合。
+
+**但我不能凭这份日志断言它就是那个写**：首故障早于首次 3D 调用。要确认只能靠下一次日志。
+
+### 本版(v03.26)做了什么
+不是"再猜一个原因"，而是**让这一类错误不可能再砸堆**：
+1. `init` 拒绝 `dim <= 0 || dim > 4096 || w*h > 16M`，**乘积用 64 位算**，
+   杜绝 `w*h*4` 溢出成小 malloc（反汇编已确认：`sub r3,r5,#1; movw r2,#4095; cmpls`）。
+2. `draw`：顶点上限 1M、索引上限 4M（`M3G_MAX_VERTS`/`M3G_MAX_INDICES`）。
+3. `present`：要求目标数组**至少** `g_w*g_h`，且**只写恰好 g_w*g_h 个像素**。
+   旧代码是 `n = g_w*g_h; if (n > len) n = len;` —— 目的地偏小就静默部分回贴，
+   而长度又是从（可能坏的）句柄读出来的。
+
+### 验证（如实）
+- `gcc -c -O2 -Wall -Wextra` 编 `m3g_native.c`：0 error / 0 warning。
+- **踩到一个构建坑**：`m3g_native.c` 属于 MIDP 的 `libobj.a`，只跑 `vita-port/build.sh`
+  不会重编它（VPK 字节数一度完全没变，是体积一模一样暴露的）。必须
+  `MIDP_EXTRA_GOAL=...libobj.a bash phoneme-midp/build_vita.sh` 再 `build.sh`。
+- 反汇编 `Java_com_sun_m3g_NativeBridge_init`：先 `KNI_GetParameterAsInt(1)/(2)`，
+  再做 1..4096 范围检查。
+- ELF 版本串 `J2ME Player v03.26`。
+- **没跑过 Vita3K，也没上真机。**
+
+### 下次判据
+1. 若 `_malloc_r` 的 `EXCEPTION_ACCESS_VIOLATION` **消失** ⇒ v03.24 的 KNI bug 就是破坏源。
+2. 若**仍然出现** ⇒ 破坏源在别处，下一步给原生大缓冲区（`g_frame`、`g_pos/g_uv/g_col/g_idx`、
+   sw3d 的 color/depth）加**前后哨兵**并每帧校验，用"哪个哨兵被改"直接指认越界写者。
+3. 顺带确认 `[m3g] backend init rc=` 是否为 1/2、`render frames=` 里的 `draws` 是否 > 0。
+
+### 教训
+- **看符号化之前先确认用的是哪一版 .sym。** 我第一次用 v03.25 的 .sym 解 v03.24 的地址，
+  得到 `_glDrawArrays_CustomShadersIMPL`（vitaGL），完全错误；换匹配的 .sym 后才是
+  `_malloc_r`。基址会漂移，符号也必须配对。
+- **"Java 异常"和"模拟器访问违例"是两回事。** `vm_output.log` 里没有异常，不代表没问题；
+  vita3k.log 里的 `EXCEPTION_ACCESS_VIOLATION` 是原生层内存破坏，属于另一条线索。
+- **一处 ABI 错误可以污染后面所有判断。** 堆坏掉之后，图片解码、纹理创建、任何 malloc
+  都可能失败，看起来像"很多个独立 bug"。先把 `EXCEPTION_ACCESS_VIOLATION` 清零，再谈别的。
+
+## 2026-10-27 v03.27：log132——模型全部塌成一个点（真正看不见人物的原因）
+
+### log132 里已经正常的部分（要记下来，别再怀疑它们）
+```
+[m3g] bind target 240x320 clip=0,0          ← vpX/vpY=0，不再是 240x180
+[m3g] backend init rc=2 active=2            ← 软件后端起来了
+[m3g] load '/hunter.m3g' ok objects=154     ← 模型加载成功
+[m3g] load '/jill_han.m3g' ok objects=201
+（[img] 失败 0 条）                          ← 堆损坏已消失（v03.25 KNI + v03.26 防护生效）
+```
+即：后端、句柄、资源加载、视口 **全都正常了**。剩下的只有一件事——画出来的东西是退化的。
+
+### 真因：`VertexArray.component()` 无条件归一化
+```java
+switch (componentSize) {
+case 1: return data[idx] / 128.0f;      // BYTE
+case 2: return data[idx] / 32768.0f;    // SHORT
+default: return data[idx] / 65536.0f;   // FIXED
+}
+```
+JSR-184 §5.5 规定 byte/short **只在 COLOR / NORMAL 上归一化**；
+**POSITION 和 TEXCOORD 必须保留原始整数**，再由 `VertexBuffer` 的 `scale/bias` 换算：
+`value = raw * scale + bias`。
+
+这些模型的 `positionScale` 本身就是 1/32768 量级（实测 hunter = 0.0276、
+jill_han = 0.0029），所以"先除 32768 再乘 scale"把顶点之间的差异**压掉了 32768 倍**，
+所有顶点都落在 `bias` 上 ⇒ 整个模型退化成**一个点** ⇒ 相机里什么都没有。
+
+### 宿主实测（可复现，用反射读真实缓冲区）
+`/tmp/probe/Q.java`：Loader 加载真实 `.m3g`，按两种公式算全体顶点的包围盒。
+
+| 模型 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `hunter.m3g` SkinnedMesh (n=1523) | v0..v2 全 ≈ (-0.005, 628.11, 95.67) = bias，**extent ≈ 0** | extent **1810 × 1046 × 406** |
+| `jill_han.m3g` (n=1073) | 全 ≈ bias | **190 × 170 × 46** |
+| `zombie.m3g` (n=675) | 全 ≈ bias | **192 × 179 × 30** |
+
+单顶点对照（hunter 前三个顶点的 x）：
+```
+修复前:  -0.0052, -0.0043, -0.0043      （几乎相同）
+修复后: -170.0,  -142.0,  -140.0        （正常分散）
+```
+
+### 修法
+- `VertexArray.componentRaw(v, c)`：返回**原始值**（FLOAT 直接返回 float）。
+  `Renderer` 里 **pos / uv / 光照用的世界坐标** 全部改用它。
+- `VertexArray.component(v, c)`：保留归一化，**只给 NORMAL / COLOR 用**（这两处未改）。
+- 顺带修 `VertexBuffer.getPositions()/setTexCoords()/getTexCoords()` 的 `scaleBias`
+  输出：原来返回占位值 `{1.0, 0.0}`，JSR-184 要求
+  `{bias[0], bias[1], bias[2], scale}`（贴图是 `{biasS, biasT, scaleS, scaleT}`）。
+
+### 诊断改进
+上一版 `render frames=` 要等 30 帧才打印，导致 log132 里"渲染器从没被调用"和
+"调用不足 30 次"分不清。现在：
+- **第一次** `releaseTarget` 就打印；一次都没渲染过时打印 `render NEVER called`；
+- 之后每 30 帧一条，字段增加 `calls=`（render 入口调用次数）、`nocam=`（没设相机）。
+
+### 极品飞车的蓝屏
+同一个 bug 可以解释：它的 `Background.setColor(...)` 用的是数据驱动颜色，
+几何体全塌成一点时屏幕上就只剩背景色 —— 用户看到的"蓝屏"。
+另外复查了它的 jar：**有 28 个真正的 M3G 条目**（`af`、`aq`、`aw`、`bl`…，
+`\xABJSR184\xBB` 头），之前只看了前几个无扩展名条目就断定"Mascot Capsule"是不对的。
+`a`/`b`/`aa` 那几个确实是 Mascot Capsule（`00 28` / `01 00` 头），但 M3G 占多数。
+
+### 改动文件
+- `jsr184/.../VertexArray.java`（新增 `componentRaw`）
+- `jsr184/.../Renderer.java`（pos/uv/worldpos 改用 componentRaw；帧统计改为一帧即报）
+- `jsr184/.../VertexBuffer.java`（scaleBias 语义修正）
+- `vita-port/CMakeLists.txt`（03.27 注释块）
+
+### 验证（如实）
+- 宿主：`/tmp/probe/Q.java` 对上表三个模型的包围盒实测（见上）。
+- `javac -encoding UTF-8 -source 1.4` 编整个 jsr184：0 error。
+  **注意：源码里有中文注释，javac 默认用 ASCII 会报 unmappable character，必须加
+  `-encoding UTF-8`。**
+- MIDP 构建 0 error；`classes.zip` 里 `Renderer`/`VertexArray` 含 `componentRaw`；
+  ELF 版本串 `v03.27`，且 `render NEVER called` / `render calls=` / `nocam=` 都在。
+- **没在 Vita3K 上跑过这一版。**
+
+### 下次判据
+1. `[m3g] render calls=N frames=N (+draws=D)`：`draws` 必须 > 0。
+   若 `calls>0` 而 `frames=0` → 相机没设（`nocam` 会涨）；
+   若 `frames>0` 而 `draws=0` → 看 `nobuf`/`noidx`。
+2. 生化危机：人物/场景应该出现（**刚体、无蒙皮变形**，因为这个移植还没实现 skinning）。
+3. 极品飞车：不应再是纯蓝背景。
+4. 若仍空白：下一个要查的是投影/视图矩阵与模型尺度是否匹配
+   （hunter 的包围盒是 1810×1046×406，而游戏用 `postScale(0.012f)`，量级上说得通）。
+
+### 教训
+- **"加载成功"离"画得出来"还有很远。** log132 里所有计数器都绿了（后端 2、模型 objects 正确、
+  无图片失败），唯一异常是"没有帧统计"——而真因是几何退化，不是链路断开。
+- **规范里"归一化"是按属性类型区分的，不是按存储类型。** 同一个 SHORT 数组，当 COLOR 要除
+  32768，当 POSITION 就不许除。我按 componentSize 一刀切，正好把最关键的 POSITION 搞错。
+- **验证要用真实资源 + 数值。** 这次如果不是把真实模型的顶点打出来、看到"三个顶点几乎相同"，
+  光看代码是发现不了"除以 32768 把差异吃掉"的。
+- 顺带纠正我上一轮的错误判断：极品飞车**有** 28 个 M3G 资源，不能一句"Mascot Capsule"带过。
+
+## 2026-10-27 v03.28:log133 分析 + 纯诊断(无行为改动)
+
+### log133 能证明的
+- v03.27 b330,两个游戏都没崩、没卡死(`input_debug.log` 心跳与 `ani` 计数一直在涨)。3D 走软件后端;JIT 关;生化危机约 15 fps。
+- `vm_output.log` 无任何异常——**不代表没出错**:`BioCanvas.printException` 方法体就是 `return`;`Display.handleThrowable`
+  虽然在 v02.77 起会打 `[APPEXC]`,但只覆盖 `paint`/`keyPressed` 这类 LCDUI 回调,**不覆盖 Timer 任务和游戏自建线程**。
+- 生化危机:`backend init rc=2`,8 个 `.m3g` 加载成功;`render calls=1 frames=0`,所有拒绝计数为 0 ⇒ 第一次 `render`
+  在 `frame()` 之前就退出了。只可能是 `renderWorld` 无相机(`Renderer.java` 旧 174 行,不计数)或 `renderNode(null)` 抛 NPE
+  (被游戏吞掉)。**两者日志里无法区分,没有结论。** 且旧 `reportFrameStats` 要 `frames` 再涨 30 才再打印,
+  frames 停在 0 时永远沉默——所以 v03.27 加的诊断恰好在最需要它的场景失效。
+- 极品飞车:本轮**没有任何 `[m3g]` 行**(没 bind、没 load、没 backend init)⇒ 从没碰过 `Graphics3D`。
+  **推翻 v03.27 对它蓝屏的解释**("几何塌成一点只剩背景色"):它根本没走到渲染。
+
+### 极品飞车静态分析(`debug/3d_game/极品飞车13之变速英文3D版.jar`,javap 反编译)
+- 流程:`AdvertTorpedoLi`(广告约 3 s)→ 线程调 `ExtendTorpedoMidlet.startOriginApp()` → `MonkeyApp.startApp()` →
+  `ab.a()`(含 `t.a()` 逐个加载资源)→ 才置 `ab.c=true` 并 `ab.c()` 起 15 ms `java.util.Timer` 主循环(`v extends TimerTask`)。
+- `ab.paint` 在 `c==false` 时用 `ad.a(g,54)` 整屏填色。**我没解出 54 号是不是蓝色**,所以"蓝屏=这个填充"是推断。
+- `[res] open OK` 只记 png/bmp/m3g/jpg/mbac/mtra(`Natives.cpp:223`),极品飞车的无扩展名资源(`/a`、`/b`…)不会出现,
+  **"adv.png 之后没有 res 行"不是证据**。
+- 我曾假设 `t.a()` 因资源读取失败(`ac.b` 吞异常返回 null → `u.a(Image,byte[])` 的 `baload` NPE)而中断。用宿主 JVM 加载游戏
+  自带资源表 `o`,与 jar 内 102 个条目逐个比对(`/tmp/g133/Chk.java`,未入库):0 缺失,97 大小一致,5 个(`/h /ao /ap /au /by`)
+  实际比期望**大**(`readFully` 读不会失败)。**该假设不成立。**
+- **没查明极品飞车卡在哪。** `ab.a()` 其余部分、`startOriginApp` 的 `while(originCanvas==advSlip)` 自旋是否正常退出,均未验证。
+
+### 本版改动(只加日志,不改行为)
+| 文件 | 改动 |
+| --- | --- |
+| `phoneme-midp/src/core/javautil/reference/classes/java/util/Timer.java`(+17 行) | `TimerThread` 里任务抛 `Exception` 被取消、抛 `Error`、以及计时线程死亡,分别打 `[TIMEREXC] ...` + 堆栈(System.out → `vm_output.log`)。`Error` 分支打印后**重新抛出**,与原行为一致 |
+| `jsr184/.../m3g/Renderer.java` | 新增 `dbgNoCamWorld`(`renderWorld` 无相机)、`dbgNullNode`(`render(null,…)`)、`dbgReleases`;`reportFrameStats` 改为按 `releaseTarget` 计数,首次 + 每 120 次打 `render releases=… noCamWorld=… nullNode=… calls=… frames=…` |
+| `vita-port/CMakeLists.txt` | 03.28 版本块 |
+
+`jsr184/` 在 git 里是**未跟踪目录**(`?? jsr184/`),所以它的改动没有 `git diff` 基线,以本节为准。
+
+### 验证(如实)
+- `vita-port/build.sh midp` 成功,产物 `vita-port/out/vpk/midp_vita_v03.28.vpk`(12005562 B)。
+- 时间戳链(`Timer.class`/`Renderer.class` 07:22:32 → `classes.zip` 07:22:33 → `ROMImage.o` 07:22:47 → `libobj.a` 07:22:48 → ELF 07:22:54)逐级递增;
+  日志出现 `compiling 2 .java files`。
+- ELF(`build/cmake/midp_vita`)里 UTF-16LE 串各 1 份:`[TIMEREXC] task `、` cancelled: `、` Error: `、`timer thread died: `、
+  `render releases=`、`noCamWorld=`、`nullNode=`;ASCII `J2ME Player v03.28` 2 份。`TimerThread.class` 含 `TIMEREXC`(2500 B)。
+- **没上真机、没跑 Vita3K。**
+
+### 构建坑(新踩,务必记住)
+1. **`touch` 源文件不够**:`build.sh midp` 开头会 `jar uf classes.zip`(Step 1,vendor 类),把 `classes.zip` 的时间戳刷到
+   **比刚 touch 的源文件还新**,随后 make 报 `no need to recompile .java files`,改动被跳过,而 `build.sh` 仍打印
+   "Build successful"、VPK 版本号也已更新(体积只多了 12 字节才露馅)。办法:`touch -d '+6 minutes' <源文件>` 再构建,
+   日志里要看到 `compiling N .java files`。删 `alljavalist.txt` 无效。
+2. 验证看 ELF 的 UTF-16LE 串;`Timer.java` 里的新串在 `TimerThread.class` 而不是 `Timer.class`(同文件第二个顶层类)。
+
+### 下一轮怎么看(`vm_output.log`)
+1. 极品飞车搜 `[TIMEREXC]`:出现 ⇒ 主循环 15 ms 任务抛了异常被取消,堆栈直接指向原因。**没有** ⇒ 不是 Timer 任务异常,
+   问题在 `ab.a()` 初始化或 `startOriginApp` 自旋,需要更深的诊断。
+2. 生化危机搜 `render releases=`:`noCamWorld` 涨 ⇒ `renderWorld` 没相机;`nullNode` 涨 ⇒ 模型数组元素为 null(`find(userID)` 取不到);
+   两者都是 0 而 `frames` 仍 0 ⇒ 退出点在别处。`frames>0` 时看 `draws`。
+
+### 教训
+- **先查已有的诊断钩子再下结论。** 我曾说"`handleThrowable` 是空操作",实际 v02.77 起就会打 `[APPEXC]`(项目记忆里有);
+  真正的盲区是**非 LCDUI 回调的线程**(Timer 任务、游戏自建线程)。
+- **"没有异常日志"必须先问"哪些路径会写日志"**,而不是默认为没出错。
+- **构建谎报成功不止一种**:这次是 make 增量判断被 `jar uf` 骗过,必须看 `compiling N .java files` 和 ELF 里的串。
+
+## 2026-10-27 v03.28：log133 的统计本身是坏的，所以它什么也没证明
+
+### 先认错
+用户说"到底分析了什么，别瞎说了"。这条批评成立，原因很具体：
+
+**log133 里那条 3D 统计只出现了一次，而且那一帧不是游戏画面。**
+```
+[m3g] render calls=1 frames=0 (+draws=0) verts=0 nocam=0 noview=0 nobuf=0 noidx=0
+      vp=0,105 240x140 target=240x320
+```
+两个独立原因：
+
+1. **触发条件写错（我的错）**：v03.27 的 `reportFrameStats` 要求
+   `dbgFrames - dbgLastFrames >= 30`。但 `dbgFrames` 恒为 0，
+   打印一次后 `dbgLastFrames = 0`，条件变成永真的 `0 < 30` ⇒ **之后再也不打印**。
+   游戏画面就算渲染了上千帧，日志也和"完全没渲染"一模一样。这是设计缺陷，不是设备问题。
+2. **唯一打印的那次不是游戏画面**：`vp=0,105 240x140` 精确对应
+   `setViewport(0,105,240,140)`，而这三个常量**只出现在 `BioCtrl.draw3DMap`**
+   （任务地图）。游戏主画面 `D_Game_JSR184` 的视口是用字段算的。
+   所以那一次是**地图画面**，它当时没有相机（`renderWorld` 里 cam 为 null）。
+
+⇒ **log133 对"游戏画面为什么空白"没有任何信息量。** 我不该在这条日志上编故事。
+
+### 另一件确认的事：没有异常逃出去
+log133 里 **`[APPEXC]` 一条都没有**。`D_Game_JSR184` 的异常表是
+`76..1668 → 1671` 和 `146..804 → 807`，catch 体里是
+`BioCanvas.printException(...)` 然后 `releaseTarget()`。
+所以若异常发生在这个范围内，它被**游戏自己吞掉并画到 2D 上**，不会进任何日志。
+这就是为什么"日志干净、屏幕空白"能同时成立。
+
+### 本版改了什么（都是为了让下一份日志能回答问题）
+1. `reportFrameStats` 改成**按 `releaseTarget` 次数**触发：前 5 次逐条打印，之后每 120 次一条。
+   不再依赖 `dbgFrames`。
+2. 新增计数：`noCamWorld`（`renderWorld` 时哪都没有相机）、`nullNode`、
+   以及 `walk()` 访问的 `nodes/meshes/sprites`。
+   这样 `frames>0 draws=0` 时能立刻区分"场景图里没有网格"和"网格被跳过"。
+3. **把 `javax.microedition.m3g` 里全部 123 处 `throw new <RuntimeException>`
+   接上日志**（29 个文件），统一走 `com.sun.m3g.M3gTrace.fail(e)`：
+   记一条 `[m3g] threw ...` 再把**同一个异常**抛出去，行为不变；上限 40 条。
+   被游戏 catch 掉的异常从此在 `midp_stderr.log` 里可见。
+
+### 改动文件
+- `jsr184/.../com/sun/m3g/M3gTrace.java`（`fail()` + 计数）
+- `jsr184/.../javax/microedition/m3g/*.java`（123 处 throw 包 fail）
+- `jsr184/.../Renderer.java`（触发条件改 releaseTarget；nodes/meshes/sprites/noCamWorld）
+- `vita-port/CMakeLists.txt`（03.28 注释块）
+
+### 验证（如实）
+- `javac -encoding UTF-8 -source 1.4` 编整个 jsr184：0 error。
+- MIDP 构建 0 error；`classes.zip` 里 `Renderer` 含 `nodes=`、`M3gTrace` 含 `threw `、
+  `Camera` 已引用 `M3gTrace`。
+- ELF 版本串 `J2ME Player v03.28`。
+- **没在 Vita3K 上跑过。这一版不含任何"修复画面"的改动，只修诊断。**
+
+### 最重要的教训（写给下一次的自己）
+**"没有日志"不等于"没有发生"，但更致命的是"日志只打一次就被判据卡死"。**
+我上一轮把 30 帧阈值留在代码里，等于给最需要观测的场景（frames 恒为 0）装了一个
+永远不触发的报警器，然后拿它当"没有渲染"的证据。**计数器必须按"外部事件次数"推进，
+不能按"被观测的计数"推进**，否则它一旦为 0 就永远静默。
+
+### 下一步需要的决定性信息（二选一，都很快）
+1. 游戏 `printException` 会把异常文本画在**屏幕上**。看一眼屏幕上那行字，
+   直接就是异常类型和消息。
+2. 或者跑 v03.28，看 `midp_stderr.log` 里有没有 `[m3g] threw ...`
+   以及 `render releases=N ... calls= frames= nodes= meshes= sprites= draws=`。
+
+## 2026-10-27 v03.29：log134 点名的两个真 bug（find() 与 FUNC_BLEND）
+
+### 先回答用户的疑问
+用户问"并没有看到屏幕打印什么字啊，哪个游戏？"
+—— **我上一轮说"屏幕会打印异常文本"是错的**。`BioCanvas.printException` 在这个包里是
+**空方法**（另一个会话在 03.28 的记录里也确认过这一点），所以屏幕上什么都不会出现。
+那条建议作废。真正让异常现形的是 03.28 加的 `M3gTrace.fail()`，**log134 里它确实生效了**。
+
+### log134 的关键证据（第一次由日志直接给出答案）
+```
+[m3g] bind target 240x320 clip=0,0
+[m3g] backend init rc=2 active=2 target=240x320
+[m3g] threw java.lang.IllegalArgumentException: bad blending
+[m3g] threw java.lang.NullPointerException                  ×39
+[m3g] render releases=N noCamWorld=0 nullNode=N calls=N frames=0
+      nodes=0 meshes=0 sprites=0 draws=0  vp=0,105 240x140
+```
+`nullNode` 每次都 +1 ⇒ `renderNode(null, ...)` 被调用 ⇒ 场景图一次都没走（`nodes=0`）。
+
+### bug A：`Texture2D.setBlending(228)` 抛异常
+JSR-184 定义了 **`FUNC_BLEND = 228`**（blendColour × texture），而我们的常量只有
+`FUNC_ADD..FUNC_REPLACE`（224..227），校验写成 `func < 224 || func > 227`。
+游戏字节码实证：`BioCtrl ... sipush 228; invokevirtual Texture2D.setBlending(I)V`。
+⇒ 游戏自己的纹理初始化在中途抛异常，后面全部不执行。
+
+### bug B：`loaded[0].find(id)` 永远返回 null —— 由两个缺陷叠加
+游戏的写法（`BioCtrl.loadSkinnedMesh` bci 40..56）：
+```java
+characterModels[i] = (SkinnedMesh) loaded[0].find(meshItemIndex[i][0]);
+```
+1. **`Loader.load()` 返回的顺序错了。** JSR-184 规定**数组 index 0 是根对象**；
+   我们返回的是文件里的槽位顺序。`hunter.m3g` 的 index 0 是个 **Image2D**，
+   于是游戏在 Image2D 上做 `find()`。
+2. **`Object3D.findInternal()` 只比较自己**（`if (userID == id) return this;`），
+   **从不遍历对象图**。JSR-184 里 `find()` 是整图搜索。
+
+两个都错 ⇒ `find()` 全返回 null ⇒ `characterModels[]` 全 null ⇒ 每帧
+`g3d.render(null, transform)` ⇒ NPE（被游戏 catch 掉）⇒ 一帧都没画。
+
+### 修法
+- `M3gReader.readAll()` 新增 `findRootIndex()`：选**没有任何对象引用它**的对象作根
+  （优先 World，其次任意 Node），把它交换到 `out[0]`。
+- `Object3D.findInternal()` 改为 **BFS 遍历 `collectReferences()`**（带 seen 去重、8192 上限）。
+- `Object3D.collectReferences()` 现在包含**动画轨道**；
+  新增 `AnimationTrack.collectReferences()` 包含它的 `KeyframeSequence`。
+  （原来 Object3D 的这个方法是空的，KeyframeSequence 从根不可达。）
+- `Texture2D` 补 `FUNC_BLEND = 228`，校验上界改为 `FUNC_BLEND`。
+
+### 宿主实测（真实模型，模拟游戏的 `loaded[0].find(id)` 逐个 id 查）
+| 模型 | objects | 带 id | 修复前 | 修复后 |
+| --- | --- | --- | --- | --- |
+| `hunter.m3g` | 154 | 152 | **0** | **151**（SkinnedMesh 可达） |
+| `jill_han.m3g` | 201 | 199 | **0** | **198**（SkinnedMesh 可达） |
+| `zombie.m3g` | 109 | 107 | **0** | **106**（SkinnedMesh 可达） |
+| `missionmap.m3g` | 16 | 14 | **0** | **14** |
+
+`hunter.m3g` 的 `out[0]` 现在从 `Image2D id=0` 变成 **`World id=1`**（实测打印）。
+
+### 构建踩坑（重要）
+`vita-port/CMakeLists.txt` 里已经存在另一处 `set(VITA_VERSION "03.28")`（更早的会话写的），
+它排在文件末尾，**CMake 取最后一个赋值**，导致我加的 03.29 被静默覆盖，
+`build.sh` 成功但 VPK 仍是 v03.28。删掉那行旧 set 后正常。
+⇒ **改版本号后必须 `strings` 校验 ELF 里的版本串，不能只看 build.sh 返回 0。**
+
+### 改动文件
+- `jsr184/.../Texture2D.java`（FUNC_BLEND + 校验上界）
+- `jsr184/.../Object3D.java`（find 改 BFS；collectReferences 含动画轨道）
+- `jsr184/.../AnimationTrack.java`（新增 collectReferences）
+- `jsr184/.../M3gReader.java`（findRootIndex + 把根换到 index 0）
+- `vita-port/CMakeLists.txt`（03.29 注释块；删除覆盖用的旧 `set(VITA_VERSION "03.28")`）
+
+### 验证（如实）
+- 宿主：上表 4 个模型的 find 命中率实测；`hunter.m3g` 的 `out[0]` 是 World。
+- `javac -encoding UTF-8 -source 1.4` 编整个 jsr184：0 error。
+- MIDP 构建 0 error；`classes.zip` 里 `Texture2D` 含 `FUNC_BLEND`、`Object3D` 含
+  `collectReferences`、`M3gReader` 含 `findRootIndex`。
+- ELF 版本串 **`J2ME Player v03.29`**，VPK `midp_vita_v03.29.vpk`。
+- **没在 Vita3K/真机上跑过。**
+
+### 下次判据
+1. `[m3g] threw java.lang.NullPointerException` 应大幅减少或消失（特别是 `nullNode=`）。
+2. `render ... nodes=` / `meshes=` 应 **> 0**，`draws=` 应 **> 0**。
+3. 若变成 `frames>0 draws=0` 且 `nobuf`/`noidx` 增长 → 网格数据问题，不再是查表问题。
+4. 若 `nodes>0` 但仍无画面 → 下一个可疑点是纹理（`[m3g] xref miss` 是否出现）与投影尺度。
+
+### 教训
+- **用户的话比我的推断准。** 我说"屏幕会显示异常"，用户直接说"没有字"。**顺着这句话我去看
+  了 printException 的实现，发现它是空方法** —— 如果早点读它，上一轮就不会给出那条错误建议。
+- **"我加的诊断没输出"要分两种情况**：诊断没被触发（场景没发生）vs 诊断本身坏了。
+  log133 是后者（判据卡死在 frames=0），log134 是前者被修好后才拿到的。
+- **同一份文件里可能存在更早会话留下的同名字段/set()**。改版本号这类"全局唯一"的东西，
+  必须校验最终产物而不是相信编辑成功。
+- 这两个 bug（根对象位置、find 不遍历）都属"规范细节"，编译器不会报，只有拿真实资源跑
+  数值对比才会暴露 —— 和上一轮的 `componentRaw` 是同一类问题。
+
+## 2026-10-27 v03.30:log134 补充 + JSR-184 签名补齐 + 多子网格 + 两个隐藏 bug
+
+### 方法:拿"游戏调用了什么"去对"jsr184 定义了什么"
+'EOF' JSR-184 编译的。JVM 按**完整描述符(含返回类型)**解析方法,所以一个签名不对就是
+`NoSuchMethodError`——它是 **Error**,游戏里的 `catch (Exception)` 接不住。脱机脚本 `/tmp/g133/apicov.py`(未入库):
+javap 扫两个游戏的全部 `javax/microedition/m3g/*` 调用,逐个在构建产物 `classes/` 里查。
+6 个(bio 3 + nfs 3),修后 **131 个独立调用(bio 47 / nfs 84)全部解析**。
+:J2ME-Loader 的 `javax.microedition.m3g`(Nokia 实现),与游戏字节码一致。
+(我之前想用 Oracle 文档核对,URL 是凭记忆拼的,404 了——没有用那条路。)
+
+### log134 的补充(另一份分析已覆盖的部分不重复:FUNC_BLEND=228、find()、根对象)
+- **log134 是三个独立进程**(`input_debug.log` 心跳从 #1 重启 2 次,`crumb.log` 有 3 次 `launcher start`)。
+  极品飞车是**单独一次全新进程**(约 19 s,13 次触摸),JIT 在启动时是开的(`UseCompiler(pre)=1`);log133 里它接在生化危机后面,条件不同。
+- `watchdog.log` 有 `STORM preload=169 (pump starved but progressing)`。
+- 极品飞车在 log134 仍是 0 条 `[m3g]`、`[TIMEREXC]`=0 —— **仍然没有证据说明它卡在哪**。
+
+### 上表之外还查出的两个隐藏 bug(都用真实 .m3g 在宿主上实测过)
+1. **`VertexArray` 存取步长与 Loader 不一致**:Loader 存 `data[v*numComponents + c]`,但 `component()/componentRaw()/
+   set()/get()` 用 `v*numComponents*componentSize + c`。SHORT(componentSize=2)时除顶点 0 外全部读错位置;
+   `new VertexArray(n,3,2).set(0,n,short[3n])` 还会越界。宿主实测:`componentRaw()` 与存储数据 12 个数组里 11 个不一致,修后 0。
+   **对照 v03.27**:那次我把"顶点塌成一个点"归因于归一化,这个步长 bug 同样会干扰结果,当时没发现。
+2. **`Matrix4.compose()` 把朝向当欧拉角**:`Transformable.orientation` 是 `{角度(度), ax, ay, az}`,
+   .m3g 文件存的也是这个(例:hunter.m3g 的节点有 `90° 绕 (0,1,0)`),但 compose 把 r[0..2] 当三个弧度欧拉角。
+   改为轴角(Rodrigues,角度制)。宿主验证:90° 绕 +Y 的矩阵、默认节点=单位阵、零长轴=无旋转。
+   hunter 世界包围盒新旧对比:新 181.0×104.6×40.6(x 对称 ±90.5),旧 130.6×153.1×40.6(x 偏向 -124)。
+   这只是间接佐证,**不是证明姿势正确**;决定性依据是规范公式与 .m3g 数据单位。
+
+### 本版改动(均在 `jsr184/`,该目录在 git 里是未跟踪的,无 diff 基线)
+| 文件 | 改动 |
+| --- | --- |
+| `m3g/Node.java` | `getParent()` 返回 `Node`;`getTransformTo` → `boolean`(不同场景图/目标矩阵不可逆返回 false;target==null 抛 NPE) |
+| `m3g/VertexBuffer.java` | 新增 `VertexBuffer()`、`setPositions(VA,float,float[])`、`setTexCoords(int,VA,float,float[])`;`requireSize` 允许 null、无参构造由首个数组定顶点数 |
+| `m3g/Mesh.java` | 新增 `Mesh(VB,IndexBuffer[],Appearance[])`;单 IB 构造填 `indexBuffers[0]`;`get/setAppearance`、`getSubmeshCount` 不再写死 1 |
+| `m3g/Renderer.java` | `drawMesh` 遍历全部子网格(各自 IndexBuffer+Appearance);位置按 VertexBuffer 算一次,UV 惰性算一次,着色按 Material 缓存 |
+| `m3g/VertexArray.java` | 步长统一为 `numComponents` |
+| `m3g/Transformable.java` | 新增 `getCompositeTransform(Transform)` |
+| `com/sun/m3g/Matrix4.java` | `compose()` 改轴角 |
+| `vita-port/CMakeLists.txt` | 03.30 版本块 |
+9 参 `VertexBuffer` 构造和 `setTexCoords(int,VA,float[])`,因为 `vita-port/midlets/M3GTest.java` 在用。
+
+### 验证(如实)
+- `javac -encoding UTF-8 -source 1.4 -target 1.4` 编整个 jsr184:0 error(35 文件/38 class)。
+  **坑**:不要给 `-bootclasspath cldc_classes.zip`,`-source 1.4` 会把 `Foo.class` 展开成 `NoClassDefFoundError.initCause()`,CLDC 没有。
+- 宿主测试(`/tmp/g133/T.java` + 桥接桓 `stub/com/sun/m3g/NativeBridge.java`,均未入库)**33 项全过**:
+  签名语义、`getTransformTo` 数值(5,7,0)、轴角矩阵、三子网格→**3 次 draw 调用**且各用自己的 cull/blend 状态。
+  这个测试第一次跑就抓到了上面两个隐藏 bug(`ArrayIndexOutOfBoundsException: 9`、`getTransformTo` 数值带 1 弧度旋转)。
+- MIDP 构建:日志 `compiling 33 .java files`;时间戳链 `classes/*.class` 11:42:17 → `classes.zip` 11:42:17 → `ROMImage.o` 11:42:31 →
+  `libobj.a` 11:42:32 → ELF 11:42:50 逐级递增;`classes.zip` 里新签名全在;ELF 里新串各 1 份,ASCII `J2ME Player v03.30` 2 份。
+  产物 `vita-port/out/vpk/midp_vita_v03.30.vpk`(12009984 B)。
+- 用构建产物 `classes/` 复查:两个游戏的 131 个 m3g 调用 0 个缺失。
+- **没上真机、没跑 Vita3K。**
+
+### 没做 / 没验证
+- 极品飞车卡在哪仍不明。签名补齐只是排除一类可能(它一旦走到 3D 会撞上 NoSuchMethodError)。
+- SkinnedMesh 仍是刚体渲染。`Renderer` 只用顶点颜色/材质,多纹理单元仍只有 1 个。
+- 9 参 `VertexBuffer`/非规范 `setTexCoords` 重载留着没删。
+- Oracle 规范页未核对(URL 404)。
+
+### 构建坑(延续 v03.28 记录)
+`touch` 源文件不够,需 `touch -d '+8 minutes'`,否则 `build.sh midp` 开头的 `jar uf classes.zip` 会把时间戳刷到比源文件还新。
+.git .github .gitignore .instructions .vscode AGENTS.md BUILD.md BUILD_QUICKSTART.md COMPATIBILITY_ROADMAP.md DEVELOPMENT_PLAN.md FILE_LAYOUT.md PHASE2_MIDP_PORTING_PLAN.md PHASE2_SIMPLIFIED_PLAN.md PORTING.md PROJECT_MEMORY.md README.md VM_BUILD.md build_env.sh debug jsr184 jsr75 patches phoneme-cldc phoneme-midp phoneme_source rebuild_vm.sh tools vita-port `compiling N .java files` 和 ELF 的 UTF-16 串。
+
+### 下一轮怎么看
+1. 生化危机:`vm_output.log` 搜 `render releases=`,应出现 `frames>0`、`meshes>0`、`draws>0`;`[m3g] threw NoSuchMethodError`(如果还有)。
+2. 极品飞车:`[m3g]` 行是否出现(说明走到了 3D);`[TIMEREXC]`;若两者都没有,问题在 `ab.a()` 初始化或 `startOriginApp` 自旋。
+
+## 2026-10-27 log135(v03.23 设备端 dump)分析:喜羊羊"依然破音"
+
+> log135 = 真机 v03.23,`pcm_dump.raw` 1228800 B(600 块 = 6.4 s),`[PCM]` 行 11 条。**没有改任何代码**,只分析。
+
+### 已被设备实测排除(不再怀疑)
+| 假设 | 证据 |
+|---|---|
+| 欠载 / 提交晚 | 11 首曲子的 `[PCM]` 直方图:每首 ~99.9% 在 10.5-10.9 ms,13 ms 以上 **0** 次,max 10754..10772 us。每首 1 次 `quick-returns`(开头第一块,声卡队列本来就空)。34 s 那首 3174 次提交 3171 次在窗内 |
+| 设备渲染与宿主不同 | dump 与宿主 `render_ref` 对同一 WAV 的参考流 **307200 帧 0 个差 >2 LSB,最大差 0** |
+| 削波 | 0 个;峰值 11264 = 34% 满幅 |
+| L≠R / 丢数据 / 512 帧接缝 | L≠R 0;接缝步长/块内步长 0.93;15 个静音段全是曲谱里的休止(18 ms / 51 ms / 318 ms),不是丢数据 |
+| 音符起止爆音 | 15 个间隙前后首尾样本 |值| 分别 ≤ 85(峰值的 0.8%),2 ms 淡入淡出有效;"采样间跳变 >50% 峰值"为 0 |
+| 暂停爆音 | `render stopped 19-20 ms after the request`,v03.15 的淡出在 |
+| 端口/音量 | MAIN 口,48 kHz,S16 立体声,512 粒度,音量 MAX_VOL;只有一个端口 |
+
+### 仍然存在的、可测量的不完美(**未证明它们就是用户听到的"破音"**)
+`debug/tools/wavq/image_err.c`:设备输出 vs 同一 WAV 的理想带限重采样(加窗 sinc):
+- 误差 rms 502 vs 信号 rms 8799 = **-24.9 dB**(未加权);A 加权 **-19.5 dB**。
+- 误差分布:0-3 kHz 是线性插值的 sinc² 衰减(2-3 kHz 约 -4 dB,**音色发闷**,不是噪声);**4-8 kHz 是镜像音**,
+  A 加权后约 -30 dB(相对信号总量),而源 WAV 在 5 kHz 以上几乎没有能量(-96 dB),所以这段是**纯粹重采样产生的**。
+- 源本身是 8 kHz/8 位、峰值只用了 8 位的 34%(约 6.9 位):量化噪声 ~ -41 dB re 信号 rms。
+- 音色:纯 PolyBLEP 方波,无包络/滤波;Sonivox(J2ME Loader)是 GM 乐器 80(Square Lead)带包络+滤波,16 位。
+
+### 结论(如实)
+#'EOF'>>
+'EOF'**时序正确、内容与宿主一致、无欠载/削波/接缝/起止爆音**。所以"破音"若真存在,
+#
+(喇叭对窄带方波/镜像的响应),要么就是**这个音色本身**(裸方波 + 线性插值镜像),
+"某处出 bug"。此前所有"修复"只能让宿主指标变好,这次的设备数据说明**没有剩下的 bug 可修**。
+
+### 工具(新增,`debug/tools/wavq/`)
+`spec_dump.c`(长期频谱/音高/谐波)、`gaps_dump.c`(休止段两端样本)、`image_err.c`(对理想重采样的误差谱)。
+
+### 下一步需要用户信息(无法再靠推理)
+- 描述"破音"的听感:是每个音符头尾"啪"的一声?持续的"嘶"?还是方波本身刺耳/发硬?
+- 同一首曲子在 J2ME Loader 的录音(手机录或内录),用来对比频谱。
+
+## 2026-10-27 v03.31：log135——3D 第一次真的画了；fovy 用了错单位
+
+### log135 是转折点：渲染管线通了
+```
+[m3g] backend init rc=1 active=1 target=240x320        ← 硬件后端(vitaGL)成功
+[m3g] render releases=1..5 calls=1..5 frames=1..5 (+draws=1) verts=708/1416/…
+      nodes=1 meshes=1 sprites=0  vp=0,105 240x140 target=240x320
+```
+**异常 0 条**（`APPEXC` 0、`[m3g] threw` 0）。说明 03.29 的 `find()`/`FUNC_BLEND` 和
+03.30（另一个会话）的 `VertexArray` 索引 / `Matrix4.compose` 轴角修复起效了 ——
+以前"什么都没提交"，现在是"提交了并且在画"。
+
+### 用户问："是不是分辨率高导致显示不全？"
+**不是。** 三个尺寸一致：
+- `crumb.log`: `display: 240x320 scale=0`
+- `[m3g] bind target 240x320`
+- `vita_display_get_width/height` → 240x320
+
+绘制面 = 画布 = M3G target = 240x320，没有缩放/裁剪导致 "显示不全" 的空间。
+
+### 真正的新发现：fovy 用了弧度当角度（JSR-184 违规）
+JSR-184 的 `Camera.setPerspective/setParallel` 的 `fovy` 是**度**：
+- `Camera` 自己的默认值是 `45.0f`（45 弧度是荒谬的）
+- 游戏传 **70.0f**（`ab.a(camera,4587520,…,4915200)`，
+  `ah.a(int)=i/65536` ⇒ `4587520/65536 = 70`，`4915200/65536 = 75` = far）
+
+而 `Renderer.projection()` 直接 `Math.tan(fovy * 0.5f)`，**当弧度用**。
+实测（`/tmp/probe/V.java`）：
+
+| fovy | 旧（按弧度） | 新（按度） |
+| --- | --- | --- |
+| 70 | f=2.1105 → **有效半视角 25.35°** | f=1.4281 → **35.00°** ✔ |
+| 45（默认） | f=1.7926 | f=2.4142 |
+
+⇒ 每个投影都宽了 1.47 倍，而且**对请求角度不单调**（`tan` 每 π 回绕），
+不同标题用相近的角度会得到完全不同的视野。已修：`halfRad = fovy*0.5*π/180`，
+字节码里确认有 `ldc 0.017453292f`。
+
+### 但仍未解释清楚的两件事（不装懂）
+1. **只有任务地图渲染过**：5 帧全是 `vp=0,105 240x140` = `BioCtrl.draw3DMap` 的矩形。
+   之后游戏打印 `map_load_end`、任务 BGM（34 s 曲子）播放、`stopMusic`、回菜单，
+   **整个任务期间没有一条 render 记录**。
+   两种可能，log135 无法区分：
+   - 游戏画面路径根本没 `bindTarget` / 没设过视口；
+   - 游戏画面渲染了但 < 120 帧（旧报告阈值）。
+   本版把判据补严：`bindTarget` 打 `bind #n WxH kind=g|img`（前 3 次 + 每 300 次）；
+   `setViewport` 打**每个不同矩形**（上限 8 个）；render 统计改为前 3 次 + 每 60 次。
+   下次日志能直接判定是"没绑"还是"没到阈值"。
+2. **极品飞车在这一轮完全没进 3D**：`[m3g] load` 10 条全属生化危机，NFS 一条都没有。
+   而且它在 `==== runMidlet enter ====` 之后**进程直接重启**（没有 `runMidlet returned`，
+   也没有任何异常/看门狗记录）。所以它的"蓝屏"是游戏自己的 2D 填充色
+   （`ab.paint` 在 `ab.c==false` 时只画背景），**不是 3D 渲染问题**。
+   这一条仍未定位到根因，需要 NFS 单独的日志（启动后立刻掉出的原因）。
+
+### 构建踩坑（重要，两次都在这上面浪费）
+1. **`set(VITA_VERSION)` 追加到文件末尾是无效的**。`vita_create_vpk(VERSION …)`、
+   `-DAPP_VER=` 给 `GenVersion.cmake` 的命令、以及 `vpk_out_copy` 里的
+   `midp_vita_v${VITA_VERSION}.vpk`，**都是按文件顺序在读到那一行时就展开**。
+   把 set 写在 4154 行（文件尾）时，前面所有消费者已经用旧值生成了 build.make。
+   ⇒ 版本号必须改在**上一个版本那一行**（首次使用之前）。
+   ⇒ 判据：`strings build/cmake/midp_vita | grep "J2ME Player"`，
+   以及 `out/vpk/` 里的文件名。**不能只看 build.sh 返回 0。**
+2. `m3g_native.c` 属于 MIDP 的 `libobj.a`，只跑 `vita-port/build.sh` 不会重编它
+   （VPK 字节数一模一样就是这个信号）。必须先
+   `MIDP_EXTRA_GOAL=…libobj.a bash phoneme-midp/build_vita.sh`。
+
+### 改动文件
+- `jsr184/.../Renderer.java`（fovy 度→弧度；报告改为前 3 次 + 每 60）
+- `jsr184/.../Graphics3D.java`（`bind #n` 计数；`viewport` 不同矩形记录）
+- `vita-port/CMakeLists.txt`（03.31 注释块；版本号改在 03.30 那一行）
+
+### 验证（如实）
+- `javac -encoding UTF-8 -source 1.4` 编整个 jsr184：0 error。
+- 宿主量化 fovy 影响（上表）。
+- MIDP 构建 0 error；`classes.zip` 里 `Graphics3D` 含 `viewport `/`bind #`，
+  `Renderer` 字节码含 `0.017453292f`。
+- ELF 版本串 **`J2ME Player v03.31`**，产物 `out/vpk/midp_vita_v03.31.vpk`。
+- **没在 Vita3K/真机上跑过。**
+
+### 下次看什么
+1. `[m3g] viewport …` 应该出现**多于一个**矩形：任务地图 `0,105 240x140`
+   + 游戏画面（`0,40 240x180` 或 `0,40 240,200` 之类）。只有一个 ⇒ 游戏画面的
+   `setViewport` 从未被调用，问题在游戏侧的分支（不是渲染器）。
+2. `[m3g] bind #n`：`n` 应随游戏画面增长。
+3. `render … frames/draws` 应继续增长；若 `frames` 涨而 `draws` 不涨，看 `nobuf/noidx`。
+4. NFS 需要单独一轮日志：它启动后进程重启，先查为什么掉出（这是独立问题）。
+
+### 教训
+- **"加了日志却只有一条"要先怀疑判据，不是先怀疑设备。** 这次第 3 次踩同一个坑
+  （frames 恒 0 导致阈值永不触发）。现在的规则：**报告按"外部事件次数"触发，
+  并且前几次逐条打**，不要用"被观测值达到某阈值"作为唯一条件。
+- **CMake 的 set() 是顺序展开的**，改全局常量必须改在首次使用之前；追加到文件尾部
+  等于没改，而且构建会成功、版本号却不变 —— 这类"成功但没生效"只能靠**校验产物**发现。
+- 用户问的分辨率假设值得认真回答（三个尺寸一致），但**不能用"不是分辨率"当作结论**，
+  还要说清下一步靠什么区分。
+
+## 2026-10-27 log135 补充:原生 `NativeBridge.draw` 从没用过索引(解释"draws>0 却看不到人物")
+
+> 版本号仍是 03.31(另一个会话已用它做 fovy 修复,本节改动在其之后编译,已并入同一个 03.31 注释块 (c) 项。
+> 若要区分"有无索引展开"的两份 03.31 VPK,看 ELF 里的 `g_xpos`/`g_xuv`/`g_xcol` 符号。)
+
+### log135 证明了什么
+- 生化危机:`backend init rc=1`(硬件 vitaGL)、`render releases=1..5 frames=1..5 (+draws=1) verts=708/1416/… nodes=1 meshes=1`,
+  **`[m3g] threw` 0 条、`[APPEXC]` 0 条**。v03.29/03.30 的签名、find()、步长、轴角修复让渲染真正跑起来了。
+- **但只有任务地图的矩形渲染过**(5 帧全是 `vp=0,105 240x140`),之后整个任务期间没有任何 render 记录。
+  (另一个会话已记录并加了 `bind #n` / viewport 诊断,我不重复。)
+- 环境与 log134 不同:**真机**(`libshacccg` 存在,`backend=hardware`),arm 卡 333 MHz(`perf.log`: "all strategies failed"),
+  fps 5~13。log135 是三个独立进程:生化危机 180 s、极品飞车 16.7 s、喜羊羊 149 s,中间各隔约 26 s(进程重启)。
+
+### 新发现:`NativeBridge.draw` 读了索引却从没用(原生层,`jsr184/src/share/native/m3g_native.c`)
+```c
+KNI_GetRawArrayRegion(indices, 0, nidx * 4, (jbyte *)g_idx);   // 读进 g_idx
+n = nidx;
+...
+v3d_draw_uv(g_pos, ..., g_col, n);                             // g_idx 再没出现过
+```
+.git .github .gitignore .instructions .vscode AGENTS.md BUILD.md BUILD_QUICKSTART.md COMPATIBILITY_ROADMAP.md DEVELOPMENT_PLAN.md FILE_LAYOUT.md PHASE2_MIDP_PORTING_PLAN.md PHASE2_SIMPLIFIED_PLAN.md PORTING.md PROJECT_MEMORY.md README.md VM_BUILD.md build_env.sh debug jsr184 jsr75 patches phoneme-cldc phoneme-midp phoneme_source rebuild_vm.sh tools vita-port (`vita_gl3d_draw_uv` 的 `glDrawArrays(GL_TRIANGLES,0,n)`、`vita_sw3d` 的 `draw_impl`)都只接受**简单三角形列表**
+(顶点 i,i+1,i+2 构成一个三角形)。传 `n = indexCount` 的后果:
+1. 把 `g_pos` 的前 n 个顶点当连续三角形画 —— **不是模型**。
+2. 顶点被共用时 `indexCount > nverts`,**读到 `g_pos/g_col/g_uv` 末尾之外**。
+'EOF''EOF''EOF'(`/tmp/g133/Idx.java`,未入库):hunter 1523 顶点/2052 索引、zombie 675/1668、jill_han 1073/3030、
+missionmap 472/708 —— **全部 `indexCount > vertices`**。log135 里 `verts=708` 正好是 missionmap 的 `indexCount`,这是一个独立印证。
+
+/场景":画出来的是乱序顶点拼成的三角形(且越界),不是模型。
+**这不是唯一嫃疑**:仍然没有任务画面的 render 记录(见上),那部分需要下一轮日志。
+
+### 修法
+`expand_by_index()` / `ensure_x()`:从 `g_idx` 建去索引的 `g_xpos/g_xuv/g_xcol` 再交给后端,**两个后端都不改**。
+def goertzel(x,          0(不信任输入);索引数按 3 截整。rate, 
+
+### 验证(如实)
+- 把真实函数从 `m3g_native.c` 文本抽出,用宿主 `gcc`(`/usr/bin/gcc -B/usr/bin`,见 BUILD_QUICKSTART #12)编译测试
+  (`/tmp/g133/expand_test.c`,未入库):**14 项全过** —— 共享顶点的 quad、uv/颜色跟随索引、越界索引、
+  hunter 形状(1523/2052)逐项核对 2052 个位置。第一版测试有 3 个 FAIL,是测试里的下标算错,不是代码错。
+- `phoneme-midp/build_vita.sh` 带 `MIDP_EXTRA_GOAL=...libobj.a` 重编 `m3g_native.o`,再 `vita-port/build.sh`。
+- 产物核对(`/tmp/g133/verify3.sh`):`m3g_native.o` 15:26:51 → `libobj.a` 15:27:07 → ELF 15:27:12 逐级递增
+  (源文件时间戳是我 `touch -d '+8 minutes'` 推后的,所以显示比它们晚,属预期;make 还打印了 `Clock skew`);
+  ELF 里有 `g_xpos/g_xuv/g_xcol/g_capX`(.bss 局部符号);归档成员 `m3g_native.o` 里也有;
+  `Java_com_sun_m3g_NativeBridge_draw` 反汇编里 `v3d_draw_uv` 有 **2 处调用**(展开/未展开两条路径),`malloc`/`free` 分别是 7/13 处。
+  `expand_by_index`/`ensure_x` 是 static 被内联,没有独立符号,所以不能拿符号名当证据。
+- ELF 版本串 `J2ME Player v03.31`。
+- **没上真机、没跑 Vita3K。**
+
+### 极品飞车(log135)
+*******没有进 3D**:`[m3g]` 里没有它的任何行。它在第一次(接在生化危机之后的同一进程)`runMidlet enter` 之后,
+`vm_boot.log` 只到 `adv.png`,随后进程重启(`input_debug.log` 心跳从 #1 重新计数,两次重启间隔约 26 s);
+`runmidlet_debug.log` 里 `ExtendTorpedoMidlet` 两次 `calling midp_run_midlet_with_args_cp now` 都**没有** `RETURNED`。
+ coredump、`[TIMEREXC]` 0 条、`kernel_forensics.log` 只有模块表。即**它不是"蓝屏卡住",而是进程直接没了**,原因日志里没有。
+(与“同一进程先跑过硬件 vitaGL 后再启动另一个游戏”这个条件完全吻合:生化危机用了 `vglInit`,它接管 GXM,
+ `vglEnd`/释放,后续游戏再初始化显示可能失败。这是**推断**,没有日志证据。最小验证:
+#.git .github .gitignore .instructions .vscode AGENTS.md BUILD.md BUILD_QUICKSTART.md COMPATIBILITY_ROADMAP.md DEVELOPMENT_PLAN.md FILE_LAYOUT.md PHASE2_MIDP_PORTING_PLAN.md PHASE2_SIMPLIFIED_PLAN.md PORTING.md PROJECT_MEMORY.md README.md VM_BUILD.md build_env.sh debug jsr184 jsr75 patches phoneme-cldc phoneme-midp phoneme_source rebuild_vm.sh tools vita-port 
+#
+19 s 没重启,这一点支持该推断。)
+
+### 下一轮怎么看
+1. 生化危机:人物/场景是否出现;`bind #n`/`viewport` 行(另一个会话加的)是否出现任务画面的矩形。
+2. 极品飞车:**单独开机后第一个游戏就启动它**,对比是否还重启。
+
+## 2026-10-27 v03.32：log136 证明几何真的在画；黑屏发生在回读/贴屏或像素本身
+
+### log136 的重大信息（必须先说，因为它推翻了我上一轮的判断）
+上一轮我说"只有任务地图渲染过、游戏画面从未渲染" —— **log136 证明这是错的**：
+```
+[m3g] viewport 0,40 240x180 (#2)                     ← 正是 D_Game_JSR184 的视口
+[m3g] render releases=63 calls=186 frames=186 (+draws=297)
+      verts=282006 nodes=186 meshes=186 vp=0,40 240x180 target=240x320
+```
+**游戏画面渲染了 186 帧、297 次绘制、282006 个顶点**，异常 0 条。
+所以"没有渲染"这一层已经过去了。剩下的问题只可能在三处：
+1. 三角形没落进 FBO（几何被剔除/在视锥外）；
+2. FBO 有内容，但 `glReadPixels` 回读失败/格式不对；
+3. 回读正确，但 `drawRGB(..., processAlpha=true)` 因为 alpha=0 被逐像素跳过。
+
+用户描述的"左右键菜单按一下闪一下就没"正好符合第 3 条：
+2D 菜单先画上去，随后 3D 的整块矩形（视口 240x180）把它盖住 —— 如果那块是
+不透明黑，就变成"闪一下、全黑"。
+
+### 本版做的两件事
+**(1) 决定性诊断（不是猜）**：`NativeBridge.present()` 读回后直接统计这一帧：
+```
+3d: present #<n> distinct=<D>/<T> first=0x<..> centre=0x<..> alpha!=0=<A> backend=<..>
+```
+- `distinct > 0` ⇒ 几何确实进了 FBO；
+- `distinct == 0`（而 297 次绘制都执行了）⇒ 绘制没产出任何像素（剔除/投影/深度）；
+- `alpha != 0` 的像素数 ⇒ 若为 0 就说明 `drawRGB(processAlpha=true)` 会把整帧跳过，
+  这正是"看不见"的机制之一。
+上限 8 条，且只在 `distinct>0` 或前 3 帧时输出。
+
+**(2) 一个真实的 GL bug**：`vita_gl3d.c` **从来没有 `glEnable(GL_DEPTH_TEST)`**
+（既不在 init，也不在每次绘制）。FBO 明明带深度附件，但深度测试全程关闭：
+- 所有三角形按提交顺序覆盖，无 z 剔除；
+- Renderer 对半透明材质会打开 blending 并依赖"不写深度"，关掉深度测试后
+  半透明面会整片盖住后面的不透明几何。
+修：在 `vita_gl3d_init()` 里一次性 `glEnable(GL_DEPTH_TEST)` +
+`glDepthFunc(GL_LEQUAL)` + `glClearDepthf(1.0f)`。
+
+### 改动文件
+- `jsr184/src/share/native/m3g_native.c`（present 里的像素统计 + 弱符号 `v3d_trace_present`）
+- `vita-port/src/vita_3d.{c,h}`（`v3d_trace_present` 实现，写 crumb.log）
+- `vita-port/src/vita_gl3d.c`（启用深度测试）
+- `vita-port/CMakeLists.txt`（03.32 注释块；版本号改在 03.31 那一行）
+
+### 验证（如实）
+- `gcc -c -O2 -Wall -Wextra` 编 `m3g_native.c`：0 error。
+- `arm-vita-eabi-gcc -fsyntax-only -Wall` 检查 `vita_gl3d.c`：0 error。
+- MIDP 构建 0 error；构建 0 error。
+- ELF：版本串 `J2ME Player v03.32`；`strings` 含 `3d: present #`、`gl3d: ready`；
+  `nm` 有 `v3d_trace_present`。
+- 产物 `out/vpk/midp_vita_v03.32.vpk`。
+- **没在 Vita3K/真机上跑过。**
+
+### 下次看什么（一句话判据）
+`crumb.log` 里那几行 `3d: present #…`：
+1. **`distinct=0`** ⇒ 几何根本没进 FBO。接着查剔除与投影：把 `v3d_set_state` 的
+   cull 强制关掉、把 MVP 打印出来核对是否所有顶点都在裁剪空间外。
+2. **`distinct>0` 但 `alpha!=0=0`** ⇒ 回读的 alpha 全 0，`drawRGB(processAlpha=true)`
+   会跳过整帧 ⇒ 去掉 `processAlpha`（或强制 alpha=255）即可立刻可见。
+3. **`distinct>0` 且 `alpha!=0>0`** ⇒ 回读和贴屏都正常，问题在贴屏矩形/时机
+   （例如被 2D 层之后又覆盖）。
+
+### 教训（这轮我错了两次，都要记）
+1. **我上一轮把"没有 render 日志"当成"没有渲染"。** 真因是我自己的报告阈值
+   （每 120 次 releaseTarget）——游戏画面在第 63 次 release 就开始了，
+   正好落在静默窗口里。**阈值必须能覆盖"刚开始发生"的那一刻**，所以现在前 3 次必打。
+2. **用户描述的"闪一下"是重要线索，不是噪声。** "先出现再消失"= 有东西把画面盖住，
+   这直接把方向从"没有渲染"改到"贴屏覆盖"，而不是继续在渲染链上加计数。
+3. **`glEnable(GL_DEPTH_TEST)` 这种"从没写过"的状态，靠读代码很难发现**；
+   这类问题只能靠"渲染了 297 次却看不到"这种矛盾数据反推。
+
+## v03.33(2026-10-27):持续"嘶嘶"声 = 线性插值的镜像噪声,换成多相 FIR 上采样
+
+> 用户确认听感是**持续的"嘶嘶"声**(不是起止"啪"声)。上一节(log135 分析)的结论仍然成立,下面是补充与更正。
+
+### 更正上一节
+- 上一节写的"A 加权后约 -30 dB"和"4-8 kHz 是镜像音"不够准确。`image_err` 的实际输出(log135 的 pcm_dump 对 D0.wav 的理想重采样):
+  4-5 kHz 误差 -29.7 dB,5-6 kHz **-30.2 dB**,6-7 kHz -34.7 dB,7-8 kHz -42.3 dB,8 kHz 以上 -41..-50 dB(均为 A 加权、相对信号总量)。
+  源 WAV 同频段是 -96..-107 dB,所以这些全是重采样制造的,比源高 60-70 dB。
+- 同一次运行的总体数字:误差 -24.9 dB(未加权),-19.5 dB(A 加权)。
+
+### 修改
+| 文件 | 内容 |
+|---|---|
+| `vita-port/src/vita_wav_resample.h` | 新增 `vwr_fir`:32 抽头 Kaiser 窗 sinc、512 相位、Q15 系数,每相位和为 32768(直流增益恰好 1);`vwr_fir_init/locate/window/dot`。`VWR_CUTOFF` 0.98、`VWR_KAISER_BETA` 7.0(可用 -D 覆盖做扫描) |
+| `vita-port/src/vita_audio_javacall.c` | `wav_render_player`:`rate < 48000` 走 FIR(窗口只在整数源下标变化时重取,8 kHz 即每 6 帧一次),`>= 48000` 仍走 `wav_sample_interp`。32 KB 表 `g_fir` 首次使用时建 |
+| `vita-port/CMakeLists.txt` | 版本 03.33 + 说明块(03.32 已被另一个会话的 3D 改动占用) |
+| `debug/tools/wavq/test_fir.c` | 新增宿主测试(用的就是会发布的头文件) |
+
+### 宿主验证(`test_fir.c` + `image_err.c` + `test_resample.c`,全部 PASS)
+- 每个相位系数和 = 32768;相位 0 对称;DC 与满幅方波钳位正常;长度精确。
+- 8 kHz 正弦经上采样后的**最强镜像**(dB re 该音,FIR / 线性):200 Hz -78.9 / -62.9;1 kHz -70.4 / -33.2;2 kHz -64.4 / -18.7;3 kHz -61.1 / -8.7;3.5 kHz -59.4 / -4.3。通带增益 3.5 kHz 内偏差 ≤ 0.14 dB。
+- 参数扫描(截止 0.94/0.96/0.98 × beta 7/8):截止低则 3.5 kHz 衰减 0.4-1.1 dB,选 0.98/7。
+- D0.wav 整曲:对理想重采样的误差,A 加权 **-19.5 dB -> -37.4 dB**;5-8 kHz 段 **-30..-42 dB -> -76..-93 dB**。3-5 kHz 仍有 -38/-52 dB 的残余,是通带边缘(3.5-4 kHz 的方波高次谐波)被滤波器过渡带衰减造成的,属于设计取舍。
+
+### 未验证
+- **没有在真机上听过 v03.33。** 以上全是宿主指标;"嘶嘶"是否消失要用户听。
+- 没有量 CPU 占用:每个输出样本 32 次乘加,48000 样本/秒约 150 万次乘加/秒,窗口 6 帧重取一次;预计对 Vita 不是负担,但没有实测(`audio_debug.log` 的 `[PCM]` 直方图可以看,若出现 13 ms 以上说明跟不上)。
+- 音色本身(裸方波,无包络,8 位)没动。
+
+## v03.34(2026-10-27):铃声改走 MIDI(48 kHz TinySoundFont),不再合成 8 kHz WAV
+
+> 用户:"参考其他模拟器是如何重采样输出的,8khz 输出肯定很差的。"
+
+### 其他模拟器怎么做(查证)
+- **J2ME-Loader**(`Sound.java`,源码已读):**根本不合成铃声,也不重采样**。`init(data, FORMAT_TONE)` 先 `ToneVerifier.fix(data)`,
+  然后 `Manager.createPlayer(stream, "audio/midi")`,由 Android 的 MediaPlayer(Sonivox EAS)播放。EAS 自己的 OTA 解析器(`eas_ota.c`)
+  把每个音符变成 MIDI:GM 程序 **80**(Square Lead)、CC7=127、力度 `vol*4+67`、通道 0,然后由 16 位合成器输出。
+  `Sound(freq, duration)` 则是 `ToneManager.createPlayer(note, ...)`,同样是 MIDI。
+- 所以 v03.14..v03.33 的方向(8 kHz/8 位 WAV + 各种上采样)和 Loader 的做法**根本不同**,上采样器再好也只能修"镜像",修不了 8 kHz/8 位源本身。
+
+### 修改
+| 文件 | 内容 |
+|---|---|
+| `vita-port/nokia_src/RingTone.java` | 新增 `toMidi(byte[])`/`buildMidi(int[])`:把已有的事件表(解析/节奏/style 逻辑不动)写成单轨 SMF:division 500、tempo 500000 µs(1 tick = 1 ms)、程序 80、CC7 80、力度 `vol*4+67`(和 eas_ota.c 一致)、`style` 产生的尾部静音保持不变;自己的 4 槽缓存 |
+| `vita-port/nokia_src/Sound.java` | `init()`:Nokia 铃声先走 `RingTone.toMidi` → `Manager.createPlayer(..., "audio/midi")`;失败才回退到原来的 8 kHz WAV 路径(仍含 03.33 的 FIR) |
+| `vita-port/CMakeLists.txt` | 版本 03.34 + 说明块 |
+| `debug/tools/wavq/RingToneTest.java` | 新增 SMF 结构检查(MThd/MTrk、division、tempo、程序 80、CC7 80、音符数、力度、总时长、末尾 note-off 位置、缓存命中、垃圾输入) |
+| `debug/tools/wavq/render_smf.c`、`DumpMidi.java`(新) | `render_smf` = `vita_midi.c` 的渲染循环 + 峰值/削波/高频能量统计;`DumpMidi` 把真实铃声 blob 转成 .mid |
+
+### 为什么 CC7 是 80 而不是 Sonivox 的 127
+.git .github .gitignore .instructions .vscode AGENTS.md BUILD.md BUILD_QUICKSTART.md COMPATIBILITY_ROADMAP.md DEVELOPMENT_PLAN.md FILE_LAYOUT.md PHASE2_MIDP_PORTING_PLAN.md PHASE2_SIMPLIFIED_PLAN.md PORTING.md PROJECT_MEMORY.md README.md VM_BUILD.md build_env.sh debug jsr184 jsr75 patches phoneme-cldc phoneme-midp phoneme_source rebuild_vm.sh tools vita-port  TinySoundFont + TimGM6mb 渲染三首真曲子(`render_smf`,播放器音量 100):CC7 127 时**削波** 72 / 3487 / 5563 个样本(峰值 100% FS);
+ CC7 40..90:80 时峰值 28 / 30 / 34 % FS、0 削波,与旧 WAV 路径(34%)相当。这是**按这个音色库实测定的**,不是照抄 Sonivox。
+
+### 宿主验证(如实)
+- `RingToneTest` 48 项全过(含 SMF 解析)。
+- `render_smf` 用真实 D0/D1/D2:`tml` 解析正常(1 通道、1 个程序、22/181/127 个音符,总长 8999/33847/20568 ms,与 WAV 路径的曲长一致)。
+- 音色库里 0 号库的 80 号预设存在,名字是 `Square Wave`。
+- `build.sh midp` 成功,VPK `midp_vita_v03.34.vpk`;ELF 里(UTF-16 字符串)能搜到 `ringtone->midi`、`midi createPlayer`,说明 Java 改动进了 ROM。
+
+### 未验证 / 风险(请在真机上看)
+1. **音色**:TimGM6mb 的 "Square Wave" 和 Sonivox 的 80 号不是同一个采样,听感会不同,我没听过。
+2. **CPU**:`tsf_render_short` 在 Vita 上跑单个音符问题不大(每首只有 1 个声部,上限 32),但没测。看 `[MIDI] ended ... render avg/max us (budget 10666 us, N over)` 这行;`over` 不为 0 说明跟不上。
+3. **尾音**:`vita_midi_play` 在最后一个音之后固定再渲染 1500 ms 的释放尾巴,所以 `getDuration`/END_OF_MEDIA 比 WAV 路径晚约 1.5 秒;如果游戏用 END_OF_MEDIA 切歌,切换会稍慢。**没改**,因为那是所有 MIDI 共用的路径。
+4. **暂停/停止**:MIDI 路径的 stop 是否带淡出我没查;WAV 路径有 v03.15 的 10 ms 淡出。停止时可能有爆音,需要听。
+5. **首次加载**:`vita_midi_init` 第一次要把 5.7 MB 的音色库读进内存(约 10 MB);喜羊羊之前没用过 MIDI,第一次播放可能有明显停顿。已在 `[MIDI] soundfont loaded` 日志里能看到。
+6. 本版只改了 `Nokia Sound` 的铃声路径。真 WAV 文件和 `Manager.createPlayer(..., "audio/x-wav")` 的 8 位低采样率文件仍走 03.33 的 FIR。
+
+## 2026-10-27 v03.35:极品飞车蓝屏——纠正两处错误判断 + 加 Display 切屏诊断(无行为改动)
+
+### 用户给的关键事实(推翻了我的两个说法)
+1. **"进程消失"是用户强制关的**,不是崩溃。极品飞车卡在蓝屏,退不出去。
+   我上一轮写的"进程直接没了、无 coredump"是我把用户操作当成了崩溃。
+2. 画面**不是纯蓝**:右侧垂直居中有一小块灰白色窄矩形。说明有东西在往画布上画,不是停在初始填充。
+
+### log136 里极品飞车那一段能证明的(`input_debug.log`,约 52 s)
+- 心跳一直到最后一拍(#3969)都是每约 660 ms 一拍,`CE`(事件计数)与 `ani`(动画线程发送/完成)同步增长,
+  `ani=3968/3968` 无积压;触摸事件一直在收。**VM 活着,Java 层在持续刷新,但界面停在蓝屏、输入无效。**
+- 与已知字节码一致的一条链(推断,无直接日志):`AdvertTorpedoLi` ~3 s 后在线程里调
+  `startOriginApp()`,后者有 `while (originCanvas == advSlip)` 忙等自旋。`getCurrent()` 一直返回广告页就会空转。
+- `Display.getCurrent()` 在 `current == initialDisplayable` 时返回 null,在切屏过程中返回 `transitionCurrent`。
+
+### 我没能确定的
+- 灰白色窄矩形到底是什么。`af.b(Graphics)`(游戏自己的 UI 控件)里有 `fillRect/drawImage` 和状态 `tableswitch`,可能画出
+  右侧软键提示/滚动条,但**只是猜测**。日志里没有极品飞车的截图(`shot.log` 只有 poller up)。
+- `ab.paint` 里 `ad.a(g,54)` 的 54 号颜色是不是蓝色仍未解出。
+
+### 本版改动(纯诊断)
+`phoneme-midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/Display.jpp`,经 `System.out` 进 `vm_output.log`,每次运行最多 40 行:
+- `[DISPLAY] setCurrent(<class>@<id>) thread=.. t=..` —— 每次调用;
+- `[DISPLAY] getCurrent() -> <class>@<id> ..` —— **只在答案变化时**打(先比较引用,忙等循环不会每次分配 String);
+- `[DISPLAY] getCurrent() still <x> after N identical calls` —— N=1000 时一次,之后每 20000 次(忙等自旋的证据);
+- `[DISPLAY] callScreenChange ENTER|DONE <class>@<id>` —— 事件线程真正切屏。`callScreenChange` 在
+  `current == newCurrent` 或无前台时会提前 return,那时只有 ENTER 没有 DONE,这是真实路径,没为凑日志改逻辑。
+- `vita-port/CMakeLists.txt`:03.35 版本块,版本号改在上一版那一行本身(不是追加到文件尾)。
+
+### 怎么读结果
+| 日志 | 含义 |
+| --- | --- |
+| 有 `setCurrent(...ab...)`、没有对应 `callScreenChange ENTER` | 事件线程没处理切屏事件(事件队列/线程问题) |
+| `ENTER` 有、`DONE` 没有且 `current==new` 不成立 | 卡在新屏的 `showNotify`/`paint`(应再看那里) |
+| `getCurrent() still <splash>` 一直不变 | 自旋循环在等一个永远不来的切换 |
+| 根本没有 `setCurrent(...ab...)` | `MonkeyApp.startApp`/`ab.a()` 没走到那一步,问题在更早 |
+
+### 验证(如实)
+- `build.sh midp` 日志 `compiling 1 .java files`;时间戳链 `Display.class` 09:10:34 → `classes.zip` 09:10:35 → `ROMImage.o` 09:10:49 →
+  `libobj.a` 09:10:50 → ELF 09:11:08 逐级递增。
+- 生成的 `Display.java` 含 `[DISPLAY]`×4、`vitaTraceSetCurrent`×2、`callScreenChange ENTER`×1;`classes.zip` 的 `Display.class` 里五个关键串都在;
+  ELF(UTF-16LE)里 `[DISPLAY] setCurrent(`×1、`[DISPLAY] getCurrent() -> `×1、`identical calls thread=`×1;ASCII `J2ME Player v03.35`×2。
+- 产物 `out/vpk/midp_vita_v03.35.vpk`(12021567 B,比 03.34 大约 6.7 KB)。
+- CLDC 1.1 里 `System.identityHashCode`、`Thread.toString`、`Class.getName` 都存在,所以这段代码能编过。
+- **没上真机、没跑 Vita3K。**
+
+### 下一轮需要
+1. 用 03.35 跑极品飞车(**先重启游戏程序,第一个就启动它**),发 `vm_output.log` 里所有 `[DISPLAY]` 行。
+2. 若能截图:卡在蓝屏时同时按 SELECT+START,把截图和 `shot.log` 一起发,直接看那块灰白矩形。
+
+### 教训
+- **用户的操作不是系统事件。** "进程消失"先问用户是不是他关的,不要自己编成崩溃。
+- **用户描述的画面细节("右侧一小块灰白")比我读的字节码更硬。** 它把"没画任何东西"排除了。
+
+## 2026-10-28 v03.36：log137 —— 黑屏的根因是**相机矩阵被多求了一次逆**
+
+### 判读（log137，v03.35 设备端）
+`3d: present` 探针（03.32 加的）给出决定性证据：
+
+```
+3d: present #1 distinct=33600/76800 first=0x00000000 centre=0xff000000 alpha!=0=33600
+3d: present #2..#8  distinct=49200/76800 ...（同上）
+```
+
+- `distinct == alpha!=0 == 33600`，正好是 `240×140` 的视口矩形面积 → 内容**不是空的**，
+  是清屏色铺满视口后没有被任何三角形改写。
+- `centre=0xff000000` 就是 `clear()` 强制补上 A=0xFF 后的清屏色 → 几何**一个像素都没落到**。
+- 同一份 log 里 `render releases=1..3 calls=.. frames=.. verts=708/1416/2124`，
+  累计几百次 draw、28 万顶点，**零异常**（`M3gTrace.fail` 打点是 0）。
+
+结论：几何在提交、没有抛错，但全部被裁剪掉了。
+
+### 根因：`Graphics3D.setCamera(camera, transform)` 的 transform 已经是视图矩阵
+JSR-184 规范里这个参数是 **world space → camera space** 的变换，本身就等于 view matrix；
+只有传 `null` 时才回退到"取 camera 节点自身 transform 的逆"。
+`Renderer.frame()` 之前两种情况**都求了逆**。
+
+证据来自标题自己的字节码（`BioCtrl.D_Game_JSR184`，bci 80..143）：
+
+```java
+Transform t = new Transform();
+t.postTranslate(m03/409.6f, m13/409.6f, m23/409.6f);
+t.postScale(0.012f, 0.012f, 0.012f);
+g3d.setCamera(cam, t);
+```
+
+`Transform.postTranslate/postScale` 都是 `Matrix4.mul(m, t, m)`（右乘），所以合成结果是
+"先缩放 0.012，再平移"的一个合法视图矩阵：
+
+| 用法 | 模型（extent ≈1810 单位）落到视图空间的量级 | 与相机 0.1..75 的关系 |
+| --- | --- | --- |
+| 直接当 view（正确） | `0.012 × 1810 ≈ 21.7` | 在 [near, far] 内 ✅ |
+| 再求逆（v03.35 及以前） | `83.3 × 1810 ≈ 15 万` | 远超 far=75，全部裁剪 ❌ |
+
+这解释了"跑得很流畅、什么都没报、屏幕全黑"。
+
+修复（`Renderer.frame()`）：给了 `camXform` 就直接 `arraycopy` 成 `view`，
+只有 `camXform == null` 时才 `Matrix4.invert(view, worldMatrix(cam))`。
+
+### 同时加的两个"一次定位"探针
+- 裁剪空间探针（前 12 个子网格）：
+  `ndc n=.. behind=.. inside=.. x[..] y[..] z[..] cull=.. blend=.. tex=.. vp=..`
+  与 `ndc winding posArea=.. negArea=.. cull=..`。
+  下次再"画了看不见"：`behind>0` → 视图矩阵错；`inside==0` → 投影/近远平面错；
+  `inside>0` → 是剔除/深度/状态问题（`posArea` 与 `negArea` 对比即知绕向是否反）。
+- 清屏探针（前 6 次）：`clear color=0x.. depthClear=.. colorClear=..`。
+  若某标题关掉深度清屏，FBO 里深度恒为 0，`GL_LEQUAL` 会把所有片元拒掉 ——
+  这是"画了看不见"的另一条路径，现在一眼可辨。
+
+### 顺手修掉的两处**自己造成的**卡顿（用户："生化危机越来越卡"）
+1. `m3g_native.c:present()` 每帧无条件扫描整个 76800 像素做统计（03.32 加的探针）。
+   改为只在 `probeReported < 8` 且 `presentCount<=3 || presentCount%30==0` 时采样，
+   且带步长（每次 ≤20000 采样）。`perf.log` 曾显示 fps 10.1 → 4.6、周期尖峰 3603 ms。
+2. 每帧 `malloc/free` 一个 307 KB 的 ARGB 暂存区 → 改为复用静态 `g_out`。
+   （Vita 上 307 KB 的每帧堆操作会触发频繁 GC 级别的抖动。）
+
+### 验证
+- `javac -source 1.4` 无错；`frame()` 字节码里 `Matrix4.invert` 只剩 null 分支。
+- MIDP 重建 + VPK 重建成功；ELF（UTF-16LE）里三个新探针串各 1 份：
+  `ndc n=`、`ndc winding posArea=`、`clear color=0x`。
+- ASCII `J2ME Player v03.36`；产物 `out/vpk/midp_vita_v03.36.vpk`（12023549 B）
+  与 `midp_vita_v03.36.sym`。
+- **没有在真机/Vita3K 上看到画面。** 以上是字节码 + 规范 + 数量级的推理，
+  加上"探针确实进了镜像"的验证；能不能出画面必须看下一次设备日志。
+
+### 教训
+- **"draw 了、没报错、全黑" = 顶点被裁剪，先算数量级。** 不要再去读回探针/贴图链路
+  里找 bug（上一版就耗在这里）。拿模型的字节尺寸和相机 near/far 一比，
+  `83.3 倍` 与 `far=75` 的冲突是算出来的，不是猜的。
+- **规范里"变换方向"这种一句话差别，代价是 12 轮日志。** 遇到 `setXxx(obj, Transform)`
+  先确认参数方向（world→local 还是 local→world），别靠直觉。
+- **自己加的诊断也可能成为性能 bug。** 每帧全屏扫描 + 每帧 300 KB 堆操作，
+  在 333 MHz 的 ARM 上足够把 10 fps 砍到 4.6。探针必须有次数上限和步长。
+
+## log137(v03.35 = MIDI 铃声)分析 + v03.37 探针(2026-10-28)
+
+> 用户:"破音少了,但整体播放很奇怪,像是曲调被拉长了一样。"选"说不清,先在设备上抓 MIDI 输出的 PCM 转储再比对"。
+
+### log137 能证明的
+- 5 次 `ringtone->midi ok`(246 / 1669 字节),`audio_debug.log` 里 `notify END_OF_MEDIA (midi done)` 正常,循环正常。
+- 第一首(D0)相邻两次 `start` 间隔 11.66 / 10.59 / 11.52 s = 9.0 s 曲长 + 1.5 s 释放尾巴(`MIDI_RELEASE_MS`)。**循环周期比 WAV 路径(9.0 s)长 1.5 s**,这是事实。
+- `pause` 时 `ran` 与 `cur` 相差 ≤7 ms,所以回调计时本身没漂。
+
+### log137 不能证明的(如实)
+- **没有任何 `[MIDI]` 行**:`vita_midi.c` 的统计走 `stderr` → `midp_stderr.log`,而该文件每次启动游戏都被 `freopen("w")` 清空;log137 的最后一局是极品飞车,把喜羊羊的内容冲掉了。所以**没有渲染耗时、没有 over 计数、没有音色库加载记录**。
+- 没有 `pcm_dump.raw`(MIDI 路径当时没接探针)。
+
+### 宿主上对同一份 SMF 的复核(TinySoundFont + TimGM6mb,`render_smf`)
+| 项 | 结果 |
+|---|---|
+| 曲长 / 起音时刻 | D0 8999 ms;起音 0/600/900/1162/1762... ms,与 EAS 的 tick 表一致(`bpmTable`、`32>>exp`、style 0 休止 1/16 全部逐项对过) |
+| 音高 | key 60/64/67/62/65/69 实测 +4/+7/+6/+5/+6/+1 cent(自相关法),**没有被拉低** |
+| 声道 | L/R 相对差 0.96 %,基本单声道 |
+| 包络 | **TimGM6mb 的 80 号 "Square Wave" 不是持续音**:一个 282 ms 的音在 note-off 前就从 RMS 19500 衰减到 ~5500(≈-11 dB),note-off 后 ~65 ms 到 -34 dB。Sonivox 的 80 号是平的方波 |
+| 预设 | 0:80 Square Wave、81 Saw Wave 存在;库里没有更像 Sonivox 的平顶方波 |
+
+### 我之前的一处错误(更正)
+ote-off 后 100-770 ms 才衰减"当成释放太长,**那是把下一个音的起音算进去了**,单音渲染(`prog_sweep`)显示 80 号 note-off 后 65 ms 就到 -34 dB。所以"音符糊在一起"这个解释**不成立**,已撤回。
+
+### 结论
+- 速度、音高、声道在宿主上都对,**我没有找到"拉长"的客观证据**。能解释"和以前不一样"的只有两点,都是**假设**:
+  1. 音色:衰减型而不是平方波(听起来像拨弦/木琴,不像手机铃声);
+  2. 循环周期多 1.5 s。
+- 用户说"说不清",我不替他选。**先量设备**,所以本版只加探针,不改声音。
+
+### v03.37 改动(`vita_audio_javacall.c`、`CMakeLists.txt`)
+1. `midi_out_cb` 接入 v03.22 的 PCM 探针:提交间隔直方图 + 最初 6.4 s 写 `ux0:data/J2ME00001/pcm_dump.raw`(每进程一次)。
+2. 每首曲子在 `audio_debug.log` 里多一行 `[MIDI] play r= smf=.. vol=.. mute=.. smf_len=.. rendered frames=.. ms wall .. ms` 和一行 `[PCM] midi submissions=.. intervals(ms): ...`。这两行**不会被 stderr 的 freopen 冲掉**。
+3. 版本 03.37。构建:`build.sh` exit 0,0 个 `error:`,VPK `midp_vita_v03.37.vpk`;`strings` 能在 ELF 里搜到 `[MIDI] play r=`。
+4. **没有上真机,也没有改任何声音。**
+
+### 请用户做的
+#
+ `midp_vita_v03.37.vpk`,启动喜羊羊,让第一首完整放 ≥7 s(最好放完一轮),然后**先退出,不要接着开别的游戏**,把 `audio_debug.log`、`vm_output.log`、`pcm_dump.raw`、`midp_stderr.log` 发回来。
+:是**每个音拖尾**、**整体变慢**、**两轮之间停顿长**、还是**音高偏低**。
+
+## log138(v03.37 探针)分析 + v03.38(2026-10-28)
+
+### 设备实测(log138,pcm_dump.raw 1228800 B,5 首 MIDI)
+| 项 | 结果 |
+|---|---|
+| 设备 dump vs 宿主 TinySoundFont 渲染(CC7 80) | **逐样本一致**(err/sig 0.0,峰值 9175 = 28 % FS)。合成器、电平、音高、定时在设备上都和设计一致 |
+| 提交间隔 | 10.5-10.9 ms 占 ~96 %,无 ≥13 ms,max ~11 ms,quick-returns 1(开头那次)。**没有欠载** |
+| 渲染耗时 | avg 0.5-0.9 ms / 预算 10.7 ms,0 over,复音 max 6 |
+| 音色库 | 5969788 B、136 预设,正常加载 |
+| 一轮时长 | 9.0 s 的曲子渲染 504832 帧 = **10517 ms**,wall 10.5-11.6 s |
+
+### 发现的真问题
+`vita_midi_play` 在最后一个音之后固定再渲染 1500 ms。对铃声(平衡的方波、释放 ~65 ms)这段里 **后 ~1.2 s 是数字静音**
+(宿主渲染:+100 ms 峰值 315,+300 ms 峰值 2,+400 ms 起全 0)。所以每轮循环有一个 1.2 s 的空洞,END_OF_MEDIA 也晚 1.5 s。
+ start 间隔 10.6-11.7 s。
+
+### v03.38
+`vita_midi.c` 释放尾巴里加 `if (tsf_active_voice_count(g_tsf) == 0) break;`:所有声部结束就收尾,释放中的声部仍计数,不会截断衰减。
+**所有 MIDI 通用**(游戏里的 BGM 末尾同样受益,但行为有变:以前总补 1.5 s 静音,现在可能更早 END_OF_MEDIA)。
+ exit 0,0 个 `error:`,`midp_vita_v03.38.vpk`。**未上真机。**
+
+### 诚实的边界
+- "拉长"是否就是这 1.2 s 空洞,**是假设**:空洞只让每轮间隔变长,不会让每个音变长。如果用户仍觉得"拉长",
+  剩下的客观差异就只有音色(TimGM6mb 80 号是衰减型,Sonivox 是平方波)。
+- 下一步候选(未做):换成持续型预设,或在 SF2 里改包络——需要用户先说明听感。
+
+## 2026-10-28 v03.39：log138 —— v03.36 的"相机修复"是我自己的回归，已回退
+
+### 先说错在哪
+v03.36 我把 `setCamera(camera, transform)` 的参数当成"已经是视图矩阵",删掉了求逆。
+log138 直接否掉:
+
+```
+[m3g] ndc n=472 tris=708 behind=472 inside=0 x[?,?] y[?,?] z[?,?] cull=1
+```
+
+472 个顶点的裁剪空间 w 全部 ≤ 0 —— **全部在相机背后**。
+
+### 决定性证据(宿主 + 字节码 + 移植自己的 reader)
+`javap -c BioCtrl` 找到三处 `setCamera`，其中两处变换**只有一个平移**，没有旋转也没有缩放：
+
+```java
+t.postTranslate(-9.0f, 90.0f, 180.0f);
+camera.setPerspective(70.0f, 1.7142857f, 1.0f, 10000.0f);   // 街景视角
+g3d.setCamera(camera, t);
+
+t.postTranslate(-8.0f, 16.0f, 32.0f);      // 或 (-15, 18, 30)
+camera.setPerspective(70.0f, 1.2f, 1.0f, 10000.0f);         // 地图/道具视角
+g3d.setCamera(camera, t);
+```
+
+这些数就是**相机的世界坐标**。`setCamera(cam, t)` 给的是"作用在相机节点上的变换"
+（camera→world），所以视图矩阵要取逆。**v03.35 本来就是对的**，是我改坏的。
+顺带修正：near=1 / far=10000，不是我当时假定的 0.1..75。
+
+用 `debug/tools/m3gprobe/`（新增，跑在宿主 JVM 上、复用移植代码的 `M3gReader`）实测：
+
+| 模型 | 取逆（正确） | 直接用（v03.36/03.37） |
+| --- | --- | --- |
+| jill_han 1073 顶点 | `behind=0 inside=1073`，NDC x[-0.55,0.39] y[-0.80,0.66] | — |
+| zombie 675 顶点 | `behind=0 inside=675`，NDC x[-0.40,0.49] y[-0.79,0.72] | — |
+| hunter 1523 顶点 | `behind=84 inside=122` | **`behind=1523 inside=0`** |
+
+`hunter` 在"直接用"下 `behind=1523/1523`，与设备端 `472/472` 完全同型 —— 闭环。
+
+角色模型 jill_han / zombie 在取逆后**100% 顶点落在视锥内并且居中原点**，
+NDC y 占满约 94% —— 说明模型就是按 (-9,90,180) 这个相机位姿建模的。方向已确定。
+
+### 顺带排除一个假设：绕向（culling）不是黑屏原因
+同一批实测里 `posArea` / `negArea` 是**混合**的（543/467、293/263），
+说明三角形绕向没有整体反向，"JSR-184 屏幕 y 向下 vs GL y 向上导致正面被当背面剔除"
+这个假设在真实模型上**不成立**。
+仍然加了自动测量作为保险（只在"全部三角形都是背面"时才翻转，见下），
+对这个标题它会判定 `flip=0`（不翻转），是一个 no-op。
+
+### 改动
+1. `Renderer.frame()`：回退成"取逆"。`camXform == null` 时用相机节点世界矩阵的逆，
+   否则用传入矩阵的逆（同一个方向）。附字节码证据注释，并加一次性
+   `[m3g] cam xform eye=x,y,z m00=.. m11=.. m22=..` 原始数值日志。
+2. 绕向**测量式**自动纠正：探针统计前 3 个子网格投影三角形面积的符号，
+   只有 `pos==0 && neg>0`（每一个都被当背面）才翻转提交顺序，打印
+   `[m3g] ndc winding FIX flip=1 pos=0 neg=N samples=3`。
+   翻转结果按 `IndexBuffer` 缓存（`triangleList()` 返回稳定数组），每帧零分配。
+3. `vita_gl3d_present()`：**只回读 scissor 矩形**（在 `vita_gl3d_set_scissor` 里记录）。
+   `perf.log` 显示 `flip=25.9 ms/帧` —— 那是 `glReadPixels` 的 GPU→CPU 全同步，
+   原来读整幅 240×320，而游戏只写 240×140 的视口。现在回读 44% 的像素。
+
+### 验证
+- Java：`javac -source 1.4` 无错；C：VPK 构建 `rc=0`，无 `error:`/`undefined reference`。
+- ELF（UTF-16LE）里能搜到 `ndc winding FIX flip=`、` m00=`、`ndc n=`。
+- ASCII `J2ME Player v03.39`；产物 `out/vpk/midp_vita_v03.39.vpk`（12025540 B）
+  与 `midp_vita_v03.39.sym`。
+- **仍然没有在真机上看过画面。** 但这次"几何在不在视锥内"不再是推理：
+  宿主用同一份 reader 和同一组相机参数算出 `inside=1073/1073`。
+
+### 教训
+- **规范读错一句话 ≠ 有理由删掉别人验证过的代码。** 改之前先去读标题的字节码，
+  别读我的总结。
+- **能算的就不要猜。** 这次把 `M3gReader` 搬到宿主 JVM 上跑，20 分钟拿到了
+  设备端要花一轮日志才能拿到的数字。以后 3D 判读先跑 `debug/tools/m3gprobe/`。
+- **自己上一版的"修复"要当作第一嫌疑。** log138 的 `behind=472/472` 一句就定位了。
+
+## 2026-10-28 log138：极品飞车（仍未解决，只有事实，没有结论）
+
+设备端 `vm_output.log` 里 NFS 的全部 Display 轨迹只有 10 条：
+
+```
+[DISPLAY] getCurrent() -> null          (#1)
+[DISPLAY] setCurrent(AdvertTorpedoLi)   (#2)
+[DISPLAY] callScreenChange ENTER AdvertTorpedoLi (#3)
+[DISPLAY] setCurrent(ab)                (#4)
+[DISPLAY] callScreenChange ENTER ab     (#5)
+[rms] open 'nfs10dat' x2
+[DISPLAY] getCurrent() -> ab calls=4    (#6)
+[DISPLAY] setCurrent(ab)                (#7)
+[DISPLAY] setCurrent(ab)                (#8)
+[DISPLAY] callScreenChange DONE ab      (#9)
+[DISPLAY] callScreenChange ENTER ab     (#10)   ← 之后整个日志结束
+```
+
+事实：
+- 只有 4 次 `setCurrent`、1 次 `getCurrent` 返回变化；**没有任何 `[m3g]` 行** —— 从未进 3D。
+- `#10` 没有 DONE 是**正常**的：`callScreenChange` 开头 `if (current == newCurrent) return;`
+  早退时不会走到 DONE 打点（打点位置在方法末尾）。所以不能据此判断卡在里面。
+- 同一份 log 的 watchdog 末次采样里线程 `#5 vm=RUNNING lastop=io_getstat` ——
+  VM 活着，不是死锁。
+- `midp_stderr.log` 无异常。
+- `java/util/Timer`、`TimerThread`、`TimerTask` 都在 `classes.zip` 里，不缺类。
+
+所以现在**没有**证据说它"卡在某个 API"。很可能是：`ab` 已经切过去了，
+但 `ab.paint()` 画出来就是那块蓝底 + 花屏矩形（截图里那个抖动双色块），
+也就是"跑着但画错"，不是"卡住"。
+下一轮需要针对性打点（`ab.paint` 进出、绘制调用计数、`Image.createImage` 后的首字节），
+**在没加这些点之前我不再猜原因**。
+
+## log139(包 v03.39,含我的 v03.38 尾巴修复)分析(2026-10-28)
+
+> 用户:"声音拉长,应该是一种拖慢或者掉帧的感觉。"**没有改任何代码**,只分析。
+
+### 设备实测
+| 项 | 结果 |
+|---|---|
+| pcm_dump.raw vs 宿主 TinySoundFont(CC7 80) | **逐样本一致**(err/sig 0.0,峰值 9175) |
+| 提交间隔 | 879 次中 833 次在 10.5-10.9 ms,最大 ~11 ms,无 ≥13 ms,无欠载 |
+| v03.38 生效 | 渲染 450048 帧 = 9376 ms(v03.37 是 10517 ms),尾巴空洞已去掉 |
+| 暂停 | `ran=3196 ms cur=3178 ms`,时钟没漂 |
+
+### 结论(如实)
+- **音频线程没有掉帧、没有拖慢**:输出和设计逐样本相同,时间轴 1:1。所以"拖慢/掉帧"的感觉**不在合成与提交链路里**。
+- 还剩的、能在数据里看到的客观因素(都是**假设**,没有一条被证实是用户听到的):
+  1. **游戏本身很卡**:`perf.log` 菜单 6-10 fps,单帧最长 1.5-3.0 s。音乐是独立线程不受影响,但**循环重启要走 Java 侧
+     END_OF_MEDIA→set_time→start**:第一轮从渲染结束到下一次 `start` 隔了约 2.4 s(第二轮只有 0.26 s)。画面/逻辑卡顿期间音乐也会"断一下再起"。
+  2. **起音量化抖动**:`vita_midi_play` 在每个 512 帧块边界才派发消息,起音比理想时刻晚 0-10.7 ms,逐音不一致(±5 ms 级的节奏抖动)。
+  3. **音色在音内变化**:80 号 Square Wave 是衰减型(282 ms 内约 -11 dB),且谐波成分随衰减变化。像拨弦,不像手机铃声的平方波。
+- 没有证据支持"速度错误"(音高 +1..+7 cent,起音时刻与 EAS tick 表一致)。
+
+### 未做
+- 样本精确派发(把块拆成"到下一个事件为止"的小段渲染);换/改持续型音色。两者都需要用户先确认听感方向。
+
+## 2026-10-28 v03.40：log139 —— `Transform.post*` 实现成了 pre-multiply（规范级错误）
+
+### log139 的实测数字（v03.39 设备端）
+
+```
+[m3g] cam xform eye=-9.0,90.0,180.0 m00=1.0 m11=1.0 m22=1.0
+[m3g] ndc n=472 tris=708 behind=0 inside=472 x[4,4] y[-40,-40] z[98,98] cull=1 tex=1
+[m3g] ndc winding FIX flip=0 pos=0 neg=0 samples=3
+3d: present #1 distinct=36184/76800 first=0x00000000 centre=0xff000000 alpha!=0=33332
+```
+
+`fmt()` 是 `(int)(v*100)`，所以 NDC 实际是 **x=0.04, y=-0.40, z=0.98**。
+
+- **相机方向对了**：`behind` 从 472 → **0**，`z=0.98` 正好是 eye z=180 / far=10000 的预期值。
+  这一段确认 v03.39 的"取逆"是对的，v03.36 的"直接用"是错的。
+- **但 472 个顶点全落在同一个 NDC 点**。宿主 `debug/tools/m3gprobe/SceneDump` 用同一份
+  `M3gReader` 算出 `inside=472 / z=0.989`，与设备一致 —— 说明顶点数据本身没问题，
+  塌陷发生在**变换**上。
+- `alpha!=0 = 33332`，视口 33600 → **268 个像素 alpha=0**，即几何只覆盖约 268 像素且全透明。
+
+### 根因：`post*` 是 pre-multiply
+
+`Matrix4.mul(out, a, b)` 的语义是 `out = a * b`（见 `Matrix4.java:20`）。
+而 `Transform` 里所有 `post*` 都写成 `Matrix4.mul(m, x, m)`，即 **`m = x * m`** —— 这是
+**pre-multiply**。`pre*` 系列方法则根本不存在。
+
+JSR-184 规定：
+
+| 方法 | 规范 | 我们的旧实现 |
+| --- | --- | --- |
+| `postMultiply(t)` | `M = M * t` | `M = t * M` ❌ |
+| `postTranslate(...)` | `M = M * T` | `M = T * M` ❌ |
+| `postScale(...)` | `M = M * S` | `M = S * M` ❌ |
+| `postRotate(...)` | `M = M * R` | `M = R * M` ❌ |
+
+**为什么这会让整个 3D 场景消失：**`javap -c BioCtrl` 显示标题给每个节点都这样构造变换：
+
+```java
+t.postTranslate(m03/409.6f, m13/409.6f, m23/409.6f);
+t.postScale(0.012f, 0.012f, 0.012f);
+```
+
+按规范是 `T*S`，顶点映射为 `0.012*v + p`，**平移原样保留**。
+按我们的实现是 `S*T`，顶点映射为 `0.012*(v + p)` —— **平移也被除以 83**，
+于是所有节点被拖回原点附近，不管游戏把它放在哪。这就是"472 顶点塌成一点"。
+
+**为什么相机一直是对的：**`BioCtrl.setCameraTransform` 用 `Transform.set(float[16])`
+（一次性赋值，不走 post*），所以相机路径从来不受这个 bug 影响。这也解释了
+为什么我前几轮在相机上反复折腾都没解决画面 —— 相机一直没错。
+
+### 修复
+
+- `postMultiply/postTranslate/postRotate/postScale` → `M = M * t`
+- 新增 `preMultiply/preTranslate/preRotate/preScale` → `M = t * M`（原来完全缺失）
+- 旋转矩阵抽成私有 `rotation(...)`，两处共用
+- 宿主验证：`postTranslate(13, 37.65, 180)` 后 `postScale(0.012)`
+  → 对角 0.012、**平移仍是 (13, 37.65, 180)**；旧实现是 (0.156, 0.4518, 2.16)
+
+### 新增诊断
+
+```
+[m3g] root t=<tx>,<ty>,<tz> s=<m0>,<m5>,<m10>
+```
+
+只打前 3 次。下次日志可以直接看到"标题构建出来的 root transform 到底是多少"，
+不需要我再从字节码推测。
+
+### 验证
+
+- `javac -source 1.4` 无错；MIDP + VPK 重建 `rc=0`。
+- 从 `classes.zip` 反编译 ROM 里的 `Transform.class`，`postScale` 尾部是
+  `invokestatic Matrix4.mul(m, m, s)` → 确认修复进了 ROM。
+- ELF 里能搜到 `root t=`、`cam `、`ndc n=`、`ndc winding FIX flip=`。
+- ASCII `J2ME Player v03.40`；产物 `out/vpk/midp_vita_v03.40.vpk`（12026197 B）。
+- **依旧没有在真机/模拟器上看到画面。** 这是规范层的确定错误（有字节码依据），
+  但我无法从 log139 反推设备上 post* 的实际行为，所以**不保证这一版就能出画面**。
+  `root t=` 那一行就是为此加的。
+
+### 教训
+
+- **`post*`/`pre*` 这类"语义方向"错误，光看渲染结果是查不出来的**：相机对、顶点对、
+  投影对、探针全绿，唯独自家的矩阵库把乘法写反了。这种代码必须**对照规范逐条核对**，
+  而不是等日志报错。
+- **探针要打输入，不要只打中间量。** 我打了 mvp 算出来的 NDC，却没打 `rootTransform.m`
+  本身；如果有那一行，v03.38 就能定位，不至于拖到 v03.40。
+- **用户说"别瞎说"是对的。** 我在 v03.36 把"相机取逆"当成根因并宣布修好，结果是我自己
+  的回归；v03.39 又只修回原样。两轮都建立在"我觉得规范应该是这样"之上，而不是先量数据。
+
+## 2026-10-28 log139：卡顿 —— 数字上没有"减缓"，反而更慢
+
+`perf.log`：
+
+```
+f=300  fps=9.9 period=100.2 (33.3..1484.8) flip=23.2 (14.8..38.8) prepare=14.9 arm=333MHz
+f=600  fps=8.0 period=124.9 (50.0..3036.4) flip=25.6 (17.3..42.8) prepare=17.3 arm=333MHz
+```
+
+- `flip` = `total - prepare`，其中包含 `sceDisplaySetFrameBuf` + `sceDisplayWaitVblankStart`。
+  vblank 本身就 16.7 ms（60 Hz），所以 v03.39 的"只回读视口"改动**在这项里看不出来**，
+  它影响的是 `prepare`。
+- `prepare` 14.9→17.3 ms 是 Java/渲染侧。
+- `period` 100→125 ms，而 flip+prepare ≈ 40 ms → **每帧还有 60~90 ms 花在 MIDlet 自己的
+  Java 逻辑**上，运行在卡死的 333 MHz ARM（`[PERF] arm stuck at 333 MHz (asked 444)`）。
+- 用户感觉"卡顿减缓"与这三个数字（fps 9.9→8.0→6.1）不一致。**我没有找到能解释这种
+ 主观改善的量，所以不宣称已经优化。**
+
+## 2026-10-28 log139：极品飞车（仍是蓝屏，本轮无改动）
+
+`vm_output.log` 里 NFS 段依然**没有任何 `[m3g]` 行**，`midp_stderr.log` 无异常，
+`[DISPLAY]` 轨迹与 log138 同型（4 次 `setCurrent`、1 次 `getCurrent` 变化）。
+本轮改动全部在 jsr184，与它无关。**下一轮要专门为它加探针，在那之前不给结论。**
+
+## v03.41:GM 80 号改成持续型单层方波(2026-10-28)
+
+> 用户:"换成持续型音色。我很好奇你是怎么得出 dump 音频没问题的……能真实听到才对吧。"
+
+### 对"dump 没问题"的更正(重要)
+"dump 与宿主渲染逐样本一致,所以音频没问题"。**这个推理只证明了一件事**:设备把合成器的输出原样交给了硬件,
+ivox 听感一致——两边都错也会"逐样本一致"。
+"传输无损"说成"声音没问题"是我的过度结论。**听感只能由耳朵判断**,我这里所有数字都是代理指标。
+
+### 衰减的真正来源(实验,不是猜)
+'EOF' TinySoundFont 渲染 D0 第 1 个音(282 ms),20 ms → 260 ms 的电平变化:
+| 变体 | 变化 |
+|---|---|
+| 原样 | -8.2 dB |
+| 关 modEnv→滤波 | -8.4 dB(**我先前的猜想被推翻**) |
+| 关 LFO 音量/滤波 | -8.2 dB |
+| 关 modEnv 音高 | -3.1 dB |
+| + 振幅包络平顶 | -2.6 dB |
+| + 只留一层 | **-0.1 dB** |
+80 号预设有两组各 7 个 region(0-6 与 7-13),同一键域上两层调音差几音分(tune -6 与 0)会**拍频**,且两层 sustain 不同(0.977 / 0.676),第二层还有 modEnv 音高扫频。
+Sonivox 的 80 号是平的。
+
+### v03.41 做了什么
+`vita_midi.c` 新增 `midi_patch_square_wave()`,在音色库加载后调用:只留第一层,振幅包络平顶(decay 0 / sustain 1),关掉 modEnv/LFO 的音高和滤波,滤波全开,
+attenuation -6 dB(补回去掉的一层)。**只改 0:80**,游戏 BGM 的其他音色不变。
+
+### 验证(宿主,把出货函数原样 awk 抽出来编进测试程序)
+(((≥150 ms 的音)起音 vs 松键前电平:
+- D0(22 个音):中位数 -10.4 → **0.0 dB**,最差 -16.1 → -1.3
+- D1(181 个音):中位数 -7.4 → **-1.2 dB**,最差 -18.0 → -3.7(F5 附近,采样本身的残留)
+- D2:所有音 88 ms,不适用此指标
+- 峰值 30 / 33 / 37 % FS,无削波
+ `build.sh` exit 0,0 个 `error:`,`midp_vita_v03.41.vpk`。**未上真机,没听过。**
+
+### 已知风险
+- 单层方波比两层叠加"薄",我只补了 6 dB 的电平,**没有**补音色厚度。
+- 样本循环点和 Sonivox 的合成方波不同,谐波结构会不一样。
+- 这只是代理指标,听感是否"像手机铃声"要用户来判。
+
+## 2026-10-29 v03.42：log140 —— 先纠正我自己制造的两个错误判断
+
+### 错 1：log140 的 `present` 探针是**垃圾数据**，我差点当成"有进展"
+
+```
+3d: present #1 distinct=76780/76800 first=0x81504690 centre=0xff000000 alpha!=0=56488
+```
+
+`alpha!=0 = 56488` **大于**视口面积 33600，`first = 0x81504690` 明显是堆指针。
+原因是我 v03.39 改动：`vita_gl3d_present()` 只回读 scissor 矩形，但
+`m3g_native.c present()` 仍然转换全部 `g_w*g_h` 像素并把整个数组交给 Java，
+于是**视口外的行从未被回读写入，是 malloc 未初始化内存**。
+
+而 v03.39 那次改动**实测没有任何收益**：
+
+| 版本 | flip | prepare |
+| --- | --- | --- |
+| v03.38 全幅回读 | 25.6 ms | 17.1 ms |
+| v03.39 只读视口 | 25.3 ms | 17.1 ms |
+
+`flip` 被 `sceDisplayWaitVblankStart`（16.7 ms）主导，`prepare` 一点没动。
+所以我把它**回退**成全幅回读——代价为零，换来帧缓冲语义完整、探针可信。
+
+### 错 2：v03.40 的 `post*` 修复对本 draw **没有任何影响**
+
+log140 的 ndc 行与 log139 **逐字节相同**（`x[4,4] y[-40,-40] z[98,98]`）。
+虽然 `root t=` 那行证明 03.40 代码确实在 ROM 里跑，但这一帧的输出没变。
+
+### log140 证明的事实（自洽，不能再解释成格式问题）
+
+```
+[m3g] root t=0.0,0.0,0.0 s=0.67,0.67,0.67
+[m3g] ndc n=472 ... x[4,4] y[-40,-40] z[98,98]
+[m3g] ndc winding posArea=0 negArea=0
+```
+
+`posArea == negArea == 0` 只可能发生在**每个三角形投影面积恰好为 0** 时，
+也就是 472 个顶点真的落在同一个点上。"塌陷"是真实的。
+
+### 但它**在宿主上无法复现**
+
+新增 `debug/tools/m3gprobe/HostRun`：把 `com.sun.m3g.NativeBridge` 换成记录桩，
+在桌面 JVM 上跑**真正的 `Graphics3D` + `Renderer`**，加载与设备**同一个 jar**
+（设备日志 `[jarmem] loaded ... size=1006733`，与本地文件字节数相同）。
+
+| root 变换 | 宿主结果 |
+| --- | --- |
+| `S(0.67)`（设备日志里的值） | `ndc x[-0.976,0.978] y[-0.395,0.339] pos=236 neg=0` |
+| `T*S(0.012)`（字节码里的值） | `ndc x[0.023,0.058] y[-0.406,-0.393] pos=236 neg=0` |
+| identity | `ndc x[-1.477,1.440] y[-0.390,0.706] pos=236 neg=0` |
+
+**同样的代码、同样的文件，宿主是散开的，236 个三角形全部正面。**
+所以差异在**输入数据**，不在数学。
+
+### 因此 v03.42 只加一行，用来打输入（前 3 个子网格）
+
+```
+[m3g] ndc src v0=<x,y,z> v1=<...> vL=<...> mdl=<m0,m5,m10> mt=<tx,ty,tz>
+              ps=<positionScale> pb=<bias> cnt=<n> comps=<c> sz=<s>
+```
+
+判读规则（写死，不留解释空间）：
+- `v0 == v1 == vL` → 顶点数组在设备上是退化的（读取/ROM 数据问题）
+- `v0 != v1 != vL` → 退化来自模型矩阵
+
+**我不再往下猜。**
+
+### 性能：数字与"越来越卡"的描述相反
+
+| 日志 | fps | period | period 尖峰 |
+| --- | --- | --- | --- |
+| log137 | 4.6–10.3 | 69–216 ms | 3603 ms |
+| log138 | 4.8–11.4 | 87–207 ms | 2803 ms |
+| log139 | 6.1–9.9 | 100–163 ms | 3036 ms |
+| log140 | 5.5–15.4 | 65–180 ms | **3887 / 133** |
+
+log140 后半段（f=2050..3550）稳定 **fps 15.2–15.4、period 65 ms、尖峰 133–150 ms**，
+是四轮里最好的一段；前半段（f=300..1750）是 5.5–9.8 fps + 3887 ms 尖峰。
+同一份日志里覆盖了两种负载，所以"越来越卡"无法用这份 perf 证实或否证。
+
+已知硬瓶颈：`[PERF] VERDICT: arm stuck at 333 MHz (asked 444, all strategies failed)`。
+固件不允许上 444 MHz，一切性能都被压在 333 MHz。本轮不改性能。
+
+### 教训（第三次同类）
+
+- **数字要先做合理性检查再相信。** `alpha!=0 > 视口面积` 是物理上不可能的，
+  如果我第一步就查这个，就不会有"distinct=76780 好像画出来了"的错觉。
+- **自己上一版的改动永远是第一嫌疑。** log140 的假数据完全来自 v03.39。
+- **能在宿主复现的，就不要让用户测。** `HostRun` 这次一次性排除了"数学错误"，
+  把范围压缩到"输入数据"，而这是以前几轮完全没做到的。
+
+## v03.43:释放时间过长导致音符互相拖尾(2026-10-29,log140 分析)
+
+ v03.41:"根本没有用,音质依然稀烂,声音拉长。"
+
+### log140 证明了什么
+- `[MIDI] preset 0:80 patched to a steady single layer: 7 regions kept, 7 dropped` 在 midp_stderr.log,补丁确实生效(v03.41 b330)。
+- 渲染 avg 262 us / budget 10666 us,0 over;提交间隔 10.5-10.9 ms 占 99.5%,无欠载。传输链路没问题(这一点和"好不好听"无关)。
+- 所以 03.41 的"电平拉平"**不是**"拉长"的原因。我上一版的结论(持续电平下滑 = 拖)是错的方向。
+
+### 真正漏掉的:release
+ J2ME-Loader:它对 Nokia 铃声只做 `ToneVerifier.fix` 然后原样交给 Sonivox(EAS OTA 解析器),**自己没有任何 OTA→MIDI 转换**;
+Sonivox 的方波 note-off 后立即停。核对了本仓库 RingTone.java 与 eas_ota.c:时值表、附点/三连音、style 的 1/16 静音、scale、volume 都一致,节奏换算没有偏差。
+::TimGM6mb 0:80 的 `ampenv.release = 0.385 s`(宿主用出货函数实测:note-off 后 120 ms 仍 -23 dB),
+>> D2 = 88 ms、D1 = 176 ms —— 每个音都拖进下一个音里,听起来就是"拉长、糊"。
+(默认 tempo 另有一处与 EAS 不同:RingTone 初值 `BPM_TICK[15]`,EAS 是 30476;三首曲子都显式发 tempo,不影响本问题,未改。)
+
+### 改动
+`vita_midi.c` `midi_patch_square_wave()` 增加 `r->ampenv.release = 0.02f`。
+'EOF''EOF':note-off 后 10 ms -40 dB,20 ms 后 0 个活动 voice。build.sh exit 0,0 error,`midp_vita_v03.43.vpk`。**未上真机,没听过。**
+
+### 如果还不对,下一步(不再猜)
+1. 让用户录一段设备声音 / 或说明具体听感:是"每个音变长"(应已解决)还是"整体速度慢"(则查 tempo)。
+2. 对 D2 做逐音时域对比:Sonivox 渲染(需要 EAS 库)vs 当前,而不是只比电平。
+
+---
+
+## 2026-10-30 v03.45：帧耗时 17.1 ms 的来源——先量带宽（只测量，不改行为）
+
+> 产物 `out/vpk/midp_vita_v03.45.vpk`（12029843 B），版本串
+> `J2ME Player v03.45 b330`。**未在真机运行。**
+
+### 为什么盯上 `prepare`
+log140（v03.41）每一帧行都长这样：
+
+```
+[PERF] f=300 fps=9.4  period=105.40 flip=25.55 prepare=17.27
+[PERF] f=600 fps=9.1  period=109.38 flip=25.53 prepare=17.12
+[PERF] f=900 fps=9.8  period=101.37 flip=25.09 prepare=17.05
+```
+
+`prepare` = 我们自己在 `flip_to_display()` 里的绘制（清黑边 + 缩放 blit + 覆盖层）。
+它在几千帧上稳定在 **16.86..18.12 ms**。这个"太稳"恰恰是关键：ALU 密集的循环会被
+调度器打断，抖动会大得多；而内存受限的循环抖动很小。
+
+算一下就通了：
+
+```
+每帧写入 = 407 × 543 px × 4 B = 884 KB
+prepare  = 17.1 ms
+隐含带宽 = 884 KB / 17.1 ms ≈ 52 MB/s
+```
+
+52 MB/s 不是 Cortex-A9 的 ALU 上限，是 **uncached 内存写入**的数量级。而
+`vita_fbmem.h` 用的正是 `SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW`——v01.67 为了修
+真机黑屏**特意**选的 uncached（显示控制器直接读内存，CPU 的脏行留在 cache 里）。
+
+### 一条必须写死的"不可行"
+把 framebuffer 改成 cacheable **不能做**，包括 `CDRAM_L1WBWA_RW`：名字里的
+write-back write-allocate 正是 v01.67 那个黑屏的成因。所以选项只剩"怎么把这些
+uncached 写发出去"：32 位单字、64 位、还是 LDM/STM 突发。
+
+`rgb565_to_abgr` 已确认是 `static inline`、ELF 里 0 处 `bl`（反汇编验证），所以
+17 ms 里 ALU 占比未知——**这正是要测的**。
+
+### 探针做了什么
+`vita-port/src/vita_membw.c`（新），在 `lfjport_ui_init()` 里 CDRAM 块刚分配完、
+**第一次 memset 之前**跑一次（那时两个缓冲都是未初始化内容，写脏了也没人看见）：
+
+| 变体 | 目的 |
+| --- | --- |
+| `fill32` cached / uncached | 纯写成本基线（cached 侧是"ALU 能跑多快"的对照） |
+| `fill64` uncached | 64 位 store ⇒ 总线事务数减半，看是否 transaction-bound |
+| 库 `memcpy` cached / uncached | "先写 cached 中转缓冲再整块拷出"这个设计的直接测量 |
+| 手写 4 字复制 uncached | 若比库 memcpy 快 ⇒ newlib 没用上最宽的 store |
+| `rgb565→abgr` cached / uncached | **真实热循环**，两者之差 ≈ 纯内存代价 |
+
+每次 128 KB、重复 3 次**取最小值**（任何扰动只会让一次跑得更慢，所以下界才是机器
+的真实能力），每个变体末尾读回一个值到 `volatile` 汇点，防止被优化掉。
+
+输出：
+```
+[MBW] n=128KB reps=3 | fill32 cached=X uncached=Y MB/s | fill64 uncached=Z \
+      | memcpy cached=.. uncached=.. MB/s | copy4 uncached=.. MB/s
+[MBW] rgb565->abgr cached=.. uncached=.. MB/s (us A vs B, dst=128KB)
+[MBW] VERDICT frame=884KB @32b=T1 @64b=T2 | ratio uncached/cached=N%
+[MBW] hint: @32b frame time = .. ms (implied .. MB/s); perf.log prepare=17.1 ms
+```
+
+**判读规则（写死，避免以后又猜）**：
+- `@32b frame time ≈ 17 ms` ⇒ blit 是内存受限；正解是**加宽 store** 或
+  **cached 中转 + 突发拷贝**，NEON 无用。
+- `fill64` / `copy4` 明显快于 `fill32` ⇒ 直接换宽写，1 个小改动的收益可算出来。
+- `rgb565→abgr cached` 与 `uncached` 差不多 ⇒ 说明 ALU 才是瓶颈，那才轮到 NEON。
+- `memcpy uncached` 远快于 `copy4` ⇒ newlib 已经最好，别自己写。
+
+开关 `ux0:/data/J2ME00001/membw.cfg` 的 `on=0` 关掉（默认开，一次性约 60 ms）。
+进程内只跑一次（`g_ran` 守卫）。
+
+### 关键文件修改记录
+- `vita-port/src/vita_membw.c` / `vita_membw.h`（新）：六个变体 + `time_min_us()`
+  取最小 + `mbps_x10()`（**bytes/us 恰好等于 MB/s**，所以用整数十分之一避免浮点）
+  + `frame_us()` 外推 + `membw_enabled()` + `vita_membw_get()`（给以后诊断浮层用）。
+- `vita-port/src/vita_display.c`：include；`lfjport_ui_init()` 在 `vita_fb == NULL`
+  检查之后、两次 memset 之前调 `vita_membw_probe()`。
+- `vita-port/CMakeLists.txt`：`src/vita_membw.c` + `set(VITA_VERSION "03.45")`。
+- `COMPATIBILITY_ROADMAP.md`：P1-3 第 3 项补"先量"的判据，并把
+  "framebuffer 改 cacheable（含 L1WBWA）" 标为**不可行**及原因。
+
+### 验证
+- **新增主机单测** `/tmp/mbwtest`（9 场景全 PASS，每场景 fork 隔离 static）。
+  测量本身是真机事实，测的是"把测量变成结论"的那部分：
+  1. 算术：给定假时钟步长，`128 KB / 1000 us` 必须报 **131.0 MB/s**（131072/1000），
+     且 884 KB 外推到 **6906 us = 6.90 ms**；
+  2. 慢目标按比例放大（20 ms/128 KB ⇒ 138125 us = 138.12 ms）；
+  3. 源太小（128×160 = 20480 像素）时**收敛到 80 KB**，不会读越界；
+  4. 源 100 像素时拒绝并打印 `source too small, skipped`；
+  5. `NULL` / 过小 `bytes` 不崩；
+  6. `on=0` 关掉且**第二次调用完全不输出**（run-once 守卫）；
+  7. cfg 里没有 `on=` 时保持启用（容忍手写多余键）；
+  8. **探针确实写了**（framebuffer 内容必须改变，否则"零成本"会伪装成无限带宽）；
+  9. 第二次调用返回 0 且无输出。
+- 11 套既有单测（gdtest/p2test/vkeytest/dectest/jpegtest/permtest/perfshim/
+  splashtest/bartest/jartest/mbwtest）全 PASS。
+- `./build.sh` exit 0，`out/vpk/midp_vita_v03.45.vpk`，版本串
+  `J2ME Player v03.45 b330`；`nm` 含 `vita_membw_probe` / `vita_membw_get`，
+  `strings` 含全部 `[MBW]` 格式串。
+- `readelf -l`：TEXT `+0x3db8b4`，RW 起 `0x813f0000` → 余量约 **82 KB**。
+- **真机未验证**（本版就是给真机取数用的）。
+
+### 踩到的坑
+- 改 `CMakeLists.txt` 里 `set(VITA_VERSION "03.44")` 时把紧跟其后的 `# 03.33 …`
+  两行注释一起删掉了，且第一次忘了补 `set(VITA_VERSION "03.45")`
+  —— grep 版本序列才发现。**规矩：每次追加版本块后立刻
+  `grep -n 'set(VITA_VERSION' | tail -4` 核对序列与总数。**
+- 探针的两个断言一开始把毫秒精度写错（报了 `6.906ms`，实际打印 `6.90ms`）。
+  单测失败暴露的是**我的期望值**错，不是代码错——这类"格式断言"要用实际格式反推。
+
+### 没做 / 下一步
+1. 真机跑一轮拿 `[MBW]` 四行，按上面的判读规则选路：
+   - 内存受限 → 加宽 store / cached 中转（1–2 个会话，可用 `prepare` 直接验收）；
+   - ALU 受限 → 才考虑 NEON（但要先解决 `-mfpu=neon` 与解释器硬浮点 ABI 的冲突）。
+2. 顺带可以做 P1-8 的 FPS 浮层：`vita_perf_get()` 与新的 `vita_membw_get()` 都已有
+   数据，接上去以后就不用每次拔卡看 `perf.log`。
+3. 仍在等真机日志的三条：v03.44 的 `[img]`/`[gfx]` 探针、v03.42 的
+   `[m3g] ndc src`（顶点是否退化）、v03.43 的音质听感。
+   （log141 已回答前两条的一部分，见下一节。）
+
+## 2026-10-30 build.sh 不重编 Java 的修复 + log141 分析（v03.45 设备日志）
+
+### 构建修复：vita-port/build.sh
+- 现象：v03.44 第一次构建，ROM 里没有新加的 `[img]`/`[gfx]`/`psBits=` 探针，`Image.class` mtime 仍是 10-26，
+  但脚本退出 0。
+- 根因：`build.sh midp` 在调 `build_vita.sh` 之前对 `classes.zip` 做 `jar uf`（并入厂商类），zip 的 mtime 被刷新；
+  midp 的 make 用源文件 mtime 对比 zip，判定“无需重编”（日志 `no need to recompile .java files`）。
+- 修复：`jar uf` 前 `touch -r` 记下 zip 的 mtime，之后还原（`mktemp` 临时文件，用完删除）。
+- 验证：只 `touch` 一个 `Image.java` 再跑 `build.sh midp`，日志变成 `compiling 1 .java files` +
+  `preverifying 1 .class files`，`Image.class` mtime 更新。
+- 另一个依赖：宿主需要 `gawk`（只有 mawk 时 `reldir` 报错，且 `build_vita.sh` 在 Settings.gmk 之后不继续）。
+- 遗留：`build_vita.sh` 在 Java 没重编时仍然静默退出 0；没有加断言，因为“确实无改动”是正常情况。
+
+### log141 在 NFS（极品飞车）上的事实
+- 位图全部加载成功：`[img] ok` 均有尺寸，`load ...fail` 为 0，`drawRegion REJECTED` 为 0。
+  所以“位图没加载”和“drawRegion 被拒”都被排除（仅限探针覆盖的前 60 次调用）。
+- 前 60 次 `drawRegion` 全部落在目的 x >= 240（屏幕宽 240）：24 个 32x32 瓦片从 x=240 起、11 个 16x16、25 个字形
+  在 x=340..402。其中 35 次的裁剪区是 `0,0 0x0`（空），25 次是 `0,0 240x320`。
+- 这 60 次只是第一帧。它们是“从右侧滑入”动画起点，还是布局基于更宽的屏幕，从这份日志分不出来。
+- 日志末尾停在 `callScreenChange ENTER ab`（#11），与 log137 同型。
+- 没有结论。下一版探针要看后续帧：只记目的落在可见区内的调用、记 `setClip` 变化、把采样改成按帧间隔而不是只取前 60 次。
+
+### log141 在 BioMain（生化危机）上的事实
+- 仍然是 `ndc n=472 ... x[4,4] y[-40,-40] z[98,98]`，顶点塌成一点。
+- `ndc src` 一行都没有出现。ELF 里 v03.44/v03.45 都有该字符串，所以不是没编进去。
+- 计数：`ndc n=` 12 次，`ndc winding posArea` 9 次，差 3；并且前 3 个 `ndc n=` 后面都没有 winding 行。
+  `ndc src` 恰好位于二者之间、只对前 3 次执行。
+- 推断（未证实）：`ndc src` 的字符串拼接在前 3 次抛了异常，异常在 `drawMesh` 里一路传出，被游戏吞掉，
+  这 3 个子网格的 `NativeBridge.draw` 被跳过。log140（v03.41，没有这条探针）没有这个缺口。
+  也就是说这条探针本身可能是回归，v03.42 起前 3 次绘制被丢掉。
+- 计数对照：log140（无该探针）`ndc n=` 12 次、`ndc winding` 12 次；log141 是 12 对 9。少的 3 次与 `dbgVertDump < 3` 吻合。
+- v03.46 已做：`ndc src` 包 `try/catch Throwable`，失败时打 `ndc src FAILED <异常>`，绘制继续。ELF 里已确认字符串在；未上机。
+
+### 运行环境更正：log141 跑在 Vita3K，不是真机
+- log141 的性能数字（`arm=444 MHz`、fps 14.7/14.2、`prepare` 1.3 ms）都是模拟器的，不能和真机的 log137~140 比，
+  也不能用来验证或否定 v03.45 的带宽假设。此前我写"原因不明"，现在原因清楚：环境不同。
+- 真机 log140 的 `prepare` 17.1 ms 仍是真机数字；要验证带宽假设必须用真机日志。
+- v03.45 的 `vita_membw` 探针结果没出现在 log141，很可能也是模拟器环境所致（未核实）。
+- 与环境无关的结论仍成立（位图加载、`drawRegion` 参数、顶点塌缩）。新信息：**生化危机的顶点塌缩在 Vita3K 上同样复现**，
+  说明它不依赖真机硬件，可以在模拟器上迭代调试。
+
+## 2026-10-30 v03.48：生化危机 3D 黑屏根因 —— `Float.intBitsToFloat` 返回值在 s0，解释器读 r0（log142/log143）
+
+### 证据链（log143，v03.47，Vita3K）
+- `ndc src` 输出（v03.47 改成打 IEEE 位模式，因为 v03.46 的 `Float.toString` 对这些值抛了无消息的 `RuntimeException`）：
+  `ps=813f3258 pb=813f3258,813f3258,813f3258`，`raw r0=c6f17e00,c6803800,0`，`model m=3f2b851f`（0.67）。
+- 原始整数顶点分量正常且各不相同；Java 自己算出来的 0.67 也正常；但 `positionScale` 和三个 `positionBias` 的位模式**完全相同**，
+  都是 `0x813f3258`。`nm` 查到它是 `_current_thread` / `jvm_fast_globals` 的地址，不是浮点数。
+- `M3gReader.f32()` = `Float.intBitsToFloat(u32())`，所以每个 float 都读成了 r0 里的残留指针（-3.5e-38）。
+  所有顶点被缩到 ≈1e-33，所以 `ndc` 恒为 `x[4,4] y[-40,-40] z[98,98]`。
+- 同源现象：`Float.toString` 遇到这类值时 `FloatingDecimal` 的 `Assertion botch` 抛 `RuntimeException`，这就是 v03.42 探针失败的原因。
+
+### 机制
+- `Java_java_lang_Float_intBitsToFloat` 反汇编：`vldr s0,[r3,#-4]; bx lr`，结果在 s0。
+  `Double_longBitsToDouble`：`ldrd r2,r3; vmov d0,r2,r3; bx lr`，结果在 d0。
+- 解释器（`bc_impl_fast_invokenative_internal` → `shared_call_vm` → `bc_impl_freturn/dreturn`）从整数寄存器取结果：
+  float → r0，double → r0 = HIGH / r1 = LOW。与 `native_math_*_entry`（`jvm_*_isoft` 适配）是同一约定。
+- 这两个 native 不在 `QuickNativesMatcher` 的 float/double 分支里（只有 void/int/obj），所以走通用 native 入口，路径如上。
+- `floatToIntBits` / `doubleToLongBits` 返回整数，没有问题。
+
+### 修复（overlay，不改共享源、不改 build/share）
+- 新增 `phoneme-cldc/src/vm/os/vita/vita_kni_fp_overlay.S`：两个适配入口，保留原名，调 `*_c`，再把 s0/d0 搬到 r0 / r0:r1。
+- 新增 `phoneme-cldc/src/vm/os/vita/patch_kni_fp.sh`：在定义这两个 C 体的库成员（`_MergedSrc003.o`）里
+  `objcopy --redefine-sym X=X_c`，再把 overlay 作为独立成员 `ar r` 进库；`nm` 校验 X 与 X_c 各恰好一份。幂等（已有 `_c` 就跳过）。
+- `rebuild_vm.sh` `pack_lib`：在打包 `Interpreter_arm.o` 之后调用 `patch_kni_fp.sh`（+5 行）。
+- 没有放进 `vita-port/CMakeLists.txt`（它只管链接）。新文件未被 `.gitignore` 屏蔽。
+- 库：21 → 22 个成员。
+
+### 验证
+- 新增 `debug/tools/fpmodel/bitsnat.py`：用真实 ELF 里的入口跑 42 个用例（`floatToIntBits` 12、`doubleToLongBits` 10、
+  `intBitsToFloat` 11、`longBitsToDouble` 9），检查调用方能观察到的整数寄存器。
+- **修复前（v03.47 ELF）**：ok=22 wrong=20。`intBitsToFloat` 11/11 错、`longBitsToDouble` 9/9 错，`r0=0x813f3258`，
+  与 log143 里设备上读到的值**逐位相同**——模型复现了设备现象。
+- **修复后（v03.48 ELF）**：42/42。回归：校准 0 不一致、解释器 FP 字节码 40/40、Math 42/42、硬浮点 d2i/f2i 50/50。
+- `patch_kni_fp.sh` 对同一个库连续跑两次，结果相同；链接 0 error、0 undefined。
+- 产物 `vita-port/out/vpk/midp_vita_v03.48.vpk`。**还没有在 Vita3K 或真机上跑过。**
+
+### 用例里踩到的一个坑（防再犯）
+- 第一次写 `bitsnat.py` 时把 `doubleToLongBits` 的参数高低字放反了，报了 10 个 WRONG，差点当成 ELF 缺陷。
+  对照 `KNI_GetParameterAsLong`（`JavaStackDirection < 0`：base-4 是 HIGH、base-8 是 LOW）改正后 10/10 通过。
+  这是 fpmodel README 里"先怀疑模型/用例"那条的又一次实例。
+- 用例里一度写死了全局变量地址；KNI 参数基址是 `_kni_parameter_base`（`0x813f333c`），不是 `jvm_fast_globals`。现在从符号表取。
+
+### 浮点问题排查结论（本轮盘点）
+- 原生函数表 552 项，签名含 `F`/`D` 的 14 项：
+  - `invokeD` / `invokeF`（`DebuggerInvoke`）：调试器专用，未用，未检查返回约定。
+  - `NativeBridge.draw` / `setMvp`（`([F...)`）：只是 `float[]` 数组，用 `KNI_GetRawArrayRegion` 按字节拷贝，不经过 float 寄存器，不受影响。
+  - `floatToIntBits` / `doubleToLongBits`：返回整数，模型 22/22 通过。
+  - `intBitsToFloat` / `longBitsToDouble`：**本次修复**。
+  - `Math.sin/cos/tan/sqrt/ceil/floor`：早已由 `native_math_*_entry` 适配，模型 42/42。
+- 其他 C 代码里没有再出现 `KNI_GetParameterAsFloat/Double`、`KNI_ReturnFloat/Double`、`jfloat Java_` 的使用（`FloatNatives.cpp` 之外）。
+- 解释器调用的 28 个 `jvm_*` 助手：v03.10/11 已全部适配，本轮校准与 40 项字节码用例重跑通过。
+- **没覆盖的**：JIT 生成的浮点代码（`launch.cfg` 为 `jit=0`；`vita_arm.cfg` 里 `ENABLE_JIT := true` 只是默认值，实际是否生效以 `jit=` 为准）；
+  `DebuggerInvoke.invokeD/F`；`jvm_l2d`/`jvm_l2f`（libgcc 是 Thumb，模型跑不了，只验证了寄存器搬运）。
+
+### 影响面与对旧结论的修正
+- 受影响的是**所有**读 float 的 Java 代码：`M3gReader` 的 44 处 `f32()`（缩放、偏移、相机、变换、动画关键帧）、
+  `DataInputStream.readFloat`、以及任何经 `Float.intBitsToFloat` 的路径。
+- 此前对生化危机黑屏的多条归因（矩阵方向、winding、`post*` 顺序、相机取逆）都建立在被污染的 float 数据上，其中 v03.36~v03.40
+  的"修复"没有一个是这次的根因；它们是否仍然正确，要等 v03.48 真正显示出画面后才能重新判断，**不要据此回退任何一项**。
+- 极品飞车不走 M3G 加载器（没有 `[m3g]` 行），但它的 2D 界面如果读过 float，也可能受影响；log141 里没有 float 相关证据，未下结论。
+
+## 2026-10-30 v03.49：log144 分析 —— 浮点修复生效，但仍黑屏；加软件光栅器计数探针（只诊断）
+
+### log144（v03.48，Vita3K）事实
+- `ndc src`：`ps=3c1d8609`（0.0096）、`pb=c1502520,43229378,0`（-13.0, 162.6, 0）；`ndc n=` 从 `x[4,4] y[-40,-40]` 变成
+  `x[-97,97] y[-39,33]`；`ndc winding` 从 `pos=0 neg=0` 变成 `posArea=236 negArea=0`；`ndc src FAILED` 为 0。**v03.48 的浮点修复在 Vita3K 上起效。**
+- 用日志里的位模式重算第一个顶点：视图空间 (-198.8,-86.8,-180) → NDC ≈ (-0.92,-0.69)，在视锥内；`z=0.98` 对应视距 180（near=1/far=10000），在 [-1,1] 内。
+- 这一屏是任务地图（`missionmap.m3g`，472 顶点），其 `ps`≈0.0096；此前拿来对照的 0.0276 是 `hunter.m3g` 的值，不是同一个模型。
+- 画面仍黑。`crumb.log` 的 `present` 行 `distinct=33600 / 49200`、`centre=0xff000000`：33600=240x140（任务地图视口）、
+  49200=240x205；这只是"清屏后的矩形"，**分不出"没画出像素"和"画出了黑色像素"**，所以现有探针无法回答。
+- `gl3d: libshacccg.suprx not found under ur0:data` → 回退 software 后端（Vita3K 上；真机是否同样回退未核实）。
+- 玩法阶段（视口 `0,40 240x180`，`render releases` 到 123、307，`draws` 持续增长）没有任何 `ndc` 几何数据：该探针只记前 12 次，全是任务地图。
+
+### 宿主验证（真实 `vita_sw3d.c`）
+- 画单位三角形 4 种组合：cull=0 时 CCW/CW 都画出 9600 像素；cull=1 时 CCW 画出 9600、CW 画出 0。
+  日志里三角形全是 CCW（`posArea>0`），所以不会被剔除 → **背面剔除方向不是原因**。
+- Java→C 的 `setMvp/draw/clear/setScissor` 都走 KNI 取参，`float[]` 按字节拷贝，不受 s0/r0 问题影响。
+
+### 本版做了什么（vita-port，无行为变化）
+- `vita_sw3d.c/.h`：新增 `vita_sw3d_stats_t` 与 `vita_sw3d_take_stats()`。三角形级：进入/被 w 裁剪丢弃/面积 0/被 cull/包围盒为空/真正光栅化；
+  像素级：写入、在三角形外、z 越界、深度测试失败、写入后"亮"（任一通道>32）、带纹理/无纹理；颜色：传入顶点色最大值与实际写入最大值；
+  纹理：创建成功/失败/全暗（抽样 ≤4096 点，三通道都 ≤32）、清屏次数。
+- `vita_3d.c`：`v3d_present` 在 software 后端按"第 1-3 帧 + 每 60 帧"输出 3 行 `sw3d#N ...` 到 `crumb.log`。
+  不再依赖 `m3g_native.c` 的 `probeReported < 8`（那个上限在启动后几秒内就用完，覆盖不到玩法帧）。
+- 宿主用真实 `vita_sw3d.c` 跑 7 个场景核对计数语义：空清屏、白三角形、CW+cull（`cull=1 rast=0`）、暗色(10)三角形
+  （`wr=9600 bright=0 out=10,10,10`）、w<0（`clip=1`）、全黑纹理（`tex dark=1`，`bright=0 out=0,0,0`）。
+- 产物 `vita-port/out/vpk/midp_vita_v03.49.vpk`；ELF 里已搜到三个新格式串与 `vita_sw3d_take_stats`；0 error、0 undefined。**未上机。**
+
+### 怎么读下一份日志（写死判读规则）
+- `rast=0`：看 `clip`（w<0，整批在眼后）/`a0`（面积 0）/`cull`/`bb`（包围盒为空）哪个占满。
+- `rast>0` 且 `wr=0`：看 `out`（点在三角形外）/`zr`（z 越界）/`zt`（深度测试失败）。
+- `wr>0` 但 `bright=0` 或 `out=0,0,0`：画出来了但是黑的。再看 `in=`：`in` 也很小 → 着色阶段的问题；`in` 正常而 `out` 为 0 → 纹理（`tex dark>0`）或混合。
+- `tex fail>0`：纹理创建失败，贴图丢失。
+
+### 一个待核对的假设（没有设备证据）
+- `Renderer.shade()` 在没有任何光贡献时颜色 = `ambient*0.2 * 顶点色`；材质为空时默认 ambient=0.2 → 约 10/255，
+  会被探针归为"暗"。如果 `in=` 很小，这就是下一步要查的地方。BioCtrl 里有 `Light` 的创建和 `setMode/setColor`，
+  但没有核实它是否经 `Graphics3D.addLight` 真的进入了 `xLights`（只确认 `Graphics3D.addLight` 存在）。
+
+### 没做的
+- 此前提过"`ndc` 几何探针改成按视口采样以覆盖玩法阶段"，本版**没有做**：先看 `sw3d#N` 的数字能否直接回答；不够再加，避免一次改太多。
+
+## 2026-10-30 v03.50：log145 分析 —— 玩法画面的三角形全部死在 w 裁剪；加玩法相机/网格采样探针（只诊断）
+
+### log145（v03.49，Vita3K）光栅器计数 —— 第一份有因果信息的数据
+- 任务地图（前 3 帧，视口 `0,105 240x140`）：`dr=1 tri=236 clip=0 a0=0 cull=0 bb=0 rast=236`，`px wr=8770 out=26650 zr=0 zt=0 bright=7437 tex=8770`，
+  `in=255,255,255 out=231,40,66`，`tex ok=1/2 fail=0 dark=0`。**软件光栅器、纹理、着色、背面剔除方向、浮点修复全部正常。**
+  地图确实被画出来了：写入 8770 像素，其中 7437 个"亮"，最大颜色 (231,40,66)。
+- 此前"画面是黑的"只对玩法阶段成立。上一版（v03.49 之前）的 `present` 探针把"清屏矩形"当成"有内容"，所以分不出这一点。
+- 进游戏后（视口 `0,40 240x180`）：
+  - 第 60 帧窗口：`dr=244 tri=75926 clip=73094(96.3%) rast=2832 wr=105240`，其中 2832=12×236，恰好是 12 个"地图式"draw 还在画；
+  - 第 120/180 帧窗口：`dr=310 tri=97460 clip=97460(100%) rast=0 wr=0 out=0,0,0`。
+  - `a0=cull=bb=0`，`zr=zt=out=0`：**唯一的丢弃原因是 `clip_w`**。`clip_w` 只在三个顶点的 w 都 ≤ 1e-4 时丢掉整个三角形，
+    也就是玩法几何**整体在眼后（或 w 退化）**。
+- `tex ok=10 fail=0 dark=0`：10 张纹理创建成功，没有全暗。
+- 日志里没有 `threw`/`FAILED`/异常，排除"被游戏吞掉的异常"。
+
+### 玩法相机来自哪里（字节码，未在设备上验证）
+- `BioCtrl.setCameraTransform(int, AffineTrans)`：把 `AffineTrans` 的 `m00..m23`（整数，除以 4096）按行填进 `float[16]`，
+  `m30..m32` 固定写 0、`m33=1`，再 `camTransform.set(float[])`；`camera.setPerspective(camFOV[i]*7/9, 1.3333334f, 1, 10000)`。
+- 该 `AffineTrans` 来自 `m_3D_ViwTrans.setViewTrans(pos, look, up)`（游戏自带的 `com.capcom.mascotcapsule.AffineTrans`），
+  再乘 `rotationX/Y/Z(2048)` 的结果。**游戏 jar 里的 `setViewTrans` 是个桩：`setIdentity(); Thread.sleep(1)`，没有计算任何视图矩阵。**
+  所以玩法相机矩阵到底是什么，光看字节码推不出来；`pos/look/up` 向量由游戏逻辑填，是否合理不知道。
+- `Transform.set(float[])` 的转置方向（`m[col*4+row] = matrix[row*4+col]`）我读过，与"按行填入"的约定一致，不是明显错误，但没做数值验证。
+- 取逆是否正确（`Renderer.frame` 里 `view = invert(camWorld)`）只在任务地图相机（纯平移）上被设备数据证实；
+  对带旋转的玩法相机没有设备数据。
+
+### 本版做了什么（jsr184 Renderer，无行为变化）
+- `frame()`：玩法帧（`vpDrawH != 140`）每 30 帧一次、最多 12 次，输出
+  `gcam#N f=帧号 vp=WxH xform|node camW r0/r1/r2/t/w行`，以及 `gcam#N view t=,w= ; root=`（视图矩阵平移与 w 行、根变换）。
+- `drawMesh()`：玩法帧每 200 次 draw 一次、最多 16 次，输出
+  `gmesh#N d= n= idx= tex= cull= blend= v0= world= eye= w=`（第一个顶点的模型/世界/眼空间坐标和裁剪 w）
+  与 `gmesh#N model m= t= proj m0= m5= m10= m11= m14= m15=`。
+- 全部用 IEEE 位模式（`hx()`），不再走 `Float.toString`（log142 里它对坏值抛过无消息异常）；整段包在 `try/catch Throwable` 里，失败打 `gcam FAILED`/`gmesh FAILED`，不影响绘制。
+- 版本 03.50。`Renderer.class` 重编（含 4 处新字符串）、ELF 里 `gcam#`/`gmesh#` 在、0 error、0 undefined。**未上机。**
+
+### 怎么读下一份日志（写死判读规则）
+- `gmesh` 里 `eye=` 的第三个值（z）：Java 的相机看向 -Z，所以**可见物体的眼空间 z 应为负**。
+  - z > 0 或 `w <= 0`：几何在眼后。再看 `gcam`：
+    - `view t` 与 `camW t` 互为相反数（平移取负）且 `w=0,0,0,3f800000`：取逆本身没问题，问题在相机位置/朝向的来源（`pos/look/up` 或 `AffineTrans`）；
+    - `view` 的 w 行不是 `0,0,0,1`：矩阵的第四行被污染，查 `Transform.set(float[])` 的填充或游戏的 `m30..m33`。
+  - z < 0 且 `w > 0` 但 `|z|` 超过 far(10000)：尺度问题（`model` 的缩放，看 `gmesh model m=`）。
+- `gmesh model m=` 的缩放：地图是 0.67；玩法阶段如果是 0.012（`T*S(0.012)`）或 0，要结合 `v0` 的量级判断。
+- `proj m0/m5` 不在 1~3 之间，或 `m11` 不是 `bf800000`（-1）：投影矩阵有问题。
+
+### 没做的 / 仍不知道的
+- 是不是游戏本身在 Vita3K 上把相机放错（例如依赖了 MascotCapsule 的 `AffineTrans` 真实实现，而这个 jar 里的是兼容桩）：没有证据，只是字节码里 `setViewTrans` 是桩这一点值得怀疑。
+- 真机与 Vita3K 的差别、硬件 GL 后端（`libshacccg.suprx` 缺失，回退 software）：未核实。
+
+## 2026-10-30 log146 分析（v03.50，Vita3K）—— 玩法几何整体在相机后方；相机只有朝向、没有位置（只分析，未改代码）
+
+### 数据（`gcam#`/`gmesh#`，位模式已解码）
+- 玩法相机（视口 `240x180`，帧 31~361 共 12 次采样）**完全不变**：`camW` 3x3 为正交旋转（det=0.9993，行长 0.9997~0.9999，行间点积≈0），
+  行 = (0.358,0.801,0.479) / (0.479,-0.598,0.642) / (0.801,0.000,-0.598)；**平移 = (0,0,0)**，w 行 = (0,0,0,1)。
+- 视图矩阵（取逆）平移也是 0，w 行 (0,0,0,1)：取逆本身没有出错。
+- 投影：`m0=1.6457 m5=1.2343 m10=-1.0002 m11=-1 m14=-2.0002 m15=0`，m5/m0=0.75、fovy≈78.0°，是正常的透视矩阵（`setPerspective(camFOV*7/9, 1.333, 1, 10000)`）。
+- 7 次网格采样（僵尸、Jill、两个四边形）的**眼空间 z 全为正**（0.19~3.81），即全在相机后方，`w=-z<0`，与 log145 的 `clip=100%` 完全吻合。
+  对同一组世界坐标做推演：`view=R^T`（现行）7/7 在后方；`view=R` 与 `view=I` 都有部分/全部在前方，但都在视锥外（偏轴），所以这几个点**区分不了**相机约定。
+- 模型矩阵的对角项出现 0（如 Jill 的 `m=0,38e978d5,0`）：非均匀/带旋转的缩放，尺度 0.0011~0.012 不一，Jill 约 0.0011（房间叠加层 0.012）。
+  Jill 世界位置约 (-4.8,0.3,-4.3)。**没有解出这些缩放是否合理**。
+- 视口、`near=1/far=10000`、投影都正常；`FAILED` 为 0。
+
+### 字节码（BioCtrl，未在设备上验证；有一处自相矛盾没解开）
+- 相机只有一个调用点：`setCameraTransform(i, m_3D_Trans[4])`，其中 `m_3D_Trans[4] = m_3D_ViwTrans * (rotZ(2048) * (rotX(0)*rotY(2048)))`。
+  `setCameraTransform` 把 `m03/m13/m23`（除以 4096）写进 `float[16]` 的第 3/7/11 项，第四行固定 0,0,0,1，再 `Transform.set(float[])`
+  （`m[col*4+row]=matrix[row*4+col]`，我核对过下标，平移落在 m[12..14]，没有丢）。
+- 这个 `AffineTrans` 的平移来自 `m_3D_ViwTrans.m03/m13/m23`。游戏 jar 里 `setViewTrans` 是桩（`setIdentity(); Thread.sleep(1)`），
+  而另一段代码（偏移 385 起）才用 `BioData.m_ViwData[i][0..2]` 把位置写进 `m_3D_ViwTrans`，且位于 `setCameraTransform` 调用**之后**。
+  所以"平移恒为 0"在字节码里是说得通的，**但日志里的旋转是一般旋转而不是 `rotY(180°)*rotZ(180°)=diag(1,-1,-1)`**，
+  说明调用时 `m_3D_ViwTrans` 并非单位阵——我没能把这两点对上，不排除我对控制流（偏移 166~278 与 385 起是否同一路径）读错了。
+- 本仓库没有内置任何 `mascotcapsule`/`capcom` 类（ELF 里 `AffineTrans` 为 0 次），所以不是 ROM 同名类盖住了游戏 jar 里的实现。
+
+### 两个仍然成立的假设（都没有设备证据）
+1. **相机约定**：`Renderer.frame` 对 `setCamera(cam, t)` 取逆（把 `t` 当相机→世界）。这在任务地图相机（纯平移）上被设备数据证实；
+   对"带旋转、零平移"的玩法相机没有证据。若游戏传入的其实已经是世界→相机（MascotCapsule 的 `setViewTrans` 语义），应当不取逆。
+2. **相机位置丢失**：`gcam` 的平移是 0，物体离原点 4~5 个单位。若游戏本应把位置放进这个矩阵（`m_ViwData[..][0..2]`），那么位置是在别处丢的（游戏里的 `AffineTrans` 乘法/赋值顺序，或 `m_ViwData` 本身）。
+- 7/7 都在后方而不是约一半，概率上更像系统性问题（约定/符号），而不是相机恰好背对。但样本太少，不能当证据。
+
+### 下一步（待用户选择）
+- 方案 A（推荐）：加运行时开关，从 `ux0:/data/J2ME00001/defaults.cfg` 读 `m3gcam=inv|direct`（沿用 `3d=` 的读取方式），一次装机即可对比两种约定；默认保持现行 `inv`，不改变行为。
+- 方案 B：在 `Transform.set(float[])` 上记录前 N 次 16 个浮点（含调用顺序），把游戏实际传给相机的矩阵全部落盘，验证上面那处矛盾。
+- 两者都不涉及改现行渲染行为。
+
+## 2026-10-30 v03.51：相机约定运行时开关 `m3gcam=`（默认行为不变）
+
+### 为什么做
+- log146：玩法相机旋转正常、平移为 0；7/7 采样网格在现行 `inv` 约定下眼空间 z > 0（全在相机后）。这 7 个点分不出三种约定，
+  所以不再猜，改成可在一次装机里对比。
+
+### 怎么用
+- 在 `ux0:/data/J2ME00001/defaults.cfg` 里加一行（必须在行首，与 `3d=` 同样的匹配方式）：
+  - `m3gcam=inv`（默认，缺省/写错都是它）：`view = inverse(T)`，即此前所有版本的行为
+  - `m3gcam=direct`：`view = T`（`T` 已经是视图矩阵，MascotCapsule `setViewTrans` 语义）
+  - `m3gcam=invt`：`view = inverse(transpose(T))`（`T` 的行列填反）
+- 启动后 `vm_output.log` 会有 `[m3g] camMode=inv|direct|invt`，据此确认开关读到了。每种模式装机各跑一次生化危机进游戏，
+  看 `gcam#`/`gmesh#` 里 `eye=` 的 z 是否变负，以及画面是否出现。
+
+### 改动
+- `vita_3d.c/.h`：`v3d_configured_cam()`（读 `m3gcam=`，0/1/2）。
+- `jsr184/.../m3g_native.c`：`Java_com_sun_m3g_NativeBridge_camMode`（KNI 返回 int，**没有 float，不涉及 s0/r0 问题**）；弱符号声明。
+- `NativeBridge.java`：`public static native int camMode()`。函数表由 `jcc` 自动生成，已核对 `nativeFunctionTable.cpp` 里出现 `JVM_NATIVE("camMode","()I",...)`。
+- `Renderer.frame()`：首次进入时读一次并缓存（读失败按 0），按模式算 `view`；`inv` 的代码路径与改动前一致。
+- `debug/tools/m3gprobe/NativeBridgeHost.java`：补 `camMode()` 桩（`-Dm3gcam=N`）。
+
+### 验证
+- 宿主 `HostRun`（真实 Renderer，任务地图相机 + `jill_han.m3g`）：`inv` → `behind=0 inside=1073`；`direct` → `behind=1073`；
+  `invt` → `behind=455`。说明开关生效，且默认 `inv` 与此前结果一致。**这个相机是纯平移，无法判断哪种约定对玩法相机正确。**
+- Java 重编（`Renderer.class`/`NativeBridge.class` 09:01）、KNI 符号 `NativeBridge_camMode` 在 ELF、`camMode=` 与 `m3gcam=` 字符串在 ELF、0 error、0 undefined。**未上机。**
+- 宿主运行 `HostRun` 需要把设备端 `phoneme-midp/build/vita_arm/classes` 加进运行时 classpath（否则 `NoClassDefFoundError: lcdui.Graphics`），README 里没写。
+
+### 不解决的
+- 如果三种约定都不对：说明问题在相机平移被丢（`gcam` 平移恒为 0）而不在约定，那时要走"方案 B"，记录 `Transform.set(float[])` 收到的 16 个浮点。
+- 字节码里"平移在 `setCameraTransform` 之后才写入"与"旋转不是 diag(1,-1,-1)"的矛盾仍未解开。
+
+## 2026-10-30 log147 分析：`m3gcam=` 三种约定（inv / direct / invt），以及宿主重放玩法帧（只分析，未改渲染）
+
+### log147 的结构
+- 一份 `vm_output.log` 里是三个会话（第 1~209 行 `camMode=inv`、210~425 行 `direct`、426~644 行 `invt`），每个都是 `BioMain` 进到玩法画面。
+
+### 事实
+- **任务地图（纯平移相机）**：`inv` → 472 顶点全在视锥内、236 个三角形朝前、能画出；`direct` 与 `invt` → `behind=472 inside=0`，画面空。
+  所以"setCamera 的变换是相机→世界、视图取逆"这条在地图上被设备数据证实，换约定地图就没了。
+- **玩法相机**（12 次采样，三会话完全一致）：3x3 为正交旋转（R·Rᵀ=I，det=0.9993），平移恒为 0，w 行 0,0,0,1。
+  对正交 R：`inverse(transpose(R)) = R`，**`invt` 与 `direct` 在玩法相机上数学上等价**（日志也如此），`invt` 对旋转相机是重复模式。
+- **玩法网格眼空间 z**：`inv` 0/3 在前；`direct` 3/4 在前；`invt` 4/6 在前。**"在前"≠"可见"**：在前的也全在视锥外（|x/z| 远大于 0.608）。
+- 8 个不同的采样点（log146+log147，僵尸/Jill/两个四边形）的世界坐标范围 x[-4.76,-1.04]、y[0.11,4.23]、z[-4.33,-1.72]，**z 全部为负**。
+  在"相机=单位阵"下这 8 个点全在相机前方（0/8 在视锥内，只是偏轴），而 `inv` 下 0/8 在前（偶然的概率约 0.8%）。
+  对 4 个点分别试 `view=I / R^T / R`：可见数都是 0/4。
+
+### 宿主重放（新增 `debug/tools/m3gprobe/GameplayRun.java`）
+- 用日志里的相机矩阵与根平移、真实 `Renderer`、`jill_han.m3g`/`zombie.m3g` 重放一帧（视口 `0,40 240x180`，fovy=70*7/9）：
+  - `inv`：1073/1073 在眼后（与设备一致）；
+  - `direct`：在前但 NDC≈(-4.1,-4.4)，超出视锥约 4 倍；
+  - **单位相机（`-DIDENT=1`）**：1073/1073 在前、`z≈0.53`，NDC≈(-1.62,+0.27)（x 超出左边缘约 0.6）。
+- 即：把相机当单位阵时，人物的位置、朝向（`pos`/`neg` 约 55/45）、深度都落在合理范围，只是水平偏出屏幕。
+
+### 字节码线索（BioCtrl，设备上未验证）
+- **相机只有 `SetRoomData` 里一个设置点**（`setCameraTransform(i, m_3D_Trans[4])`，偏移 278）；`SetRoomData` 有 2 个调用点。
+  写 `m_3D_ViwTrans.m03/m13/m23` 的 `putfield` 共 10 处，其中 `SetRoomData` 里偏移 402/411/420 与 598/612/626 等都在 278 **之后**。
+- **单位不一致**：物体变换在 `D_Game_JSR184`/`drawM3GFigure` 里 `m0x/409.6`，相机在 `setCameraTransform` 里 `m0x/4096`，同一个定点平移值差 10 倍。
+  这可能是游戏有意为之，也可能是 MascotCapsule 在真机上的约定我没复现；**没有证据判断哪个**。
+- 每帧 `D_Game_JSR184` 直接 `setCamera(camera, camTransform)`，`camTransform` 在 `SetRoomData` 之外没有被再设置（至少在这个方法里没看到）。
+- 游戏 jar 里的 `AffineTrans.setViewTrans` 是桩（`setIdentity(); Thread.sleep(1)`）；`AffineTrans.multiply` 的整数实现我只读了前几项，没有逐项核对。
+
+### 结论（已确定 / 推断 / 未知）
+- 已确定：约定开关救不了——地图要求 `inv`，玩法没有任何约定让几何进视锥；`invt` 对旋转相机重复；所有采样几何的世界 z 为负。
+- 推断（有数据，没有证实）：游戏的"世界"坐标系里相机在原点附近朝 -Z，物体都在 z<0 的一侧；`inv`（取逆 R）把相机转到了错误的朝向。
+  支持这一点的是：单位相机下 8/8 在前方、人物落在合理深度，而 `inv` 下 0/8。反对/保留：单位相机下仍然偏出屏幕（NDC x≈-1.6），
+  说明缺了一个水平方向的平移或朝向，**不是"忽略 R"就能解决**。
+- 未知：`m_3D_ViwTrans` 在 `setCameraTransform` 之后被写入的平移（以及 `/409.6` 与 `/4096` 的 10 倍差）是否才是真正缺失的那部分。
+
+### 没做 / 不建议做
+- 没有改任何渲染行为；`m3gcam=` 开关保留（默认 `inv` 不变）。
+- 不建议直接"忽略 R"或"把相机设成单位阵"：这只在个别采样点上看起来合理，人物仍在屏幕外，且会让地图相机（纯平移）失去正确性。
+- 下一步需要的数据不是相机，而是 **`SetRoomData` 之后 `m_3D_ViwTrans` 的值**：在 `Renderer.frame` 看到的 `camTransform` 之外，还要知道游戏想要的平移。
+  这需要在游戏侧可见的地方打日志（例如 `Graphics3D.setCamera` 被调用时，同时输出 `camTransform` 的 16 个值与调用序号），不能只靠 `Renderer`。
+
+## 2026-10-30 v03.52：`Transform.postRotate/preRotate` 把角度当弧度（JSR-184 规定是度）—— 参考 J2ME-Loader 后排除相机约定，转向变换数学
+
+### 做法与许可
+- 对照 J2ME-Loader 原生 M3G（`app/src/main/cpp/m3g/src/m3g_rendercontext.c`，Apache-2.0）**只看行为**，未复制代码（与本仓库的 GPL 不兼容，见 2026-10-25 一节）。
+- 它的 `m3gSetCamera(ctx, camera, transform)`：`transform != NULL` 时 **取逆** 存成 `viewTransform`，为空则单位阵；
+  `m3gRenderNode` 用 `toCamera = viewTransform * transform`。**与我们 `Renderer.frame` 的约定完全一致**，所以相机约定不是原因，
+  这与 log147 里 `direct`/`invt` 都不行的结论相符（`m3gcam=` 开关保留，默认不变）。
+
+### 根因（有证据）
+- 游戏的 `AffineTrans.rotationX/Y/Z(i)` 实现为 `rotate(i*360/4096, ax,ay,az)` → `Transform.postRotate(angle, …)`，**角度单位是度**。
+- 我们的 `Transform.rotation()` 直接 `Math.cos(angle)`，等于把度当弧度。`Matrix4.compose`（节点 orientation）早就做了 `*π/180`，只有这一处漏了。
+- 宿主复现：`postRotate(90°, Z)` 修复前得 `(-0.448,-0.894 / 0.894,-0.448)`，修复后 `(0,-1 / 1,0)`；游戏自带 `AffineTrans.rotationY(2048)` 修复后 `m00=m22=-4096`（180°）。
+- **和设备日志对上**：在 `(rx,ry)∈[0,4096)` 上搜索"用旧（度当弧度）实现算出的 `rotZ(2048)·(rotY(ry)·rotX(rx))`"，与 log146/147 里的 `camW`
+  最大偏差只有 **0.0003**，落在 `rx=0, ry=2048`——正是游戏在 `SetRoomData` 里的取值；用修复后的旋转同样搜索，最小偏差是 0.4792，**对不上**。
+  即设备上那个"一般旋转、没有 diag(1,-1,-1)"的相机矩阵，是这个 bug 的产物，不是游戏本意。
+- 这也消除了 log147 分析里"旋转不是 diag(1,-1,-1)与代码对不上"的矛盾（我当时说成是自己读错了控制流，**那个说法也不对**：控制流没读错，是旋转实现错了）。
+
+### 改动
+- `jsr184/.../javax/microedition/m3g/Transform.java`：`rotation()` 里 `angle` 先乘 `π/180` 再算 `cos/sin`（+3 行，含一行注释）。
+- `vita-port/CMakeLists.txt`：03.52 版本说明。
+- `debug/tools/m3gprobe/GameplayRun.java`：新增 `-DCAMROT=1`（相机 = diag(1,-1,-1)）选项。
+- 影响面：我们自己树里只有 `vita-port/midlets/M3GTest.java` 调用 `postRotate`，且传的是 `angle`（每次 +3、对 360 取模）= 度数，所以它是被修对而不是被破坏；
+  游戏侧只通过 `AffineTrans` 调用。`setOrientation`/`Matrix4.compose` 本来就是度，未改。
+
+### 验证
+- 宿主：`RotChk`（修复前后对比）、`AffChk`（游戏自带 `AffineTrans` 的 180° 结果）。
+- 构建：`Transform.class` 重编（09:34）且含 `0.017453292519943295`、0 error、0 undefined、`midp_vita_v03.52.vpk`；
+  `fpmodel` 回归不变（校准 0 不一致、40/40、42/42、50/50）。
+- **没上机。**
+
+### 重放结果的保留（不要拿它下结论）
+- `GameplayRun -DCAMROT=1`（相机 diag(1,-1,-1)）下，Jill/僵尸仍是 `behind=全部`。**这个重放不能当证据**：它用的根变换
+  `s=(0.0055,0.0011,5e-4)` 等是设备日志里记下的，而那些根变换同样是用**旧的错误旋转**算出来的（`drawM3GFigure` 里也有旋转），
+  所以重放把"修复后的相机"和"被污染的物体变换"拼在了一起。要验证必须在装上 v03.52 之后看设备上新的 `gcam#`/`gmesh#`。
+- 预期（待证实）：`gcam` 的 3x3 变成 `diag(1,-1,-1)`（行 `3f800000,0,0 / 0,bf800000,0 / 0,0,bf800000`），`gmesh` 的 `eye` z 不再几乎全为正。
+
+### 还没解的
+- 物体平移 `/409.6` 与相机平移 `/4096` 差 10 倍；位置在 `setCameraTransform`（偏移 278）之后才写入 `m_3D_ViwTrans`（偏移 402~420）——
+  这是字节码里确认的事实，但在旋转修对之前，不应在它上面做任何结论。
+
+## 2026-10-30 v03.53：log148 分析 —— 旋转修复起效；`Background.setImage` 从未被绘制（预渲染房间背景缺失）
+
+### log148（v03.52，Vita3K）事实
+- **v03.52 的旋转修复生效**：12 次 `gcam` 完全相同，`camW` 3x3 = `diag(1,-1,-1)`、平移 0（与预测一致）。
+  7 个玩法网格的眼空间 z 全为负（-2.43 ~ -6.06），世界坐标 z 为 +2.4 ~ +6.1（此前是 -1.7 ~ -4.3）。
+  **v03.51/03.50 里"全在相机后方"的现象就是旋转 bug 造成的。**
+- 光栅器计数（玩法阶段）：`clip=0`（不再被 w 裁剪）、`rast` ≈ 44~46% 三角形、`cull` ≈ 42~46%、`a0` 5~13%、`zt` ≈ 100~160、
+  每帧写入约 52 万像素；**视口只有 43200 像素，等于约 12 倍过度绘制**。
+- 但"亮"像素（任一通道 > 32）：第 60 帧 12.4%，之后各帧只有约 0.5%。用户看到的是整体黑、只有一两个小贴图。
+- 地图阶段（前 3 帧）与 log145 完全相同（`rast=236 wr=8770 bright=7437`）。
+- 无 `threw`/`FAILED`/异常。
+
+### 新发现的缺口（有证据，已修）
+- 游戏每帧在 `setViewport(0,40,240,180)` 之后 `Graphics3D.clear(background)`；`BioCtrl.setBGTexture` 把 `bg<N>.png`
+  （调色板 PNG，**120x90**，正好是 240x180 视口的一半）经 `Image2D` 交给 `Background.setImage`。设备日志加载的是 `/bg2.png`。
+- 游戏从未调用 `setCrop`/`setImageMode`。
+- `Renderer.clear()` 完全没有读 `Background.image`（`Background.java` 注释写着"stretch the whole image"，但没有任何实现）。
+  所以预渲染房间背景从来没有画过。
+
+### 修复（v03.53，jsr184 Renderer）
+- `clear()` 在颜色清屏之后，如果 `colorClear && bg.getImage() != null`，调用新的 `drawBackgroundImage()`：
+  把整幅图当成铺满视口的四边形（两个三角形，`z=0.9999`，单位 MVP，不剔除，不混合，纹理 v=0 在上边缘）。
+  纯 Java，复用现有 `setMvp/setState/draw`，软件与硬件后端都适用，不动 native。
+- 首 3 帧输出 `[m3g] bgimg WxH tex=N vp=x,y WxH`。
+- 假设（没核实）：crop 矩形按"整幅图"处理。游戏没调 `setCrop`，规范里 `setImage` 对 crop 的默认行为我没有核对原文。
+
+### 验证
+- 宿主，用**真实 `vita_sw3d.c`**，同样的数字（目标 240x320、视口 0,40 240x180）：四边形 NDC `l=-1 r=1 b=-0.375 t=0.75`；
+  覆盖 **43200 = 视口面积**，bbox x[0,239] y[40,219]；上边缘取到纹理上半（红）、下边缘取到下半（蓝）→ **上下没有颠倒**；
+  视口外像素不变；之后画的更近的三角形**没有被背景挡住**（深度 0.9999 vs 0.5）。
+- 构建：`Renderer.class` 重编（09:49）含 `drawBackgroundImage` 与 `bgimg`、0 error、0 undefined、`midp_vita_v03.53.vpk`。**没上机。**
+
+### 仍然没解释的（不要把背景图当成唯一原因）
+- 每帧约 52 万像素写入里只有 0.5% 是亮的：即使加了背景，**3D 人物/物体本身为什么几乎是暗的**还没有答案。候选（均无设备证据）：
+  1. `Renderer.shade()` 在没有光照贡献时只有 `ambient*0.2`（约 10/255）——游戏的光是 `mode=128`（DIRECTIONAL）、intensity 1.05，
+     我只确认过 `Graphics3D.addLight` 存在，**没有确认它进入了着色**；
+  2. 12 倍过度绘制说明有大量重叠的大面积网格（如房间叠加层 `room_overlay`，`blend=1`），它们按 `ALPHA` 混合时如果 alpha 偏低会把画面压暗；
+  3. 纹理里大量像素本身就是暗的或透明的（调色板 PNG 的 `tRNS` 在 `effects.png` 上有，`bg2.png`/`en_all.png` 没有）。
+- 下一步判读：装 v03.53 后看 `bgimg` 行是否出现，再看 `sw3d#N` 的 `bright%` 是否明显上升。
+
+### 订正此前的说法
+- log147 一节里我写过"旋转不是 diag(1,-1,-1)与代码对不上，不排除读错控制流"，后来在 v03.52 一节已订正：控制流没读错，是 `postRotate` 把度当弧度。
+
+## 2026-10-30 v03.54：log149 分析 —— 背景已显示，人物不可见；加逐 draw 探针（仅诊断）
+
+### log149（v03.53，Vita3K）事实
+- `[m3g] bgimg 120x90 tex=7 vp=0,40 240x180` 出现；第 60 帧 bright 1133981/2397854（约 47%，此前 0.5%）。背景修复有效。
+- 无 threw/FAILED/异常；clip=0；tex fail=0 dark=0。帧率约 13~15 fps（Vita3K 数字）。
+- Jill 的 draw：`gmesh#2 n=1073 idx=54 tex=8`，世界 (-1.92,0.83,6.07)，眼空间 z=-6.07（在相机前方）。
+
+### 宿主核对（jill_han.m3g，用真实 Loader）
+- SkinnedMesh：224 条绑定，覆盖全部 1073 个顶点，无重叠，每条权重 1000；distinct 骨骼 40 根。刚性绘制不会把位置画错。
+- 7 个模型文件（jill_han/zombie/hunter/nemesis/item/aim/effect）的 SkinnedMesh 节点缩放均为 0.1（来自文件）。
+- 游戏对 Jill 只有 `postScale(0.012)`，未调用 setScale。日志模型矩阵 m5=-0.000970，root m5=-0.00970，比例恰为 10。
+- 按此缩放估算 Jill 在 180px 视口内约 3px 高（**换算，非实测**）；若无 0.1 则约 37px。
+
+### 未解释
+- 物体平移 `/409.6` 与相机平移 `/4096` 的 10 倍差，与模型 0.1 缩放可能同源——**无证据**。
+- 人物是"只有几像素"还是"根本没写像素"，日志里区分不了。
+
+### v03.54（仅诊断，未改渲染行为）
+- `vita_sw3d.c/.h`：每个 draw 记录 nverts/tex/cull/blend/tri_in/tri_rast/px_wr/px_zt、投影包围盒、实际写入包围盒；最多 32 条。
+- `vita_3d.c`：在第 59、119… 帧（<400）present 末尾武装，下一帧 present 时输出 `sw3d#N dK nv= tex= c= b= tri= rast= wr= zt= proj[..] wrote[..]` 到 crumb.log。
+- 看点：Jill 的 draw（`nv=54`，`gmesh#2` 里 idx=54；`tex=` 是光栅器句柄，不一定等于 Java 侧的 8）的 `rast/wr/zt` 与 `proj/wrote` 包围盒。
+- 验证：宿主 `gcc -Wall -Wextra` 编 vita_sw3d.c 通过；`vita-port/build.sh` rc=0，`midp_vita_v03.54.vpk`，ELF 含版本串与探针格式串。**未上机**。
+
+## 2026-10-30 log150 分析（v03.54，Vita3K）：人物确实在画，但只有约 5~10 像素
+
+### 事实（逐 draw 探针，第 60/120/180/240 帧）
+- d0 背景：`nv=6 wr=43200`，正好铺满视口。
+- Jill 的 3 个 submesh（`nv=54/114/3030`，tex=7）：`rast` 403~540、`zt=0`，包围盒约 `proj[53,152..60,157]`，实际写入 0~8 像素（`wr=0` 的帧是三角形落在像素中心之间）。
+- 敌人（`nv=1668 tex=8`，gmesh 的 n=675）：约 10x6 像素，`wr` 16~17。
+- 屏幕位置与投影公式吻合（x≈56、y≈152），没有被遮挡（`zt` 0~1），没有被裁剪。结论：渲染路径在**给定输入**下是自洽的，问题是输入的尺度。
+
+### 尺度来源（均已核对）
+- `.m3g` 原始字节解析（手工按文件格式）：jill_han 的 SkinnedMesh 组件变换 `T=(0,0,0) S=(0.1,0.1,0.1) Q=(0,0,0,1)`，**0.1 是文件里的数据，读取器没读错**。7 个模型文件都是 0.1。
+- 游戏只在 `BioCtrl.drawM3GFigure` 里 `postScale(0.012)`（所有调用点都传 0.012），随后 `Graphics3D.render(skinnedMesh, transform)`。没有任何 `setScale/setTransform` 去覆盖节点自带缩放。SkinnedMesh 没有动画轨道，全文件 0 个 SCALE 轨道。
+- 最终缩放 = 0.1 × 0.012 = 0.0012；Jill 高约 170 → 0.204 世界单位，距离 6.07 → 约 4 像素（与探针吻合）。若只有 0.012 则约 37 像素。
+
+### 推断（无设备对照，不是结论）
+- 0.012 是游戏刻意选的系数，按 37 像素算一个全身角色占视口 1/5 高，合理；4 像素不合理。因此"真机上节点自带的 0.1 没有乘进去"是首要怀疑，但**还没证实**：我只读了 J2ME-Loader 的 `m3gRenderNode`（`toCamera = view * transform`，之后由节点的 `setupRender` 处理节点自身变换），没有读到 `setupRender`，所以无法据此断言行为。
+- 另一个可能：蒙皮。规范里蒙皮顶点经"骨骼到蒙皮网格"的矩阵变换，真机可能让骨骼矩阵里的缩放抵消节点缩放；本项目蒙皮未实现，这一条也无证据。
+- 物体平移 `/409.6` 与相机 `/4096` 的 10 倍差：与上面的 10 倍可能同源，**无证据**。
+
+### 下一步（未做）
+- 加运行时开关（类似 m3gcam）：对 SkinnedMesh 根节点忽略自带缩放，看 Jill/敌人是否变成合理大小。先做开关再决定默认值，不直接改默认。
+
+## 2026-10-30 v03.55：SkinnedMesh 忽略自带缩放的实验开关（默认关，行为不变）
+
+### 改动
+- `vita_3d.c`：新增 `cfg_value()`；`v3d_configured_cam()` 额外读 `m3gskin=noscale`，结果放在返回值 bit 8（低 8 位仍是 m3gcam）。`vita_3d.h` 注释同步。复用 `NativeBridge.camMode()`，**ROM 的 native 函数表不变**。
+- `Renderer.java`：`camMode` 首次读取时拆出 `skinNoScale`；`walk()` 对 `SkinnedMesh` 节点在 `skinNoScale!=0` 时用 `Matrix4.compose(..., scale=1,1,1)` 代替 `getCompositeMatrix`。日志 `[m3g] camMode=inv skinNoScale=N`。
+- `debug/tools/m3gprobe/NativeBridgeHost.java`：`camMode()` 同步支持 `-Dm3gskin=1`。
+
+### 用法
+- 在 `ux0:/data/J2ME00001/defaults.cfg` **新增一行** `m3gskin=noscale`（行首）。
+- **注意**：设置菜单的 `defaults_save()`（vita_menu.c）会整个重写 defaults.cfg，只写它自己的 7 个键，**会丢掉这一行**（`m3gcam=` 同理）。进过设置菜单后要重新加。
+
+### 宿主验证（真实 Renderer，log150 的相机 diag(1,-1,-1)、root t=(-1.92,0.83,6.07) s=0.012，视口 0,40 240x180）
+- 默认：NDC x[-0.495,-0.440] y[0.001,0.039] → 约 6x3 像素（与设备探针 7x5 同量级）。
+- `m3gskin=1`：NDC x[-0.810,-0.247] y[-0.334,0.043] → 约 68x34 像素。
+- 两种设置下 `behind=0 inside=1073/1073`。
+
+### 验证与限制
+- `vita-port/build.sh midp` rc=0，0 error；`Renderer.class` 含 `skinNoScale`，ELF 版本串 v03.55，含 `m3gskin=`；`midp_vita_v03.55.vpk`。**未上机**。
+- 这是**实验**：它回答"去掉 0.1 之后人物大小/位置是否合理"，**不证明**真机行为就是忽略节点缩放。若位置/大小合理，再去查 `m3gRenderNode`/`setupRender`（J2ME-Loader 里没有这部分文件）或规范，决定是否变默认；若仍不合理，说明 10 倍来自别处（`/409.6` vs `/4096`）。
+
+## 2026-10-30 log151 分析（v03.55，Vita3K，m3gskin=noscale）
+
+### 事实
+- `[m3g] camMode=inv skinNoScale=1`：开关生效。无异常，整帧 wr 约 312 万，bright 约 149 万（约 48%）。
+- 尺寸变大约 10 倍：敌人（nv=1668，zombie n=675）log150 `proj[205,212..215,218] wr=16` -> log151 `proj[171,144..293,227] wr=1898 wrote[171,145..239,219]`；
+  Jill 包围盒 log150 `[53,152..60,157]` -> log151 `[42,96..57,157]`（约 15x61）。
+- **Jill 的三个 submesh 本帧 wr=0、zt=0**（rast=423/35/0）；log150 同帧是 wr=5/1/8。整帧 zr=0。
+  即：没有任何像素中心落进 Jill 的三角形。**未解释**。敌人（d4）确实写了像素。
+  用户看到的"人物模型"可能是敌人而不是 Jill——**待向用户确认**。
+
+### 无动作：证据链
+1. 宿主（真实 Loader）：jill_han.m3g 共 60 条动画轨道，**SkinnedMesh 自身 0 条**，全部在骨骼等节点上；从 SkinnedMesh 经引用可达 195 个对象（52 个节点），60 条轨道的控制器均 active。
+2. 游戏（BioCtrl.drawM3GFigure）只调一次 `characterModels[i].animate(frame)`，实参为方法最后一个 int（== -1 时跳过）。
+3. `Object3D.animate()`（Object3D.java:164）只遍历**自身**轨道，不遍历引用对象 -> 骨骼上的 60 条轨道永远不会被采样。
+4. `SkinnedMesh.addTransform()` 是空函数，渲染按静止姿态画 -> 即使骨骼动了，网格也不会变形。
+- 推断（**我记忆中的规范，未读原文**）：JSR-184 `animate` 会更新对象及其所有可达对象。
+- 没核对：`AnimationController` 的 speed/refWorldTime 与游戏传入帧号的映射。
+
+### 弹窗
+- 日志：`[DISPLAY] getCurrent() -> null` 之后 `[ALERT] ... "This application does not use the screen and runs in the background." type=INFO timeout=-2`，随后 `callScreenChange` 切到 BioCanvas。
+- 来源：`CldcForegroundController.registerDisplay`（:66）返回 `HeadlessAlert` 作为 `getCurrent()==null` 时的占位 Displayable；上游 phoneme_source 有同样文案。是 INFO 占位提示，不是异常。
+- log138/139/143/144/147/148/150/151 各有 1 行 `[ALERT]`，log140/145/146/149 为 0 行。**为何有时没有，未查**。
+- 用户未给截图，**无法确认他看到的就是这个弹窗**。
+- 本轮未改代码。
+
+### 下一步（未做，待用户决定）
+- (a) `Object3D.animate` 递归引用对象；(b) CPU 蒙皮（骨骼矩阵 = 骨骼到 mesh 变换 * 绑定逆；每顶点单骨骼，权重 1000）。(a) 不做则骨骼不动，(b) 不做则骨骼动了也不变形。
+- 先在宿主验证（animate(t) 后骨骼世界矩阵是否随 t 变化、蒙皮后顶点范围是否变化），再上设备。
+- Jill wr=0 建议先查清；探针需补 root 完整 16 个 float 才能在宿主用真实 vita_sw3d.c 重放。
+
+## 2026-10-30 v03.56：查 Jill wr=0 的诊断探针（仅诊断，渲染行为不变）
+
+### 动机
+log151：Jill 三个 submesh `rast=423/35/0` 但 `wr=0 zt=0`，整帧 `zr=0`；包围盒 15x61 px。"proj 包围盒"是顶点的包围盒，不依赖三角形；
+要区分"三角形都是亚像素细条"与"覆盖/光栅化有 bug"，需要完整 root 矩阵（只有对角线 + 平移不够）和三角形面积分布。
+
+### 改动
+- `Renderer.java`：对 SkinnedMesh 的 draw（视口高 != 140，`dbgFrames%30==1`，最多 6 次）输出
+  `[m3g] skin#N f= n= model=<16 个 float 的 IEEE hex>` 与 `skin#N local x[] y[] z[] aabb px[x0,y0..x1,y1] behind= noscale=`（局部 AABB 的 8 个角投影到屏幕）。
+- `vita_sw3d.c/.h`：逐 draw 记录新增 `px_out`（像素中心在三角形外）、`px_zr`（z 越界）、`tri_small`（光栅化三角形中 |cross|<1，即面积<0.5 px）、
+  `amax`（最大 |cross|）、第一个被光栅化的三角形的屏幕坐标。
+- `vita_3d.c`：在原 `sw3d#N dK ...` 行之后再写一行 `sw3d#N dK out= zr= small= amax10= first10=(..)(..)(..)`（数值乘 10 取整，因为 crumb_printf 缓冲只有 256 字节）。
+- 版本 03.56。
+
+### 宿主验证（真实 Renderer，log150 的相机，jill_han.m3g）
+- `skin#` 两行格式正确、无异常。默认 AABB px[60,153..67,159]（约 8x7）；`m3gskin=noscale` px[19,153..91,217]（约 73x65）。
+- `vita-port/build.sh midp` rc=0，0 error，0 undefined；ELF 含 `amax10=`，ROM 含 `aabb px`；`midp_vita_v03.56.vpk`。**未上机**。
+
+### 读日志的方法
+- 找 `d1/d2/d3`（Jill，`nv=3030/114/54`）对应的第二行：
+  - `small` 接近 `rast` 且 `amax10` 很小（<10 即最大面积 <0.5 px）：三角形全是亚像素，`wr=0` 是正常的，问题在尺度/姿态，不在光栅化。
+  - `amax10` 很大但 `out` 巨大、`wr=0`：覆盖测试有问题，用 `first10` 的三个点在宿主上手算该三角形覆盖了哪些像素中心。
+  - `zr>0`：z 范围问题。
+- `skin#` 的 model 矩阵可直接在宿主重放。
+
+## 2026-10-30 v03.57：animate() 递归 + 关键帧采样修正 + CPU 蒙皮
+
+### 起因（log151，m3gskin=noscale）
+人物和敌人都显示了，但不动。宿主（真实 Loader）：jill_han.m3g 60 条动画轨道全在骨骼上，SkinnedMesh 自身 0 条；
+`Object3D.animate()` 只处理自身轨道；`SkinnedMesh.addTransform` 空函数；渲染按静止姿态画。
+
+### 动画数据的事实（jill_han.m3g，AnimDump 实测）
+- 属性：268(ORIENTATION)x44 条 4 分量，270(SCALE)x2，275(TRANSLATION)x14 条。
+- 文件里的插值码：四元数轨道全是 **177**，平移/缩放 **176**，一条两帧缩放 **180**；repeat 全是 **193**。
+  我们原来的常量 LINEAR=193 等**不对**。JSR-184 值（我的记忆，但与文件数据吻合）：LINEAR 176、SLERP 177、SPLINE 178、SQUAD 179、STEP 180、CONSTANT 192、LOOP 193。
+- 四元数样本 (0,0,0.061,-0.998) 模长为 1 -> ORIENTATION 关键帧是 (x,y,z,w) 四元数。原 `Node.applyAnimation` 把它当 angle/axis 写入。
+- 控制器：speed=1 weight=1 activeStart=activeEnd=0 refSeqTime=0 refWorldTime=0；序列 duration=5733 ms。
+- 游戏传给 animate 的是毫秒：`getFrameValue(..)*50/3` 或 `*100/3`；5733 = 172*100/3，与 173 个关键帧吻合。
+- 51/53 个 Group 有非单位静态变换；骨架根 Group 的 parent == null（没挂在 World 或 SkinnedMesh 下）。
+
+### 测量更正
+- 我在上一轮对话里说"骨骼到骨架根的累计变换约等于单位矩阵（……平移 0）"。**平移 0 是错的**：我打印了列主序矩阵的 m[3],m[7],m[11]（恒为 0），
+  应为 m[12..14]。重测：骨骼到骨架根的累计平移 x[-101.5,62.0] y[3.5,149.0] z[-4.7,11.0]，与绑定姿势包围盒吻合。
+  对角线 (0.99999, 1, 0.99999) 用的索引是对的，所以"骨骼里没有藏着 10 倍缩放"这一点仍有依据，但"累计变换约等于单位"不成立。
+- 记忆文件里此前没有写入这个错误断言。
+
+### 改动（jsr184）
+- `Matrix4.atan2`：CLDC 1.1 的 Math 没有 atan2/acos，自写（对 Math.atan2 最大误差 2.3e-10）。
+- `KeyframeSequence`：常量改为上面的 JSR-184 值，新增 SLERP、LOOP，去掉 WRAP/CLAMP（无人使用）。
+- `AnimationTrack.sample()`：LOOP 按 duration 取模；STEP 保持；SLERP/SQUAD 对四元数球面插值（取最短弧、归一化）；有效区间内二分查找。SPLINE/SQUAD 退化为线性/SLERP（本模型没用）。
+- `Transformable.setOrientationQuat` + `Node.applyAnimation` 的 ORIENTATION 分支改用四元数。
+- `Object3D.animate()`：遍历所有可达对象（广度优先，戳记去重，上限 8192），日志 `[m3g] animate t= root= reached= tracks=`（前 3 次）。
+  原逻辑改名 `animateSelf()`，`Renderer.walk` 仍调它（行为不变）。
+- `SkinnedMesh.captureBindPose()`：加载完成后记录每根骨骼"骨骼到 mesh"矩阵的逆；`M3gReader.readAll` 在解析完所有对象后调用。
+  `applySkin(pos,n)`：每顶点 = 权重归一化的 Σ w*(骨骼当前矩阵 * 绑定逆) * v；`Renderer.drawMesh` 在构建 pos 后调用。
+  骨架根的 parent 为 null，链在 null 处终止并包含根的局部矩阵。日志 `[m3g] skin bind: entries=224 chain=41 bones=40 singular=0`。
+
+### 宿主验证（真实代码，jill_han.m3g；全部通过）
+- atan2 对 Math.atan2；四元数 -> compose 矩阵（6 个样本）；slerp 中点 45.000001°、模长 1。
+- **静止姿态蒙皮后顶点不变**（最大偏差 1.5e-5）——证明骨骼链与绑定逆自洽。
+- animate 到达 195 个对象、60 条轨道；11 个时间采样姿势都在变；LOOP：t 与 t+5733 姿势完全一致（0.0）；所有顶点有限。
+- 三角形最长边相对绑定姿势的拉伸：中位数 1.00，t=0/1000/1500/2000/4000 的最大值 2.3/2.0/2.0/1.9/1.7，没有任何三角形超过 3 倍 -> 没有"顶点炸开"。
+- 文字点阵：绑定姿势是张开双臂的人形；t=0 是站立人形；t=1500 是倾斜的另一姿势（输出被截断，下半身没读到）。
+
+### 没验证 / 局限
+- **没上机**。游戏在某一帧要的姿势是否正确（时间映射、动作表）未验证。
+- **法线没有蒙皮**：旋转后的部位光照方向会不对。
+- `SkinnedMesh.addTransform()` 仍是空函数（只有文件加载的蒙皮生效）；`duplicate()` 对 SkinnedMesh 返回刚性 Mesh（游戏没调用 duplicate，API 统计里没有）。
+- 图片工具只返回链接，我没有看到 pose.png 的内容，只读了文字点阵。
+- Jill 在 log151 采样帧 wr=0 的疑点（v03.56 探针）仍待 log152。
+
+## 2026-10-30 log152 分析（v03.57，真机，硬件后端）——本轮只分析，未改代码
+
+### 事实
+- 真机：`gl3d: vglInit returned 0`、`backend=hardware`；ARM 时钟只有 333 MHz（想要 444），帧率约 4~10 fps。两次 BioMain 运行：第一次 `skinNoScale=0`，第二次 `=1`。
+- v03.57 在真机上工作：`skin bind: entries=224 chain=41 bones=40 singular=0`，`animate t=4300 ... reached=191 tracks=60`，无 threw/FAILED/异常。
+- 尺寸：noscale=0 时 Jill 约 4x7 px、敌人约 6x8 px；noscale=1 时敌人约 83x95 px、Jill（完整矩阵帧）约 39x78 px。
+- **root 矩阵在"完整旋转"和"只剩一列"之间交替**（skin# 的 4x4 解码，列模长除以 0.012）：
+  Jill f=91/f=151 为 (0,1,0)、det=0；f=211 为 (1,1,1)、det=0.999。noscale=0 的运行里也有（skin#5）。
+- 这个现象**不是 v03.57/noscale 引起的，早就存在**：gcam 里 root 对角线 `0,bc1eed91,0` 的采样比例 log146 2/12、log147 9/36、log148 4/12、
+  log149 2/12、log150 2/12、log151 2/12、log152 5/17（log145 没有 gcam 采样）。我此前各轮只看对角线，没注意。
+- 宿主重放（真实 Renderer，log152 的两个真实矩阵，m3gskin=1）：完整矩阵 -> 投影总面积 2439 px²、740 个 >0.25px² 的三角形；
+  只剩一列 -> 总面积 0 px²，顶点散布短轴 0.0000 px。即：这类帧里 Jill 被压成一条线，这解释 log151 里 Jill 的 `wr=0`。
+- 秩 1 矩阵 = V * diag(0,1,0)（推断，依据：第二列与正常帧相同，而 rotationY 的第二列恒为 (0,1,0)）：游戏的 m_Rw_Trans（角色朝向）在这些帧里 m00=m02=m20=m22=0。
+- 输入事件正常到达（0x10/0x20/0x40/0x80 脉冲）；`Ch_PlMove` 里方向键 -> `rotationY` 改朝向并置转向标志。
+
+### 已排除（宿主，真实代码）
+- 游戏自带的 AffineTrans 壳 + 我们的 Transform：单轴旋转 36867 个、两轴乘积 524288 个、别名调用 `D.multiply(V, D)`（游戏每帧就这么调）10240 个，
+  全部正交，且别名结果与写入新对象的结果一致。`Transform.postRotate` 扫 200001 个角度无 NaN、无全零。-> 这一层算术产生不了该矩阵。
+- `Vector3D.unit()`：输入零向量才输出零向量（(3,0,4) -> (2457,0,3276)），所以它只是保持零，不是零的来源。
+  M_Action 在 `m_OneSecFlg`（每秒）时对每个角色的 x/z 行做 unit 并写回 m00/m02、m20/m22。
+
+### 未解释
+- 朝向矩阵为什么在某些帧是零（根因未定位）。Vita3K 与真机都有，所以不是真机特有。
+- "能转向但不能移动"：位移与走路动作受 `m_Mi_CanMoveFlg` 控制（写入点 M_MissionSet 置位/清零、Ch_PlDamage 置位；读取点只有 Ch_PlMove），运行时值未知。
+  jar 里有墙壁数据 `KabePos0..14.txt`（CRLF、逗号分隔），日志里完全没有对这类文本资源的加载记录，**无法判断读没读成功**。
+- "每次按方向键人物刷新、变小，再按恢复"：与秩 1 帧对应，但**没有按键与帧的时间对齐，不能断言因果**。
+- "敌人一闪一闪"：采样太少，可能同源，也可能是硬件后端（vita_gl3d.c）的问题，均未验证。
+- input_debug 里同一方向键 0.5 秒内多次 0x40/0x00 交替，是用户点按还是轮询抖动，未判断。
+
+### 下一步（建议，未做）
+- 带毫秒时间戳、只在状态变化时输出的探针：SkinnedMesh/敌人 root 矩阵的状态（完整/秩1/过小）、`Transform.set(float[])` 的输入 3x3，
+  以便与 input_debug 的 `[HEARTBEAT] ms=` 对齐；另记录 `getResourceAsStream` 对 .txt/.act 等资源的结果。
+
+## 2026-10-31 log152 追查：移动向量、任务表、VM sin/cos（本轮只分析，未改代码）
+
+### 新事实（均有代码或数据依据）
+- **角色移动方向 = 朝向矩阵的 (m02, m12, m22)**：`Ch_PlMove` 读 `m_Rw_Trans[i].m02/m12/m22` -> `Vector3D.unit()` -> x、z 分量乘速度（>>12）再乘 iload7 -> 加到 `m_Ch_Pos` -> `MoveCheck`（碰撞）。
+  所以朝向矩阵为 diag(0,1,0)（m02=m22=0）时 x、z 位移恒为 0。"变小"与"不能移动"是同一个矩阵状态的两个表现（**推断**，依据是这段字节码；没有位置变化的直接日志）。
+  与此一致：log150/151/152 所有采样里 Jill 的世界位置都是 (-1.92, 0.83, 6.07)、敌人 (2.00, 1.99, 4.48)，从未变化。
+- **不能移动不是任务设计**：`m_Mi_CanMoveFlg` 的写入者只有构造函数（true）、`M_MissionSet`（任务类型 m_Mission[21] 为 5 或 6 时置 false，否则 true）、`Ch_PlDamage`（true）。
+  解析 `Mission.mis`（按 `GetMissionCsv` 的规则，120 行）：类型槽位 [21] 的取值只有 0(106 行)、1(3)、3(4)、15(1)、20(1)、60(4)，**没有 5 或 6**。
+  我此前的猜测"某些任务类型禁止移动"不成立。
+- 换房间的代码路径：`Ch_PlMove` 在确认键位（参数 3 的位 65536）且 `m_PlRoomMoveFlg` 时调用 `RoomChangeCheck(x,z)`，角色位于门区域（返回 >=0）且目标可去（`GetMissionMoveArea`）才设置 `m_RoomPosNo`、`m_ChangeRoomType=2`；
+  不在门区域则走拾取物品（`ItemGetCheck`）。**不能移动就走不到门**。每个任务各有自己的房间，我**没有**解码起始房间字段，不能确认"换任务就换房间"，也没看过游戏的任务选择界面。
+- 游戏里有任务在线联网的痕迹（BioData 有 HttpConnection 字段、jar 里有 `check.php?uid=UIDREQUEST` 等字符串），但 `BioData` 里没有任何实际打开连接的调用，log152 也没有联网记录，与房间/任务数据无关。
+
+### 已排除
+- VM 的 sin/cos（真实 ELF 入口，fpmodel）：游戏用到的 8 个方向（512 的整数倍，含 -4096..8192 共 25 个）全部与参考一致，按游戏的 4096 定点取整后 (m00,m02|m20,m22) 都不是全零；
+  抽样 333 个角度最大误差 1.1e-16，无"sin 与 cos 同时为 0"。全圈 0..4095 的检查在后台跑（/tmp/sincos_full.out）。
+- AffineTrans/Transform 算术、别名调用、`Vector3D.unit()` 对非零输入（见上一节）。
+
+### 仍未解释
+- m00/m02/m20/m22 四个元素同时为 0 是谁写的。写入者有：`rotationY`（按键）、`M_Action` 每秒一次的 `unit()` 归一化块、`Ch_TurnTrg`/`Ch_PlAttack`/`Ch_EnTrgSarch`（朝向目标）。
+  后几处只要输入向量是零向量（例如目标与自身位置相同）就会得到全零（宿主验证 `unit(0,0,0)=(0,0,0)`）。**这是候选，不是结论**。
+- 位移被挡住的另一个候选：`MoveCheck` 碰撞（`KabePos*.txt` 是否读成功，日志没有记录）。
+
+### 下一步（建议，未做）
+- 探针：`Transform.set(float[])` 输入的 3x3 变成全零块时输出（带毫秒时间戳、限量），并记录调用线程；对游戏的 `m_Ch_Pos`、朝向无法在 Java 侧看到，需要靠矩阵与位置的 root 平移变化来对齐。
+- 探针：`getResourceAsStream` 对 `.txt`/`.act`/`.mis` 的返回是否为 null、读到多少字节。
+
+## 2026-10-31 v03.58：把"朝向矩阵变成 diag(0,1,0)"和按键对齐的诊断探针（仅诊断，行为不变）
+
+### 本轮新排除的候选（均有代码依据）
+- **墙壁数据读不到**：`KabePos` 走 BioData 加载类型 0（`Get_FolderFile`，二进制读取，不是 UTF 路径），`SetRoomData` 用 `ReadCsv` 解析，
+  失败时 `m_KabeNum=0`（没有墙），只会更自由，不会不能动。
+- **移动速度为 0**：`m_PlDataList`（长度 10）静态值只有 [2]=200，其余 0；但 `Ch_PlMove` 在使用前对速度做 `+= 20`，实际距离不为 0。我上一轮没把这个 +20 算进去，那一轮"速度为零"的担心不成立。
+- **`Ch_TurnTrg`**：它会写满 m00..m22 九个元素（含 m10/m11/m12），不会产生只剩第二列的矩阵。
+- **资源缺失**：/tmp/biojar 有 255 个文件，与设备日志 `[zip] entries=255` 一致。表里的 pl_data.jar、sta_pl.jar、plt_bg.plt、KabeMen.txt 等不在 jar 里，
+  是这个版本不用的平台变体（BioData 里有 `pl_data0.jar`、`sta_pl0.jar` 的字符串引用），没有证据表明缺失导致问题。
+- `Get_FolderFileUTF` 有个游戏自身的瑕疵（每次追加整个 256 字符缓冲区而不是读到的字符数），但它只用于 fr_*.mis（类型 4，法语文案），与本问题无关。
+
+### v03.58 改动
+- `vita_input.c`：`[INPUT] buttons=0x........ ms=<gettimeofday ms>`，与 HEARTBEAT 和 Java 的 `System.currentTimeMillis()` 同源。
+- `Renderer.renderNode` -> `trackRoot()`：对每个 Mesh 的 root 矩阵统计"未消失的列数"（列模长 > 最大列的 25%），按（mesh 哈希, 位置 x, 位置 z）分槽（最多 24 个），
+  **只在列数变化或出现新位置时**输出 `[m3g] rootstate#N ms= mesh= n= pos*1000= colnorm*1e4= cols a->b`，最多 400 行。位置变化会表现为 `(new position/entity)`，所以也能看出有没有移动。
+
+### 宿主验证
+- 用 log152 的真实矩阵序列（完整、完整、压扁、压扁、完整、压扁、平移后完整、同、压扁）驱动真实 Renderer：只在变化处输出，`cols 3->1`、`1->3` 和平移后的 `(new position/entity)` 都正确。
+- 构建：`vita-port/build.sh midp` rc=0，0 error，0 undefined；ELF 含新的 [INPUT] 格式，ROM 含 `rootstate#`、`colnorm`，`Renderer.class` 含 `trackRoot`。`midp_vita_v03.58.vpk`。**未上机**。
+
+### 怎么读日志
+- 在 input_debug.log 里找方向键按下的 `ms=`；在 vm_output.log 里找 `rootstate#` 的 `ms=`。
+  - `cols 3->1` 紧跟在按键之后（几十毫秒内）：写入者是按键路径（rotationY 一带）。
+  - 与按键无关、间隔约 1 秒：每秒的归一化块（M_Action）。
+  - 压扁期间有没有 `(new position/entity)`（= 位置变了）：压扁期间不动、正常期间动，说明移动被矩阵状态直接决定；正常期间也不动，说明别处还有阻碍（碰撞/任务状态）。
+
+---
+
+## 2026-10-31 v03.59：log153 的带宽探针**否证了我自己的假设**，改为拆 `prepare`
+
+> 产物 `out/vpk/midp_vita_v03.59.vpk`（12045081 B），版本串
+> `J2ME Player v03.59 b330`。**未在真机运行。**
+
+### log153 是真机，探针跑了（4 组）
+`crumb.log` / `midp_stderr.log` 里 `[MBW]` 齐全；模块表里有 `Framecounter` 插件与
+`midp_vita`，所以是 Cortex-A9 @333MHz 的真实数字，不是 Vita3K。
+
+```
+[MBW] n=128KB reps=3 | fill32 cached=2114.0 uncached=604.0 MB/s | fill64 uncached=609.6
+      | memcpy cached=131072.0 uncached=199.1 MB/s | copy4 uncached=299.9 MB/s
+[MBW] rgb565->abgr cached=160.2 uncached=168.4 MB/s (us 818 vs 778)
+[MBW] VERDICT frame=863KB @32b=5.24ms @64b=1.45ms | ratio uncached/cached=95%
+```
+
+### 判决 1：**我的假设错了，错得很干脆**
+v03.45 推断"52 MB/s ⇒ uncached 内存受限"。实测 unbuffered 纯写 **604 MB/s**（
+是 52 的 11 倍），而转换循环的 **uncached/cached = 95~98%**（uncached 甚至常常更快）。
+
+⇒ framebuffer **不是**内存瓶颈。"加宽 store"、"cached 中转 + 突发拷贝"两条路
+**全部作废**；任何"因为 store 慢所以上 NEON"的论证也不成立。
+
+这也写进路线图了：`CDRAM_L1WBWA_RW` 亦不可行（v01.67 黑屏同因）。
+
+### 判决 2：`prepare` 里还有 12 ms 没被覆盖
+转换循环 168 MB/s ⇒ 863 KB 需 **5.24 ms**，而 `perf.log` 的 `prepare` 是
+**17.10~17.26 ms**。缺口 **≈11.9 ms** 在 `flip_to_display()` 的其它部分：
+`clear_letterbox` / `vita_vkey_draw` / `vita_shot_draw_button` /
+`vita_shot_service` / `vita_splash_draw`。
+
+**在切开这 12 ms 之前，任何 blit 优化的预期收益都是猜的。**
+
+### 判决 3：探针自己有 3 个错（都是我的）
+1. `memcpy cached=131072 MB/s` 是**垃圾**：v03.45 传的是 `v_copy_lib(cached, cached)`,
+   源与目的**同一个缓冲**——UB，被编译器优化掉，实测 `us=0`，再被我
+   `us=0 → 1` 的钳位放大成 128 KB/1 us。这条还是当时唯一的"memcpy 在本目标的
+   性能"证据。
+2. `@32b=5.24ms` vs `@64b=1.45ms` **不是同一个活儿**：前者是**转换**，后者是**纯填充**。
+   读者会以为"换 64 位 store 能 3.6 倍"，实际同一变体下 64 位只值 1%。
+3. `frame=863KB` 口径：稳态帧**不**清黑边（`clear_letterbox()` 只在覆盖层消失后
+   那两帧跑），把黑边算进每帧会虚高。
+
+### 本版改动
+1. **`[PERF] seg(...)` 行**：`flip_to_display()` 现在给五个阶段打时间点
+   （`blit` / `ltbox` / `vkey` / `shot` / `splash`），日志按窗口平均输出，并给出
+   **`other=` = prepare − 五者之和**，也就是那 12 ms 的余量。
+   **只在真的提供了分段时才输出**——缺行表示"没测"，不表示"为 0"。
+   格式：`[PERF] seg(n=60) blit=5.00 ltbox=1.00 vkey=9.00 shot=1.50 splash=0.00 | other=0.50 of 17.00`
+2. **探针三处修正**：
+   - memcpy 用**两个不同缓冲**（`cached2` 做目的），并在单测里断言
+     `memcpy cached=131072` 这个病态值**不可达**；
+   - 新增 `v_conv565_64`：同样的转换、只把 store 换成 64 位（两像素一写），
+     于是 `@32b` 与 `@64b` 是**真 A/B**，`64b gain=` 可信；
+   - `frame_bytes` 明确为游戏矩形（稳态帧实际写入量），黑边另算。
+
+### 关键文件修改记录
+- `vita-port/src/vita_perf.h` / `.c`：`VitaFrameSeg`（blit/letterbox/vkey/shot/splash）
+  + `vita_perf_frame_seg()`（`vita_perf_frame()` 变成传 `NULL` 的包装）；
+  `fp.acc_blit/letterbox/vkey/shot/splash` + `seg_samples`；两处窗口重置一并清零；
+  输出 `[PERF] seg(...)` 行（`other` 用 `prepare_avg − sum`，并**钳到 0** 防下溢）。
+- `vita-port/src/vita_display.c`：`flip_to_display()` 里 5 个时间点（`ts` + `seg`），
+  末尾调 `vita_perf_frame_seg()`。
+- `vita-port/src/vita_membw.c`：`cached2`、`v_conv565_64`、`r_frame64` 改用它、
+  `64b gain=` 输出、memcpy 真拷贝、`free(cached2)`。
+- `vita-port/CMakeLists.txt`：`set(VITA_VERSION "03.59")`。
+- `COMPATIBILITY_ROADMAP.md`：P1-3 第 3 项补实测数据与"作废"结论。
+
+### 验证
+- `vita_perf` 单测扩到 **24 场景全 PASS**，新增 3 条：
+  1. `seg_split`：60 帧、prepare 17000 而五段 5000+1000+9000+1500+0=16500
+     ⇒ 日志必须逐字输出
+     `[PERF] seg(n=60) blit=5.00 ltbox=1.00 vkey=9.00 shot=1.50 splash=0.00 | other=0.50 of 17.00`，
+     且主行 `prepare=17.00` 仍在（兼容旧读者）；
+  2. `seg_absent`：走旧接口（不分段）时**不得**输出 seg 行（全 0 会被误读成
+     "prepare 全是纯开销"）；
+  3. `seg_no_underflow`：分段之和**大于** prepare 时 `other` 必须钳 0，
+     不能回绕成 ~4294 s。
+- `vita_membw` 单测扩到 **10 场景全 PASS**，新增 `memcpy_real`：
+  固定时钟下 `memcpy cached` 必须是真实速率（26.2 MB/s），并断言
+  `memcpy cached=131072` 不可达。
+- 11 套既有单测全 PASS。
+- `./build.sh` exit 0，`out/vpk/midp_vita_v03.59.vpk`，版本串 v03.59；
+  `strings` 含 `[PERF] seg(n=%u) …`、`rgb565->abgr 32b …`、`64b gain=%u%%`。
+- `readelf -l`：TEXT `+0x3deff4`，RW 起 `0x813f0000` → 余量约 **68 KB**（在变小，注意）。
+- **真机未验证**。
+
+### 踩到的坑
+- 追加版本块时**只在注释里写了 03.59、忘了补 `set(VITA_VERSION "03.59")`**，
+  `build.sh` 出来的包仍是 03.58。这是**第二次**同类失误（上次是删掉了后一行注释）。
+  规矩：版本块写完立刻
+  `grep -n 'set(VITA_VERSION' CMakeLists.txt | tail -3` 并确认新号在里面。
+- 单测里把新增的场景函数写在 `scenarios[]` 表**之后**，C 需要先声明后使用，
+  编译报 "undeclared"。解法：把 `struct scen` + 表整体移到 `main` 前。
+- `-Wunused-but-set-variable` 抓出 `us_conv64_c` 只算不用 —— 顺手把它也打进
+  `64b cached=`，比 `(void)` 掉更有价值。
+
+### 没做 / 下一步
+1. 真机跑一轮，看 `[PERF] seg(...)` 的 `other=`：
+   - `vkey` 占大头 ⇒ 虚拟键盘绘制是元凶（它有渐变/圆角/alpha 混合）；
+   - `shot` 占大头 ⇒ `vita_shot_service()` 每帧都在做检查（或偶发 PNG 编码）；
+   - `blit` 占大头（≈17 ms）⇒ 那 5.24 ms 的顺序读探针**不代表**真实 blit 的
+     跳读/行跨 stride，要按真实 stride 再测一次。
+2. **不要**再往"加宽 store / cached 中转"方向走（已被数据否掉）。
+3. 仍等真机的三条：v03.44 的 `[img]`/`[gfx]`、v03.42 的 `[m3g] ndc src`、v03.43 听感。
+
+## 2026-10-31 log153：极品飞车"蓝屏" —— 截图量到了，两个结论可证，一个不可证
+
+### 先纠正我自己的一个错误推断
+我一度认为游戏主循环死锁（`ab.f` 只在一处清除）。**这个推断是错的，已撤回。**
+`ab.paint()` 的两条路径末尾都会 `putstatic f = false`（bci 20 与 bci 170），
+所以 15 ms 的 `java.util.Timer`（类 `v`）不会被自己的限流标志卡住。
+
+### 截图到底是什么（代码测量的，不是眼看）
+`shot_20261031_151640.png` = 960x544。游戏画布在 x 276..684（240x320 放大 1.7 倍），
+两侧是启动器的虚拟键盘。画布内**非背景像素的 bbox 正好是 x 65..239, y 90..207 = 175x118**，
+与日志里的 `[gfx] ... clip=64,90 176x117` 完全一致。颜色：底色 `#102842`，
+面板内是 `#7b9aad` 与 `#527594` 的 **50/50 棋盘**（采样 6857 : 6856）。
+`#7b9aad` 正是 `#7e98af` 的 **RGB565 展开**（126→123, 152→154, 175→173）。
+
+### 游戏在这块区域画了什么
+`ad.a(g,54)`（从 `byte[]` 调色板取色）+ `fillRect` → `#102842`；
+然后从 `bd`(250x189) 取 **(16,137) 32x32** 的瓦片铺满 176x117（24 块），
+再用 **(0,152) 16x16** 的瓦片盖住顶部 16 行（11 块）。
+`bd` 是 **NFS SHIFT 载入画面图集**（SHIFT logo、地球、菱形、NEED FOR SPEED logo），
+品红 `#ff00ff` = 调色板索引 0 且 alpha=0，即**透明色键**。
+
+### 我做了宿主回放 —— `drawRegion` 是**对的**
+用真实素材把日志里那 60 条 `drawRegion` 重放成图，结果与截图**布局完全一致**：
+面板位置、尺寸、抖动主体、顶部斜纹、深蓝底色全对。
+**所以 `drawRegion` + 调色板 tRNS 透明这条路是正确的。**
+唯一差异：抖动里"透明"的一半，设备上是 `#527594`，回放里是底色。
+`#527594` 在整个 jar 里只出现在一处：**`ar`(51x323) 的调色板索引 92**，
+而 `ar` **确实被加载了**（`[img] ok '/ar' 51x323`）。
+但 `drawImage`/`fillRect`/`drawString` 当时没有打点，
+**所以我不能说它在下面画过 —— 这是"不可证"的那一条。**
+
+### 可证的结论 1：极品飞车**从未进 3D**
+jar 里有 **28 个 `.m3g`** 资源（`q`,`y`,`af`,…），日志里**一条对应的 `[m3g] load` 都没有**。
+全部 188 条 `[m3g]` 行都属于**生化危机**（hunter/zombie/nemesis/aim/effect/item/simin/missionmap）。
+所以它不是"3D 渲染失败"，是**停在 3D 之前的 2D 画面上**。
+
+### 可证的结论 2：它自己的位图字**画在裁剪区外**
+字体图集 `cf`(166x83) 的字形通过 `drawRegion` 提交到
+**x=312..378**（240 宽画布）和 **392..458**（那次 320x240 运行），
+两种朝向下都是**右侧超出 138 px**。
+`getClipX()` 返回 `clipX1 - transX`，与 `x_dest` 同一坐标系，所以这些字形**被裁掉、看不见**。
+这与颜色问题无关，是独立的真实缺陷。
+
+### 这一版加的三个打点（正是缺的证据）
+```
+[gfx] drawImage WxH d=x,y a=anchor clip=.. trans=..
+[gfx] translate dx,dy -> trans=.. clip=..
+[gfx] setClip x,y WxH trans=.. surf=..
+```
+各自限次（60/40/40 行/次运行），与已有的 `drawRegion` 打点合起来覆盖整条 2D 路径。
+
+### 我不知道的（明说）
+**为什么停在那个画面，我不知道。** 已知链路：`ab.c()` 起 15ms Timer（类 `v`）→
+`v.run()` 在 `(ab.b || ab.f)` 时早退 → 进 3D 需要 `ai` 状态机走到**状态 19** →
+`ab.a(true)` → `d = (b && field#158.b())` → `af.b() == (g != 0)`。
+日志里没有状态号，所以无法判断它停在哪一步。下一版应当把状态号打出来。
+
+### 性能（如实）
+`f=534 fps=6.7`、`f=914 fps=9.1`、`f=1224 fps=2.7`，period 最大 3653 ms。
+ARM 依旧被固件压在 333 MHz（`arm stuck at 333 MHz (asked 444, all strategies failed)`）。
+本轮不动性能。
+
+### 教训
+- **截图能量就必须量。** 我之前几轮靠"看"描述矩形位置，这次用像素 bbox 量出 175x118，
+  一步就和日志的 `176x117` 对上了。
+- **宿主回放是这轮唯一真正推进的东西。** 它证明了 `drawRegion` 没错，
+  把范围从"渲染管线"缩到"未打点的那几条绘制路径"。
+- **不要为了给出答案而编链路。** 我先编了"Timer 死锁"，查了两行字节码就否掉了。
+
+## 2026-10-31 log153 分析（v03.58，真机，noscale=1）——本轮只分析，未改代码
+
+### 事实（rootstate 探针 + 带 ms 的 [INPUT]）
+- 探针输出 68 行（上限 400，未满）。位置全程不变：只有 5 条 `(new position/entity)`，都是各实体第一次出现；没有任何实体出现过第二个位置。
+- **敌人（n=675，位置固定）**：从 ms=...887896 起共 58 次 cols 3<->1 切换，非常规律：全状态中位 849 ms（28 次）、压扁状态中位 870 ms（29 次），切换间隔 min 721 / 中位 865 / max 2399 ms。
+  与按键无关：±150 ms 内只有 3 次，同样事件密度下随机期望 5.1；距上一次方向键的延迟 83~15429 ms、中位 4009，平均按键间隔 4993 ms，即随机水平。
+- **Jill（n=1073，位置固定）**：只有 5 次切换，全在首次出现后 15.4~24.0 s 内（3->1, 1->3, 3->1, 1->3, 3->1），最后一条记录是 3->1，之后到日志结束再无记录。
+  探针只记变化，所以"此后一直压扁"是推断，不是逐帧观测。5 次切换距上一次方向键按下依次为 8745、810、1777、906、1689 ms（±150 ms 内 0/5，随机期望 0.5）；样本太小，不下结论。
+- **所有方向键都是短点按**：游戏时段内按下到松开 153~265 ms，仅一次 425 ms，没有任何 >= 0.8 s 的按住（用户报告"长按都有"，日志里看不到）。帧率 2.7~9 fps，一次点按约等于 1 帧。
+- Jill 处于"完整"状态的 15.4 s 窗口里只有 2 次点按（LEFT 约 166 ms、DOWN 约 193 ms），位置没变。"完整状态下能否移动"**没有被检验**。
+
+### 对此前说法的更正
+- 上一节写的"'变小'与'不能移动'是同一个矩阵状态的两个表现"仍只是推断（依据是 Ch_PlMove 读 m02/m12/m22 的字节码），现在更弱：压扁状态下 dx=dz=0 是对的，但完整状态下的移动没有被观测到。
+- "按键引起压扁"：对敌人**不成立**（周期性、与按键无关）；对 Jill 无证据。
+- "每秒一次的归一化块是写入者"被削弱：该块由 `FPS_update()` 按墙钟 1000 ms 置 `m_Mi_DrawTimeFlg`，再由 `Draw` 置 `m_OneSecFlg`，`M_Action` 里清除；
+  而敌人切换间隔中位 865 ms、最小 721 ms，低于 1000 ms。帧周期 110~360 ms 的采样抖动能解释一部分，**不能排除也不能证实**。
+  该块输入非零就输出非零（宿主验证），它不是零的来源，除非输入已是零向量或 VM 上的 double 运算链出错。
+- 另：`D_Game_JSR184` 里除拷贝外还有对 m_3D_Trans[7] 的 m00/m11/m22 写入，那是命中特效缩放（n=4 的方块），与角色朝向无关。
+
+### 其他观察
+- BioMain 启动后先加载标题资源，约 36 s 后出现第一帧 3D（`missionmap.m3g`，472 顶点的地图视图，视口 0,105 240x140），约 48 s 后才出现 Jill；此前有 55 次非零按键事件（多为 ○ 和 ←，最后两次 ○ 在进入关卡前约 18.5 s 与 7 s）。
+  游戏代码里有 `runMissionSel`/`runMainMenu`/`runTitle`，我没有验证这个移植里能否走到任务选择，也不知道那张 3D 地图在屏幕上是否可见。用户反馈"没有选择任务的界面"。
+- `Transform`/`Matrix4` 没有共享的静态暂存数组（宿主检查），线程竞争造成坏矩阵的路径不存在。
+- 未看 `shots/shot_20261031_151640.png` 的内容（图片工具只返回链接）。
+
+### 下一步（建议，未做）
+- 设备端一次性自检（进游戏就跑，输出 1~3 行）：(A) rotationY 链：对 0..4095 调 `Transform.postRotate(i*360f/4096f,0,1,0)`，按游戏的 `(int)(m*4096f)` 取整，查 m00/m02/m20/m22 同时为 0 或列模长偏离；
+  (B) `Vector3D.unit()` 的 double 运算链（i2d, dmul, dadd, sqrt, ddiv, dmul 4096, d2i）对 4096 个方向，查输出为 0 或偏离。fpmodel 只测过单个字节码，没测过整条链路。
+- 请用户做一次"按住方向键不放 >= 3 秒"的测试，看 [INPUT] 里是否仍被切成短脉冲。
+
+## 2026-10-31 v03.61：喜羊羊铃声"音质不如安卓"——不是破音，是电平低 12 dB
+
+用户反馈（log153，真机 v03.58）：喜羊羊 Nokia 铃声"播放拖慢、有破音"，不如安卓 J2ME-Loader。
+上一轮我先后追了"循环空档 2.9 s"和"踢拖"，用户明确否掉了第一条（游戏设计如此），只说音质。
+
+### 先测量，不猜（设备 pcm_dump.raw，一个完整音符 0.66–0.87 s，E4）
+| 指标 | 实测 | 理想方波 | 结论 |
+| --- | --- | --- | --- |
+| f0 | 329.585 Hz = **MIDI 64.00** | 64.00 | 音高精确 |
+| H3/H5/H7/H9 | −10.4 / −15.0 / −17.9 / −20.3 dB | −9.5 / −14.0 / −16.9 / −19.1 | 齐整 1/n |
+| 偶次谐波 | **0.00 %**（H2 −55 dB） | 0 | 对称，无畸变 |
+| 谐波 1..72 占 AC 能量 | **99.987 %** | — | — |
+| 非谐波/噪声/混叠 | **0.013 %（−38.9 dB）** | — | 无任何"破"的痕迹 |
+| 削波 / 512 帧接缝不连续 | 0 / 0 | 0 / 0 | 无爆点 |
+| **峰值 / RMS** | **19.8 % FS（−14.1 dBFS）/ −16.1 dBFS** | 接近满刻度 | **唯一真实差距** |
+
+被否掉的旧结论（要记住，别再走回头路）：
+- "有破音/削波/混响拖尾/接缝嗡嗡"——全部无物理痕迹。
+- 我曾用"非整数周期相位平均"得出"平台倾斜 = 不是方波"，那是**分析伪影**。样本本身
+  （167 采样整数周期）H3 = −10.3 dB、偶次 −39 dB，是干净方波。
+
+### 根因：一个在 v03.41 之后过期的常量
+`nokia_src/RingTone.java` 的 `MIDI_CC7 = 80`。它是 v02.88 时代的测量结果——当时 preset
+0:80 还有**两层**（detune ±3 cents）。v03.41 删掉第二层时电平掉了约 6 dB，常量没跟着改。
+
+用设备同款 `tsf.h` 重扫（补丁后的 preset、velocity 95、38 音单声部曲，与 `buildMidi()`
+同构：division 500 / tempo 500000 / `rest = dur>>4`）：
+
+| CC7 | 峰值 | %FS | 削波 |
+| --- | --- | --- | --- |
+| 80（原值） | 6483 | 19.8 % | 0 |
+| 100 | 12570 | 38.4 % | 0 |
+| 112 | 17604 | 53.7 % | 0 |
+| **120（新值）** | **21589** | **65.9 %** | **0** |
+| 127 | 25587 | 78.1 % | 0 |
+| 127（v03.41 前的双层 preset） | 32768 | 100 % | 646073/1384448 = 46.7 % ← 80 的来源 |
+
+### 三处改动
+1. `vita-port/nokia_src/RingTone.java`：`MIDI_CC7` 80 → **120**（+10.5 dB，留 3.6 dB 余量）。
+   只影响 Nokia OTA/RTTTL 转出的 SMF，不影响其他游戏的真实 MIDI。
+2. `vita-port/src/vita_midi.c`：`initialFilterFc` 13500 → **14000**。
+   TSF 的判定是 `f <= 13500` 才**启用** biquad（`tsf.h` 两处都是 `<= 13500 ? cents2Hertz : 1.0f`），
+   所以 13500 一直在开一个 19.9 kHz、QInv=1 的低通，不是旁路。整曲 A/B：21614 vs 21589（0.1 %）。
+3. `vita-port/src/vita_midi.c`：preset 0:80 顶部两个 region 在 TimGM6mb 里本身是坏的——
+   keys 91–102 只循环 **12 个采样**、103–108 只有 **9 个**。把它们重映射到 336 采样的
+   C1 region（keys 0–42）。宿主实测 keys 91..108：
+
+   | 方案 | 音准误差 | crest factor |
+   | --- | --- | --- |
+   | 原样 | +3.0 ~ +6.5 cents | 1.42 ~ 1.55 |
+   | **C1 供体（采用）** | **−0.8 ~ +2.0 cents** | **1.26 ~ 1.44** |
+   | C4 供体 | +2.4 ~ +5.2 cents | 1.48 ~ 1.90 |
+
+   方波 crest 应接近 1.0（Gibbs 振铃 1.09），所以最长循环最优。keys ≤ 90 不动，
+   整曲峰值只变 0.1 %，出货铃声（keys 55–78）与游戏 BGM 不受影响。
+
+### 验证
+- 新增宿主验证 `/tmp/verify61.c` + `/tmp/cmp61.c`：用 `awk` 从 `vita_midi.c` **抽取真实的
+  `midi_patch_square_wave()`** 编进测试程序（不是手抄），输出
+  `2 high regions remapped to the 336-sample donor`。
+- 一次**自己造的误报**要记下：`verify61` 先跑 10 个单音再跑整曲，单音没 note-off，voice
+  残留叠加导致整曲报 peak=32767、10 个削波。`cmp61`（每曲重新 load sf2）得到 21589 / 0 削波。
+  **测试程序的状态污染会伪装成信号问题**，compare 要用干净进程。
+- `./build.sh clean` exit 0，`out/vpk/midp_vita_v03.61.vpk`（12047241 B）。
+- ELF 里确认 `J2ME Player v03.61 b330` 与 `[MIDI] preset 0:80 patched ... %d high regions
+  remapped to the %u-sample donor`（后一个格式串只有新代码才有）。
+- ROM 里的 `com/nokia/mid/sound/RingTone.class` 反汇编确认 `CC7` 处是
+  `bipush -80`(0xB0) → `bipush 7` → **`bipush 120`**。
+- **未上真机。** 验收：设备 `pcm_dump.raw` 峰值应从 6483 升到 ~21500，
+  `clipped samples` 仍为 0；听感应是"同样干净但响得多"。
+
+### 踩到的坑
+- 改 `CMakeLists.txt` 版本块时把 `set(VITA_VERSION "03.60")` 连同 oldString 一起替换掉了，
+  序列变成 03.58 → 03.61。`grep -n 'set(VITA_VERSION' | tail -6` 立刻发现并补回。
+  **这条 AGENTS.md/PROJECT_MEMORY 里已经写过一次，这是第二次，必须每次核对。**
+- 本机 `gcc` 是 `$VITASDK/bin/gcc`（ARM 交叉），宿主编译必须用 `/usr/bin/gcc`，
+  否则报 `invalid -march= option: armv7-a+simd`。
+
+### 遗留
+- 高音区重映射是"用长循环样本替代"，不是重采样；keys 103–108 每周期只有约 10 个输出
+  采样，仍有金属感，只是音准与 crest 明显改善。
+- `Sound.java` 每次换曲仍重建 player（275–407 ms 静音），本轮未动。
+- 循环空档 2.9 s 用户判定为游戏设计，本轮不再处理。
+
+## 2026-10-31 log153 第二轮：用户的三点描述 vs 日志 —— 我之前漏了证据
+
+### 用户给的三个事实（比我读字节码更硬）
+1. 面板**没显示全**，应该有几行菜单，只显示了第一行
+2. "IDI" 其实是 **IDIOMA**（西班牙语"语言"）；**J2ME 上在左边，不是居中**
+3. 底部**确定 / X 按钮也没显示**
+
+### 我从截图量到的
+画布内**唯一**的字形像素簇：物理 x 655..682，逻辑 **x 223..239, y 95..105**，
+列模式 `###...###########...###` = **I-D-I**，与用户读到的完全一致。
+
+### 日志里那 25 条 cf 字形却在 x=312..378，共 4 行
+```
+y=191: x 312,320,330,338,346,357,368
+y=172: x 328,335,344,352,360,367 ...
+y=152: ...
+y=133: ...
+```
+**4 行 = 用户说的"几行菜单"**，全部落在 240 宽画布**之外**，被裁掉。
+
+### 所以"用户看到的 IDI" ≠ "日志里的 25 条字形"
+这一点必须先讲清楚，因为我上一版把两者混为一谈。
+两种可能，日志无法区分：
+- (a) 可见的 IDI 由**未被记录**的绘制产生
+- (b) 离屏表面真的比 240 宽，贴屏时被裁
+
+### 一个指向 (b) 的算术
+跨两种朝向：
+
+| 朝向 | 面板 x | 字形 x |
+| --- | --- | --- |
+| 240x320 | 64 = **W−176** | 312 = **W+72** |
+| 320x240 | 144 = **W−176** | 392 = **W+72** |
+
+两个式子对 W 的斜率都是 1 —— 这是"有消费者把画布宽度当成了坐标原点"的典型特征。
+面板 W−176 表示**右贴边**（面板宽 176）；字形 W+72 在画布外 72px。
+
+### 我的打点有缺陷，先修自己
+`drawRegion` 的日志上限是 **60 条/次运行**，而这一帧的前 60 条正好被
+"24 块面板瓦片 + 11 块顶条 + 25 个字形"吃满，**真正的 UI 绘制一条都没进日志**。
+这是我上一版的仪表缺陷，不是游戏的问题。本版改为 **200 条**。
+
+### v03.62 加的（全是取证，无行为改动）
+```
+[gfx] Image.createImage WxH (#n)          <- 游戏画进去的离屏表面实际尺寸
+[gfx] drawImage WxH d=.. clip=.. trans=..
+[gfx] translate dx,dy -> trans=.. clip=..
+[gfx] setClip x,y WxH trans=.. surf=..
+[gfx] drawRegion ... <<CLIPPED            <- 被裁剪完全丢弃的绘制
+[gfx] drawRegion clipped total=N ...      <- 每 100 条汇总一次
+```
+判读规则：
+- `Image.createImage` 若不是 240x320 → 直接证实 (b)
+- 若是 240x320 且大量 `<<CLIPPED` → 证实 (a)，即游戏自己的坐标越界
+- `translate` 出现非零 → 找到偏移来源
+
+### 版本号踩坑（记下来）
+`CMakeLists.txt` 里 `set(VITA_VERSION)` 是**配置期顺序展开**：
+- `VERSION ${VITA_VERSION}` 在 4604 行、`-DAPP_VER=` 在 4256 行，
+  **把 set 放在文件末尾（4700 行）不会生效**，构建出来仍是旧版本号。
+  必须放在这些使用点之前。
+- 同一文件被多条工作线同时追加，`03.61` 已被音频线占用，
+  我的用 `03.62` 并插在 03.61 的 `set()` 之后、target 之前。
+- 改完 `set(VITA_VERSION)` 要删 `build/cmake/CMakeCache.txt` 再构建，
+  否则可能不重新配置。
+
+### 仍然不知道
+**为什么字形算到 W+72。** 我没有找到 `translate` 的调用者（全 jar 无 `Graphics.translate`），
+`Font.stringWidth` 走正常的 `gx_get_charswidth`，`Image.getGraphics()` 不带平移，
+`Display` 里的 translate 都成对恢复。所以下一份日志的 `Image.createImage` 尺寸
+和 `trans=` 字段就是决定性的。
+
+## 2026-10-31 v03.63：朝向矩阵压扁——对照 J2ME Loader、设备端自检（仅诊断，行为不变）
+
+### 对照 J2ME Loader（只读行为，未复制代码）
+- 取了 `Transform.java`（Nokia 的 EPL 薄封装，全部委托给原生）和 `m3g_math.c` 到 /tmp/jl。`m3gSetAngleAxis`：角度先乘 DEG2RAD，轴模长不在 [0.995,1.005] 时归一化，
+  零轴置零；`m3gPostRotateMatrix` = 右乘。与我们的 `Transform.rotation()` 数学一致。游戏的 `AffineTrans` 是游戏 jar 自带的整数壳，在 J2ME Loader 上跑的是同一份字节码，
+  所以差异只能在底层：虚拟机算术，或 M3G 的 Transform。Transform 这一层我在宿主上已验证，所以疑点收窄到虚拟机。
+- 其他已查：游戏里**没有**把朝向块直接写成常数 0 的代码（唯一的常数写入是 SetRoomData 里的视图矩阵 -4096）；没有 12 参数 AffineTrans 构造器的调用；`Transform`/`Matrix4` 无共享静态暂存。
+- fpmodel 大参数 sin/cos（|i| 到 2^31，51 个）：0 不匹配、0 同时为零、0 NaN；另有 2 个 rad>2e6 的参数模型跑不了（ABORT，未知，游戏用不到这么大的值）。
+
+### 改动
+- `Transform.rotation()`：真实调用的日志 `rot#N ms= ang*100= axis*100= cos= sin=`（每 16 次一条，另加 cos、sin 同时为 0 或 NaN 的每次一条，上限 160 行）。
+- `Renderer.selfTest()`：第一次 `renderNode` 时在设备上跑一次，各 4096 个角度：(A) rotationY 链 `(float)i*360f/4096f -> postRotate -> get -> (int)(a*4096f)`；
+  (B) `Vector3D.unit()` 的 double 链。输出 `selftest rotY bad=N/4096 first=I zeroBlock=Z | unit bad=N/4096 first=I | T ms`。
+- 版本 03.63。注意：构建会带上别的会话在 vita-port/src 里的改动（03.59~03.62）。
+
+### 验证
+- 宿主：自检 `bad=0/0`，NaN 角度触发 `NAN` 日志；在隔离副本里注入"100~100.5 度 sin=cos=0"，自检报告 `rotY bad=6 first=1138 zeroBlock=6 | unit bad=6`，说明它能失败。
+- 构建：`vita-port/build.sh midp` rc=0，0 error，0 undefined；ROM 含 `selftest rotY`、`rot#`；`Renderer.class` 含 selfTest，`Transform.class` 含 rotQuiet。`midp_vita_v03.63.vpk`。**未上机**。
+
+### 读日志的方法
+- `selftest ...`：rotY 或 unit 的 bad>0 -> 虚拟机上这条算术链出错，first 是第一个坏角度（i*360/4096 度）。两者都为 0 -> 零块不是这两条链产生的，来自游戏逻辑的输入。
+- `rot#... ZERO`/`NAN`：真实调用里 cos 和 sin 同时为 0 / NaN；没有则 rotationY 路径不是写入者。
+- 与 `rootstate#` 的 ms 对齐：压扁出现前后有没有 rot# 行；敌人每 ~0.85 s 的切换是否伴随 rotationY 调用。
+
+## 2026-10-31 log154（v03.63）：极品飞车菜单的"只显示第一行"定位到坐标，不是渲染管线
+
+### 新打点全部在场，数据可用
+```
+Image.createImage      1 条   -> 240x320   （离屏表面尺寸正确）
+gfx] translate       109 条   -> 全部 trans=0,0   （没有任何隐藏平移）
+gfx] setClip         107 条   -> 只有 0,0 240x320 / 64,90 176x117 / 64,90 176x16
+gfx] drawImage       126 条   -> 含 drawImage 240x320 d=0,0 a=0 满幅贴屏
+CLIPPED              179 条   -> 74 条 clip=0,0 240x320（真画到外面）；105 条 clip=0,0 0x0
+异常                     0 条
+```
+
+### 6 行菜单的实际坐标（NFS 段，src=166x83 = 字体图集 cf）
+| 行 y | 字形数 | x 范围 | 相对 240 宽画布 |
+| --- | --- | --- | --- |
+| 94 | 12 | 209..246 | 只有 209..240 可见 → **这就是用户看到的 "IDI"** |
+| 114 | 18 | 261..327 | 全部裁剪 |
+| 133 | 10 | 313..343 | 全部裁剪 |
+| 152 | 12 | 320..359 | 全部裁剪 |
+| 172 | 10 | 325..364 | 全部裁剪 |
+| 191 | 12 | 310..355 | 全部裁剪 |
+
+**结论：面板画对了，全部文字被推到 x≥209，5 行 100% 在画布外。**
+"底部确认/X 按钮不显示"同一机制（也都是越界绘制）。
+
+### 面板本身没画全的原因（另算）
+面板瓦片是 6×32=192 宽、4×32=128 高，而 clip 是 176x117 →
+右侧 16px、底部 11px 被游戏自己的 clip 切掉。这部分是游戏授权数据，很小。
+
+### 已排除（都有证据，不是推断）
+| 怀疑 | 证据 |
+| --- | --- |
+| 离屏表面尺寸不对 | `Image.createImage 240x320`，正确 |
+| 我们偷偷加了平移 | 109 条 `translate` **全部 0,0** |
+| 我们 clip 算错 | setClip 三个值都合理，`getClipX = clipX1-transX` 语义正确 |
+| drawRegion/调色板透明有问题 | 上一轮宿主回放已证明布局一致 |
+| Font 度量错 | **游戏从不调用 `stringWidth`/`charWidth`**（全 jar 0 次），用自带位图字体 + `charmap` |
+| 图片尺寸报错 | NFS 段 11 张全部 `[img] ok`，尺寸与 jar 文件逐一对上（51/250/240/240/123/128/136/6/83/166/171） |
+| 异常导致状态错乱 | 0 条异常 |
+
+### 文字 x 的真实公式（`af` 字节码，bci 221..293）
+```java
+x = s - (af.a.getWidth() >> 1) + (af.b >> 1);
+u.a(font, text, x, y, ...);        // af.a 是 Image，af.b 是 static byte
+```
+`s` 由 `af.a(int,int)` 从**调用方参数**写入（`putfield #77`，bci 24 与 249）。
+`af.a` 是**背景图**（`a(String)` 从 jar 按名加载）。
+
+**这条公式解释了"J2ME 上在左边"**：当 `s` = 屏幕中心 120、`imgW` = 240 时，
+`x = 120 - 120 + b/2 ≈ 0`，正好贴左边。现在 x≈209，说明 `s` 或 `imgW` 偏离。
+
+### 最强假设（未验证，写清楚是假设）
+若该菜单页的背景图 `af.a` 解析到了一张**远比预期窄**的图，
+`-imgW/2` 的居中修正就会变小，全部文字整体右移 `(240-imgW)/2`。
+jar 里 `/ar` 只有 **51** 宽 —— 用它算修正只有 -25 而不是 -120，正好右移 **+94.5**，
+与观测的偏移量同量级。
+反证：**图片加载失败是有日志的**（`[img] resource NOT FOUND` / `load failed`），
+本轮 0 条，所以 `af.a` 确实是成功加载的某张真图，只是可能是错的那张。
+`af` 还有一条 `af.a = a("LOG")` 的回退分支，而 **jar 里没有 `LOG` 资源** ——
+若那条分支被走到会得到一张异常图；本轮无失败日志，所以大概率没走到。
+
+### 仍然不知道
+为什么 `s` 对这些项算成 209..355。`s` 由 `af.a(int,int)` 的调用方（混淆过的
+`z`/`ai` 状态机）给出，我没能在本轮把链路走完。
+菜单数据在资源 **`/au`**（`z` 解析，`o.a[46]="/au"`），但其 item 表是压缩的，
+我未能直接读出授权坐标 —— 且 `313/320/325/310` **不是** `/au` 里存在的 short 值，
+说明它们是运行时算出来的，只有 `209` 在数据里出现过一次。
+
+### 教训
+- **"用户描述"再次比我的推断硬。** "只有第一行/IDIOMA/按钮没有"三条全部对上，
+  一次就定位到"5 行在画布外"。
+- **先排除再解释。** 这轮排除的 7 项里，有 3 项是我前几轮自己引入的怀疑
+  （离屏尺寸、translate、clip），现在都有数字否掉了。
+- **不要在自己还没量到的地方下结论。** 这轮我明确标了"假设"和"不知道"。
+
+---
+
+## 2026-10-31 v03.64：blit 终于能向量化了（log154 的 seg 数据 + 反汇编定案）
+
+> 产物 `out/vpk/midp_vita_v03.64.vpk`（12051331 B），版本串
+> `J2ME Player v03.64 b330`。**未在真机运行。**
+
+### log154 给的两把钥匙
+v03.59 加的 `[PERF] seg` 行第一次把 17.11 ms 拆开：
+
+```
+[PERF] f=600 fps=9.7 period=102.76 flip=25.76 prepare=17.11
+[PERF] seg(n=300) blit=14.69 ltbox=0.00 vkey=2.41 shot=0.00 splash=0.00 | other=0.00 of 17.11
+```
+
+⇒ **86% 是 `blit_scaled()`**，其余三段全为 0，`other=0` 说明这一段已被完全分解。
+
+同一份日志的带宽探针（顺序 rgb565→abgr）**25.0 ns/像素**，外推到 407×543 只要
+**5.52 ms**；实测 blit 是 **14.69 ms**，**慢 2.8 倍**。
+
+### 反汇编给出确切原因：**gather 无法向量化**
+| | 反汇编 |
+| --- | --- |
+| 探针 `v_conv565` | `vld2.16` / `vmovl.u16` / `vshll.u16` —— **gcc 自动向量化成了 NEON** |
+| 真 `blit_scaled` | 17 条标量指令、未展开 |
+
+原因就是 `src_row[sx >> 16]` —— **间接索引（gather）**。ARMv7 NEON 没有 gather 指令，
+向量化器只能放弃；再加上 `sx += step_x; sx >> 16` 的依赖链和跨步加载，预取也失效。
+
+### 顺带退休一个旧顾虑
+**不需要改 `-mfpu=neon`**。VitaSDK 的默认就是
+`-march=armv7-a+simd -mfpu=neon`（`arm-vita-eabi-gcc -Q --help=target` 实测），
+vita-port 的 C 代码**一直**都可以被向量化——只是这一个循环的形状不允许。
+v03.11 那个 FP overlay 的顾虑与这里无关。
+
+### 改动（映射逐像素不变）
+- **pass 1**：把整行源像素转换进 **3.2 KB** staging 缓冲，**顺序**读写——正是探针的
+  形状，gcc 会向量化。数量从 `dst_w`(407) 降到 `virt_w`(240)。
+- **pass 2**：把每个转换值写进它的目标 run。`blit_run[s] = ceil(s*65536/step_x)`，
+  已证明它**精确划分**目标行（证明写在 `blit_stage` 上方的注释里）：
+  对整数 x，`floor(x*step_x/65536)==s ⟺ ceil(s*65536/step_x) ≤ x < ceil((s+1)*65536/step_x)`。
+  内层是"重复值填充"，gcc 生成 `vdup` + `vst1.32 {d16-d17}`（一次 4 像素）。
+- **降采样（`step_x >= 0x10000`）保留原 gather**：那里 run 表几乎全空，先转换整行
+  比实际用到的列更贵——宿主基准实测 **0.56x（慢 1.8 倍）**。混合后该情形 1.00x。
+- `compute_scaling()` 末尾调 `blit_run_build()`；`blit_run_valid == 0` 时回退原循环
+  （`virt_w > VITA_MAX_W` 等异常几何仍能正确出图）。
+
+### 验证
+- **新增 `/tmp/blittest`：6061 条断言全 PASS**，全部是"新旧映射必须逐位相同"：
+  1. 13 种真实几何（240×320→407×543、320×240→726×544、176×208、360×640、480×800、
+     1:1、stretch、1×1、单列等）；
+  2. **`dst_w` 从 1 到 960 穷举**（ceil 形式最容易差一列，手挑几个尺寸抓不到）；
+  3. **`virt_w` 从 1 到 800 穷举** × 7 个目标宽度；
+  4. **无空洞无重叠**：每个目标列必须被写**恰好一次**（写 0 次＝上一帧残留的
+     "鬼影列"，在 checksum 里看不出来）；
+  5. `virt_w=800` 的边界；
+  6. **比较的是 hybrid**（设备真正跑的路径），不是纯两趟版本。
+- **宿主基准**（`/tmp/blittest/bench.c`，best-of-200，x86，只看方向）：
+
+  | 几何 | 旧 | 两趟 | 纯两趟 | hybrid |
+  | --- | --- | --- | --- | --- |
+  | 240×320→407×543 | 0.666 ms | 0.563 ms | 1.18x | **1.18x** |
+  | 320×240→726×544 | 1.191 ms | 0.799 ms | 1.49x | **1.49x** |
+  | 176×208→299×354 | 0.320 ms | 0.277 ms | 1.16x | **1.16x** |
+  | 480×800→326×544 | 0.538 ms | 0.957 ms | 0.56x | **1.00x** |
+
+- 最终 ELF 反汇编确认：`blit_scaled` 里有 `vmovl`×9 / `vshll`×9（pass1）与
+  `vdup`×1 / `vst1`×1（pass2），**不再是 17 条标量指令**。
+- 12 套单测（含新增 blittest）全 PASS。
+- `./build.sh` exit 0，版本串 v03.64。
+- `readelf -l`：TEXT `+0x3e0f74`，RW 起 **`0x81410000`** → 余量约 **124 KB**
+  （RW 起点又后移了，比上一轮的 68 KB 宽松）。
+- **真机未验证**。
+
+### 必须说清的诚实上限
+```
+period 102.76 ms
+├─ flip      25.76  (25%)  ← prepare 17.11 里 blit 14.69
+└─ Java/VM   77.00  (75%)  ← 真正的大头，被固件锁在 333 MHz
+```
+**即使 blit 归零**，period 也只到 85.6 ms，fps 9.7 → 11.7（+20%）。
+P1-3 的"渲染耗时 −50%"可达；**"2D ≥55fps"不可达**，任何绘制改动都做不到——
+那需要 VM 执行速度数倍提升，而 `configmode(1)/(0)` 都被 `rc=0x802b0000` 拒绝。
+
+### 教训
+- **"性能问题"要先问"编译器有没有帮上忙"**。同一个算术、同样的标志，探针 25 ns/px、
+  真代码 66.5 ns/px，差别只在**循环形状**（顺序 vs gather）。反汇编 20 行就能看见。
+- **基准要跑三次**。我第一次跑出 1.80x，重复后稳定在 1.18x —— 单次结果不可信。
+- **优化前先量分项**，否则会去优化占 0% 的部分（`ltbox/shot/splash` 全是 0.00）。
+
+### 没做 / 下一步
+1. 真机看 `[PERF] seg` 的 `blit=` 是否从 14.69 掉下来（预期 8–11 ms）。
+2. 无论掉到多少，下一步都该转 **VM 执行速度**（占 75%）或 **3D**（log154 里
+   `posArea=526 negArea=484`、`frames=190` 说明塌陷已修，但 `x[-69,-46]` 说明
+   模型仍在视野外）——不要再在绘制上花时间。
+
+## 2026-10-31 log154 分析 + v03.65：删除自检
+
+- 证据（真机 v03.63）：`selftest rotY bad=0/4096`、`unit bad=0/4096`，rotationY 链与 `Vector3D.unit()` 双精度链在设备 VM 上全角度正确；自检耗时 23.8 s（host 8 ms）。
+- 证据：敌人（n=675）3↔1 列切换 25 次，满矩阵中位 879 ms、压扁中位 1264 ms，27 次状态变化中只有 6 次落在手柄事件 ±150 ms 内；Jill（n=1073）满矩阵后只切换一次、之后一直压扁。角色出现后有 76 次方向键按下，4 次 ≥800 ms（最长 RIGHT 2147 ms）。
+- 推断（未证实）：零旋转块来自游戏逻辑（候选 `M_Action` 每秒块、`Ch_TurnTrg`、`Ch_PlAttack` 等），不是引擎算术。`MoveCheck` 无 long 运算，BioCtrl 里只有 `CrossPoint`/`CrossPlane` 用 long。
+- v03.65：`Renderer.selfTest()` 及调用已删除，无其他行为变化。已构建（`midp_vita_v03.65.vpk`），ROM 中无 `selftest` 字符串；未上机验证。
+
+## 2026-10-31 log154 第二轮：把"菜单只显示一行"压缩成一句可量化的结论
+
+### 一句话结论
+游戏把自己的菜单文字**居中在 x ≈ W + 100**（W = 画布宽 240），
+而正确应居中在 **W/2 = 120**。整整偏右一个屏宽多。**不是渲染管线问题。**
+
+### 推导过程（全部可复核）
+从 `af` 字节码取到文字 x 的公式（bci 221..293）：
+
+```
+x = s - (af.a.getWidth() >> 1) + (af.b >> 1);   // af.a = Image, af.b = static byte
+u.a(font, text, x, y, ...);
+```
+
+若 `af.b` 是"剩余空间"（= imgW − textW），公式化简为 **`x = s − textW/2`**，
+即 **`s` 是每行文字的中心 x**。
+
+用 log154 实测的字形位置反算（`s = x0 + textW/2`）：
+
+| 行 y | 字形数 | x 范围 | textW | 反算中心 s |
+| --- | --- | --- | --- | --- |
+| 94 | 12 | 209..246 | 37 | 227.5 |
+| 114 | 18 | 261..327 | 66 | 294.0 |
+| 133 | 10 | 313..343 | 30 | 328.0 |
+| 152 | 12 | 320..359 | 39 | 339.5 |
+| 172 | 10 | 325..364 | 39 | 344.5 |
+| 191 | 12 | 310..355 | 45 | 332.5 |
+
+后 4 行（同一组按钮文本）s ≈ **332–344**，稳定在 **≈340**。对 240 宽画布，
+中心应在 120 → **偏 +220，约等于 +W**。
+
+log153 的横屏帧（W=320）同组行 x0 = 392，竖屏 x0 = 312 → **Δx = 80 = ΔW**，
+对 W 的斜率是 1。这与 `s ≈ W + 100` 一致。
+
+### 本轮排除掉的（都有数字）
+| 怀疑 | 证据 |
+| --- | --- |
+| 离屏表面尺寸 | `Image.createImage 240x320` |
+| 隐藏平移 | 109 条 `translate` 全部 `trans=0,0` |
+| clip 算错 | 只有 `0,0 240x320` / `64,90 176x117` / `64,90 176x16`，107 条 `surf=240x320` 全一致 |
+| 图片尺寸 | 11 张全部 `[img] ok` 且与 jar 文件逐一对上；`[img] ok` 上限 80/次 VM 启动，log154 共 120 条 = 3 次运行，**未被截断** |
+| Font 度量 | 游戏**从不调用** `stringWidth`/`charWidth`（全 jar 0 次） |
+| 异常 | 0 条 |
+| anchor 语义 | 字形 `a=0`、瓦片 `a=20`，`check_anchor` 明确把 0 当 TOP\|LEFT |
+| 图片加载失败被静默吞掉 | `c.a(String)` 对未知名**返回 null 不抛异常**，但 `af.a.getWidth()` 会 NPE；无 NPE 说明 `af.a` 非空、是真实图 |
+
+### 新增的可疑点（未验证）
+`crumb.log` 三次都是 `locale=(default)`。这个游戏的菜单正是 **IDIOMA（语言选择）**，
+jar 里有 `t_CS` / `t_PL` / `t_PT-PT` / `t_RU` / `t_TR` 五份翻译文件，
+`c.a[]` = {"28182","24171","27282"} 三张图，`z`/`ad` 按索引取布局数据。
+**如果布局是按"语言/设备档案"选的，而我们报的 locale 让它选到了一份为更宽屏幕
+编写的布局，就与观测完全吻合。** 但这是**假设**，我没有证据。
+
+### 我没能拿到的（不再猜）
+`/au`（菜单数据，`o.a[46]="/au"`）的 item 表是**变长压缩格式**：
+`z` 的解析在 `e[]` 子块里有 if/switch 分支（成员数量随数据变化），
+我写的固定步长解析器在 item 3 就吃完了整个 21948 字节文件。
+全量逆向这个格式成本很高，而且**即使解出来也改不了游戏的数据**。
+`313/320/325/310` 这些值在 `/au` 里**不是任何存在的 short**（只有 `209` 出现过一次），
+说明它们是运行时算出来的，不是授权坐标。
+
+### 下一步（按价值排序）
+1. **查 locale 链路**：确认 `System.getProperty("microedition.locale")` 在我们这里
+   返回什么，以及游戏是否据此选布局。这是唯一能与"整份布局偏一个屏宽"吻合的假设。
+2. 若 locale 不是原因，则需要在 `af.a(int,int)` 被调用时拿到参数 —— 那只能在
+   游戏代码里，做不到；替代方案是把 `Image.getWidth()` 的每次返回都记下来，
+   确认 `af.a` 到底是哪张图（3 张候选之一）、宽度多少。
+
+### 教训
+- **把"现象"换算成一个等式，比描述现象有用得多。**
+  这轮把"菜单只显示一行"变成 `x = W + 100`，虽然还没修好，但范围和方向都明确了。
+- **公开承认到哪一步为止。** `/au` 的压缩格式我确实没解出来，就不假装解出来了。
+
+## 2026-10-31 v03.66：根因找到 —— `microedition.locale` 缺失，游戏因此弹出**语言选择**画面
+
+### 证据链（全部可复核）
+1. **MIDP 2.0 要求 `microedition.locale` 必须有值**。我们这里是**缺失**的：
+   - `midp_properties_dynamic.c` 的 `initializeConfig()` 只补了
+     `microedition.configuration` / `microedition.profiles` / `microedition.encoding`，
+     **没有 `microedition.locale`**。
+   - `vita_main.c` 的 `system_cfg_override()` 里
+     `vals[2] = (locale非空) ? locale : NULL`，而 NULL 的语义是"不要覆盖"，
+     `system.config` 模板里也没有这一行 → **属性根本不存在**。
+   - 结果 `System.getProperty("microedition.locale")` 返回 **null**。
+     `crumb.log` 三行都是 `locale=(default)`，与此一致。
+
+2. **游戏确实读它**。全 jar 扫 `microedition.locale`，**只命中 `u.class`** ——
+   正是那个画位图字体/处理文本的工具类。
+
+3. **读了之后干什么**（`javap -c u`，方法 `a(String[])Z`）：
+```java
+byte idx = -1;
+String loc = System.getProperty("microedition.locale");
+if (loc != null) {
+    loc = loc.toLowerCase().trim();
+    if (loc.length() < 2) return -1;
+    for (int i = 0; i < arr.length; i++) {
+        if (arr[i].length() > loc.length() && arr[i].startsWith(loc)) { idx=-1; break; }
+        if (loc.startsWith(arr[i])) { idx=(byte)i; break; }
+    }
+}
+return idx;                     // locale 为 null 时返回 -1
+```
+   **null → -1 = "语言未知"**。游戏据此判断无法确定语言，于是弹出语言选择。
+
+4. **与观测完全吻合**：
+   - 画面就是语言选择页，有 6 行 + 底部 OK/X 按钮。
+   - **6 行菜单 = 6 种语言**，而 jar 里正好有 5 份翻译文件
+     `t_CS` / `t_PL` / `t_PT-PT` / `t_RU` / `t_TR` + 英文默认 = 6。
+   - 可见的第一个字形簇是 `I-D-I` = **`IDIOMA`**（"语言"）的 `IDIO` 被裁到剩 `IDI`。
+   - 极品飞车**从未加载过它 jar 里的 28 个 `.m3g` 模型**（log153/log154 里该游戏
+     **0 条 `[m3g]` 行**）—— 因为它根本没离开这个前置画面。
+
+### 修复
+`system_cfg_override()` 在未配置时回退到 `VITA_DEFAULT_LOCALE = "en-US"`；
+`game.cfg` 里的 `locale=` 仍然优先。这些标题只比较语言子标签（`startsWith`），
+而这个 jar 是英文版，所以 `en-US` 能命中英文项。
+`crumb` 行改为打印**实际生效值**而不是 `(default)`，下一份日志能直接看到。
+
+### 不宣称的部分
+**不宣称这同时修好了上一轮量到的水平偏移**（文字居中在 `s = W + ~100` 而非 `W/2`，
+6 行里 5 行落在 240 宽画布外）。那些行属于**语言选择页**；游戏一旦跳过这一页，
+问题可能不再出现 —— 但我没有验证，所以不作为结论。
+
+### 验证
+- 构建 `rc=0`；`strings` 里 `en-US`、`microedition.locale` 均在 ELF 内。
+- ASCII `J2ME Player v03.66`；产物 `out/vpk/midp_vita_v03.66.vpk`（12050376 B）。
+- 链路已核对：`seed_system_config()` 写 `DATA_DIR/lib/system.config`，
+  而 `initProps(&applicationProperties, &APPL_PROPERTY_FILE, config_root)`
+  读的正是 `system.config`；模板没有该键时，末尾"keys the template did not carry"
+  循环会补上。
+- **未在真机验证。**
+
+### 教训（这是本项目最有价值的一条）
+- **"游戏卡在某个画面"往往是它在等一个我们没提供的环境信息。**
+  这一轮不是渲染 bug、不是内存 bug，是一个**缺失的系统属性**。
+  前几轮我在渲染管线、坐标、裁剪、图片尺寸上排查，全部方向正确但都不是根因。
+- **先查游戏读了哪些 `System.getProperty`。** 全 jar 一扫（`javap -v | grep`）
+  就命中 `u.class`，成本几分钟，收益是直接命中根因。
+- **规范里标 "required" 的属性一个都不能少。** `microedition.locale` 属于
+  MIDP 2.0 必需项，缺了它看起来"只是少个属性"，实际会让一整类游戏停在语言选择页。
+
+## 2026-10-31 BioMain 探针 jar：Vector3D.unit() 零向量日志（仅游戏侧，引擎与版本号未改）
+
+- 动机：log154 排除了 rotationY / unit() 的 VM 算术；`unit()` 对零向量得 0/0=NaN，d2i 得 0，会写出全零行，这是一个没被自检覆盖的输入。
+- 做法：`debug/tools/v3dprobe/Vector3D.java` 与原类字节码等价，仅在 `unit()` 末尾加日志：输入为零或输出全零时打 `[V3D] unit ZERO in=(x,y,z) len*1000=… out=… call#N ms=…`（最多 60 条），前 3 次正常调用打 `[V3D] unit ok`。`outerProduct/innerProduct` 与原字节码一致。
+- 构建：`javac -source 1.3 -target 1.3` + CLDC `preverify`，只替换原 jar 中的 `com/capcom/mascotcapsule/Vector3D.class`，其余 254 项不动，zip 按 build_jar.sh 方式写成非流式条目。产物 `debug/tools/v3dprobe/BioMain_v3dprobe.jar`（1003068 B；原件 1006733 B，`debug/3d_game/` 下的原 jar 未改）。
+- 使用：把探针 jar 拷到 `ux0:/data/J2ME00001/`，`launch.cfg` 指向它，类名仍为 BioMain 的 MIDlet；日志在 `vm_output.log` 里搜 `[V3D]`。
+- 判读：出现 `ZERO` 且 ms 与 `rootstate` 的 3→1 切换对得上 → 零向量输入是根因，再看 `in=` 与调用序号反推是哪个调用点；一条 ZERO 都没有 → 零块不经过 `unit()`，转向 `Ch_TurnTrg`/`Ch_PlAttack` 直接写字段。
+- 未验证：只做了编译与预校验，未上机运行；探针本身会让每次 `unit()` 多一次 `static` 计数，开销可忽略。
+
+## 2026-10-31 修正 v03.66 的结论：语言选择页是**游戏正常流程**
+
+### 用户的对照信息（比我的推断硬）
+用户："对比 j2me loader，IDIOMA 在**左边**，不是居中；底部确认和 X 按钮也显示了。"
+
+**这条信息直接修正了我上一轮的结论。** J2ME Loader 上**也显示语言选择页**，
+所以"`microedition.locale` 缺失导致弹出语言选择页"是**错的**。
+IDIOMA（语言）页是这游戏首次运行的正常设置流程。
+两边的差异不是"是否显示这一页"，而是**这一页的布局**。
+
+### 已撤回的结论
+- ❌ "locale 缺失 → 游戏弹语言选择页 → 不加载 28 个 .m3g"
+- ✅ "语言选择页是正常流程；我们的坐标算错，5/6 行落在画布外"
+
+v03.66 的 `microedition.locale` 默认值仍然**保留**（MIDP 2.0 要求该属性非空，
+这是规范符合性修复），但它**不是**这个画面的原因。
+
+### `u.a(String[])` 的真实用途（重新读了字节码）
+它不是"选布局数据"，而是**字符串排序辅助**（用 locale 做排序基准，
+把当前语言项排到前面），`istore_0 = -1 - idx` 是排序里标记已处理索引的写法。
+所以 locale 影响的是列表排序，不是几何。
+
+### 这一轮新查到的关键路径（坐标解码）
+```java
+// u.a(byte)  —— 加载解包表
+InputStream is = getClass().getResourceAsStream("/" + u.a + "charmap");
+is.skip(off << 8);                      // off 由 24 位 bitmask u.i 的位数决定
+for (k = 0; k < 128; k++) d[k] = (byte)is.read() ... ;   // short[128]
+is.close();
+
+// u.a(short) / b(short) —— 用 d[] 解码坐标
+```
+
+- jar 里 **`charmap` = 1024 字节 = 正好 4 块**（每块 256）。
+- `off >= 4` 就会 skip 到 EOF → `d[]` 全错 → **坐标解包全错**。
+- **`skip()` 的返回值被丢弃**（字节码 `pop2`），所以读坏了也不报错。
+- 这是"同一份数据在标准实现上正确、在我们这里错"的**唯一已知可能路径**。
+
+### 为什么之前查不到
+`[res] open OK` 只记录**图片类**资源（`vita_res_name_is_image`），
+所以 `charmap`、`/au`、`/bi` 这些**数据文件在日志里完全不可见**。
+而且原来的成功日志被 `VITA_RES_OK_MAX` 统一限流 —— 一个游戏开满 256 张图之后，
+连数据资源的日志也一起停了。
+
+### v03.67 的改动（只加日志，无行为改动）
+- 新增 `[res] open DATA name=... len=...` 行，**独立预算**（64 条）。
+- 图片预算与数据预算**不再互相阻塞**。
+- 下一份日志第一次能看到 `charmap` / `/au` / `/bi` 是否成功打开、长度多少。
+
+### 还没验证的（明确列出）
+1. `charmap` 是否成功打开（长度应为 1024）。
+2. `u.i` 的 24 位 bitmask 实际值 → `off` 是否 >= 4。
+3. 若上面成立，则 `d[]` 解包表是垃圾 → 坐标 209 是错值。这是目前最强假设，
+   **但仍是假设**。
+
+### 给用户的即时可验证建议（无需等新版本）
+`game.cfg` 支持 `width=` / `height=`（`vita_main.c:709/715`），所有 profile 默认
+240x320。若 J2ME Loader 用的不是 240x320（很多模拟器默认 176x208 或可设更大），
+游戏可能因此走了不同布局分支。**这是用户自己就能试的一项**，成本极低。
+
+### 教训
+- **用户手里的对照环境是最强的诊断工具。** "J2ME Loader 上在左边"这一句，
+  比我几轮字节码推断更直接地否掉了错结论。
+- **日志的"看不见"要和"没发生"区分开。** 数据资源一直没出现在日志里，
+  我默认当成"没问题"，实际是**打点根本没覆盖**。
+
+## 2026-10-31 log155（v03.67）：**我 v03.66 的 locale 改动是回归，已回退**
+
+### 用户报告
+"极品飞车直接卡在开屏 logo 那里，蓝屏都还没显示。"
+—— 而 log154 时它能到蓝屏。**这是回归。**
+
+### 决定性证据（同一标题、同一 240x320 画布）
+
+| 指标 | log154 (v03.63) | log155 (v03.67) |
+| --- | --- | --- |
+| `drawImage 240x320 d=0,0`（离屏满幅贴屏） | **2 次** | **0 次** |
+| 该次运行的 drawRegion 行数 | 完整帧 | **54**（预算 200，未耗尽）|
+| 绘制停在哪 | 全部 6 行文字 + 贴屏 | **第 3 行文字处中断** |
+| 同一批字形的 x | 310 | **314** |
+
+`ab.paint()` 的两条路径（来自字节码）：
+
+```java
+public final synchronized void paint(Graphics g) {
+    if (d) { a.b(g); f = false; return; }   // bci 5..31：直画到屏幕，提前 return
+    ... 离屏绘制 ...                         // bci 32..158
+    g.drawImage(a, 0, 0, 0);                 // bci 159..166：满幅贴屏
+    f = false;
+}
+```
+
+- 有贴屏 → 帧真的上屏（log154）
+- **无贴屏 + 帧中途停止 → 屏幕停在上一帧贴上去的内容 = splash logo**（log155）
+
+这正是用户描述的"卡在开屏 logo"。
+
+### 已排除：不是我自己的打点截断
+54 / 200，预算远未用完；`drawImage` 预算 60，该段只用了 4（3 个 splash + 1）。
+所以是**游戏真的放弃了这一帧**，不是日志被限流。
+
+### 根因：我给 locale 设了默认值
+v03.66 让 `microedition.locale` 默认 "en-US"。它确实生效了（字形 x 310→314），
+并且把标题推到了 `d == true` 那条路径上。用户的对照（J2ME Loader **也**显示
+IDIOMA 页）已经说明这一页是正常首启屏幕，**locale 不是显示它的原因，也不需要它才能过去**。
+
+**修复：回退。** 属性重新变成默认**不存在**（回到 log154 的行为）；
+`game.cfg` 的 `locale=` 仍可选择另一条路径，`-DVITA_DEFAULT_LOCALE=...` 可强制。
+`crumb` 行改为打印 `(unset)` 而不是 `(default)`，如实反映。
+
+### log155 顺带证实的两件事
+1. **所有数据资源都打开成功**：`[res] open DATA name='charmap'`、
+   `'au'`、`'bd'`、`'cf'`、`'e'`、`'g'` … 共 63 条。
+   → **v03.67 之前怀疑的"数据资源缺失"被排除。**
+   这条很重要：charmap 缺失不再是候选原因。
+2. `t_PT-PT` 被打开**两次**（t=167.3/167.4s），其余 t_ 文件一次都没开。记下来备用。
+
+### 打点修复（都是我自己的测量缺陷）
+- `drawRegion` 预算 **200 → 1500**（约 25 帧）。200 会在**第一帧内**结束日志，看起来像崩溃。
+- **满幅 `drawImage`（图片尺寸 == Graphics 表面）无条件记录**，标记 `<<FULLBLIT`。
+  "帧有没有上屏"完全取决于这一次调用，它的缺失**不能**被行数预算解释。
+  每帧最多 1 次，所以不会泛滥。
+
+### 仍然未知（不宣称修好）
+- IDIOMA 页的行被画在 x=209..365，画布只有 240 宽。
+- `charmap` 已确认能找到，但 `skip(off<<8)` 的 `off` 实际值仍然看不到
+  （jar 里 charmap = 1024 B = 4 块，`off >= 4` 仍会静默读坏）。
+- 回退后是否就能走过 IDIOMA 页，**未验证**。
+
+### 教训
+- **"修一个规范缺口"也可能让游戏变差。** locale 属性按 MIDP 2.0 应该非空，
+  但强制给默认值改变了游戏的状态机分支。**规范符合性不能凌驾于实测行为之上**，
+  改动必须保留"可回退"且默认行为不变。
+- **要区分"屏幕内容"和"帧有没有上屏"。** 这一轮唯一有效的判据是
+  `drawImage 全尺寸` 有没有出现，而不是"画了多少东西"。
+  以后凡是"画面不动"的问题，第一条要看的就是贴屏调用。
+- **对照环境（用户的 J2ME Loader）比我的字节码推断更早给出正确答案。** 上一轮
+  就是靠它纠正了 locale 的结论。
+
+## 2026-10-31 log155（探针 jar v1）：unit() 在真机上对所有非零输入都输出 (0,0,0)；探针 v2
+
+- 证据（log155，真机）：`[V3D] unit ZERO` 60 条，全部 `out=(0,0,0)`，没有一条 `unit ok`；输入包含 `(0,0,-4096)`、`(-4096,0,0)`、`(2896,0,2896)`、`(0,0,4100000)`，每条 `len*1000=0`。第 20~35 条输入本身是 `(0,0,0)`，不算异常。
+- 与 log154 的矛盾：自检（引擎类，已 ROM 化）里同一条 double 链 4096 角度全对。区别是 BioMain 的 `Vector3D` 由设备上的 `ClassFileParser` 解析（`double_parts_at_put` 按 `MSW_FIRST_FOR_DOUBLE` 摆放两个字），ROM 化的类走 romgen。`vita_arm.cfg` 对 romgen 导出 false、loopgen 导出 true，历史上 libcldc_vm 与 ROMImage 对该宏取值不对称（见 v02.40 的 mffd_false 事件）。
+- 推断（未证实）：jar 加载类里的 double 常量被读成错误值。同样可能 `len` 本身为 0；现有数据分不开，因此做 v2。
+- 探针 v2（`debug/tools/v3dprobe/Vector3D.java`，仍只替换 jar 里的 Vector3D.class）：首次 `unit()` 打一行 `[V3D] ctl`，三组对照——`ldc2_w`（经 static 字段读，防 javac 折叠）期望 `4096 1000 16 | 4`；无常量路径期望 `4096 8192 4 4096`；混合期望 `4 8192 4`；之后最多 40 条非零输入的 `sum2(long)`、`len(int)`、`len*8(int)`、`nx(int)`、`out`。主机上跑过，数值符合期望（`(0,0,-4096)`→`(0,0,-4096)`）。
+- 判读：只有第一组错 → ldc2_w 常量读错（字序，看 `MSW_FIRST_FOR_DOUBLE` 与 `ClassFileParser`）；第二组也错 → 运行时 double 算术/转换；全对但 `len(int)=0` → sqrt 或平方累加出问题；全对且 `out` 正常 → log155 的现象是别的原因。
+- 未验证：只做了编译、预校验和主机运行，未上机；引擎与版本号（03.66）未改。
+
+## 2026-10-31 v03.69：加了两个"一次定性"的仪表 + 排查路线
+
+### 为什么加这两个（针对现状）
+目前 IDIOMA 页的行被画在 x=209..365，画布只有 240 宽。
+坐标来自游戏**自己的压缩数据**（`z` 从 `/au` 等文件解析，用 `u` 的查表解码），
+**不是我们算的**。所以要么 (a) 数据解码走错、(b) 环境信息让游戏选了别的布局。
+
+之前所有日志都回答不了这两条，因为：
+- 数据资源的**读取过程**完全无打点（`[res] open DATA` 只证明"能打开"）
+- `System.getProperty` **从来没有打点**，null 返回和"没问过"在日志里长得一样
+
+### 仪表 1：`ResourceInputStream.skip()` 覆写
+```
+[res] skip want=1024 got=1024 remain=0 block=4  <<SHORT
+```
+- **调用 `super.skip()`，行为零改动**，纯观察。
+- `want >> 8` 直接就是 `u.a(byte)` 要的 charmap 块号。
+- `<<SHORT` = 流被读穿 → `read()` 返回 -1 → 解包表全 -1 → **所有坐标错**，且无异常。
+- jar 里 `charmap` = **1024 B = 正好 4 块**，所以 `block >= 4` 就出事。
+- 这是"charmap 能打开"（log155 已证）与"坐标 209..365"之间**最后一个未验证环节**。
+
+### 仪表 2：`System.getProperty` 全量打点
+```
+[prop] ask 'microedition.platform' -> 'Nokia' (len=5)
+[prop] ask 'microedition.locale' -> null
+```
+- 每个**不同**属性名一行（上限 16），值变化时再报一次。
+- 用途：如果坐标是纯数据驱动的，那各平台必然一致；既然不一样，就说明**有环境量在影响**。
+  `microedition.platform` / `microedition.profiles` / `device.*` 是首要嫌疑。
+
+### 顺带修的一个构建陷阱（重要）
+**改 CLDC 的 Java 类（`src/javaapi/...`）后，`rebuild_vm.sh` 只更新 `classes.zip`，
+不会重新 ROM 化** —— ROMImage 还是旧的。实测：`ResourceInputStream` 在 ROM 里有
+5 处引用，但 ROMImage 生成时间早于我的改动，ELF 里查不到新字符串。
+**必须再跑一次 MIDP 构建**（`build_vita.sh`）触发 romgen，然后才重新链接。
+验证方法：`ROMImage_01.cpp` 的时间戳必须晚于 `cldc_classes.zip`。
+
+### 排查路线（按信息量/成本排序）
+
+**第 0 步（已完成，无需用户）**：`charmap` / `/au` / `/bi` 都能打开 → 资源缺失排除。
+`drawImage 全尺寸` 有没有出现 → 帧是否上屏。这两条已可用 log155 判定。
+
+**第 1 步（下一次日志就能定性，成本 1 轮）**
+跑极品飞车，只抓两样：
+- `grep "\[res\] skip"  vm_boot.log` → 若出现 `<<SHORT` 且 `block>=4`，
+  **根因确定**：解包表被读坏。修法明确：不能让 `skip` 越界（或让 charmap 足够大）。
+- `grep "\[prop\] ask" vm_boot.log` → 记录游戏问了哪些属性。
+  若 `microedition.platform` 被问了，就说明**布局按平台分叉**。
+
+**第 2 步（用户可自己做，零成本，可与第 1 步并行）**
+`game.cfg` 里换 profile 试：
+```
+profile=nokia
+```
+再试 `profile=se`（`vita_main.c` 的 profiles 表里有 generic / Nokia N95 / SE K800i，
+都是 240x320）。若布局变了 → 证实"环境量驱动布局"。
+也可试 `width=176` + `height=208`（早期手机常见尺寸）。
+
+**第 3 步（取决于第 1 步结果）**
+- 若 `skip` 正常 → 排除解码，转向"环境量"：把 `[prop] ask` 里被问到的属性
+  逐个调成真实手机的值（N95 的 platform 字符串等）。
+- 若 `skip` 越界 → 在 `ResourceInputStream` 里让短 skip 显式可见（或抛异常），
+  定位是哪个 `arg` 让 bitcount 超了。
+
+**不建议再走的路**
+- 继续逆向 `z`/`u` 的压缩格式：成本极高，且**解出来也改不了游戏的数据**。
+- 继续在 `Renderer`/M3G 上找：极品飞车**从未进 3D**（0 条 `[m3g]` 行），与它无关。
+
+### 验证
+- CLDC `rebuild_vm.sh` `rc=0`（只有已知的宿主 loopgen 链接错误，无害）
+- `cldc_classes.zip` 含新 `ResourceInputStream`；`ROMImage_01.cpp` 已重新生成
+- ELF 内确认：`[res] skip want=`(UTF-16LE)、`[prop] ask`(ASCII)、`[gfx] drawImage`(UTF-16LE)
+- ASCII `J2ME Player v03.69`；产物 `midp_vita_v03.69.vpk`（12053291 B）
+- **未在真机验证**；两个仪表本身不做任何行为改动。
+
+### 教训
+- **"能打开"≠"能读对"。** log155 证明 charmap 打开成功，我差点就此排除资源问题；
+  真正的怀疑点应该是"读的内容对不对"，所以打点要打在 `skip`/`read` 上而不是 `open` 上。
+- **改 Java 核心类要检查 ROM 是否重生成。** 这是我这次差点交付一个"改动没生效"的版本
+  的原因；`strings` 验证 ELF 是唯一可靠手段。
+
+---
+
+## 2026-11-01 v03.70：P1-8 应用内诊断浮层（fps / 帧耗时 / 时钟一屏可见）
+
+> 版本号让位给并行的 3D 会话（03.65–03.69 已被占用），本条取 **03.70**。
+> 产物 `midp_vita_v03.70.vpk`（12053309 B），`J2ME Player v03.70 b330`。
+
+### 动机
+
+v03.59 把 `prepare` 拆成了 blit/vkey/ltbox/shot/splash，v03.64 又把 blit 砍了
+45%（14.69→8.03 ms）。**但这两个数字只以日志文件的形式存在**——要看一眼得先
+拔卡/传文件/等一轮。整个移植过程中每一次性能讨论都以"把 perf.log 拉下来"开头，
+这个回路本身是成本。两行屏显把它替掉。
+
+同时并行的 3D 会话（NFS/生化）每一轮都需要"fps 是多少"，浮层把这件事变成不用
+连线的常识。
+
+### 实现（新增文件，未改共享逻辑）
+
+`vita-port/src/vita_diag.{c,h}`，唯一入口 `vita_diag_draw()`，插在
+`flip_to_display()` 里 **`vita_splash_draw()` 之后、`t_prep` 打点之前**
+（最后画，谁也盖不住；耗时自然落进 `seg.splash_us` 名下，不额外开统计项）。
+
+内容：
+- **第 1 行（常显）**：`"<fps> fps  <period>ms  cpu <prepare>  arm <MHz>"`
+  - fps/period 来自 `vita_perf_get()`（10 倍定点）
+  - `arm` **实时读** `scePowerGetArmClockFrequency()`，不读缓存
+    —— v03.06 的教训：`rc=0` 不代表生效，缓存值只是自欺
+  - `prepare > 12.00 ms` 转红：12.00 正是 v03.59 的基线，低于它即改进，
+    所以颜色是一眼可判的回归警报
+- **第 2 行（`detail=1`）**：`"blit-><us> bw <conv 未缓存>/<conv 缓存> f<帧数>"`
+  - 第一个字段是真实逐帧 blit 测量（`vita_membw_get` 的 `frame_us_32b`）
+  - 后两个是 rgb565→abgr 转换带宽 MB/s（缓存/未缓存两级）
+
+### 配置与开关
+
+`ux0:/data/J2ME00001/diag.cfg`：
+```
+on=0        # 完全隐藏；缺文件 = 可见
+detail=1    # 加第 2 行
+```
+缺省 **可见、一行** —— 对一个"不知道有这个文件存在"的测试者，这是唯一有用的默认。
+
+切换：**SELECT + L 同按**（`vita_input.c`，边沿触发，模块内 static 记住按住状态）。
+- 不能单独 SELECT：它是 MIDlet 的 `'#'`，且有文本组件获得焦点时会打开系统键盘
+- 不能 SELECT+START：那是 v02.92 的截图组合
+- 不能 START/其它单键：都会被 MIDlet 吃掉
+
+### 为什么放 (2,2) 的 300 px 横条
+
+竖屏时游戏矩形从 x=276 开始（407 px 居中于 960），所以 **300 px 的左侧横条整个
+落在信箱黑边里，正常情况不覆盖任何游戏像素**。横屏/拉伸/整数放大 ≥2 时会压到
+游戏，所以它必须可关。
+
+绘制成本：纯不透明填充（显示层忽略 alpha）+ 两行短 UTF-8 走既有菜单字库。
+**不做 alpha 混合**——那需要逐帧读未缓存 framebuffer，正是 v03.64 刚消灭的那类
+停顿。隐藏时只付一次 int 比较。
+
+### 宿主单测 `/tmp/diagtest`（53 条断言，全过）
+
+覆盖：cfg 解析（缺文件 / `on=0` / `on=1` / `on=2` / `detail` 单独 / 空文件 /
+无关键 / 超 255 字节）、init 只跑一次、toggle 与其日志、`NULL`/0/负数几何、
+隐藏时不画、盒子原点与宽高、**盒子外一个像素都不写**、窄屏 200 px 与矮屏
+40 px 被裁剪而非越界、以及 12000 us 阈值恰好不告警（`>` 不是 `>=`）。
+
+顺带发现的真 bug：`vita_membw_get()` 的**第 3/4 位是 memcpy 变体、第 5/6 位才是
+rgb565 转换**，第一版把 memcpy 吞吐当成"blit 转换带宽"显示。写测试时抓到的，
+首次构建前已修。
+
+### 另一个自测教训（记录一下，避免下次再踩）
+
+shim 里把宿主 `FILE*` 强转成 `SceUID`（32 位 int）——x86-64 上指针被截断，
+一次挂掉 8 条断言，且失败信息全都指向 `vita_diag.c` 的"cfg 解析错误"。
+**测试脚手架的缺陷会伪装成被测代码的缺陷**；换指针表（`FILE *g_files[]` + 索引）
+才干净。
+
+### 验证
+
+- `vita-port/build.sh` 全量 `Build successful`；`.vpk` 12053309 B
+- `strings` → `J2ME Player v03.70 b330`；`nm` → `vita_diag_draw/init/toggle/visible` 各一份
+- `readelf -l`：TEXT 到 `0x813e16f4`，RW 基址 `0x81410000`，余量 ≈ **186 KB**
+- 宿主套件全过：perfshim / splashtest / bartest / jartest / mbwtest / blittest + diagtest(53)
+- **未在真机验证**。首次上机要看的三件事：①竖屏下横条确实不压游戏；
+  ②`prepare` 与 `perf.log` 的 `seg()` 数字一致（浮层不能自己成为负担）；
+  ③SELECT+L 不会误触发（在开着 TextField 的界面里按一次）。
+
+---
+
+## 2026-11-01 v03.71：JIT 障碍 ② 根因查明 —— 不是源码问题，是工具链把
+`__builtin___clear_cache` 编成了空操作
+
+> 产物 `midp_vita_v03.71.vpk`（12054547 B），`J2ME Player v03.71 b330`。
+
+### 上次遗留的矛盾，已定案
+
+记录里写的是"`OsMisc_vita.cpp` 源码里有 `__builtin___clear_cache`，但链出来的
+`OsMisc_flush_icache` @ `0x81109a60` 是 `bx lr`"。这次查清了：
+
+1. `arm-vita-eabi-nm -A libcldc_vm.a | grep 'T OsMisc_flush_icache'`
+   → **只有一份**定义，`OsMisc_vita.o` 的 `+0x94`，不存在"另一个成员赢了"
+2. `objdump` 该成员：`94: e12fff1e bx lr`，且 `nm -u` 里**没有** `__clear_cache`
+   → 不是"调用了但被别的空实现顶掉"，是根本没生成调用
+3. 决定性实验（脱离项目，最小复现）：
+```
+void f(unsigned *a, int n) { __builtin___clear_cache((char*)a, (char*)a + n); }
+```
+| 优化 | 结果 |
+|---|---|
+| `-O0` | `nop {0}` 占位，无 libcall，无未定义符号 |
+| `-O1` / `-O2` / `-Os` | 直接 `bx lr` |
+
+**结论：VitaSDK 的 GCC 对本 target 把 `__builtin___clear_cache` 整个折叠成空。**
+源码从来没错过，`OsMisc_vita.cpp` 也不需要改。
+
+### 另外两条路也堵死（这次一并查了，省得下次再试）
+
+- **自己写 `mcr p15, 0, ...` 做 cache 维护**：ARMv7-A 上 cache 维护指令是 **PL1**，
+  Vita 应用跑在 **PL0**，执行即 undef 异常。
+- **换用户态缓存 API**：把 VitaSDK 所有 `*_stub.a` 全扫一遍 grep `icache|dcache`，
+  命中的**全部**是 `libSceCpuForDriver_stub.a`（`ksceKernelDcacheCleanRange` …）
+  和 `libSceCpuForKernel_363_stub.a`（`ksceKernelIcacheInvalidateRange`）——
+  **ksce\* 只能内核插件用，用户态没有任何缓存 API。**
+
+### 真正的出路：VM domain（本移植此前从未用过）
+
+`psp2/kernel/sysmem.h`：
+
+| API | 语义（头文件原文） |
+|---|---|
+| `sceKernelAllocMemBlockForVM(name, size)` | VM domain 内存块，`size ≤ 16 MiB` |
+| `sceKernelSyncVMDomain(uid, addr, size)` | *"Flushes Virtual Machine caches for the given memory location"* |
+| `sceKernelOpenVMDomain()` | *"Makes all Virtual Machine domain memblocks **executeable**"* |
+| `sceKernelCloseVMDomain()` | 变为不可执行 |
+
+**所以「VM 块 + OpenVMDomain + SyncVMDomain」同时解决了障碍 ①（XN 取指）和
+②（缺 flush_icache）。**
+
+### 但不能假设，所以先探针
+
+`vita-port/src/vita_jitmem.{c,h}`，挂在 `vita_main.c` 早期启动，**只在
+`ux0:/data/J2ME00001/jitprobe.cfg` 存在时运行**——探针要执行刚写进去的机器码，
+在不通融的固件上就是 prefetch abort，会把整个 app 带走，不能默认打开。
+
+四问按序答，任一步失败即停，使崩溃可归因到唯一一步：
+
+1. `AllocMemBlockForVM` 能不能给出块？
+2. VM 域关闭状态下能不能写？（不能的话正确顺序是 open→write→close，日志会直说）
+3. `OpenVMDomain + SyncVMDomain` 之后 `bx` 进新写的字节能不能回来？
+   代码是 `mov r0,#42; bx lr`，字节 `e3a0002a` / `e12fff1e` **取自
+   `arm-vita-eabi-as`，不是凭记忆手打**。
+4. 开域之后**还能不能写**？JIT 必须原地 patch（`CompiledMethod_arm.cpp` 改写
+   `BytesPerInt` 字节再调 `OsMisc_flush_icache`），若映射是"开域即只读"，每次
+   patch 都要 close/write/open。测法：把**已执行过的同一行**改成 `mov r0,#43`，
+   重新 sync 再调一次——这是"开域时 clean 到 PoU"方案的最坏情况。
+
+输出：`crumb.log` 里每条一步的 `[JITPROBE]` 行 + 一行 VERDICT。
+`jitprobe.cfg` 不存在时只 stat 一次文件 + 写一行 "skipped"，零行为改变。
+
+### 验证
+
+- `build.sh` 全量 `Build successful`；`.vpk` 12054547 B
+- `strings` → `J2ME Player v03.71 b330`
+- `nm`：`vita_jit_probe` / `vita_jit_probe_status` 各一份；ELF 里已链到
+  `sceKernelAllocMemBlockForVM` / `sceKernelOpenVMDomain` / `sceKernelSyncVMDomain`
+- TEXT 到 `0x81be1bf4`… 实际 `readelf`：TEXT `0x81000000+0x3e1bf4`，
+  RW 基址 `0x81410000`，余量 ≈ **186 KB**
+- **未上机**。这是纯探针，不改任何既有路径。
+
+### 下一步（等探针结果）
+
+- 探针 **VERDICT 成功** → 改 `OsMisc_flush_icache`（用 v03.11 的 overlay 机制，
+  符号 `objcopy --redefine-sym` 改名后替换）指向 VM 块的 `SyncVMDomain`；
+  然后把 `ObjectHeap` 的 compiler area 从托管堆里挪进 VM 块。**后者才是真正的工作量**：
+  compiler area 目前在堆内，GC 把它当堆数据扫描/移动，挪出去要处理
+  `save_compiler_area_top` / `restore_compiler_area_top` / GC 对代码对象的遍历。
+- 探针 **VERDICT 失败** → JIT 在现有用户态权限下不可行，明确记录并放弃该杠杆
+  （路线图 P1-9 里 JIT 的 2–4 周时间盒应该在这里止步，而不是等到投入之后）。
+
+### 教训
+
+- **"源码里有" ≠ "产物里有"。** 上次把矛盾留在那里没结，代价是这一条被当成
+  "VM 侧还有隐患"反复引用。用 `nm` + `objdump` 把产物钉死，五分钟的事。
+- **编译器可能把内建函数整个吃掉，而且不吃警告。** `-Wall -Wextra` 对这种
+  折叠是沉默的；验证内建函数唯一可靠的方法是在目标上反汇编。
+
+## 2026-11-01 log156（v03.71）：分析 + 一处**必须纠正的错误结论**
+
+### log156 实际内容
+| 项 | 值 |
+| --- | --- |
+| 版本 | v03.71 |
+| 运行 | `com.app.filemanager.FileManagerMIDlet`（退出 status=0）→ `main.MainMidlet`（风神榜，持续绘制中）|
+| 异常 | **0 条**（vm_output / midp_stderr）|
+| watchdog | 全部 `recovered`，非死锁 |
+| `[prop] ask` | **24 条**（v03.69 仪表生效）|
+| `[res] skip` | **0 条** |
+| perf | `f=300 fps=2.5 period=393.25 flip=20.73 prepare=12.57` |
+| JIT | `jit cfg=0 -> policy=0`，全程解释器 |
+
+### 纠正 1（重要）：`microedition.locale` 从来就没缺失过
+我之前 v03.66 断言"该属性缺失"，v03.68 又"回退"了它。**两者都建立在一个假前提上。**
+
+- `vita-port/config/system.config` 里 **第 2 行就是 `microedition.locale: en-US`**，
+  而这一行从该文件的**第一个提交（687dd11 "j2me success run demo"）**就存在。
+- 该模板被打进 VPK 的 `data/J2ME00001/lib/system.config`（CMakeLists:4845），
+  且每轮从模板重新生成。
+- log156 的 `[prop] ask 'microedition.locale' -> 'en-US'` 直接证实它一直有值。
+
+**结论：**
+- log154（v03.63）和 log155（v03.67）的 locale **都是 en-US**。
+  所以 **locale 不能解释 log155 的回归**（卡在 splash）。
+- v03.68 的"回退"在磁盘上**没有改变任何字节**（NULL 语义是"保留模板行"，
+  而模板值恰好也是 en-US），是个 **no-op**，无害但也无效。
+- 我曾把 `crumb.log` 的 `locale=(default)` 读成"属性缺失"——**这是错的**。
+  那一行只表示 **game.cfg 没有指定 locale**，与属性实际值无关。这个误读直接导致了两轮错误。
+
+**log155 回归的真正原因仍未确定。** v03.64 重写了 `blit_scaled()`，是 log154→log155
+之间唯一的渲染路径改动，但它本身是**有效的**（见下），所以不能直接定罪。
+v03.68 加的 `<<FULLBLIT` 无条件打点就是为下一次判定准备的。
+
+### 好消息：v03.64 的 blit 重写确实生效
+| | blit | prepare |
+| --- | --- | --- |
+| log154（重写前） | **14.66 ms** | 17.06 ms |
+| log156（重写后） | **8.15 ms** | 12.57 ms |
+
+1.8x 提速，`other=0.00`，说明 `prepare` 已被完整拆分。
+
+### JIT 全程关闭是**刻意设计**，不是 bug
+`VITA_JIT_DEFAULT 0`（vita_main.c:139），原因写在注释里：v01.45 记录过
+开启 JIT 会破坏堆的 compiler area，根因未闭合前默认整条 JIT 路径关闭。
+用户可通过 `ux0:/data/J2ME00001/launch.cfg` 里写 `jit=1` 打开
+（注意：`(cfg_jit == 1 && round > 0) ? 0 : cfg_jit` —— 只有**第 0 轮**会启用，
+从第 1 轮起自动降级，这是 v02.94 的已知限制）。
+
+**所以 fps 2.5 / period 393 ms 的主要原因是"解释器 + 333 MHz"，不是渲染。**
+`[PERF] VERDICT: arm stuck at 333 MHz (asked 444, all strategies failed)` 是硬瓶颈。
+
+### `[res] skip = 0` 的含义（已排除"仪表缺失"）
+当前 ELF 里 `[res] skip want=`(UTF-16LE, 3487718) 与 `[prop] ask `(ASCII, 1890168)
+**都在**。所以 0 条是**真的没被调用**：FileManager 和风神榜不使用
+`is.skip(off<<8)` 读 charmap 这种模式，只有极品飞车的 `u.a(byte)` 会。
+该仪表仍在待命。
+
+### 下一步
+1. **跑极品飞车**才能触发 `[res] skip`。这是目前唯一未验证的环节。
+2. 若想改善流畅度，试 `launch.cfg` 加 `jit=1`（只影响第 0 轮），或见 v01.45 的
+   compiler-area 根因是否值得重开——这是独立的性能工程，与画面问题无关。
+3. **不要再基于 `locale=(default)` 做任何推断**（见纠正 1）。
+
+### 教训（本项目管理层面最该记住的一条）
+- **日志里的一行"看起来像什么"不等于它"是什么"。** 我把
+  `locale=(default)` 当成"属性缺失"，而这行只反映 game.cfg；实际属性值
+  一直由 VPK 模板提供。**一个误读的形容词，换来了两轮错误修复。**
+- **改之前先 `git log -S` 查这一行/这个值的历史。** `git log -S"microedition.locale: en-US"`
+  一条命令就能证明它从第一个提交起就在，成本 10 秒。
+- **"回退"要验证磁盘/产物真的变了**（`strings` / 字节比较），否则会得到一个
+  "看起来修了其实没动"的版本，然后继续在错误的方向上解释现象。
+
+## 2026-11-01 log156（探针 v2）：jar 加载类的 double 常量字序颠倒——压扁的根因
+
+- 证据（真机 vm_output.log）：`[V3D] ctl` 三组对照全部为 0（期望 4096 1000 16 | 4 等）。`unit()` 明细：`sum2(long)` 与 `len(int)` 正确（如 `(0,0,-4096)` → `sum2=16777216 len(int)=4096`），`sum(int)=2147483647k`（= `sum/1000.0` 饱和）、`len*8(int)=0`、`nx(int)=0`、`out=(0,0,0)` 对所有 41 条非零输入成立。
+- 修正我上一轮的错误：对照组 2、3 不是"无常量路径"——javac 会把 `(double)4096`、`Math.sqrt((double)16)` 折叠成 `ldc2_w`，所以三组都经过 `ldc2_w`，只有 `unit()` 里 `(double) x` 的 i2d 才是真正的运行时转换。
+- 推断链：运行时 i2d/dmul/dadd/sqrt/d2i 正确（`len(int)` 对）；凡是乘除 `ldc2_w` 常量的结果都错：`sum/1000.0` 饱和成 INT_MAX（除数≈0），`len*8.0`、`*100.0`、`*4096.0` 全为 0（乘数≈0）。这与"double 常量高低字互换后成为极小非规格化数"完全吻合。
+- 反汇编证据（`libcldc_vm.a` → `_MergedSrc004.o` 的 `JVMClassFileParser::parse_constant_pool_entries`，tag 6 分支 0x3300~0x3350）：先读的 u4（类文件大端的高字）在 r2，后读的（低字）在 r1，然后 `str r1,[r3,#12]`（槽 0）、`str r2,[r3,#16]`（槽 1）——即 **低字在前**，等价于 `MSW_FIRST_FOR_DOUBLE=0`。解释器 `bc_impl_fast_2_ldc_w_internal`（`Interpreter_arm.s` 7873）按槽 0、槽 1 原样取出，loopgen 按 `MSW_FIRST_FOR_DOUBLE=true` 生成。`rebuild_vm.sh` / `vita-port/CMakeLists.txt` / `build.sh` 里 grep 不到 `MSW_FIRST`，`ROMImage.hpp` 的默认值是 `!HARDWARE_LITTLE_ENDIAN`=0。
+- 为什么 log154 自检通过：自检在 ROM 化的引擎类里，常量由 romgen 写入；游戏 jar 的类由设备上的 `ClassFileParser` 解析。两条路径字序约定不同。
+- 未验证（推断）：ROM 里的 double 常量实际是高字在前（自检通过与此一致，但没直接查 ROMImage）；修复后其他读 `ConstantPool::double_at` 的地方是否仍一致；JIT 路径。
+- 影响面（推断）：所有 jar 内带 double 常量的类，不止 BioMain（`Vector3D.unit()`）；包括 `ldc2_w` 取 long 常量不受影响（long 低字在前与解释器一致，未见异常）。
+- 下一步：在 `VITA` 条件下让 `double_parts_at_put` 与解释器/ROM 的约定一致（高字在前），或让解释器 `ldc2_w` 与解析器一致；改动前先核对 `ConstantPool::double_at` 与 ROM 写入端。
+
+---
+
+## 2026-11-01 v03.72：游戏变卡的元凶是**调试日志本身**，不是 JIT
+
+> 产物 `midp_vita_v03.72.vpk`（12054239 B），`J2ME Player v03.72 b330`。
+
+### log156 判决
+
+**JIT 全程是关的**，所以"开了 JIT 之后变卡"这个前提不成立：
+
+```
+round 0: jit cfg=0 -> policy=0
+vm UseCompiler(post)=0 <- actual round mode
+jit: round 0 done: UseCompiler=0 compile-requests=0 produced-code=0
+jit: compiler area size=0 used=0
+```
+
+`policy=0` → 注入 `-int` → 0 次编译、0 字节代码。那一份日志里所有帧都是纯解释器跑的。
+
+### 真因：`[gfx]` 探针，一条 println ≈ 26 ms
+
+| 打点 | log155 | log156 |
+|---|---|---|
+| `[gfx] drawRegion` | 254 | **2211** |
+| `[gfx] drawImage` | 64 | 257 |
+| `[gfx] translate` | 61 | 319 |
+| `[gfx] setClip` | 58 | 274 |
+| `vm_output.log` 行数 | 762 | **3591** |
+
+代价推导（全部来自本移植自己的实测，不是估计）：
+1. `midp_run.c` 的 v02.48 注释：**ux0: 上每次同步小写 ≈13 ms**，且每个字符**写两份**
+   （`vm_output.log` 走 `crumb_append`，`vm_stderr.log` 走 `pcsl_print_chars`）。
+   我核对了 log156：两份文件只差 3 行尾部截断，双写依旧成立。
+2. ⇒ 一条 `System.out.println` ≈ **26 ms** 阻塞 I/O，而且在 VM 线程上。
+3. 封神榜那一段（`vm_output.log:2410-3591`）**一帧 20–30 次 `drawRegion`**
+   ⇒ **0.5–0.8 s/帧**。探针比它要观测的渲染还贵。
+
+**独立佐证**：`watchdog.log` 73 个采样里 **52 个**抓到 VM 线程停在 `sceIoWrite`，
+单次最长 2821 ms；其余 `io_read` 7 / `lwmutex` 3 / `mkdir` 3 / `open` 2 / `close` 2。
+
+### 为什么 log155 之后突然变多
+
+`dbgRegionCalls < 1500` 的预算是**按进程**算的，但 log156 里 NFS 被启动了 **6 次**，
+每个 round 都从 0 重新武装，于是同一个探针在 6 个 round 里各写满一遍。
+v03.68 把上限从 200 提到 1500（当时是为了"一帧放不下"），叠加多 round 就成了 8.7 倍。
+
+### 修法
+
+`Graphics.java` 加 `private static final boolean DBG_GFX`，从 MIDlet 属性
+`j2me.gfxdebug` **只读一次**，默认 off。5 个探针点全部门控：
+`translate`、`setClip`、`drawImage`（含 `<<FULLBLIT` 那条）、`drawRegion` 的两个分支。
+绘制逻辑一行未动。
+
+保留而不删除的理由：这些探针正是 v03.61/68 定位 NFS 布局问题的手段，
+删掉意味着下次要重新推导一遍。需要时 `-Dj2me.gfxdebug=1` 就恢复。
+
+### 验证
+
+- `./build.sh midp` → 全量 → `Build successful`
+- **ROM 确实重新生成了**：`strings -e l`（UTF-16LE，与项目既有记录一致）能搜到
+  `j2me.gfxdebug`。用 `strings`（ASCII）搜是 0，差点误判成"改动没进 ROM"。
+- `J2ME Player v03.72 b330`；`.vpk` 12054239 B
+- **未上机验证**。上机要看：`vm_output.log` 行数应回落到百行级，
+  `watchdog.log` 的 `lastop=io_write` 应大幅减少。
+
+### 教训
+
+- **"日志很便宜"是最贵的假设。** 一次 `println` 在这个平台上是 26 ms 的阻塞 I/O，
+  比大多数游戏的整帧预算还长。加任何打点前先算：这条 × 每帧次数 × 26 ms。
+- **有上限的探针在一个会重启 VM 的宿主里等于无上限**（6 个 round × 1500）。
+- **下结论前先确认被测版本真的开了被测功能**：log156 被当成"JIT 日志"，
+  实际 `compile-requests=0`。
+
+## 2026-11-01 极品飞车：根因范围锁定到 `charmap` 块选择（附宿主实证）
+
+### 新工具：`/tmp/nfs/AuDump.java`（跑游戏自己的解析器）
+用 `sun.misc.Unsafe.allocateInstance` 跳过构造器（`z` 的构造要 `m`，而 `m`
+在字节码里有 `a(I)I` 和 `a(I)Le;` 两个同参不同返回的方法，**Java 源码无法实现**），
+然后反射调用 `private final void z.a(DataInputStream)`，喂真实的 `/au`。
+**结果：21948 字节全部消费，无异常。**
+
+⚠️ 踩坑记录：一开始我的方法筛选条件只查了"名字 a + 单参 + DataInputStream"，
+匹配到了 `private static short z.a(DataInputStream)` —— 那只是 `readShort` 的包装
+（catch IOException 返回 -1）。它不填任何字段，输出全是 null，**看起来像"解析器坏了"**。
+必须同时要求 `返回类型 == void` 且 `非 static`。
+（教训与项目一贯问题同型：**看似结论的东西要先验证前提**。）
+
+### 宿主解析结果（z 的字段）
+```
+d short[3144]   c short[5752]   g short[101]   f short[101]
+h short[101]    i short[101]    a short[444]   b int[5]   a int[60]
+```
+
+### `d[]` 是按三元组存的打包坐标
+```
+每 3 个 short = (packed, x, y)
+packed: 高 2 位 = kind, 低 14 位 = coord   （z.a 里 &16383 / >>14&3）
+```
+统计 1048 组：
+
+| 量 | 范围 | distinct |
+| --- | --- | --- |
+| **x** | **100 .. 4650** | 115 |
+| y | −367 .. 308 | 211 |
+
+x 高频值：150(129次) 600(57) 750(56) 300(55) 450(53) 120(52) 110(43) 620(30)
+
+**`d[]` 里没有 209 / 313 / 314 / 320 / 325** —— 设备上那些坐标**不是数据原值**。
+x 最大 4650 远超 240 宽画布，**必须经过缩放/解包**。
+按 ÷20 换算：4650→232.5（正好落在 240 内）、150→7.5、600→30、750→37.5，**全部合理**。
+
+**结论：游戏作者的数据是正常的。设备上 209..365 是解码/缩放环节出错。**
+
+### 解码路径（字节码确认）
+```java
+// u.b(short) = u.d[v - 128]        u.d[] = short[128]
+static short b(short v) { return u.d[v - 128]; }
+```
+`u.d[]` 来自 `/charmap`：
+```java
+is = getResourceAsStream("/" + u.a + "charmap");
+is.skip(off << 8);                 // 256 字节/块
+for (k = 0; k < 128; k++) u.d[k] = readShort(is);
+is.close();
+```
+- **jar 里 charmap = 1024 字节 = 正好 4 块**
+- **block 0 = 恒等表：128, 129, 130, 131, ...** → `u.b(v) == v`
+- `off` = 24 位 bitmask `u.i` 的 **popcount**，`u.i` 取自某个数据文件的第 3–5 字节
+
+### 由此推出的机制（这是本轮最强结论）
+| off | `u.d[]` 内容 | `u.b(v)` 结果 |
+| --- | --- | --- |
+| 0 | 128,129,130,... | **v（正确，坐标原样）** |
+| 1..3 | 另一个块的映射 | **坐标被错误映射** |
+| **≥4** | 越界，`read()` 返回 −1 | **全 −1**（坐标全废） |
+
+设备上坐标是 209..365（**不是 −1**），所以**不是越界，而是读了错误的块**（off ∈ 1..3）。
+这与"同一份数据在别的实现上正确"完全吻合：别的实现 `off` 算成 0，我们没算成 0。
+
+### 下一步（唯一必要的一步，成本一次运行）
+**跑极品飞车，然后：**
+```
+grep "\[res\] skip" vm_boot.log
+```
+v03.69 起 `ResourceInputStream.skip()` 覆写会打印
+`[res] skip want= got= remain= block= [<<SHORT]`。
+- `block=1024/256=4` 或更大 + `<<SHORT` → 越界，坐标全废
+- `block=256`/`512`/`768`（1/2/3）→ 读了错误的块，**这就是根因**
+- `block=0` → 我的推断错了，要回头查缩放（÷20 的实际来源）
+
+### 尚未做到
+- 没能拿到 `u.i` 的真实值：它来自 `u.a(byte[])` 读的数据文件（第 3–5 字节），
+  而那个数据源在游戏的混淆代码里，需要设备端打点才能看到。
+- 没有在宿主上跑通 `z.a(Graphics,...)` 的完整绘制：`Graphics` 是 final 且方法是
+  native，无法在宿主 JVM 拦截 drawRegion 参数。**所以最终坐标只能靠设备日志。**
+
+### 教训
+- **逆向一个"看似卡住"的游戏，先把它的数据文件喂给它自己的解析器跑一遍**，
+  成本很低（一个 Unsafe + 一个反射调用），收益是**把"数据对不对"和"我们读得对不对"
+  彻底分开**。这一步早该在前几轮就做。
+- **反射找方法必须校验完整签名（返回类型/static）**，否则会拿到同名辅助方法，
+  然后得出"解析器坏了"这种错误结论。
+
+## 2026-11-01 v03.73：修复 jar 加载类的 double 常量字序（log156 根因）
+
+- 改动（`phoneme-cldc/src/vm/share/handles/ConstantPool.hpp`，`#if defined(VITA)` 隔离，host 工具不受影响）：
+  `double_parts_at_put` 恒按"槽 0 = 高字、槽 1 = 低字"存放；`double_at()` 按同样顺序用 `jdouble_from_msw_lsw` 读回。这样解析器、C++ 读取端（`Method::iterate_push_constant_2`、`InstanceClass` 静态字段初值、ROM 优化器）与解释器 `ldc2_w`、romgen 一致。
+- 为什么要连读取端一起改：`double_at()` 原来走 `double_field()`（小端下直接取 64 位原生值），若只改存放顺序，静态 double 字段初值（`InstanceClass.cpp:1040`）会被读反。
+- 验证：`./rebuild_vm.sh` rc=0，`library packed: 22 members`；`_MergedSrc004.o` 与最终 ELF `midp_vita_v03.73.sym`（0x810e00cc）的 Double 分支均为 `str r2,[r3,#12]; str r1,[r3,#16]`，对照 03.72 为 `str r1; str r2`（互换）。`vita-port/build.sh` rc=0，产物 `midp_vita_v03.73.vpk`。
+- 未验证：真机运行；ROM 化类里 double 常量的字序我没直接核对（自检通过只是间接证据）；JIT 路径未涉及（launch.cfg `jit=0`）。
+- 上机验证：装 v03.73，用 `debug/tools/v3dprobe/BioMain_v3dprobe.jar` 看 `[V3D] ctl`，期望 `4096 1000 16 | 4 ## 4096 8192 4 4096 ## 4 8192 4`，`unit()` 的 `out` 不再是 (0,0,0)。若对照正确，再去掉探针 jar 用原游戏 jar 看角色是否恢复正常比例、能否移动。
+
+## 2026-11-01 v03.74：charmap 假设**不成立**，改用画布尺寸打点
+
+### 本轮否掉了自己的上一轮结论
+上一轮我把根因指向 `charmap` 块选择。**它不成立**，理由是自己算出来的：
+
+追到 `u.i` 的真实来源：
+```
+t.a()  ->  ac.b(100)  ->  resource "/cw" (213 bytes)  ->  u.a(byte[])
+cw[0..4] = 01 00 00 04 4C
+  u.a = 0x00
+  u.i = (0x00<<16) | (0x04<<8) | 0x4C = 0x00044C  (popcount = 4)
+```
+`off = 4` → `skip(4<<8) = skip(1024)`，而 `charmap` 正好 **1024 字节 = 4 块**，
+所以会跳到 EOF，`u.d[]` 全部变成 -1 → **每个坐标都是 -1**。
+
+但设备上坐标是 **有序递增的 209/261/313/320/325**，不是 -1。
+**观测与"越界"矛盾 → charmap 不是这个 bug 的原因。**
+
+（`charmap` 4 个块确实不同：block0 恒等，block1 差 57 处，block2 差 94 处，
+block3 差 6 处，所以 `off` 有影响 —— 但影响形态不对。仪表保留，等运行定性。）
+
+### 宿主实证：数据本身是正常的
+`/tmp/nfs/AuDump.java`（Unsafe 跳过构造器 + 反射调 `private final void z.a(DataInputStream)`）
+跑通游戏的解析器，21948 字节全消费：
+- `d short[3144]` 按**三元组 (packed, x, y)** 存，1048 组
+- **x = 100..4650**，y = −367..308
+- **表里没有 209 / 313 / 314 / 320 / 325**
+
+所以设备上的坐标**不是数据原值，是算出来的**；而且 x÷20 落在 240 内，说明
+**作者的数据是合理的，错在计算输入**。
+
+### 唯一还没测过的输入：布局时刻的画布尺寸
+`af.<init>(int,int)` 用 `Displayable.getWidth()/getHeight()` 初始化布局。
+如果那一刻返回的不是 240，所有行会**整体偏移、间距不变** ——
+**这正是观测到的形态**（有序、等间距、全部越界）。
+
+新增仪表（值变化时才打印，不会刷屏）：
+```
+[dim] getWidth=240 getHeight=320 lf=<class>
+```
+
+并已确认打点落在**真正被编译的那个文件**：
+`SUBSYSTEM_LCDUI_MODULES=chameleon` → `lcdlf/lib.gmk` 走 `lfjava` 分支
+→ 改的是 `lcdlf/lfjava/.../DisplayableLFImpl.lGetWidth()`，不是 lfplatform。
+（验证方式：编译后 `classes.zip` 里 `DisplayableLFImpl.class` 含 `[dim]` 字符串。）
+
+### 当前四个仪表（v03.74 全部在 ELF 内，已逐一 `strings` 验证）
+| 仪表 | 串 | 定位 |
+| --- | --- | --- |
+| 画布尺寸 | `[dim] getWidth=` | 布局输入是否错 |
+| charmap 块 | `[res] skip want= ... block= <<SHORT` | 解码表是否读错 |
+| 帧是否上屏 | `<<FULLBLIT`（无条件） | 画面卡住时帧是否被贴 |
+| 属性查询 | `[prop] ask '...' -> ...` | 游戏读了哪些环境 |
+
+### 诚实的现状
+**我仍然不能给出确定的修复方案。** 已排除的：locale、clip、translate、
+Image 尺寸、m3g、异常、数据缺失、数据本身。
+剩下的候选只有"某个 API 在布局时刻返回了错值"，而 `[dim]` 就是为它准备的。
+
+**修复取决于下一份日志**：
+- `[dim]` 出现非 240 → 修 `lGetWidth()`/`resetViewport()` 的初始化时机（我们能修）
+- `[dim]` 只有 240，且 `[res] skip` 有 `block>=4 <<SHORT` → 越界，修资源读取
+- `[dim]` 只有 240、`skip` 正常 → 需要新的方向，我不预设
+
+### 教训
+- **假设要能被自己的数据否掉，而不是只被日志否掉。** charmap 这一轮是被
+  "off=4 会让坐标全 -1，但观测是 209..365"这条纯算术否掉的，比等一轮设备日志快得多。
+- **改打点前先确认改的文件真的参与编译。** `SUBSYSTEM_LCDUI_MODULES=chameleon`
+  这条决定了 lfjava vs lfplatform，两个目录里有同名类；改错文件会得到"仪表不出现"
+  然后误判成"API 没被调用"。
+
+---
+
+## 2026-11-01 log157 分析（+ v03.75）：`jit=2` 闪退的签名拿到了，探针原来败在一个可修的错误码上
+
+> 产物 `midp_vita_v03.75.vpk`（12057861 B），`J2ME Player v03.75 b330`。
+
+### 1. 闪退现场（两个 coredump 都解出来了）
+
+dump 文件是 `.tmp`（写入被中断），`psp2dmp.py` 因最后一个 PT_LOAD 截断而抛异常。
+但**所有 note 都完整**（note 区在前 0x91b8 字节内），手工解析即可：
+
+```
+VM 主线程 tid=0x40010003
+  pc == lr == 0x83b689ac        (第二份 dump: 0x83a689ac，差 1 MiB)
+  cpsr = 0x60070010   r12 = 0x81992b18
+  条目尾部: +0x168 = 0x0000000d   <- fault status = permission fault
+            +0x16c = 0x83b689ac   <- FAR == pc，WnR 清零
+```
+
+`pc == lr` + `FAR == pc` + permission status = **取指 XN 异常**，
+与 v01.45 的 `0x83a5f52c` 完全同型。两个地址都在 64 MiB Java 堆里
+（`0x81C00000 + ~32 MiB`）——**compiler area 仍在 USER_RW 堆块内**。
+
+JIT 确实编译了代码，不是"开了没生效"：
+`watchdog.log` 有 `[WD] STORM ce=15148 clinit=85 gc=165`，
+而 log156（`UseCompiler=0`）是 `ce=0`。
+
+`crumb.log` 的因果链清晰：`round 0: jit cfg=2 -> policy=2` →
+`vm UseCompiler(pre)=1 (jit policy=2)` → 封神榜启动 → **没有 `UseCompiler(post)` 行**，
+即在第一帧绘制前就死了。
+
+### 2. 探针为什么没预警：它败在第一步，且错误码没被读懂
+
+```
+[JITPROBE] alloc uid=0x80024b05
+[JITPROBE] VERDICT: executable memory NOT available
+```
+
+`0x80024B05` = **`SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_SIZE`**（`psp2/kernel/error.h:110`），
+不是内存不足。我 v03.71 申请的块是 **4096 字节**；VM domain 块有**最小尺寸**，
+而 VitaSDK 头文件只写了上限 16 MiB，没写下限。
+
+所以探针根本没走到"能不能执行"那一步，它的结论"不可用"是对的，
+但原因是可修的。
+
+### 3. v03.75 的三处改动
+
+1. **尺寸自探测**：依次试 64 KiB / 256 KiB / 1 MiB / 4 MiB / 16 MiB，
+   记录内核接受了哪个；所有 rc 都翻译成符号名（`ILLEGAL_MEMBLOCK_SIZE` 等）。
+   跑一次就能回答"VM 块最小多大"。结束后 `FreeMemBlock` + `CloseVMDomain`
+   —— 探针不该留下"所有 VM 块都变可执行"这个状态。
+2. **不再在启动时无条件运行**：移到 round 循环里，**只在 `jit=` 非 0 时**跑第一次。
+   `jitprobe.cfg` 仍是额外门控（最后一步要执行刚写进去的机器码）。
+3. **判决改为决定策略，而不是只给建议**：探针 FAILED ⇒ 本次会话强制 `cfg_jit=0`，
+   并写一行 crumb 说明原因。于是 `jit=2` 的结果从"杀进程"变成
+   "解释器 + 一条可读的解释"。默认 `jit=0` 完全不进这条路径。
+
+### 4. 这没有让 JIT 能跑（重要）
+
+开 VM domain 只对**放在 VM 块里**的代码有帮助，而 compiler area 仍在托管堆内。
+真正的工作量没变：把 compiler area 挪进 VM 块后，要处理
+`save/restore_compiler_area_top`、GC 对代码对象的遍历（现在它把 compiler area
+当堆数据扫描/移动）。
+
+### 5. 教训
+
+- **错误码必须翻译成名字再看。** `0x80024b05` 让我上一轮把"尺寸非法"
+  读成了"VM domain 不可用"，方向错了一整轮。VitaSDK 有完整的 `error.h`，
+  `grep` 一次就有。
+- **头文件只写上限时，别假设下限是 1。** 4096 字节被拒。
+- **探针失败必须能改变行为。** 一个"只写日志"的前置检查等于没检查：
+  它照样让 JIT 启动了，照样闪退。现在判决直接决定 policy。
+- **coredump 截断不等于报废**：note 区在文件前部，PT_LOAD 在后部；
+  先解 note，寄存器/fault status 全在。
+
+## 2026-11-01 log157（v03.73 + 探针 jar）：double 常量修复在真机上生效；剩下的是帧率
+
+- 证据（真机）：`[V3D] ctl` 读数 `4096 1000 16 | 4 ## 4096 8192 4 4096 ## 4 8192 4`，全部等于期望；`unit()` 输出恢复，例如 `(0,0,4100000)` → `out=(0,0,4096)`、`(-227500,0,65000)` → `(-3938,0,1125)`。用户确认人物正常显示。结论：v03.66~03.72 里的"压扁/变小/不动"根因就是 jar 加载类的 double 常量字序（见 v03.73 一节）。
+- 用户反馈：移动、打怪"非常卡，半天才响应"。
+- 帧率（推断，非直接测量）：`gcam#` 的 `f=` 是 `dbgFrames`（每次 `frame()`，即每次 render 调用 +1），不是游戏画面数。`render releases/calls`：区间 3→63 为 2.65 次调用/画面，63→123 为 3.28。`f=91`（夹在 rootstate#9 与 #10 的 ms 之间）到 `f=121`（#20 与 #21 之间）30 次调用用了约 6.5~8 s，折算约 9~11 个画面，**约 1.1~1.8 画面/秒**。比此前记录的 2.7~10 fps 更低；日志里没有 3D 阶段耗时，瓶颈位置未知。
+- 探针局限（我差点误读）：`trackRoot` 的槽位 `RS_MAX=24`，日志里 `rootstate` 恰好 24 条（敌人 16、Jill 5、其他 3），最后一条在进游戏后约 +80 s；之后没有记录是**槽位耗尽**，不代表角色不再移动。以位置作 key 也使每走一步就占一个新槽。
+- Jill 位移（证据，仅 +72~78 s）：4 次变化，间隔 1609/1629/1856 ms，每次 `dpos*1000` 约 (46,102,-142)，|d|≈180；同一时段按下 DOWN 7 次（+72.4~+76.8 s，每次 133~356 ms）。位移量几乎相同，说明在沿固定方向走；是否对应 DOWN 键方向没有核对。
+- 输入：BioMain 阶段共 50 次按键，最长约 400 ms；没有长按，所以"长按行走"没有被测到。
+- 无关发现：目录里有两个未完成的 `psp2core-…tmp`（148 KB、142 KB），文件名时间戳（推断为 epoch 秒）约在切到极品飞车之后 65 s 和 81 s，属于 NFS 阶段而非 BioMain；未用 psp2dmp 判读。
+- 下一步（未做）：(1) 3D 阶段计时探针：`applySkin`、`frame()` 内各段、提交绘制、`releaseTarget`，每 N 个画面汇总一行；(2) `trackRoot` 改为按 mesh 记最新位置，不再耗尽槽位；(3) 先确认是 Java 软件蒙皮还是填充/GPU 在拖。
+
+### 6. 更正（用户指出）：`jitprobe.cfg` 一直都在
+
+我上一轮口头说过"下一步只需要放一个 jitprobe.cfg"，**这是错的**，而且和
+log157 自己的日志矛盾：
+
+```
+[JITPROBE] alloc uid=0x80024b05
+```
+
+`alloc` 能返回一个值，就证明 `probe_enabled()` 已经通过了 —— 文件就在那里。
+log156 里的 `skipped: absent` 是 v03.71 那一轮，之后才放的。**探针一直在跑，
+只是死在我给的 4096 字节上。** 一句正确的复盘比一个"请你再做一件事"重要。
+
+### 7. 探针加强（同一版 v03.75 内，未改行为）
+
+既然要再跑一轮，就把这一轮能拿到的东西一次拿全：
+
+1. **倍增扫描 4 KiB → 16 MiB**（13 档，失败很快）。原来是 5 个粗粒度候选，
+   只能知道"64 KiB 行不行"；倍增能**定出准确阈值**，一次运行就够。
+2. **普通 alloc 对照**：先 `sceKernelAllocMemBlock(USER_MAIN_RW, 4 KiB)`，
+   成功就写一行 "memory is available"。这样如果 VM alloc 全灭，
+   日志能区分"内存不够"和"VM domain 不给"——这两件事的后续动作完全不同。
+3. **权限位直读**：`sceKernelGetMemBlockInfoByRange` + `SceKernelMemBlockInfo.
+   access`（X/W/R 位）。在 alloc 之后、OpenVMDomain+Sync 之后各查一次，
+   打印 `access=0x? -> RWX` / `X-absent`。
+   这一条是关键安全网：**执行测试可能直接杀进程，而 crumb 是即时落盘的**，
+   所以权限记录一定能留下来。如果开域后 `X` 位仍然缺席，那么"执行"那一步
+   必然崩，日志会先给出原因而不是只有崩溃。
+
+产物 `midp_vita_v03.75.vpk`（12059264 B），`J2ME Player v03.75 b330`。
+**仍未上机。**
+
+### 8. 另一条已排除的路
+
+`psp2common/kernel/sysmem.h` 里的 memblock 类型只有 `R` 和 `RW`
+（`USER_MAIN_R`=0x0C20D040、`USER_MAIN_RW`=0x0C20D060 ...），**没有 `RX`**，
+也没有 mprotect。所以"分配一块 RX 再想办法往里写"不成立，
+VM domain 是用户态唯一的 RWX 路径。这一点查过了，不用再试。
+
+## 2026-11-01 v03.76：3D 阶段计时 + rootstate 改为每 mesh 一槽（仅诊断，行为不变）
+
+- 动机：log157 里 v03.73 修复生效，但估算只有约 1.1~1.8 画面/秒，且日志里没有任何 3D 阶段耗时（perf.log 的 `seg` 是启动菜单的 2D 数据）。
+- 改动（均在 `jsr184/.../javax/microedition/m3g/`）：
+  - `Renderer.java`：新增 `ptMs/ptN/ptAdd/ptReport`，每 20 个已释放画面输出一行 `[m3g] ptime ms=… frames=… per-frame ms: total= gap= anim=(xN) decode= skin=(xN) shade= draw=(xN) present= blit=`。`total` 是 bindTarget→releaseTarget；`gap` 是 release→下一次 bind，即游戏自己的逻辑与 2D 绘制；括号里的 xN 是每画面调用次数。计时点在 `walk` 的 `animateSelf`、`drawMesh` 的顶点解码 / `applySkin` / `shade` / `NativeBridge.draw`。
+  - `Graphics3D.java`：`bindTarget` 记起点与 gap，`releaseTarget` 计时 `present` 与 `drawRGB`，并调用 `ptReport`。
+  - `trackRoot`：每个 mesh 一个槽（原来每个 mesh+位置占一个，log157 的 24 个槽在约 80 s 内用完）；列数变化，或位移 ≥0.1 且距上次 ≥400 ms 才写行。
+- 精度限制：只有 `System.currentTimeMillis()`，单段耗时在毫秒量级以下会被截成 0，所以只看每 20 画面的总和平均；各段相加不一定等于 total（段外还有矩阵运算与 `new float[]`）。
+- 验证：`vita-port/build.sh midp` rc=0；`Renderer.class`/`Graphics3D.class` mtime 09:10:32 晚于编辑，`javap` 里有 `ptAdd/ptReport/rsAt/rsNext`；ELF `midp_vita_v03.76.sym` 里 `ptime ms=` 出现 1 次（03.75 为 0 次）。主机侧用 `debug/tools/m3gprobe/PtimeRun.java`（45 帧，jill_han.m3g）：ptime 行每 20 帧一行且窗口清零；rootstate 同一 mesh 只占 1 槽，约每 400 ms 一行、位置持续更新。主机上的毫秒数没有参考价值。
+- 注意：`/tmp/midp_build.log` 里仍写着 "no need to recompile .java files"，那是该日志里较早一次 make 的输出；这次靠 class mtime 与 ELF 字符串判定已重编。
+- 未验证：真机上的数值。判读：`gap` 大 → 瓶颈在游戏逻辑 / 2D（不是 3D）；`skin`/`decode`/`shade` 大 → Java 里逐顶点计算；`draw` 大 → 原生提交（GL）；`present`/`blit` 大 → 帧缓冲拷贝。
+
+---
+
+## 2026-11-01 log159 分析（+ v03.77）：VM domain 三个关键参数拿到了；探针的**顺序**是错的，这才是闪退原因
+
+> 产物 `midp_vita_v03.77.vpk`（12060308 B），`J2ME Player v03.77 b330`。
+
+### 1. log159 拿到的三个事实（全部实测）
+
+```
+[JITPROBE] control: plain RW 4096 bytes -> uid=0x40010185 (memory is available)
+[JITPROBE] alloc 4096 bytes -> 0x80024b05 = ILLEGAL_MEMBLOCK_SIZE
+...
+[JITPROBE] alloc 524288 bytes -> 0x80024b05 = ILLEGAL_MEMBLOCK_SIZE
+[JITPROBE] alloc 1048576 bytes -> uid=0x40010187  <-- ACCEPTED
+[JITPROBE] base rc=0x00000000 ptr=0x85d00000
+[JITPROBE] perm before-open @0x85d00000 type=0x0c20d050 access=0x4 -> R--
+```
+
+**(a) VM 块最小 1 MiB**。4 KiB–512 KiB 全被 `ILLEGAL_MEMBLOCK_SIZE` 拒；
+1048576 接受。对照组（普通 `USER_MAIN_RW` 4 KiB 分配成功）排除了"内存不够"。
+
+**(b) 块分配后是只读的**：`access=0x4` → 只有 R，**没有 W，也没有 X**。
+
+**(c) 开域之前写 = 整个进程 data abort**。coredump 是硬证据：
+
+```
+主线程 pc=0x810b5678   (在 memcpy 的 store 指令上)
+r0=0xe3a0002a  r1=0xe12fff1e   ← 正要写进去的两个指令字
+紧接着 "perm before-open ... access=0x4" 那一行之后
+```
+
+log159 里两份 dump 是同一次 abort（第二份是重启后又重复了一遍）。
+
+### 2. 我的探针顺序错了 —— 这是闪退的原因
+
+v03.71 我在注释里写过这个可能性：
+
+> "If the block is data-writable in its default state this succeeds; failure
+> here means the order has to be open -> write -> close, which the probe
+> reports explicitly rather than guessing."
+
+**然后我按 write → open 写了。** 正确顺序是：
+
+```
+alloc → OpenVMDomain → write → SyncVMDomain
+```
+
+### 3. v03.77 的改动（仅探针，行为未变）
+
+1. `OpenVMDomain` 移到**第一次 store 之前**，两侧各 dump 一次权限，
+   让 `0x4 → ?` 的转变在日志里看得见。
+2. **硬闸门**：`dump_perm()` 现在返回 access 位，**W 不在就拒绝写**。
+   拒绝写 = 一行 crumb；尝试写 = 一个 coredump。已经崩了两次，够了。
+3. 成功时打印**实测最小尺寸**和 JIT 必须遵循的顺序 —— 这是本次唯一的交付物。
+
+### 4. 对 JIT 设计的直接后果
+
+- 1 MiB 是最小申请单位，所以 JIT 代码区至少要 1 MiB。
+- `sceKernelOpenVMDomain()` 是**进程级**的：让所有 VM 块都可执行。
+  必须**启动时调一次然后保持打开**；每次 patch 都 open/close 的话，
+  inline cache 改写会变成 open/write/close/sync 的循环，不可接受。
+- 每个 patch 后必须 `SyncVMDomain(uid, addr, len)` —— 这就是缺失的 flush_icache。
+
+### 5. 还没验证的（下一轮的问题）
+
+- `OpenVMDomain` 到底加不加 **W**？闸门会直接回答。
+- 写完的代码能不能**执行**。
+- `CloseVMDomain` 是否把块退回 R-only（如果会，JIT 期间不能关）。
+
+### 6. 教训
+
+- **注释里写下的可能性，要真的当成约束去遵守。** v03.71 我已经知道"可能需要
+  open→write"的顺序，却按 write→open 实现了，代价是两次真机崩溃 + 两轮日志。
+- **任何会崩的操作前，先用能查询的接口确认前提。** `GetMemBlockInfoByRange`
+  一次调用就能知道 W 位在不在，我却选择"先试试看能不能写"。
+- **对照组很便宜，且能一次性排除一类假设**：普通 alloc 成功这一行，
+  让"内存不够"这个方向当场排除。
+
+---
+
+## 2026-11-01 v03.78：诊断浮层挪到右上角并按文字收窄（避开 Vita 帧率插件与虚拟按键）
+
+> 产物 `midp_vita_v03.78.vpk`（12061180 B），`J2ME Player v03.78 b330`。
+
+用户反馈："帧率显示和虚拟按键重叠了，和 vita 自带的帧率插件也重叠了"。
+两处冲突在代码里都能核实：
+
+- **左上角 (2,2) 正是 Vita 自带帧率插件的位置**；
+- **左信箱黑边归虚拟按键**：`vita_vkey.c` 的 `build_layout` 在 bars 模式下
+  数字键盘放在 `x0≈13..263, y0=(544-total_h)/2≈104..440`；截图相机键在
+  `(6, 56, 56x36)`。旧的 300 px 横条正好压在这一带上。
+
+### 竖屏几何（这次先算再改）
+
+```
+面板 960x544
+游戏列 x=276..683
+右黑边 683..960（277 px 宽）
+动作键从 y=60 起
+=> 右上角 y=2..28 的横条，既压不到游戏，也压不到任何按键
+```
+
+### 三处改动
+
+1. **默认角落改成右上角**，`diag.cfg` 加 `pos=`：
+   `0`=右上（默认）、`1`=左上、`2`=右下、`3`=左下；越界回落 0。
+   谁的插件在别处，改配置即可，不用重编。
+2. **宽度按文字实测**（最长行 × 字宽 + 8），不再是固定 300 px。
+   当前文本算出 248 px，盒子从 `x=710` 起
+   （`960-248-2=710 > 683`）—— 只覆盖右黑边，**一个游戏像素都不压**。
+3. **文本缩短**（这是第 2 条能成立的前提）：两行都改成单空格，
+   且 `cpu` 改为**毫秒**。原来打印的是微秒原值，相邻显示成
+   `cpu 10450` 和 `102ms`，两个单位并排，还白白多了两位宽度。
+   新格式：
+   ```
+   9.7 fps 392ms cpu 10.4 arm 333
+   blit 8030 conv 5678/1234 f288      (仅 detail=1)
+   ```
+
+### 宿主单测（69 条断言，全过）
+
+旧断言硬编码了"盒子从 (2,2) 开始"——**这正是那种产品错了测试还绿的断言**。
+新增：四个角落各验一次、`pos=9` 越界回落、盒子必须比旧的固定 300 窄、
+文字起点必须在面板左缘内 4 px。
+
+### 教训
+
+- **固定尺寸 + 硬编码位置 = 三种覆盖物必然打架。** 位置要可配，
+  尺寸要跟内容走；两者都做到了，才不用每加一个 UI 元素就改一次。
+- **并排的数字必须同单位。** `cpu 10450` 挨着 `102ms` 是我自己造成的歧义。
+- **测试断言写死布局，等于把 bug 固化成期望值。**
+
+---
+
+## 2026-11-01 v03.79：浮层设置搬进「设置」页（不再改 diag.cfg）
+
+> 产物 `midp_vita_v03.79.vpk`（12061550 B），`J2ME Player v03.79 b330`。
+
+用户："这些功能加在设置页面啊，改 cfg 不麻烦吗" —— 确实麻烦，要读卡器。
+`SET_JIT` / `SET_VKEY` / `SET_PROFILE` 等早就在设置页里了，
+只有我 v03.70 加的那套诊断开关还停在 cfg 文件上，属于设计不一致。
+
+### 新增四行（tab 3「设置」，排在 JIT 编译之后）
+
+| 行 | 取值 | 落到哪里 |
+|---|---|---|
+| 帧率浮层 | 开 / 关 | `vita_diag_set_visible()` |
+| 浮层位置 | 右上 / 左上 / 右下 / 左下 | `vita_diag_set_pos()` |
+| 浮层详细 | 开(两行) / 关(一行) | `vita_diag_set_detail()` |
+| JIT 探针 | 开 / 关 | 创建 / 删除 `jitprobe.cfg` |
+
+- **状态只有一份**，在 `vita_diag.c`（和 `vita_vkey` 同样的做法）：
+  菜单调 setter，再调 `vita_diag_save()` 把 `on=/detail=/pos=` 整体重写回
+  `diag.cfg`。菜单不存副本，避免两处不一致。
+- 前三项**下一帧生效**；JIT 探针由 round 开始时读取，所以标签写明
+  "下次启动生效"。
+- 探针那一项做成**文件存在性开关**，因为 `vita_jitmem.c` 就是 `stat` 这个文件。
+  文件里写了两行说明，将来在卡上被翻到能自己解释。
+
+### 布局：SET_N 9 → 13，必须滚动
+
+`64 + 13*30 = 454`，再加提示块和存储数字就出屏了。所以：
+
+- `SET_LINES = 10`（可视行），`settop` 作为窗口原点；
+- 共享的光标 clamp 对 tab 3 改用 `SET_LINES`（原来用列表页的 `lines=13`，
+  会让最后几行永远够不到）；
+- **点击映射也要过 `settop`** —— 否则滚动后点第一行可见项，
+  切换的是另一个选项。
+
+### 验证
+
+- `./build.sh` 全量 `Build successful`；`.vpk` 12061550 B
+- 新文案确认进二进制（直接 `grep -ac` UTF-8，因为 `strings` 默认不输出非 ASCII）：
+  `帧率浮层` / `浮层位置` / `浮层详细` / `JIT 探针` 各 2 处，`jitprobe.cfg` 1 处
+- 宿主单测 `/tmp/diagtest` 仍 69/69（`vita_diag` 的 setter 尚未纳入测试，
+  下一轮补：设值后 `draw()` 行为应随之改变）
+- **未上机**
+
+### 教训
+
+- **同一个类别的东西要放在同一个地方。** 设置页有 9 项、我却在旁边开了个 cfg
+  文件做同类的事，用户第一次碰到就会问"为什么不放设置里"。
+- **加列表项前先算行数**：`64 + N*30 + 提示块` 是否 ≤ 544。
+  这次一算就溢出，顺手把滚动和点击映射一起修了。
+
+## 2026-11-01 log158（v03.76）：ptime 数据——卡顿的大头是 Java 里的逐顶点计算；5 键 / 软键的按键处理与重绘
+
+- 证据（真机 ptime，每 20 个画面一行，单位 ms/画面）：total 659→679→713→811→814，gap 约 46（第一行 1093 含加载），shade 265→404→426→472→472，skin 83→143→141→171→189（每画面 1→3 次），decode 16~27，draw 1~4，present 18~25，blit 1。相邻 ptime 的墙钟间隔除以 20 为 726/761/857/862 ms，与 total+gap（725/760/856/860）吻合，说明各段计时可信。**每画面约 0.73~0.86 s，约 1.2~1.4 画面/秒。**
+- 结论（证据+算术）：shade+skin+decode 占 total 的约 85%（如 472+189+27=688 / 814）；draw+present+blit 合计不到 35 ms。瓶颈是 `Renderer.shade`、`SkinnedMesh.applySkin` 和顶点解码这些在无 JIT 的 333 MHz 解释器里逐顶点跑的 Java 代码，不是 GL 提交，也不是游戏自己的逻辑（gap 只有 46 ms）。
+- `shade()` 的代价来源（读源码）：每顶点两次 `normals.component`/`positions.componentRaw` 虚调用、一次 `sqrt`、每个光源每顶点再算 `sqrt`；点光源分支每顶点 `new float[3]`。每画面对每个 mesh 全量重算。
+- 输入：log158 的 40 个触摸采样按 `build_layout` 条形模式（960x544 面板，240x320 游戏缩放到 408x544）复算后，全部落在 3 个键上：数字键 5（21 次，矩形 x99..177 y190..268）、左软键 L（11 次）、右软键 R（8 次）。与用户说的"5 键"和"菜单"对应。
+- 按键处理（BioCanvas 字节码）：`keyPressed` 置位、`keyReleased` 用 `ixor` 清位，`J_Dev_KeyRead` 在每次 `run()` 开头只把 `KeyValue` 快照成 `m_Trg/m_Cont`。`run()` 的周期就是画面周期（约 0.8 s）。-5 → 0x10000，-6 → 0x20000，-7 → 0x40000（`m_Trg & 131072` 是确认键）。
+- 推断（未直接测量）：按下和松开都发生在两次采样之间的短按，对游戏等于没按。3D 期间手柄 11 次按下的保持时间为 126/133/143/148/186/187/193/204/366/1741/10029 ms，其中 9 次短于一个画面周期；按均匀相位估算只有约 4 次会被采到。长按有效：DOWN 保持 10 s 期间 Jill 位置持续变化，约 `(-2333,979,5869)` → `(-1723,1535,5104)`。
+- 5 键的游戏反应（证据）：第一批 5 键触摸（hb 相对约 +93.3~+94.6 s）正好落在 `rootstate#24`（新出现一个 34 顶点 mesh，`mesh=9c875b6`）的时刻，之后 `gmesh#2 d=401 n=34 tex=9 cull=1 blend=0` 才出现。这个 mesh 是什么（攻击特效？）没有证实。
+- 闪烁（**未证实的候选机制**）：`vita_input.c` 在 `JVMSPI_CheckEvents` 里调用 `vita_display_vkey_tick()`，每次点按后至少 260 ms（按住则持续，最长 1200 ms）每 33 ms 用 `vita_screen_pixels` 的当前内容重放一次。游戏渲染期间 CheckEvents 约每 10 ms 一次（心跳 64 次=662 ms），一个 0.8 s 的画面里约 77 次，可以反复撞上。BioCanvas 里没有 `createImage(II)`（只有按路径/字节加载），没看到离屏双缓冲；而 3D 的结果要到 `releaseTarget` 才 `drawRGB` 到屏幕，所以重放可能把"2D 已画、3D 还没画"的半成品显示出来。perf.log 里确实出现 33.3 ms 的最小翻页周期（f=300 窗口：period 148 ms，范围 33.32~3620 ms），说明强制重放存在，但没法据此判断它是否在画面中途发生。
+- 未验证 / 下一步：(1) 在 `vita_display_vkey_tick` 里给"重放时 `vita_screen_pixels` 与上一次 `lfjport_refresh` 完成时的内容不同"计数，直接证明或排除半成品重放；(2) 若成立，重放改用最近一次 `lfjport_refresh` 时拷下来的完整帧；(3) 性能：把 shade/skin/decode 挪到原生（C），或先去掉每顶点的虚调用和 `new float[3]`；(4) 软键/5 键短按丢失：在 `vita_input.c` 给游戏 `keyPressed`/`keyReleased` 之间加最小保持时间（需要核对不会让菜单连发）。
+
+## 2026-11-01 log158 更正：菜单和 5 键走虚拟键，上一节有两处要改
+
+- 更正 1（短按漏采）：上一节"3D 期间手柄 11 次按下里 9 次短于画面周期、约 4 次会被采到"只适用于手柄。用户说明菜单（左/右软键）和 5 键走的是虚拟键，那 11 次手柄数据与这两个键无关。虚拟键路径（`vita_input.c` 的 `vkey_touch`/`vkey_release`）：手指首次命中按钮时发 PRESSED，手指离开面板或滑出按钮时发 RELEASED，中间没有最小保持时间，所以按键保持时间就是手指停留时间。log158 算不出这个时间：`[TOUCH] up` 行没有时间戳，HEARTBEAT 的精度约 0.7 s。游戏侧 `J_Dev_KeyRead` 每个画面（约 0.8 s）只快照一次 `KeyValue`，所以点按漏采是否发生，只能靠新探针量。
+- 更正 2（半成品重放）：`BioCtrl.Draw` 在进入 3D 前只用 `fillRect(0,37,240,3)` 和 `fillRect(0,220,240,3)` 画了视口上下两条 3 像素边条，随后 `setClip(0,40,240,180)` 再调用 `D_Game_JSR184`，没有清 3D 视口。所以"重放时看到被清黑的 3D 区域"这个机制没有字节码支撑；`vita_display_vkey_tick` 的 33 ms 重放仍是候选，但比上一节写的弱。
+- 触摸日志语义（读 `vita_touch_poll`）：`[VKEY] touch phys=` 只在 `dbg_down` 状态切换到 3 时写一行，即每次"面板空闲→命中虚拟键"一行；手指在两个虚拟键之间滑动不会再写，所以 40 次是按下次数的下限。按布局复算后：5 键 21 次，左软键 11 次，右软键 8 次。
+- 软键去向（读 MIDP 源码 + 字节码，未实测）：BioMain 里没有 `addCommand`/`setCommandListener`，`SoftButtonLayer.keyInput` 只在 `isSoft1Active()/isSoft2Active()` 为真时吞掉软键，所以 L/R 应当直通 `BioCanvas.keyPressed(-6/-7)`。5 键是 keyCode 53：`keyPressed` 开头 `if (pause && keyCode == 53) pause = false`，`getBinKey(53)` 返回 32。
+- 暂停界面（未排除）：`hideNotify` 把 `pause` 置 true，此时 `paint` 画黑屏加文字，`run()` 只 `sleep(5)` 再 `callSerially(this)`，游戏逻辑不推进。`CanvasLFImpl.uCallHide/uCallFreeze` 会调用它。log158 里 5 行 ptime 均匀推进，没有长时间停顿，没有 pause 证据。
+- 5 键的游戏反应（时间上吻合，含义未证实）：5 键首批触摸在 HEARTBEAT 相对 setCurrent 约 +93 s（绝对约 …139100，精度 ±0.7 s），约 2 s 后 `rootstate#24`（…141390）出现新 mesh（34 顶点，`mesh=9c875b6`）。是不是攻击特效没有证据。
+- 下一步（待用户确认，未做）：(1) 虚拟键按下/松开各写一行 `[VKEY] press|release key=… ms=…`，量手指停留时间并与 ptime 画面周期比较；(2) `vita_display_vkey_tick` 重放时计数"屏幕缓冲与上一次 `lfjport_refresh` 完成时是否不同"；(3) 若点按确实被漏采，给虚拟键的 RELEASED 加一个不短于一个游戏画面周期的最小保持（要避开菜单连发）。版本号：其他会话已到 03.79，下一版取 03.80 起，先 grep。
+
+## 2026-11-01 v03.80：虚拟键按下/松开时间戳 + 重放屏幕指纹（仅诊断，行为不变）
+
+- 动机：用户确认菜单（软键）与 5 键走虚拟键。要回答两个问题：(a) 手指停留时间相对游戏约 0.8 s 的画面周期有多长，短点按会不会被 `J_Dev_KeyRead` 的每画面一次快照漏掉；(b) `vita_display_vkey_tick` 的 33 ms 重放是否会展示 Java 画到一半的屏幕。
+- 改动（`vita-port/src`）：
+  - `vita_input.c`：`vkey_edge_log()`，在 `vkey_touch` 按下和 `vkey_release` 松开时各写一行 `[VKEY] press|release key=<KEYMAP 值> btn=<按钮序号> ms=<gettimeofday 毫秒>` 到 `input_debug.log`，与 `[INPUT]`、`ptime` 同一个墙钟。key 值：`KEYMAP_KEY_5`=53（'5'），`KEYMAP_KEY_SELECT`=-5；软键值见 `keymap_input.h`（预期 -6/-7）。
+  - `vita_display.c`：`screen_fp()` 对虚拟屏幕每 97 个像素取一个 FNV 哈希（约 790 个采样）；`lfjport_refresh` 记 `g_fp_refresh`；`vita_display_vkey_tick` 每次真的重放前比较，不同则 `g_replay_diff++` 并写 `[VKEY] replay DIFF n= diff= refreshes= ms=`（最多 40 行），闪烁窗口结束时写一行 `replay end`。补了 `<psp2/io/fcntl.h>` 和 `<sys/time.h>`。
+- 验证：`vita-port/build.sh` rc=0，日志里没有 vita_display/vita_input 的 warning；两个 `.c.obj` 的 mtime 16:06:24 晚于编辑；ELF `midp_vita_v03.80.sym` 里 `replay %s n=%u diff=%u refreshes=%u ms=%lld` 和 `%s key=%d btn=%d ms=%lld` 各出现 1 次（03.79 为 0）；`vkey_replay_log` 在符号表里，`vkey_edge_log` 被内联所以不在。第一次我用不含 `ms=%lld` 的串去搜，误报 0，是搜索串写错，不是代码缺失。
+- 未验证：真机上的行为；指纹只采样 1/97 像素，极小的改动可能漏检（漏检方向只会少报 diff）。
+- 判读：
+  - `press`→`release` 的间隔 vs 相邻两行 `ptime` 之间的画面周期（约 0.73~0.86 s）：间隔明显更短 → 点按大概率被漏采，需要给虚拟键的 RELEASED 加最小保持。
+  - `replay end` 行里 `diff=0` 且 `n>0` → 排除"重放展示半成品"；`diff>0` → 成立，修法是让重放使用最近一次完整刷新时拷下来的帧。
+  - `n=0` 说明闪烁窗口根本没有触发重放，闪烁另有原因（再看暂停界面 / 画面本身）。
+
+---
+
+## 2026-11-01 log160 分析（+ v03.81）：JIT **没生效**，`OpenVMDomain` 返回成功但权限位一位没变
+
+> 产物 `midp_vita_v03.81.vpk`（12062440 B），`J2ME Player v03.81 b330`。
+
+### 1. 判决：JIT 没有运行
+
+```
+[JITPROBE] alloc 1048576 bytes -> uid=0x40010187  <-- ACCEPTED
+[JITPROBE] perm before-open  @0x85c00000 type=0x0c20d050 access=0x4 -> R--
+[JITPROBE] OpenVMDomain rc=0x00000000            ← 返回成功
+[JITPROBE] perm after-open   @0x85c00000 type=0x0c20d050 access=0x4 -> R--   ← 完全没变
+[JITPROBE] VERDICT: the VM block is READ-ONLY even with the domain open
+jit: cfg=2 -> policy 0 (interpreter); ...
+vm UseCompiler(post)=0  compile-requests=0  produced-code=0   （6 个 round 全是）
+```
+
+**"没闪退"不是 JIT 成功了，是我 v03.75 加的降级路径生效了。**
+6 个 round 每个都 `compile-requests=0`，一次编译都没发生。
+
+用户确认是**真机**（不是 Vita3K），所以这是关于硬件的结论，不是模拟器缺陷。
+
+### 2. 但有一个问题被我自己堵住了
+
+v03.77 我加了"硬闸门"：`access` 里没有 W 就拒绝写。
+于是 **"开域之后到底能不能写"这件事，从来没有被测过** ——
+闸门依据的 `access` 字段本身就是待验证的东西，我拿未验证的前提去阻止验证。
+
+### 3. v03.81：一次跑完，按风险递增，先便宜的证据
+
+1. **校准**：用同样的查法去问**权限没有疑问**的内存 ——
+   普通 `USER_MAIN_RW` 块、以及我们自己可写的 `.bss`。
+   - 若普通 RW 报 `0x6` → `access` 字段是实时的，VM 块确实只读；
+   - 若普通 RW 也报 `0x4` → 该字段根本不能用，只能靠实际写入来判定。
+2. **两种 size 各查一次**（4 字节 / 整块）：单字范围的查询可能走不同的记录。
+3. **`OpenVMDomain` 改到 alloc 之前**：log160 是 alloc 之后调的，反向顺序没试过。
+4. **终于真的写一次**，不设闸门，写前打 `MARKER` 行。
+   `crumb_append` 是直接 `sceIoWrite`、无缓冲，所以**下次日志停在 MARKER 就说明写入 abort** ——
+   那就是答案：VM domain 这条路在此固件上不能承载代码。
+5. 写成功则 `SyncVMDomain`，再打第二个 `MARKER` 后调用。取指 abort = 可写但不可执行。
+
+### 4. kubridge 路线在你这台机器上不成立（已查证）
+
+`log160` 的 precheck 是 `installed-NOT-visible`，其含义按代码是：
+`ku_probe()` 失败 **且** `kuPowerGetSysClockFrequency()` 没返回合理时钟
+⇒ `ku_available()` 为假。而 `vita_kernel_forensics.c` 自己的注释写明：
+**没装插件时调用 kubridge stub 本身就是致命的**。
+所以"用 `ksceKernelIcacheInvalidateRange` 做缓存维护"这条需要先装插件，
+是用户动作，不是代码改动。
+
+### 5. 教训
+
+- **不要用待验证的前提去阻止验证。** `access` 字段是否可信正是待测项，
+  我却拿它当闸门条件，白白多花一轮。
+- **"程序没崩"必须追问"那它到底做了什么"。** 降级让崩溃消失，
+  很容易被误读成"JIT 生效了"。
+- **报错要翻译**（前一轮的教训继续有效），这次直接给出三段式判定
+  （可写可执行 / 只可写 / 只读），下一轮无论结果如何都是结论。
+
+---
+
+## 2026-11-02 v03.83：找到 JIT 真正该用的 API —— `pss_code_mem_*`（PSS/Mono 桥）
+
+> 产物 `midp_vita_v03.83.vpk`（12061542 B），`J2ME Player v03.83 b330`。
+
+### 1. 我 v03.71–v03.82 全走错了方向
+
+十一轮都在 `sceKernelAllocMemBlockForVM` + `sceKernelOpenVMDomain` 上打转，
+而 log160/161 每次都确认这条路在真机上死了（`access=0x4` 只读、
+`OpenVMDomain` 返回 0 却一位不改、写入直接 abort）。
+
+**漏掉的原因是一个命名巧合**：这个 API 不叫 `*cache*`、不叫 `*exec*`，
+它叫 **`pss_code_mem_*`** —— PSS = PlayStation Suite，其 Mono 运行时
+**就是托管代码 JIT**，面临的正是 JVM 的问题。我搜 `icache|dcache` 时
+`pss_code_mem_flush_icache` 就在结果里本该出现，但我当时只看了
+`ForDriver`/`ForKernel` 命中的那两个库，没注意 `SceLibMonoBridge`。
+
+### 2. 实际核对（在装好的 VitaSDK 里，不是推测）
+
+```
+psp2/pss.h:
+  void *pss_code_mem_alloc(SceSize *);
+  void  pss_code_mem_flush_icache(const void *, SceSize);
+  void  pss_code_mem_lock(void);
+  void  pss_code_mem_unlock(void);
+
+libSceLibMonoBridge_stub.a 还导出（头文件没声明）：
+  pss_code_mem_initialize  0xD67BC7AB
+  pss_code_mem_terminate   0x6899C39C
+  pss_code_mem_free        0xB468C313
+  pss_code_mem_alloc       0xF466ABEC
+  pss_code_mem_flush_icache 0x110F567B
+```
+
+独立测试程序**链接通过**，weak 变体也通过（`_stub_weak`）。
+所以现在用 **weak** 链接：固件上没有 SceLibMonoBridge 时，
+`pss_code_mem_alloc` 返回 NULL，探针就降级，**不会阻止 app 启动**。
+
+### 3. 为什么它同时解决两个障碍
+
+| 障碍 | 为什么 pss_code_mem_* 解决 |
+|---|---|
+| 不可执行内存（XN） | 它是托管运行时**专门为此分配**的代码内存 |
+| 缺 icache flush | `pss_code_mem_flush_icache` 是**用户态**调用。而 `__builtin___clear_cache` 被这个 GCC 折叠成空、`mcr p15` 是 PL1、`ksceKernelIcacheInvalidateRange` 在用户态**连链接都失败** |
+
+### 4. 探针重写（PATH A = PSS，PATH B = VM domain 只留一行确认）
+
+因为头文件没写参数语义（unit？in/out？），所以 `pss_code_mem_alloc`
+依次试 `*size = 1 MiB / 0 / 4 KiB`，日志直接告诉实现认哪个。
+
+完整序列，每步前打 `MARKER`（崩了可归因）：
+
+```
+initialize → alloc → 写 mov r0,#42; bx lr → flush_icache → 调用（期望 42）
+           → 原地改成 mov r0,#43 → flush → 再调用（期望 43）
+```
+
+**最后那步原地 patch 很关键**：`CompiledMethod_arm.cpp` 就是原地改写
+`BytesPerInt` 字节再刷缓存。可执行但不可改写 = 仍然不能用。
+
+### 5. 这一版没有声称"JIT 能用了"
+
+只证明**内存和 flush 两件事**。下一步才是真正的工作量：
+把 `ObjectHeap` 的 compiler area 从托管堆搬进这块缓冲区 ——
+GC 现在把 compiler area 当堆数据扫描、甚至可能移动它，
+`save/restore_compiler_area_top` 和代码对象遍历都要改。
+
+### 6. 教训（这条最重要）
+
+- **不要用自己想到的命名去搜 API，用"这个平台一定有谁做过同样的事"去想。**
+  托管代码 JIT 需要 RWX + icache flush，PS Vita 上除了我们自己，
+  **Mono（PSS/PSM）也在做同一件事**，Sony 必然给了它接口。
+  应该第一轮就问"PSS 是怎么做 JIT 的"，而不是在 `sysmem.h` 里穷举。
+- **搜索结果的过滤条件会隐藏答案。** 我当时用 `grep -v ForDriver | grep -v ForKernel`
+  过滤，而正确的答案在一个完全没被检查的模块里。
+  教训：先看"哪些库导出过 cache/exec 相关符号"的**全表**，
+  再逐个排除，不要先过滤再判断。
+- **用户给的信息要逐个实际核对，不要凭印象归类。** 前两条（`USER_RW_W_X`、
+  `sceKernelCpuDcacheWritebackInvalidate`）确实不存在，第三条（Unsafe Homebrew）
+  确实存在且我们早已启用，第四条（`pss_code_mem_*`）**完全正确且是解**。
+  逐条查证的代价是几条 grep，收益是十一轮的弯路。
+
+## v03.84 原生蒙皮 + 「人物变小」说明
+
+**改动(未上真机验证)**
+- 新增 `jsr184/src/share/native/m3g_skin.h`(纯 C 蒙皮内核,逐浮点运算对应 Java 循环)。
+- `m3g_native.c` 新增 `Java_com_sun_m3g_NativeBridge_skin`(返回 boolean,参数全部边界检查,缓冲复用)。
+- `NativeBridge.java` 声明 `skin(...)`;`SkinnedMesh.applySkin` 先统一构建骨骼矩阵,再 `applySkinNative` 打包调用;被拒绝或抛异常则永久回退 Java 循环。
+- A/B 开关:`defaults.cfg` 写 `m3gnative=0` 关闭原生(`vita_3d.c` 编码到 camMode bit16,`Renderer` 解包为 `SkinnedMesh.useNative`)。日志行 `camMode=... nativeSkin=1|0` 标明走哪条路径。
+- 主机桩 `NativeBridgeHost.skin` 返回 false;`debug/tools/m3gprobe/skin_test.c`(宿主 gcc 须 `PATH=/usr/bin:/bin`,因 vitasdk 的 gcc/as 抢占 PATH)。
+
+**验证(证据)**:主机测试最大相对误差 2.1e-6,含越界矩阵索引/负起点/越界范围;`nm` 中 `Java_com_sun_m3g_NativeBridge_skin` 存在;`nativeFunctionTable.cpp`、`ROMImage_01.cpp` 含该符号;`SkinnedMesh.class` mtime 新于头文件;ELF 含 `nativeSkin=`、`native skin refused`。
+**真机待查**:ptime 的 `skin` 项(log158 基线 189 ms/帧)应明显下降;结果若与 Java 路径不同,用 `m3gnative=0` 对照。
+**未做**:`shade`(472 ms/帧)仍在 Java,是下一个目标。
+
+**「人物变小」两个现象**
+1. 角色整体极小(log150 约 5x7 px):推断来自 `.m3g` 里 SkinnedMesh 节点缩放 0.1 × 游戏 `postScale(0.012)` = 0.0012。目前只有可选开关 `m3gskin=noscale`(v03.55,`Renderer.walk`)绕过,它是权宜之计、未证明是正确默认;近期日志都开着它。
+2. 按方向键时角色缩扁/消失、敌人闪烁:有证据。jar 加载类里的 double 常量字被存反,`Vector3D.unit()` 返回 (0,0,0),朝向矩阵块变 0。v03.73 在 `ConstantPool.hpp` 的 `double_parts_at_put`/`double_at` 修复,log157 真机确认。
+
+## v03.85 上游来源归档（文档，无代码改动）
+
+**做了什么**
+- 新增 `UPSTREAM_SOURCES.md`：登记本仓库三个基线来源与实际 commit
+  （`phoneme_source/phoneME` = magicus `5a13f65`；`phoneme-cldc` = tberthel
+  `aae56e14a7e3`；`phoneme-midp` = tberthel `8d44713992fd`）、PhoneJ2ME 组织的
+  29 个模块仓清单、模块→目录映射、获取与核验命令、归档维护规则。
+- 补 `.gitmodules`（此前缺失，导致 `git submodule update --init` 报
+  `no submodule mapping found`）：`phoneme_source/phoneME` → `magicus/phoneME.git`。
+  补后 `git submodule status` 正常输出 `5a13f65…`。
+- `README.md` / `AGENTS.md` / `.github/agents/jvm-dev.agent.md` 增加指向本文档的入口，
+  智能体新增「上游源码获取（查实现时的落点）」一节。
+
+**实测核验（2026-11-02）**
+- 链接均可达：PhoneJ2ME 组织（29 仓）、`PhoneJ2ME/cldc`、`PhoneJ2ME/pcsl`、
+  `tberthel/phoneme-components-{cldc,midp}`、`magicus/phoneME`、`KiddRwxSsj/j2vita`。
+- 基线 commit 存在：`aae56e14a7e3`、`8d44713992fd`、`5a13f65…`（GitHub API 200）。
+- **官方 zip 归档已失效**：`phonej2me.github.io/downloads_page.html` 页面 200，但 zip
+  指向 `download.java.net`，实测 `301 → 404`。归档页只能当历史清单。
+- **易混淆**：`sympower/phoneme-midp` 的 GitHub 描述是 *"Fork of Phone-J2ME MIDP JAD
+  tool … JadTool"*，**不是 MIDP 全量源码**，不能当上游。
+
+**遗留**：`jsr75/`、`jsr184/` 无上游完整实现（PhoneJ2ME 组织无 jsr184 仓，JSR-75 上游
+只有空钩子），来源仍按目录注释与本文档追踪。
+
+## v03.86 外部 API 文档入口（文档，无代码改动）
+
+**新增参考**：`https://nikita36078.github.io/J2ME_Docs/` —— Sun/Nokia 官方 Javadoc 与
+规范页镜像（维护者即 J2ME Loader 作者）。已登记到 `UPSTREAM_SOURCES.md` 第 3 节
+（含目录→本仓库模块映射表），并在 `.github/agents/jvm-dev.agent.md`
+「上游源码获取」里设为查签名/常量/异常的第一落点。
+
+**实测（2026-11-02）**
+- **坑**：首页列表的 href 是 Windows 反斜杠（`docs\jsr184`），点开 404；改成正斜杠
+  `.../J2ME_Docs/docs/<目录名>/` 后实测全部 200。
+- 已抽查确认可用的目录：`cldc-1.1`、`midp-2.0`、`midp-3_0-fr-javadoc`、`jsr75`、
+  `jsr75-pim`、`jsr120`、`jsr135`、`jsr172`、`jsr177`、`jsr179-1_1-mrel-javadoc`、
+  `jsr184`、`jsr205`、`jsr211`、`jsr226`、`jsr239`、`jsr256`、`jsr257`、
+  `jsr280_1.0_spec`、`jsr82_1.1.1_javadoc`、`Mascot_Capsule_API`、`Motorola3D_API`、
+  `Nokia_UI_API_1_1`、`nokiaapi2`、`Siemens_API`、`Samsung_API_1_0`、
+  `Vodafone_API_2_0`、`Motorola_Gaming_API`、`Motorola_FunLights_API_1_0`、
+  `Motorola_iDEN_API`、`LG_MMPP_API`、`DoJa_5_1`、`ezplus_3`、`Star_API_2_0`、
+  `VibeLight`、`BlackBerry_API_7_1_0`。
+- `jsr184` 为 2005-06-30 生成的 M3G Javadoc（frameset 版），可直接对照
+  `SkinnedMesh`、`Transformable`、`Loader` 等成员；此前在 /tmp 抓的 jsr184 文档即来源。
+
+**用法边界**：只作查阅，不整站复制进仓库；与真实游戏行为冲突时以规范 + 真机日志 +
+上游源码三方交叉验证。
+
+## v03.85 render(Node, Transform) 忽略节点自身变换（取代 m3gskin=noscale）
+
+**根因（有规范原文）**：M3G 1.1 Javadoc `Graphics3D.render(Node, Transform)`：「The node transformation of the given node is ignored, but its other attributes are respected」，`transform` 是该节点局部到世界的变换。Renderer.walk 对最外层节点仍乘了 `getCompositeMatrix`，jill_han 等 SkinnedMesh 的文件缩放 0.1 被多乘一次，叠加游戏 `postScale(0.012)` 得 0.0012。来源页：nikita36078.github.io/J2ME_Docs/docs/jsr184（M3G 1.1 Javadoc 镜像；与 JCP 官方原文是否逐字一致未核对）。JCP 页面本身不托管规范；phoneME 上游树不含 M3G 源码（仅构建脚本引用 `$(COMPONENTS_DIR)/jsr184`）。
+
+**改动**：`Renderer.frame/walk` 增加 `ignoreOwn`：`renderNode` 传 true（含 transform==null 即单位阵），`renderWorld` 传 false（render(World) 行为不变）；后代节点照常用各自变换。删除 `skinNoScale`（Renderer、vita_3d.c 的 m3gskin= 解析、vita_3d.h 注释）；defaults.cfg 里残留的 `m3gskin=` 行无副作用。
+
+**验证（宿主，真实 Renderer，jill_han.m3g，log150 相机/根变换，新增 `debug/tools/m3gprobe/NodeScaleRun.java`）**：节点自带缩放 0.1；旧行为 draw#1 NDC x[-0.501,-0.444]（跨度 0.057），新行为 x[-0.832,-0.248]（跨度 0.584），正好 10 倍；behind=0 inside=1073/1073。旧基线是在 /tmp 副本里去掉 ignoreOwn 分支得到的（jsr184/ 目录整体未被 git 跟踪，没有 HEAD 基线）。构建：`midp_vita_v03.85.vpk`，ELF 无 skinNoScale，Renderer.class 已更新。**未上机**。
+
+**风险/待查**：(1) 其他非 SkinnedMesh 的根节点若自带非单位变换，现在也被忽略（按规范应如此）；(2) 「root 矩阵在完整旋转与单列之间交替」(log152) 已由 v03.73 解释，与本改动无关；(3) `/409.6` 与 `/4096` 的 10 倍差之前怀疑与此同源，本改动后需看真机尺寸再判断。
+
+---
+
+## 2026-11-02 log175 分析（+ v04.05）：JIT 探针自己把启动打崩了 —— `pc=0`，未解析的 weak import
+
+> 产物 `midp_vita_v04.05.vpk`（12065637 B），`J2ME Player v04.05 b330`。
+
+### 1. 崩溃点（coredump 是硬证据）
+
+```
+pc = 0x00000000      far = 0x00000000
+fault status = 0x00000007    ← TRANSLATION fault（地址 0 没有映射）
+lr = vita_jit_probe 内的调用者
+```
+
+`crumb.log` 停在：
+
+```
+[JITPROBE] === PATH A: PSS code memory (pss_code_mem_*) ===
+```
+
+下一行本应是 `pss_code_mem_initialize() returned`，**中间只隔一次调用**。
+所以崩溃就是 `pss_code_mem_initialize()` 本身。
+
+注意是 **translation fault 而不是 permission fault** —— 地址 0 根本没有页表映射，
+这正是"未解析的导入"的样子，不是权限问题。
+
+### 2. 机制（在构建出的 ELF 里核实，不是推断）
+
+```
+.vitalink.fstubs.SceLibMonoBridge   0x50 字节 @ 0x811c3670
+  pss_code_mem_alloc        0x811c3670
+  pss_code_mem_flush_icache 0x811c3680
+  pss_code_mem_free         0x811c3690
+  pss_code_mem_initialize   0x811c36a0
+  pss_code_mem_terminate    0x811c36b0
+```
+
+每个是 16 字节数据 stub（`00000008 / d46680e4 / <NID> / nop`），
+`vita-elf-create` 把它变成 import 表项。**模块不在进程里 → 表项为 0 → `bl` 跳 0。**
+
+这与 v04.04 记录的 `getenv` 故障是**同一类**：都是"libc/库符号悄悄变成 import"。
+
+### 3. 我的关键错误：`_stub_weak` 不能把"模块缺失"变成空操作
+
+v03.83 我以为用 weak stub 就能"缺失时返回 NULL、探针降级"。**错了。**
+
+weak stub **仍然是同一段里的 16 字节实体 stub**，所以
+`&pss_code_mem_initialize == 0x811c36a0`，**不是 NULL**。
+NULL 检查看不见这个问题，**只有问内核"模块在不在"才能**。
+
+### 4. v04.05 修法（三层，都便宜）
+
+1. **`pss_module_present()`**：`sceKernelGetModuleList` 遍历 type `0x01..0x04`，
+   找 `"SceLibMonoBridge"`。**这是决定性的闸门** —— 不在就绝不碰任何 `pss_*`。
+   （这个 API 端口早就在用，不需要内核权限。）
+2. **失败时额外打印**所有名字含 `Mono`/`Pss`/`Psm` 的模块，
+   这样"没有"这个词才有可操作性：万一这个固件里导出者叫别的名字，日志会显示出来。
+3. 保留函数指针判空，但**注释里写明它是次要的**，不是防这次崩溃的东西。
+
+PATH A 失败 → PATH B（VM domain，一行确认）→ policy 0，不再带崩进程。
+默认 `jit=0` 完全不走这条路径。
+
+### 5. 教训
+
+- **`weak` 链接解决的是"链接期缺符号"，不是"运行期缺模块"。** 这两件事我混为一谈了。
+  运行期模块缺失必须用模块列表查，不能用符号地址判断。
+- **看到 `.vitalink.fstubs.*` 就要警惕。** 端口 v04.04 已经为 `getenv` 付过一次代价，
+  这次又付一次。任何从 Sce 库导入的符号，如果那个库可能不在进程里，
+  调用前必须查模块。
+- **取符号地址做判空，对 fstub 是无意义的**：地址是 stub 的地址，永远非 0。
+
+## 2026-11-02 log176 分析（v04.04，真机，BioMain 后接极品飞车）+ v04.07 蒙皮分项计时
+
+**事实（log176）**：`backend=hardware`，ARM 仍卡 333 MHz（fps 7.3 / 5.1）。BioMain 人物 aabb 约 45x76 px、敌人约 57x109 px，无 skinNoScale，v03.85 的规范修复在真机上生效。ptime（frames=40/60）：skin 85/139 ms、shade 396/486 ms、total 609/804 ms；log158（Java 蒙皮）同帧位 skin 143/141、shade 404/426。**原生内核没有带来可见的 skin 下降**。frames=20 的 `skin=0(x0)` 是场景未出角色，不可比。
+**推断（未实测）**：skin 计时包住整个 applySkin，里面每帧还有 computeWorld 与 41 个骨骼矩阵 mul 和数组分配，耗时可能不在逐顶点循环。
+**虚拟键（input_debug.log）**：34 对 press/release，33 对按住 < 200 ms，中位 116 ms，最短 64 ms；游戏约 0.8 s 采样一次 KeyValue，所以短按很可能被漏采（推断）。`replay end` 累计 n=1765、diff=1473（约 83%）：重放时屏幕缓冲区已不同于上一个完成帧，支持"重放把半成品帧送上屏幕"的闪烁假设；无截图，未证明用户看到的就是半成品。
+**极品飞车**：开始加载 M3G，`load FAILED '/bo' (Image2D pixel length mismatch)` 后 Timer 任务因 NPE 被取消（M3gReader.readImage 对带调色板图像只跳过调色板、仍按 w*h*bpp 校验）。该项由另一会话在 v04.06 处理，本轮不碰。
+
+**v04.07（仅诊断，不改行为）**：ptime 行末尾追加 `| skin split: world= mats= kernel=`（computeWorld / 骨骼矩阵 / 打包+内核，ms/帧，槽位 9–11，数组扩到 12）。Java 回退路径也计入 kernel，可与 `m3gnative=0` 对比。宿主：NodeScaleRun 的 NDC 与 v03.85 完全一致；PtimeRun 的 ptime 行格式正确（宿主过快，分项全 0，不代表设备）。构建：midp_vita_v04.07.vpk，ELF 含 `skin split`，SkinnedMesh.class 已更新。**未上机**。
+**待办**：(1) 上机看 skin split；(2) 虚拟键重放改叠加到上一完成帧、短按保持至下次采样（会改行为，待你决定）；(3) shade 优化。
+
+---
+
+## 2026-11-02 log178 分析（+ v04.09）：不闪退了，但 JIT 仍没生效 —— 模块不在进程里，改为主动加载
+
+> 产物 `midp_vita_v04.09.vpk`（12068944 B），`J2ME Player v04.09 b330`。
+
+### 1. 判决：闪退修好了，JIT 还是没跑
+
+```
+[JITPROBE] SceLibMonoBridge NOT loaded (6 modules enumerated)
+[JITPROBE] PATH A skipped: the providing module is absent
+jit: cfg=2 -> policy 0 (interpreter)
+vm UseCompiler(post)=0   compile-requests=0   produced-code=0   （每一轮）
+```
+
+**"没闪退"是 v04.05 的模块检查生效，不是 JIT 通了。**
+它查不到模块就拒绝调用任何 `pss_*`，于是没有再跳到地址 0。
+
+### 2. 交叉验证："不在"不是我过滤器的问题
+
+我用的类型是 `0x01..0x04`（枚举到 6 个），而 `kernel_forensics.log` 用的是
+`0x81..0x84`（枚举到 11–14 个）。两套列表都**没有** `SceLibMonoBridge`：
+
+```
+vsh, Framecounter, SceAppUtil, SceLibPvf, SceLibft2, SceLibDbg,
+SceCommonDialog, SceShellSvc, SceGxm, SceGpuEs4User, SceAvcodecUser,
+SceDriverUser, SceLibKernel, midp_vita
+```
+
+所以"不在"这个结论是可靠的。这也符合预期：`SceLibMonoBridge` 属于 PSM 运行时，
+普通 app 进程本来拿不到。
+
+### 3. 但是——sysmodule ID 是存在的（破解机的机会）
+
+`psp2/sysmodule.h`：
+
+```
+SCE_SYSMODULE_MONO_BRIDGE = 0x003F
+SCE_SYSMODULE_MONO        = 0x0040
+SCE_SYSMODULE_PSM         = 0x0041
+```
+
+而端口**早就在用这套机制**（`SceSysmodule_stub` 已链接，键盘的
+`SCE_SYSMODULE_IME` 就是这么加载的）。所以 v04.09 改成主动加载：
+
+```
+IsLoaded(0x3F) → LoadModule(0x3F) → 复查模块列表
+          失败才试 LoadModule(0x40)
+```
+
+先 BRIDGE 后 MONO 的理由：BRIDGE 才是导出 `pss_*` 的那个，依赖更小；
+往游戏进程里塞更多运行时不划算。
+
+每个 rc 都带符号名打印 —— **在破解机上这个调用最可能被拒，"被拒"必须在日志里可见**，
+不能看起来像"模块本来就不存在"。
+
+### 4. 关键的第二条诊断
+
+加载成功后**再打印一次 `pss_*` 指针值**。原因：fstub 是 `vita-elf-create`
+在**构建期**绑定的；如果模块加载成功但表项仍是 0，日志会显示
+`init=0x0 ...`，那就说明**导入必须在链接期改成可选**，是另一套修法。
+提前把这两种情况分开，省一轮日志。
+
+### 5. 如果 LoadModule 也被拒，用户态的结论就完整了
+
+已逐一实测排除：
+
+| 路径 | 结论 |
+|---|---|
+| VM domain | 块只读（`access=0x4`），`OpenVMDomain` 无效，写入 abort |
+| PSS（`pss_code_mem_*`） | 提供者模块不在进程里 —— **本版正在试加载** |
+| kubridge 内核路线 | `installed-NOT-visible`，`ku_available()` 假，调用致命 |
+| `__builtin___clear_cache` | VitaSDK GCC 折叠成空 |
+| `mcr p15` | PL1 指令，应用在 PL0 |
+| 用户态缓存 API | 全库扫描无 |
+
+到那一步就只剩**内核插件**一条（需要用户装 kubridge 或其他 skprx）。
+
+### 6. 教训
+
+- **"模块可以按需加载"这个可能性我上一轮就该查。** log178 显示模块不在时，
+  我的第一反应是"那这条路死了"，而不是"能不能加载它"。
+  sysmodule ID 就在同一个头文件的第 90 行。
+- **崩溃修好 ≠ 功能可用。** 这次是两个完全独立的结论，日志必须分开读。
+
+## 2026-11-02 log177 分析 + v04.10（骨骼矩阵 / 虚拟键 / shade）
+
+**log177（v04.07，真机）事实**：skin 79-128 ms/帧，其中 world 45-87、mats 11-30、kernel 6-11；shade 316-610 ms；ARM 仍 333 MHz，fps 6.6-12.4。原生内核有效（只占 skin 约 10%），瓶颈在每帧重算骨骼世界矩阵（估算：41 骨/网格，每帧约 330 次数组分配、123 次 4x4 乘法，**估算，非实测**）。极品飞车 /bo 等 7 个文件已加载，随后 ClassCastException（由另一会话在 04.08 处理）。虚拟键 54 对 press/release：37 对 < 200 ms，中位 122 ms；`replay end` 累计 n=14635 diff=13801（约 94%）。
+**版本号**：log177/178 是 04.07、log179 是 04.09，但 CMakeLists 里没有它们的块（04.08 的块注明了这个缺口）；本次取 04.10。我之前加的 04.07 块被覆盖，`skin split` 代码仍在 Renderer/SkinnedMesh 里。
+
+**改动（v04.10，未上机）**
+1. 骨骼：`Matrix4.compose` 改闭式 T*(R*S)（无临时数组、无通用乘法）；新增 `Matrix4.mulNoAlias`；`Transformable.getCompositeMatrix` 缓存上次结果，**比较输入**（TRS 10 个 float + userTransform.m 16 个 float）而非脏标记，因为 TRS 数组与 Transform.m 会被加载器/setter/动画/游戏原地改写，NaN 输入不相等故重算；`SkinnedMesh` 复用 world/bone 矩阵和 state 数组（`computeWorldInto`）。
+2. shade：每盏灯的常量（强度、颜色、模式、方向与长度、点光位置与衰减）提到顶点循环外；点光位置只在存在点光时计算（原来 normals!=null 就算，且是 componentRaw 未乘 scale/bias，**这个行为我保持不变，但它对点光是疑点**）；点光 ll 复用 d；去掉每顶点 `new float[3]`。未做解码法线/颜色缓存：`VertexArray.set()` 原地改数据且无版本号。
+3. 虚拟键（vita_display.c / vita_input.c）：`lfjport_refresh` 在键盘启用时拷贝完成帧（malloc 按 virt_w*virt_h，失败回退实时缓冲），重放 `vita_display_vkey_tick` 通过 `g_blit_src` 显示该拷贝；记录刷新周期（EMA，间隔 >= 2 s 视为菜单，周期置 0）；按键最小按住 = 游戏刷新周期（上限 1 s，周期 0 则不延迟），`defaults.cfg` `vkeyhold=0` 关闭、`vkeyhold=<ms>` 固定（上限 2000）；release 日志追加 ` held=`。手指回到被挂起释放的同一键则取消挂起；换键立即释放再按下。
+
+**验证（宿主）**：ComposeCheck 20 万组 TRS（含零角/零轴/零缩放/负缩放）与旧 compose 逐元素相同；SkinHash 14 步动画 + 原地改 TRS/userTransform 的蒙皮校验和与改前基线相同；ShadeCheck 168 个 buffer/灯/材质/模型组合哈希与基线相同；NodeScaleRun 的 NDC 不变；vkeyhold_test.c（状态机逻辑副本，不是真文件）13 项通过。构建：midp_vita_v04.10.vpk，ELF 含 `vkeyhold=`、` held=%lld`、`skin split`，`vita_display_frame_period_ms` 已导出，4 个 .class 已更新。
+**未验证**：速度提升（看下一份日志的 ptime：world / mats / shade）；闪烁是否消失（`replay DIFF` 仍会记录，但现在显示旧完成帧，靠肉眼判断）；点按是否被游戏采到；按住时间变长对其他游戏的影响（可用 `vkeyhold=0` 关闭）。
+**风险**：auto 模式下慢游戏的一次点按会被延长到最多 1 s，游戏若按"持续按下"处理会多走一步；`Transformable` 缓存增加每节点约 40 个 float 的内存。
+
+---
+
+## 2026-11-02 log179 分析（+ v04.11）：PSS 死了（ENOENT），但发现两件更重要的事
+
+> 产物 `midp_vita_v04.11.vpk`（12071648 B），`J2ME Player v04.11 b330`。
+
+### 1. log179 判决：JIT 没有生效
+
+```
+sysmodule 0x003f IsLoaded = 0x805a1001   ← SYSMODULE_ERROR_UNLOADED
+sceSysmoduleLoadModule(0x003f) rc = 0x80010002
+sysmodule 0x0040 IsLoaded = 0x805a1001
+sceSysmoduleLoadModule(0x0040) rc = 0x80010002
+[JITPROBE] PATH A skipped: still absent after LoadModule attempts
+```
+
+`0x80010002` = 通用 errno 域的 **ENOENT** —— **模块文件不存在**。
+`SCE_SYSMODULE_MONO_BRIDGE` 这个 **ID 存在**，但**载荷没装在这台机器上**
+（PSM 运行时），所以怎么 LoadModule 都找不到。
+
+日志打的 `0x80010002?` 是我的 `vm_err()` 没翻译 errno 域，已修（现在会打
+`ENOENT (no such module/file)`）。**一个 `?` 值一整轮**。
+
+### 2. 发现一：kubridge 没有加载 —— 这是破解机能自己打开的口子
+
+在 ELF 里查实（不是推测）：`kuPowerGetSysClockFrequency` 在
+`0x8114034e`，位于 **`.text`**（不在任何 `.vitalink.fstubs` 段），函数体是：
+
+```
+push {r7} ; add r7,sp,#0 ; movs r3,#0 ; mov r0,r3 ; pop {r7} ; bx lr
+```
+
+**VitaSDK 的 kubridge 桩是"直接返回 0"的 weak 函数。**
+这正好解释了启动预检的 `installed-NOT-visible`：
+`.skprx` 文件在 tai 目录里，但**没写进 `config.txt`**，所以模块没驻留。
+
+**这是用户动作，不是代码问题**：往 `ur0:tai/config.txt` 加一行
+`ur0:tai/kubridge.skprx`（在 `*KERNEL` 段下），重跑探针。
+`kuKernelCpuUnrestrictedMemcpy` 一旦可用，就有了内核读写 ——
+这是"改页表让内存变可执行"所需要的能力。
+
+### 3. 发现二：VM 域"开域后能不能写"这个测试从来没真正跑完过
+
+翻历史才看清楚：
+
+| 版本 | 实际做了什么 | 结论 |
+|---|---|---|
+| log159 | **开域之前**就写 | abort（这是我的 bug，不是平台答案） |
+| log160/161 | 开域成功，但 v03.77 的硬闸门拒绝写 | **什么都没学到** |
+| v03.81–04.09 | PSS 看起来有希望后，PATH B 退化成"alloc + 查权限" | **也没写** |
+
+而 `OpenVMDomain` 的文档语义（"让所有 VM 域块可执行"）**从来没被真正验证过**，
+唯一的反证（`access` 字段不变）建立在一个**含义本身未证实**的字段上。
+
+所以 v04.11 的 PATH B 做完整测试：
+`OpenVMDomain(之前) → alloc → OpenVMDomain(之后) → 写 → 整块尾部写 →
+SyncVMDomain → 调用 mov r0,#42`，每步前打 `MARKER`。
+
+**"开域前就 alloc" 这个变体是第一次试。**
+
+### 4. 顺带修了一个 CMake 真陷阱
+
+我先把版本块追加到 `CMakeLists.txt` 末尾，结果 `vita_version.h` 还是旧版本。
+原因：`add_custom_command(... -DAPP_VER=${VITA_VERSION} ...)` 在第 5866 行，
+`${VITA_VERSION}` 在**配置期就在那一行展开**了。
+**`set(VITA_VERSION)` 必须写在这个消费者之前**，写在文件末尾等于没写。
+（讽刺的是我自己的记录里有一条"追加版本块后立即 grep 确认"，但那条只查了
+"是不是最后一个 set()"，没查"是不是在消费者之前"。）
+
+### 5. 教训
+
+- **错误码不翻译，会把"文件不存在"读成"未知失败"。** 又一个 `?`。
+- **"测试过"要具体到"哪一步在什么状态下跑的"。** log159 的 abort 是开域前写的，
+  我却据此判定"VM 域不可写"，这个结论一直没有被正确验证过。
+- **CMake 变量是配置期展开的**：`set()` 的位置相对消费者很重要，
+  不是"文件里最后一个赢"。
+
+---
+
+## 2026-11-02 v04.13：`installed-NOT-visible` 这个结论从来不足以说明问题（我的探针有缺陷）
+
+> 产物 `midp_vita_v04.13.vpk`（12073359 B），`J2ME Player v04.13 b330`。
+> 版本号：04.12 被并行会话（3D 纹理修复）占用，本版取 04.13。
+
+### 1. 用户指出：`ur0:tai/kubridge.skprx` 早就加了
+
+我上一轮据此断言"没写进 config.txt"——**那句话没有依据**，因为我从没读过 config.txt。
+
+### 2. 读自己的探针代码，找到缺陷
+
+`vita_kf_precheck()` 判定 `installed-NOT-visible` 只用两个事实：
+
+```c
+if (g_ku_enum_rc >= 0 && g_ku_nmod > 0) {
+    if (sceIoGetstat("ux0:tai/kubridge.skprx", &st) >= 0 ||
+        sceIoGetstat("ur0:tai/kubridge.skprx", &st) >= 0)
+        return "installed-NOT-visible";
+}
+```
+
+**它只 stat 了 .skprx 文件，从没读 config.txt，也从不打印时钟返回值。**
+所以三种完全不同的情况打印同一个字符串：
+
+| 情况 | 真实状态 |
+|---|---|
+| (a) 文件在，config.txt 没有那行 | 未加载 |
+| (b) config.txt 有，但段错了 / 目录错了（ux0 vs ur0） | 未加载 |
+| (c) 插件**已加载**，但我们的 weak `ku*` 桩**从未被重绑**到真代码 | 已加载但调不通 |
+
+### 3. 为什么 (c) 完全可能 —— 两条证据
+
+**证据 1（历史）**：v02.24 记录 log47 里**同一个调用返回了 190**，
+也就是这个项目上 kubridge **真的工作过**。
+
+**证据 2（SDK，反汇编可证）**：`libkubridge_stub.a` 里是
+
+```
+kuPowerGetSysClockFrequency:   movs r3,#0 ; mov r0,r3 ; bx lr
+kuKernelCpuUnrestrictedMemcpy: mov.w r3,#-1            ; bx lr
+```
+
+**这是 `.text` 里的 WEAK 函数，不是 `.vitalink.fstubs` 条目。**
+taiHEN 重绑的是**导入表**，而这里**没有导入表槽位可重绑** ——
+所以"插件已加载"和"我们的调用能到它"是两件独立的事。
+
+### 4. v04.13 加的诊断（一次运行区分 a/b/c）
+
+`vita_kf_kubridge_report()`，每次启动往 `kernel_forensics.log` 写一段 `[KB]`：
+
+1. **`kuPowerGetSysClockFrequency()` 的原始返回值**
+   —— 0 = weak 桩从未重绑；111/166/222/333/444 = 可调用。
+2. **两个 config.txt 逐行扫描**，每处 `kubridge` 命中打印
+   **行号 + 它所属的段头**（`*KERNEL` / `*main`）。
+   taiHEN 会忽略不在段里的条目，这正是"行在那儿但什么也不发生"的样子。
+3. **两个 tai 目录的文件清单**，文件放错位置一眼可见。
+
+**刻意避开** `taiGetModuleInfo` 和一切跨域 taiHEN 查询 ——
+v02.26 为此付过两次 coredump，那类 syscall 在这台机器上永不返回。
+文件读取 + 一个已经验证安全的 kubridge 调用足够了。
+
+### 5. 教训
+
+- **诊断输出必须能区分"我以为是哪种情况"。** 一个字符串覆盖三种状态，
+  等于没有诊断；而且它会主动误导（我就是被它误导着说了一句没根据的话）。
+- **`weak` 函数 ≠ fstub。** weak 函数在 `.text`，是真实代码（返回 0/-1）；
+  fstub 在 `.vitalink.fstubs.*`，是待重定位的数据字。
+  taiHEN 只能处理后者。这个区别决定了"能不能被 hook"。
+- **用户说"早就加了"时，应当先读自己的判定逻辑，而不是解释用户哪里做错了。**
+
+---
+
+## 2026-11-02 log180 分析（+ v04.14）：kubridge 诊断成功，但我上一轮的测试是死代码
+
+> 产物 `midp_vita_v04.14.vpk`（12072645 B），`J2ME Player v04.14 b330`。
+
+### 1. v04.13 的诊断按设计工作了
+
+```
+[KB] kuPowerGetSysClockFrequency() = 0 (weak stub never rebound: NOT callable)
+[KB] ux0:tai/config.txt: absent
+[KB] ur0:tai/config.txt  line 14 [*KERNEL] ur0:tai/kubridge.skprx
+                         line 15 [*KERNEL] app0:kubridge.skprx
+[KB] ur0:tai: ... kubridge.skprx ...
+```
+
+**文件在、两行都在 `*KERNEL` 段下、调用仍返回 0。** 这三种状态第一次被区分开。
+
+### 2. 与历史上唯一一次成功对比（v02.24 / log47）
+
+记录里写得很清楚：
+
+> 生效的是 `app0:kubridge.skprx` 行（VPK 自带文件）；`ur0:tai/kubridge.skprx`
+> 行实际无效（`tai ux0:0 ur0:0`，ur0:tai/ 里没有该文件）。
+
+**当时能用的是 VPK 自带的 `app0:kubridge.skprx`co。**
+而当前这个 VPK **根本不含 `kubridge.skprx`**（`unzip -l` 查过，无）。
+
+所以现在两条加载行都指向 taiHEN 拿不到的东西：
+
+| config 行 | 状态 |
+|---|---|
+| `ur0:tai/kubridge.skprx` | 文件在，但历史上这条就被记录为无效 |
+| `app0:kubridge.skprx` | **本 VPK 里没有这个文件** |
+
+这是**打包选择问题，不是代码问题**。
+
+另外排除了一个常见怀疑：v02.23 那次成功也是 boot 期主线程调用，
+和现在完全一样，所以"线程上下文不对"不是候选。
+
+### 3. 我的 bug：PATH B 是死代码
+
+v04.11 把 PATH B 重写成完整的 写+执行 测试，
+但 **v04.05 留下的 `return 0` 还在**（PATH A 失败时直接返回）：
+PATH B 永远执行不到。
+
+log180 是铁证：日志里有 `PATH A skipped`，**一行 PATH B 都没有**。
+那个"从来没跑完过的测试"，其实是**连进都没进去过**。
+
+修法：`return 0` → `goto path_b`。
+
+### 4. 教训
+
+- **改完一段代码要回头看它是否可达。** v04.11 我专心写 PATH B 的实现，
+  却没检查它上游有没有早退。加完功能立刻问一句"谁会走到这里"。
+- **历史记录里"哪一条生效了"这种细节，价值高于结论本身。**
+  v02.24 那句"生效的是 app0 行、ur0 行无效"直接定位了这次的问题；
+  如果只记"CALLABLE"，我就得重新排查一遍。
+- **打包内容会随时间漂移。** VPK 不再带 skprx 这件事没有任何记录，
+  是 `unzip -l` 查出来的。
+
+---
+
+## 2026-11-02 v04.16：为什么"不访问 ur0:tai/kubridge.skprx"—— 因为二进制里根本没有对它的导入
+
+> 产物 `midp_vita_v04.16.vpk`（12073243 B），`J2ME Player v04.16 b330`。
+
+### 1. 关键事实：kubridge 在 VitaSDK 里**不是可导入的库**
+
+```
+objdump -h libkubridge_stub.a    -> Sections: 只有 .text (0x28 字节)
+objdump -h libSceDisplay_stub.a  -> .vitalink.fstubs.SceDisplayUser ...
+grep -r kuKernelCpuUnrestrictedMemcpy /usr/local/vitasdk
+                                 -> 只有 libkubridge_stub.a，没有 yml/NID 表
+```
+
+`.vitalink.fstubs.*` 段是**导入项**（`vita-elf-create` 会把它变成 import 表项，
+taiHEN 才能重绑）。kubridge **没有这个段**，它是两个**本地 weak 函数**。
+
+我们的 ELF 里 `0x81140b26` 处是真实指令：
+
+```
+b480 af00 2300 4618 46bd bc80 4770    push {r7} ... bx lr  -> 返回 0
+```
+
+**所以：无论插件加没加、config.txt 怎么写、文件放在 ur0 还是 app0，
+这个调用都执行本地代码并返回 0。** 这正是"为什么不访问 ur0:tai/kubridge.skprx"
+的答案 —— **不是我们不去访问，而是二进制里没有指向它的任何东西。**
+
+### 2. 我上一轮的两个错误（已纠正）
+
+**错误 1**：我说"本 VPK 里没有 kubridge.skprx"。**错的**。
+`zipfile` 列出 `kubridge.skprx 14820 字节`，CMakeLists 里也有
+`FILE ${PORT_DIR}/kernel/kubridge.skprx`。我的依据是 `unzip -l` 输出为空
+—— 而 unzip 根本没安装。**这是本项目第二次把"空输出"当成"否证"。**
+
+**错误 2**：我描述成"插件加载了但 weak 桩没被重绑"。
+**没有可重绑的东西** —— 没有 import 表项。
+
+### 3. 仍然存在的可能性，用字节判定
+
+唯一能让插件生效的机制是：kubridge 加载时**直接改写我们进程的内存**
+（patch 本地 stub）。v02.24 记录的 190 如果是真的，只能是这种情况。
+
+所以 v04.16 的 `[KB]` 报告现在做一件决定性的、零风险的事：
+**运行时读回那 8 个半字，与链接期字节比较**（读不会像调用那样触发异常）。
+
+| 结果 | 结论 |
+|---|---|
+| 字节**相同** | 没人 patch 我们；这个调用永远是本地空函数，插件与该符号无关 |
+| 字节**不同** | kubridge 确实改写了我们的代码；那么返回 0 说明 patch 位置/内容有问题，是另一个课题 |
+
+同时把 skprx 在三处路径（ur0:tai / ux0:tai / app0:）的存在性都打进日志，
+避免"文件不在"这种误读再次发生。
+
+### 4. 教训
+
+- **空输出不是否证。** `unzip` 不存在 → 空输出 → 我判定"文件不在"。
+  命令是否真的执行成功，必须与"结果为空"区分开。
+- **`weak` 符号要区分两种**：`.vitalink.fstubs.*` 里的（导入，可被 taiHEN 重绑）
+  与 `.text` 里的（本地弱定义，永不改变）。我之前把两者混为一谈。
+- **判断"能不能用某个插件"要落到"二进制里有没有指向它的引用"**，
+  而不是"文件在不在"。
+
+---
+
+## 2026-11-02 log181 分析（+ v04.17）：**VM domain 验证通过 —— 官方 JIT 内存 API 可用**
+
+> 产物 `midp_vita_v04.17.vpk`（12074345 B），`J2ME Player v04.17 b330`。
+> 用户批评："没说要 kubridge 插件，不是让你分析官方怎么用 JIT 吗" —— 这个批评成立，
+> 下面全部回到 `SceKernelAllocMemBlockForVM` 这条官方路径上。
+
+### 1. 突破：VM domain 全部通过（真机 v04.14 实测）
+
+```
+[JITPROBE] VM OpenVMDomain (before alloc) rc=0x00000000
+[JITPROBE] perm VM block @0x85c00000 access=0x4 -> R--        ← 字段骗人
+[JITPROBE] VM store survived: e3a0002a e12fff1e               ← 写入成功
+[JITPROBE] VM block end = 5a5a5a5a                            ← 整块可写
+[JITPROBE] VM SyncVMDomain rc=0x00000000                      ← flush 成功
+[JITPROBE] VM generated code returned 42 (want 42)            ← ★ 可执行
+[JITPROBE] VERDICT: VM DOMAIN WORKS.
+jit: executable-memory probe PASSED
+```
+
+**`access=0x4`（只 R）这个字段是假的** —— 实际内存可读可写可执行。
+v03.77 我基于它加的"硬闸门"挡了 7 个版本，log160/161 的"VM 域只读"结论
+**是错的，作废**。
+
+`OpenVMDomain` 的调用顺序也确认了：**alloc 之前调**（返回 0）；
+alloc 之后调返回 `0x80010058`（已打开）。
+
+### 2. 那为什么还是闪退？
+
+```
+pc = lr = 0x83a689ac    ← 在 Java 堆里
+fault status = 0x0d     ← permission fault
+FAR = 0x83a689ac        ← FAR == pc，取指
+vm UseCompiler(pre)=1 (jit policy=2)
+```
+
+**探针 PASSED → policy 保持 2 → JIT 真的编译并执行了 → 但 compiler area 还在 Java 堆内。**
+这不是矛盾：探针证明**平台能承载代码**，没证明**JIT 把代码放在那里**。
+
+### 3. v04.17 做的两件事
+
+1. **策略判定加一层**：`vita_jit_code_area_ready()` 为假（compiler area 尚未迁移）
+   时强制 policy=0，日志写明原因。于是 `jit=2` 现在是
+   "解释器 + 一行明确解释"，不再闪退。
+2. **JIT 代码区就位**（`vita_jitmem.c`）：4 MiB VM 块，
+   `OpenVMDomain` 先、alloc 后，**domain 保持打开**（JIT 会持续 patch），
+   提供 `vita_jit_flush_icache()` = `SyncVMDomain`。
+   分配时自检：头尾各写一次读回，**再实际执行一次**（确认 X 位真的在）。
+
+### 4. 还差的工作（这是真正的一步）
+
+让 `ObjectHeap` 指到这个区：
+
+- `compiler_area_end()` 在 VITA 下返回 VM 块尾（现在是 `mark_area_end()` =
+  `_large_object_area_bottom`，堆内）
+- `initialize()` 里 `_compiler_area_start/_top` 指向 VM 块基址，
+  且不再把 `inline_allocation_end` 压给它
+- `compact_and_move_compiler_area()` VITA 下跳过（GC 现在**会移动**
+  compiler area）
+- `verify_layout()` 里关于堆内顺序的 GUARANTEE 要放宽
+
+### 5. 教训
+
+- **不要用"某个字段的值"代替"实际行为"。** `access=0x4` 让我 7 个版本都在
+  错误的方向上；一次真实写入就把结论翻过来了。而那次写入之所以拖延，
+  正是因为我用这个未验证的字段做了闸门。
+- **探针 PASS ≠ 功能可用。** 这次要把两件事分开表述：
+  "平台能承载代码"（已验证）与 "JIT 使用那块内存"（未做）。
+- 用户指出的方向（官方 API）一直是对的，我不该在旁边找插件替代方案。
+
+---
+
+## 2026-11-03 v04.18：JIT 使能 —— Java 堆整块从 VM 域分配，compiler area 原地就变可执行
+
+> 产物 `midp_vita_v04.18.vpk`（12074280 B），`J2ME Player v04.18 b330`。
+
+### 1. 设计：不改 ObjectHeap，改堆的来源
+
+log181 已经证明**平台能承载可执行内存**（写、整块写、sync、执行 42 全通过）。
+崩溃原因只是**生成代码放在了 Java 堆里**。
+
+`ObjectHeap.hpp` 的布局注释写明：chunk 1 = 胶水代码 + 老/新生代 + **compiler area**，
+连续分布。所以**只要 chunk 本身是 VM 域内存，里面任何位置都可执行** ——
+compiler area 在哪都无所谓。
+
+这直接取消了原计划（v04.17 注释里写的）全部 ObjectHeap 手术：
+
+| 原计划 | 为什么不需要了 |
+|---|---|
+| 改 `compiler_area_end()` | 有 20+ 调用点，其中多个是 `clear_bit_range(heap_start, compiler_area_end())` —— 指向堆外地址会立刻崩 |
+| 跳过 GC 移动 compiler area | 不需要动 |
+| 放宽 `verify_layout()` | 不需要动 |
+
+### 2. 单点改动
+
+`share/runtime/OsMemory.cpp` 的 `OsMemory_allocate_chunk()` ——
+Java 堆块唯一的来源（`SUPPORTS_ADJUSTABLE_MEMORY_CHUNK=0`，走的就是这里的默认实现）。
+用 `#if defined(VITA)` 隔离，**malloc 路径原样保留作为回退**。
+
+约束与处理：
+- VM 块上限 **16 MiB**（下限 1 MiB，log159 实测），而申请量是 `max_size + alignment`
+- Java 堆大小是**编译期默认值**（`JAVA_HEAP_SIZE := 64` MB），运行时可能被
+  `MS_getHeapRequirement()` 覆盖 —— **编译期不知道真实值**
+- 所以：落在 1..16 MiB 就用 VM 块，否则 malloc，**两条路都打日志**。
+  放不下时行为与 v04.17 **逐字节相同**
+
+顺序按 log181 实测：`OpenVMDomain` → alloc → 写。
+自检：头尾各写一个 word 读回。**不用 `access=0x4` 判断**（那个字段骗了我 7 个版本）。
+
+### 3. 策略跟随真实状态
+
+`vita_main.c` 现在要求 `vita_heap_executable()`（weak 导入，缺失=0）与探针双通过。
+`jit=2` 时日志会出现三者之一：
+
+```
+jit: cfg=2 left ENABLED - probe passed and the Java heap is VM-domain ...
+jit: cfg=2 -> policy 0 ... the Java heap is NOT in a VM block ...
+jit: cfg=2 -> policy 0 ... no executable memory ...
+```
+
+**日志直接说明哪个前提没满足**，而不是留一个崩溃。
+
+### 4. 验证
+
+- `./rebuild_vm.sh`：`34 ARM objects OK`、`library packed: 22 members`
+  （末尾的 `collect2: ld returned 1` 是 AGENTS.md 记录的预期主机侧错误，
+  同时报的还有 `fast_memclear` / `shared_entry`，不是我引入的）
+- `nm libcldc_vm.a` 确认新代码进库；`./build.sh` → `Build successful`
+- `nm midp_vita` → `vita_heap_executable`
+- 二进制里 8 处 `heapmem` 诊断串
+- **未上机**
+
+### 5. 上机要看的两行
+
+```
+[heapmem] chunk0 needs N bytes; outside the VM block range (...) -> malloc
+[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: 0x..., N bytes
+```
+
+第一行 → 堆太大（>16MiB），下一步是把 Java 堆降到 16MB 以下（调 cfg，不是改 VM）。
+第二行 → 编译器区已是可执行内存，`jit=2` 应该能真正跑起来了。
+
+### 6. 教训
+
+- **"移动某个区域"之前，先问"能不能让它原地合法"。** 我为 compiler area 设计了
+  一整套迁移方案，而真正的解是让承载它的容器换一种内存 —— 一个函数就够。
+- **共享文件的回退路径必须保留且等价。** 条件不满足时走原路径，
+  是我这次能放心改 `OsMemory.cpp` 的唯一原因。
+
+## 2026-11-03 log180 分析（v04.13，真机）+ v04.19 重放预算
+
+**更正（重要）**：`[VKEY] replay end n= diff= refreshes=` 是**累计值**。我在 log176/177/180 的分析里把各行相加，得到的 1765/1473、14635/13801、4660/4420 全部作废。按每次按键的差值看，方向没变（diff 接近 n，即重放时屏幕多半不同于上一完成帧），但绝对数字以本节为准。log180 真实累计：306 次重放、269 次 DIFF、26 次按键、按住总时长 29 s。
+**事实（log180）**：ptime 比 log177 快：frames=40 total 819→443、skin 114→52、world 72→30、shade 562→283；frames=100 shade 469→419（后期收益不稳），mats 在 80/100 窗口升到 26-27 ms（原因未查）。ARM 仍 333 MHz，fps 5.1-15.8。held= 中位 815 ms、p90 1639、最大 8875；释放到下次按下的间隔中位 746 ms。极品飞车：`/af` 加载后 `PolygonMode.setWinding` 抛 `IllegalArgumentException: bad winding`（另一会话方向，未查）。
+**用户反馈**：v04.10 后人物移动和打怪动作很久才响应。
+**判断**：(1) 最小按住只延后 release，press 立即发出，**不会让游戏更晚响应**（我上一轮说反了）；它只会让点按被看成更长的按住。(2) 重放在 VM 线程同步执行 flip_to_display（prepare 12.2 + flip 20.2 ≈ 32 ms，perf.log），v04.10 让按住变长后每次按键重放 11-16 次（此前 4-6 次）；306 次约 9.8 s，按住期间约三分之一以上的 VM 时间被占（推断）。(3) 剩下的延迟是游戏自己的 0.5-0.8 s 帧周期（total 443-682 + gap 45-129）和每帧只采样一次按键，属于 3D 渲染成本，shade 仍是最大头（240-420 ms）。
+**v04.19（未上机）**：`vita_display_vkey_tick` 对同一画面（以 `vita_vkey_pressed()` 为签名）最多重放 3 次（两块显示缓冲各一次 + 1 次余量）；签名变化重新计数。日志 `replay end` 的语义不变。宿主：vkeyhold_test.c 加了预算用例（共 18 项通过，仍是逻辑副本）。构建：midp_vita_v04.19.vpk，`vita_display_vkey_tick` 反汇编里确有对 `vita_vkey_pressed` 的调用。
+**下次日志看什么**：每次按键的 `replay end` 差值应约 3；ptime 的 total/gap 在按住时是否下降；用 `vkeyhold=0` 对比手感。
+**待做**：shade 原生化或复用（model 的 3x3、灯、材质、vb 不变时复用上次 rgba；风险：VertexArray 可被原地改写，无版本号）；mats 在后期窗口变大的原因；极品飞车 bad winding。
+
+## 2026-11-03 v04.20：shade 原生化（环境光 + 方向光）
+
+**动机**：log180（v04.13，真机）shade 仍是 240-420 ms/帧，是游戏 0.5-0.8 s 帧周期里最大的一块；反应迟钝的剩余部分来自这个帧周期（见上节）。
+**改动（未上机）**
+- 新增 `jsr184/src/share/native/m3g_shade.h`（纯 C 内核，无 KNI）；`m3g_native.c` 新增 `Java_com_sun_m3g_NativeBridge_shade`（12 个参数，数组长度/分量数/灯数全部检查，拒绝返回 false）；`NativeBridge.java` 声明；`Renderer.shade` 在没有点/聚光灯（`needPos` 为假）时打包 prm（材质常量、法线矩阵、默认色、每灯 9 个 float）并直接传 VertexArray 自己的 `data`/`floatData`，原生返回 true 就直接用结果，否则（含有点光灯）走原来的 Java 循环。
+- 内核逐表达式对应 Java 循环，包含另一会话加的「没有带方向的灯时用固定主光」分支（`anyDirect`），以及 Java `(int)` 转换语义（NaN→0、饱和）。
+- 开关：`defaults.cfg` `m3gshade=0` 只让 shade 走 Java；`m3gnative=0` 同时关原生蒙皮和 shade（bit16 / bit17 → `Renderer.useNativeShade`）。被拒绝则永久回退并写日志。ptime 行末尾追加 `| shade calls native=N java=M`（累计）。
+**验证**：宿主 `ShadeCheck` 转储 Renderer 实际打包的参数和 Java 循环输出，`shade_test.c` 用 C 内核回放：240 个用例（byte/short/float/宽整数存储，3/4 分量颜色，NaN/Inf，多种灯组合，有无 Material）逐字节一致；另 96 个含点光的用例按设计走 Java。产物：`midp_vita_v04.20.vpk`；`nm` 有 `Java_com_sun_m3g_NativeBridge_shade`；`nativeFunctionTable.cpp` 含该符号；ELF 含 `shade calls native`、`native shade refused`、`m3gshade=`；反汇编：无 vfma/vfms，`vcvt.s32.f32` 4 处，`sqrtf` 为库调用。
+**没验证**：ARM 上的实际结果（本机无 qemu，ARM 的 `sqrtf` 是 newlib 库函数，我推断它与 Java 的 `(float)Math.sqrt` 同为正确舍入，没有在 ARM 上跑过）；速度（下次日志看 ptime 的 shade 项）；BioMain 是否带点光（看 `shade calls native=/java=`；若 java 计数在涨，说明有点光，原生没生效）。
+**已知局限**：点光源路径仍是 Java，且其世界位置用 componentRaw（未乘 scale/bias）的疑点没动。
+
+---
+
+## 2026-11-03 log182 分析（+ v04.21）：JIT 仍未生效，但 v04.18 的自检按设计工作了
+
+> 产物 `midp_vita_v04.21.vpk`（12077378 B），`J2ME Player v04.21 b330`。
+
+### 1. 判决：JIT 没有生效，原因是**堆太大**
+
+```
+[heapmem] chunk0 needs 33562752 bytes (32.0 MiB); outside the VM block range
+          (1048576..16777216) -> malloc
+[heapmem] VM alloc of 1179700 bytes FAILED: 0x80024b05 -> malloc
+jit: cfg=2 -> policy 0 ... the Java heap is NOT in a VM block
+```
+
+**没有闪退** —— v04.18 的自检生效了：堆回退 malloc → `vita_heap_executable()`
+为 0 → policy 0。探针仍然 PASS（VM 域可写可执行可 sync，42 返回正常）。
+
+所以：**平台已就绪，堆放不进去。**
+
+### 2. 顺带发现一个真 bug：VM 块 size 必须是 1 MiB 的整数倍
+
+`1179700`（bitvector chunk，1.125 MiB）被 `ILLEGAL_MEMBLOCK_SIZE` 拒，
+而同一次运行里探针的 `1048576` 成功。
+
+```
+1048576  = 1.000 × 1MiB  整数倍 → 成功
+1179700  = 1.125 × 1MiB  非整数倍 → 失败
+33562752 = 32.008 × 1MiB 非整数倍 → 失败
+```
+
+**我之前把这条读成"最小 1 MiB"是错的** —— 是"1 MiB 对齐"，探针扫的每一档
+非整数倍都因此失败。已改：申请前向上对齐到 MiB，日志同时打印原始值与对齐值。
+
+### 3. v04.21：把尺寸问题变成可测、可控
+
+1. **PATH C 容量探测**：先申请一个 16 MiB 块，再一个个加 1 MiB 直到失败，
+   打印**总预算**。这个数字决定"堆放 VM 域"是否可行
+   （单块上限 16 MiB 且块之间不保证连续，所以堆本身必须装进**一个**块）。
+2. **堆大小可在设置页调**（不用读卡器）：
+   `Java 堆` 行循环 `默认(32MB) / 15 / 14 / 12 / 10 / 8 MB`，
+   写 `ux0:/data/J2ME00001/heap_mb`，`runMidlet.c` 在 `JVM_Initialize` 前读取并
+   `JVM_SetConfig(HEAP_CAPACITY/HEAP_MINIMUM)`。
+
+   这是**取舍**不是免费午餐：32 MiB 是所有游戏一直在用的值，调小可能饿死大 3D 游戏。
+   所以做成 opt-in，`≤15 MB` 才让堆可执行。
+
+### 4. 上机请做两件事
+
+1. 跑一次（`jit=2`，堆保持默认），贴回：
+   ```
+   [JITPROBE] 16 MiB block OK / FAILED
+   [JITPROBE] TOTAL VM-DOMAIN BUDGET = N MiB across M blocks
+   ```
+   —— 决定总量够不够。
+2. 然后设置页把 `Java 堆` 调到 **15MB**，重启游戏，看：
+   ```
+   [heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: ...
+   jit: cfg=2 left ENABLED ...
+   ```
+   如果这两行出现，JIT 就真的跑起来了；如果游戏因为内存不足出错，我们再权衡。
+
+### 5. 教训
+
+- **"最小值"和"对齐要求"是两种约束，报错码相同。** 我把对齐误读成最小值，
+  导致 bitvector chunk 一直被无谓地拒掉。
+- **回退路径是对的，但静默回退会掩盖进度。** 这次日志清楚写明"堆不在 VM 块"，
+  所以一轮就定位了。
+
+---
+
+## 2026-11-03 log183 分析（+ v04.23）：三个独立缺陷，都不是 JIT 引擎本身
+
+> 产物 `midp_vita_v04.23.vpk`（12080893 B），`J2ME Player v04.23 b330`。
+> 用户报告两条：①jit 似乎导致打开游戏闪退 ②没有设置 Java 堆的地方。
+> **两条都不是表面上看起来的样子。**
+
+### 1. 致命时序 bug：策略在堆还不存在时就决定了
+
+log183 每一轮都是同一个模式：
+
+```
+jit: cfg=2 -> policy 0 ... the Java heap is NOT in a VM block
+[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: ...        ← 判决比证据早一步
+```
+
+**原因**：`vita_main.c` 在 round 开始时问 `vita_heap_executable()`，
+但 Java 堆是在 `JVM_Initialize()`（`runMidlet.c` 里更晚的位置）才分配的。
+所以永远读到上一轮的值（首轮为 0）——**v04.18 建的机制从未真正被执行过**。
+
+**修法**：决策移到 `runMidlet.c`，紧跟 `JVM_Initialize()` 之后。
+只有在堆确实没变成可执行内存时才注入 `-int`。`vita_main.c` 只记录请求值。
+
+### 2. VM 真 bug：分配失败导致 chunk 槽位错乱
+
+`OsMemory` 默认 chunk 分配器用 `chunks[0] == NULL ? 0 : 1` 选槽位，
+**假设第一次一定成功**。round 1 时 32 MiB 堆 malloc 失败
+（`[heap] chunk alloc FAILED ... Could not allocate VM heap`，
+vm_output.log:5，端口自 v01.45 起的"第二轮耗尽"），`chunks[0]` 保持 NULL，
+于是 1.1 MiB 的 bit-vector **也拿到 slot 0** —— 标记栈顶替了 Java 堆：
+
+```
+[heapmem] chunk0 needs 33554433 bytes ... -> malloc
+[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: 0x85c00000, 2097152 bytes
+```
+
+slot 0 同时"需要 32 MiB"和"变成 2 MiB"。
+
+**修法**：按 **尺寸**判定槽位（堆 >8 MiB，bit-vector ~1 MiB，且比值只随堆变大而扩大），
+并拒绝重复占用。尺寸派生天然幂等，失败无法移动它。
+
+### 3. 「Java 堆」设置项难找 + 标签错误
+
+- 它在 14 行里的第 14 行，可视窗口只有 10 行 → 用户认为"没有"。
+  现在**紧跟「JIT 编译」**（JIT 的前置条件放在 JIT 三屏之外就是可用性 bug）。
+- `[heapmem]` 对 chunk1 也打印"the Java heap ... is now executable"，
+  但 chunk1 是 bit-vector。现在两种角色分开打印。
+
+### 4. "闪退"到底是什么
+
+| round | status |
+|---|---|
+| 0 | **0（正常）** |
+| 1+ | **-1** |
+
+`-1` 来自 **32 MiB 堆在 64 MiB newlib arena 里第二次分配失败**，
+与 JIT 无关（每轮 `policy=0`）。这是 v01.45 以来的老问题。
+
+**调小 Java 堆同时缓解两个问题**：第二轮分配更容易成功 + 堆能进 16 MiB VM 块。
+
+### 5. 教训
+
+- **检查时机比检查内容更重要。** 我加了一个正确的判据，却放在数据出现之前，
+  结果它永远返回"否"，机制一次都没跑过，而日志看起来"工作正常"。
+- **上游代码里"第一次一定成功"的隐含假设，在失败路径下会造成静默错乱。**
+  用尺寸而非顺序派生身份，就不会有这个问题。
+- **用户说"没有这个功能"时，先确认它是否在可视区域。** 功能存在但够不着，
+  等于不存在。
+
+## 2026-11-03 log183 分析（v04.23，真机）+ v04.24 速度第三轮（decode / bones 原生化 + 计时补全）
+
+**log183 事实**：3D 帧周期 = `total+gap`（相邻 ptime 时间戳换算，差 0-2 ms），没有隐藏在帧外的时间。窗口 frames=160-300：total 113-239 ms，其中已计时分项（anim+decode+skin+shade+draw+present+blit）只有 83-177 ms，**total 里还有约 30-73 ms 没被任何计时覆盖**。分项：decode 12-34、skin 33-75（world 约 21、mats 10-36、kernel 约 10）、shade 11-21、present 17-42。ARM 仍 333 MHz（`want arm=444`，所有策略失败），fps 5.2-6.3。
+**判断**：skin 里的 world/mats 是 40 次 4x4 乘法（约 0.45 ms/次，解释器 333 MHz），decode 和 uv 是 `componentRaw` 逐元素调用，和 shade 一样属于"Java 逐元素循环"；uv 循环以前根本没计时。
+**v04.24（未上机）**
+- `m3g_geom.h`（纯 C）+ `NativeBridge.decode`：`out = raw*scale + bias`，positions（stride 3）和 texcoords（stride 2）直接读 VertexArray 的 int[]/float[]；`Renderer.decodeAttr` 在原生被拒时走原 Java 循环。scale/bias 用 `float[4]` 传，不经过 float 参数寄存器（v03.48 的教训）。
+- `NativeBridge.bones`：`world[k]=world[parent]*local[k]`、`bm[k]=world[k]*bindInv[k]`、有限性检查（state 1/2）；local 仍由 `Transformable.getCompositeMatrix`（有缓存）提供；结果直接写进 skin 内核读的 `packMats`，省掉逐骨拷贝。原生端拒绝 parent 不在 child 之前的链。
+- ptime 行末新增 `| uv= mvp+state= drawMesh=(xN) walk=`：drawMesh 与 walk 是整段计时，下一份日志能直接看出那 30-73 ms 在 drawMesh 里还是外面。
+- `defaults.cfg` `m3gnative=0` 现在同时让 skin、shade、decode、bones 回 Java；`m3gshade=0` 只关 shade。
+**验证（宿主）**：GeomCheck 转储 Java 代码真实传给 decode/bones 的参数和 Java 结果，geom_test.c 用 C 内核回放：decode 14 例（int/float 存储、3/4 分量、NaN/Inf）、bones 11 例（8 个动画时刻 + 3 个损坏 bindInv 产生 state 2：1e30、NaN、-1e25）全部逐位一致；SkinHash（Java 回退路径）仍与冻结基线相同。产物：`nm` 有 `NativeBridge_decode`/`_bones`，`nativeFunctionTable.cpp` 各 2 处，ELF 含 `native decode refused`/`native bones refused`/`mvp+state=`，Renderer/SkinnedMesh/NativeBridge 的 .class 已更新。反汇编：decode/bones/shade 都没有 vfma/vfms；有 `vmla/vmls`（decode 4、bones 2、shade 32），按 ARMv7 VFP 的定义它们是先舍入乘积再加（非融合），与 Java 逐步运算相同——这是按架构手册的判断，未在 ARM 上跑过。
+**没验证**：ARM 上的实际结果和速度；那 30-73 ms 未计时部分的真正位置；present 17-42 ms（疑似 GPU 回读/等待，改它需要改 vitaGL 到显示的路径，没动）。
+**还剩**：333 MHz 时钟（多次尝试都失败，见更早的章节）是全局乘数，不是这一轮能解决的。
+
+## 2026-11-04 log184 分析（v04.25，真机）：decode/bones 原生化生效，3D 帧周期约减半
+
+**事实（log184，BioMain 战斗窗口）**：由相邻 ptime 时间戳换算的 3D 帧周期中位数 log183 为 246 ms（p25 180、p75 265），log184 为 128 ms（p25 122、p75 167），约 1.9 倍；log182 的窗口混有菜单阶段，不作对比。典型窗口（frames=300）：total 79、gap 48、decode 5、skin 5（world 2、mats 0、kernel 1）、shade 5、draw 3、present 22、uv 0、drawMesh 31（x2）、walk 32。skin 由 33-75 降到 2-14，decode 由 12-34 降到 0-7，shade 由 11-21 降到 3-7。`shade calls native` 递增、java 恒为 0。ARM 仍 333 MHz。偶发外值窗口（gap 137/138/230）是暂停或加载，不是常态。
+**v04.25 是否含 v04.24**：含（ptime 行带 `uv= mvp+state= drawMesh= walk=`）。
+**剩余耗时（total 79 ms 的构成）**：present+blit 约 22（28%）；drawMesh 31，其中 decode/skin/shade/draw 合计约 18，**drawMesh 内仍有约 13 ms 未计时**；walk 外、present 前还有约 25 ms 未计时（推断：frame() 里的背景 clear、projection、bindTarget 等，未验证）。极品飞车（NFS）窗口：每帧 19-20 个网格，total 181-352、drawMesh 99-215、draw 15-27、present 31-39，drawMesh 内未计时约 50 ms；`Image2D.getTextureHandle()` 在 textureDirty 时会重新上传纹理，NFS 是否每帧脏未查。
+**输入**：虚拟键只用了 -7 ×4、-6 ×3（held 中位 129/164 ms，最小按住随帧周期缩到约 130 ms），新加的虚拟 FIRE 本次没被用到，玩家用物理 ×（11 次）。重放 7 次按键、累计 25 次（预算有效）。
+**异常（非本人范围，记录）**：`[heap] chunk alloc FAILED heap_chunk=33562624 ... UseCompiler=0` 在 BioMain 之前出现 5 次（JIT 堆块申请失败，回退到不用编译器，不影响 BioMain）；NFS 的 `TIMEREXC NullPointerException` 仍在。
+**下一步候选**：(1) 把 present 拆开计时（glFinish/GPU 等待、glReadPixels、转 int[]、drawRGB），因为它是单项最大；(2) 在 frame() 起点到 walk 之间、drawMesh 内部再加计时，定位那两段未计时；(3) 查 NFS 的纹理是否每帧上传。
+
+## 2026-11-04 log184 追问分析（+ v04.26）：第二轮必崩是 v04.18 引入的回归；JIT 仍关
+
+**问题一：JIT 是否开启？——否。** log184 每一轮都是
+`jit: cfg=2 -> policy 0 (interpreter); no executable memory`，
+且 `[heapmem] chunk0 needs 33554433 bytes (MiB-aligned 34603008); outside the
+VM block range (1048576..16777216) -> malloc`——32 MiB 堆装不进 16 MiB 的 VM 块，
+用户还没在设置页把「Java 堆」改小。**但这一轮还叠了第二个原因**（见下），就算改
+小也仍然是 0。
+
+**问题二：打开过一次再打开其他程序必闪退——确认是回归，且定位到 v04.18。**
+
+证据链（`exit_probe.log` 的 `round=N status=`）：
+| log | 版本 | round 0 | round 1+ |
+| --- | --- | --- | --- |
+| log182 | v04.20 | 0 | **0（正常）** |
+| log183 | v04.23 | 0 | **-1** |
+| log184 | v04.25 | 0 | **-1** |
+
+log184 `vm_output.log`：
+```
+[heap] chunk alloc FAILED heap_chunk=33562624(max 33562624)
+       bitv_chunk=1179572(max 1179572) ... UseCompiler=0 comp%=0
+[heap]   got heap_chunk=0x0 bitv_chunk=0x85c00000
+       | newlib arena=40267776 inuse=6690704 free=33577072 top=14664
+Could not allocate VM heap, try smaller HeapCapacity.
+```
+`free=33577072` 对 `need=33562624`，只剩 **14 KB** 余量。`bitv_chunk=0x85c00000`
+是 VM 块地址，证明位向量走了 VM 路径，而堆块 `0x0` 失败了。
+
+每轮的 `crumb.log` 分配序列（log184 共 47 行 heapmem，log182 只有 10 行）：
+```
+[heapmem] chunk0 ... outside the VM block range -> malloc
+[heapmem] OpenVMDomain rc=0x00000000
+[heapmem] chunk1 backed by VM memory: 0x85c00000, 2097152 bytes
+[heapmem] freeing chunk1 (VM block uid=0x4002019f)
+```
+**机制**：v04.18 把**两个** chunk 都送进 `vita_try_vm_chunk`，于是每一轮都会为位向
+量额外分配并释放一个 2 MiB 的 VM 块。`sceKernelOpenVMDomain()` 不可逆，VM 块又会
+记进进程内存预算，所以第一轮之后 32 MiB 的 malloc 就再也放不下。log182（无 VM 路
+径）完全没有 `chunk alloc FAILED`。
+
+**修法（v04.26）**：`OsMemory_allocate_chunk` 里把 VM 路径限制在 `i == 0`（堆块）。
+位向量不承载任何代码，给它可执行内存从一开始就没有意义。默认路径因此重新与
+v04.20 逐字节等价。
+
+**顺带发现的第二个缺陷（也是我的）**：`jitprobe.cfg` 是第二道、互相矛盾的开关。
+探针本来就只在用户要 `jit!=0` 时调用，再要求一个文件意味着：
+```
+[JITPROBE] skipped: ux0:/data/J2ME00001/jitprobe.cfg absent
+jit: executable-memory probe FAILED (see [JITPROBE])
+jit: cfg=2 -> policy 0 (interpreter); no executable memory
+```
+用户打开了 JIT，却因为一个他从未听说过的文件得到永久的「无可执行内存」判决。这也
+是 log182 能探、log184 不探的原因。v04.26 删掉该闸门与设置页「JIT 探针」行；探针
+现在只在策略需要时运行。
+
+**遗留**：32 MiB 堆仍然无法可执行（VM 块上限 16 MiB），所以 JIT 仍要等用户在设置
+页把「Java 堆」调到 15MB 才可能真正打开。
+
+**教训**：
+1. 同一件事不要设两道开关——两道开关会互相矛盾，而且失败信息会指向错误的那道。
+2. 「探针失败」与「探针没跑」必须可区分，但**不能靠用户建文件**来区分。
+3. 给不承载代码的内存申请可执行权限是纯负债：位向量 chunk 白烧掉每轮 2 MiB 的
+   VM 预算，代价是一次回归。
+4. 回归定位用「同一日志字段跨版本对比」（`round=N status`），比读代码猜快得多。
+
+## 2026-11-04 贴图黑边（v04.28）+ present/api 计时
+
+**用户报告**：有些贴图边缘有明显黑边。没有截图，不知道是哪个游戏、哪张贴图。
+**先排除（数据，不是推断）**：用真实 Loader 扫描 5 个 3D 游戏 jar 里的全部 M3G 文件（TexScan.java，43 个文件、36 个 Texture2D、24 张 Image2D、67 个 CompositingMode）：Texture2D 全是 WRAP_REPEAT + FILTER_LINEAR（没有一个 CLAMP/NEAREST），CompositingMode 的 alphaThreshold 全为 0。所以 Texture2D 的 wrap/filter 和 alpha 测试虽然都没有传到 GL（`vita_gl3d.c` 固定 GL_REPEAT + GL_LINEAR，`alphaThreshold` 只记录），**在这五个游戏里不是黑边的原因**，本次没有动它们；将来别的游戏若用 CLAMP/NEAREST/alphaThreshold 再补。
+**确认的现象**：含 alpha=0 纹素的图像里，这些纹素的 RGB 几乎全是 0。M3G 内嵌图像 9/9 张，26821/26821 个纹素；PNG（运行时加载，BioMain 用它做模型贴图）：`jil_all.png` 128x128 有 578 个 alpha-0 纹素，100% 为 RGB 0；`effects.png` 1387 个，100%；`ic.png` 301，100%；极品飞车 `cf` 4471 个 100%、`cj` 128 个 100%（同一游戏另有几张是 0% 黑，说明各张不同）。GL_LINEAR 会把这些黑色平均进不透明部分的边缘，边缘两纹素对的中点亮度只有不透明侧的 50%。
+**推断（未上机验证）**：这就是你看到的黑边。依据是上面的数据和线性过滤的数学，不是截图对比。
+**改动（v04.28）**：`m3g_texfix.h`（纯 C）+ `NativeBridge.textureCreate` 在上传前调用：alpha 为 0 且 RGB 恰好为 0 的纹素，取 8 邻域里已有颜色的纹素的平均 RGB，迭代 3 次；alpha 从不改变；非黑的透明纹素、半透明纹素、不透明纹素不动；全不透明或全透明的贴图不动。HW 和 SW 两个后端都经过这条路。`defaults.cfg` `m3gtex=0` 关闭。
+**验证（宿主，ASan+UBSan）**：texfix_test.c 14 项通过（环 1/环 3 取色、环外保持黑、alpha 不变、不透明/全透明/非黑透明不动、1x1/5x1/1x5、空指针和非法参数）；真实贴图上边缘中点亮度 before 50% → after：jil_all 107%、effects 118%、ic 102%、NFS cf 102%、cj 111%。构建：midp_vita_v04.28.vpk，ELF 含 `m3gtex=`、`present split us/frame`，`gettimeofday` 已链入，Renderer/Graphics3D 的 .class 已更新。
+**副作用要注意**：以 REPLACE（不混合）使用的透明贴图，以前透明部分显示黑，现在显示邻近颜色；M3G 的 REPLACE=68，扫描里 36 个 CompositingMode 是 REPLACE，但哪些和含透明纹素的图像配对没法从文件判断（BioMain 的贴图在运行时由 PNG 创建）。如果某处出现“以前黑、现在彩”的块，用 `m3gtex=0` 对比。
+**计时补全（只增诊断）**：ptime 行追加 `| api: render= clear= lights= release-other= game= | mesh: app+tex= mvp+idx=`，其中 game = total − 所有 M3G 调用 − present − blit，即 bindTarget 与 releaseTarget 之间游戏自己的 Java（2D 绘制、逻辑）；stderr 每 20 帧输出 `[m3g] present split us/frame: v3d= (backend says ) conv= copy=`。`m3gnative=0`、`m3gshade=0`、`m3gtex=0` 现在可以同时写（之前遇到第一个就提前 return）。
+**下次日志看什么**：`game=` 占 total 多少（如果很大，剩下的“未计时”其实是游戏代码，不是 M3G）；`present split` 里 v3d、conv、copy 谁最大；贴图边缘是否还黑。
+
+## 2026-11-04 「Java 堆调到 15/14M 没用」的根因：`runMidlet.o` 是孤儿对象（v04.28）
+
+**用户的质疑是对的**：调了 15 和 14 MB 都无效。但我核对了数值本身——
+**15 MiB 不是猜的，是算出来的上限**：
+
+`ObjectHeap.cpp:1458` → `heap_chunk_size = extra_size + target_heap_size
++ minimum_marking_stack_size`，其中 `MimimumMarkingStackSize = 2048 ×
+sizeof(OopDesc*) = 8192`，`extra_size` 由 glue code 决定（实测 2176）。
+`vita_try_vm_chunk()` 再把它向上取整到 1 MiB，上限 `VITA_VM_BLOCK_MAX`
+= 16 MiB。
+
+| HeapCapacity | heap_chunk = cap+8192 | 取整 1 MiB | 能否进 16 MiB 块 |
+| --- | --- | --- | --- |
+| 13 MiB | 13639680 | 14 MiB | ✅ |
+| 14 MiB | 14688256 | 15 MiB | ✅ |
+| **15 MiB** | **15736832** | **16 MiB** | ✅ 正好卡满 |
+| 16 MiB | 16785408 | **17 MiB** | ❌ 溢出 |
+
+（log184 实测 `heap=33552256`、`heap_chunk=33562624` 与公式吻合，
+差 8192 正是 marking stack。）
+
+**真正的根因与数值完全无关**：`phoneme-midp/build/vita_arm/obj/arm/
+runMidlet.o` 是**孤儿对象**——全树没有任何构建规则会刷新它。
+
+- `src/ams/example/jams/lib.gmk` 里 `AMS_RUNMIDLET_NATIVE_FILES = runMidlet.c`
+  确实存在，但 `AMS_RUNMIDLET_OBJ_FILES` 只在 `runMidlet` **可执行文件**
+  是构建目标时才被消费；本项目把它链进 `midp_vita`，所以该目标永不触发。
+- `libobj.a-list` 第 88 行写的是 `runMidlet_md.o`（908 字节的桩），不是
+  `runMidlet.o`。
+- `vita-port/CMakeLists.txt:6514` 却直接链 `${MIDP_OBJ_DIR}/runMidlet.o`。
+- `build.sh midp` 只检查 `ROMImage.o` 是否过期，不碰其它成员。
+
+**证据链**：
+| 事实 | 值 |
+| --- | --- |
+| `runMidlet.c` 修改时间 | 2026-11-04 03:34 |
+| `runMidlet.o` 修改时间 | **2026-11-02 06:18** |
+| 旧 `runMidlet.o` 里 `heap_mb` 字符串数 | **0** |
+| 旧 ELF 里 `heap_mb` 字符串数 | **0** |
+| log182–184 里 `runMidlet: heap_mb=` 行数 | **0**（每次启动都有 `runMidlet: ENTRY`，说明函数跑了但那段代码不在） |
+
+也就是说 v04.19（heap_mb 覆盖）与 v04.24（JIT 判定时机）**从未进入过任何
+一个 VPK**，用户的设置写进了 `ux0:/data/J2ME00001/heap_mb` 却没有任何代码
+去读。所以「JIT 一直 policy 0」「堆一直 32 MiB」两个现象与设置值无关。
+
+**修法（v04.28）**：`vita-port/build.sh` 新增 **Step 0.5**，在链接前按
+`-nt` 比较源与对象，过期就重编；include 列表取 CMake 的
+`CMakeFiles/midp_vita.dir/flags.make` 中的 `C_INCLUDES`，外加 MIDP makefile
+自带 vpath 提供、CMake 没有的三个目录：
+`src/core/memory/include`（midpMalloc.h）、
+`src/ams/example/ams_common_port/include`（commandLineUtil_md.h）、
+`src/ams/example/ams_params/include`（ams_params.h）。
+编译后校验对象里必须出现 `heap_mb` 字符串，否则告警。
+
+**验证**：
+- 手工编译得 12220 字节对象，`grep -a heap_mb` = 2、`JIT ENABLED` = 1。
+- `touch runMidlet.c` 后跑 `./build.sh`，打印
+  `==> runMidlet.o is older than runMidlet.c - rebuilding it`。
+- 最终 `build/cmake/midp_vita`（ELF）里 `grep -ac heap_mb` = **3**，
+  `strings` 可见 4 条新日志（含 `JIT ENABLED`）。
+- 注意：`strings midp_vita.self` 搜不到是正常的——SELF 是加密容器，
+  必须查 ELF 或 `.sym`。之前我用 SELF 判断「字符串不在二进制里」得出
+  错误结论，这一步差点又误导自己。
+
+**教训（重要，写入通用规则）**：
+1. **判断「改动是否进了产物」只能用二进制搜索，不能用日志缺失反推**。
+   日志没有既可能是代码没跑，也可能是代码没编进去。
+2. **看到源文件比对象新，先怀疑构建规则缺失，而不是参数写错**。
+   本次先花了几轮算 15 MiB 的边界——数值是对的，但根本不是数值问题。
+3. **`strings` 默认跳过非 ASCII 运行**，二进制里搜字符串用 `grep -a`；
+   SELF 是加密的，只能查 ELF/`.sym`。
+4. 项目里凡是被 CMake 直接链接的「手工编译对象」，都要在 `build.sh` 里
+   有显式的过期重建步骤，并在编译后校验一个特征字符串。
+
+## 2026-11-04 log186 分析（v04.28 真机）+ v04.29：堆终于可执行，JIT 仍关——两处顺序错误
+
+**log186 的关键事实（一次启动，三轮）**：
+
+第 2 轮（用户把「Java 堆」设成 15MB 后）：
+```
+[heapmem] OpenVMDomain rc=0x00000000
+[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: 0x85c00000, 15728640 bytes
+          => THE JAVA HEAP IS EXECUTABLE (compiler area included); JIT may run
+```
+**这是 v04.17/v04.18 的内存工作第一次真正生效**。第 1 轮（尚未设堆）是
+`chunk0 needs 33554433 bytes ... outside the VM block range -> malloc`，
+第 3 轮（设 14MB）也打印 `VM alloc of 16777216 bytes FAILED: 0x80024b0b`
+然后回退 malloc（见下「新发现」）。
+
+但每一轮都是：
+```
+*** runMidlet: JIT requested but the Java heap is not in executable memory -> -int
+```
+且探针本身通过（`[JITPROBE] VERDICT: VM DOMAIN WORKS. ... 1 MiB minimum block`）。
+即：**内存对了，判定错了**。
+
+### 缺陷一：堆不在 v04.24 以为的地方分配
+
+v04.24 把判定移到「`JVM_Initialize()` 之后」，前提是 `JVM_Initialize()`
+会建堆。**它不会** —— 它只做 tty 和参数解析（`utilities/Arguments.cpp:505`）。
+堆由 `Universe::initialize() -> ObjectHeap::create()`
+（`handles/Universe.cpp:549`）创建，运行在 `JVM::start()` 内部，即
+`midpRunVm` 里，**晚于 `-int` 还能注入的最后一个点**。
+
+所以从 `runMidlet.c` 里查询 `vita_heap_executable()` 永远读到上一轮的状态，
+round 0 恒为 0。**这个查询没法靠改位置修好，只能去掉**。
+
+修法：**预测**而非查询。算式是精确的（见 `OsMemory.cpp`）：
+```
+heap_chunk = HeapCapacity + 8192          (MimimumMarkingStackSize)
+VM 块必须是 1 MiB 倍数且 ≤ 16 MiB
+15 MiB -> 15736832 -> 16777216  正好装下
+16 MiB -> 16785408 -> 17825792  装不下
+```
+故 `heap_mb <= 15` 即前置条件。真实结果仍由 VM 侧日志
+（`BACKED BY VM-DOMAIN MEMORY` vs `outside the VM block range -> malloc`）
+给出，预测错了同一份日志里能看到。
+
+### 缺陷二：`setHeapParameters()` 静默撤销覆盖
+
+值在 `setHeapParameters()` **之前**应用，而该函数
+（`ams_common/native/heap.c:135`）无条件执行
+`JVM_SetConfig(JVM_CONFIG_HEAP_CAPACITY, getHeapRequirement())`。
+所以 log186 打印了 `heap_mb=15`，堆还是 32 MiB。
+
+修法：拆成 `vita_read_heap_mb()`（早调用，喂给 JIT 判定）与
+`vita_apply_heap_mb()`（在 `setHeapParameters()` 之后调用，不会被覆盖）。
+
+### 附带发现（未查完）
+
+第 3 轮 14MB 时出现 `VM alloc of 16777216 bytes (MiB-aligned) FAILED:
+0x80024b0b`。`0x80024b0b` 与之前的 `0x80024b05`(ILLEGAL_MEMBLOCK_SIZE)
+不同，疑似「内存不足」。14 MiB 应取整成 15 MiB 块，可能 VM 域预算已被
+探针/上一轮的块占用。**这需要在 15MB 稳定后再测 14MB，不能现在下结论。**
+
+### 构建侧的两个真坑（本次实际卡住的地方）
+
+**(1) `_rom_linkcheck_mffd` 链接失败 —— 变更旗标后 make 不重编**
+
+接 v04.28 的 `build.sh Step 0.5` 之后，链接报：
+```
+undefined reference to `_rom_linkcheck_mffd_true'
+undefined reference to `_rom_linkcheck_mffl_false'
+```
+`ROMImage.hpp:265` 把 `MSW_FIRST_FOR_DOUBLE` 变成链接期自检：
+编译成哪个拼写就引用哪个符号。冻结的 `Interpreter_arm.s`
+（10-13，441533 B）是 `_true`，而 `_MergedSrc005.o`（11-03）是 `_false`。
+默认推导是 `MSW_FIRST_FOR_DOUBLE = (!HARDWARE_LITTLE_ENDIAN)`，
+Vita 小端 → **false**，与冻结解释器相反。正确值必须显式传
+`-DMSW_FIRST_FOR_DOUBLE=1`（`ROM.cpp:229` 注释亦印证 MIDP.gmk 就是这样编的）。
+
+`rebuild_vm.sh` 的 `CPP_DEF_FLAGS_TARGET` 原本**没有**这两个 -D。
+补上后仍不生效，因为 **make 按时间戳认为 `_MergedSrc005.o` 无需重编**
+（它 11-03，比 Makefile 新）。必须 `./rebuild_vm.sh clean` 清空
+`target/` 再编，符号才统一。**这是「改了旗标必须清空 target」的又一例**
+（与 v01.79「make 单对象重编要先 rm 旧 .o」同源）。
+
+**(2) 手工重编 `_MergedSrc005.o` 是错的**
+
+我试过用 `rebuild_vm.sh` 的旗标手工编译 `target/generated/_MergedSrc005.cpp`，
+符号确实变成 `_true`，但链接爆出
+`typeinfo for JVMUTF8Stream`、`system_symbols` 等未定义 ——
+因为手工命令缺 `-fno-rtti -fno-exceptions -fno-operator-names
+-fno-gnu-keywords -fno-optional-diags`。**VM 对象只能由 `rebuild_vm.sh`
+经 make 生成，不要手工编**。
+
+### 教训
+
+1. **「为什么这块内存/这个开关不生效」先查旗标与时间戳，再查逻辑**。
+   本次两个坑都是构建缓存，不是代码。
+2. **`rebuild_vm.sh` 改了 `CPP_DEF_FLAGS_TARGET` 之后必须 `clean`**，
+   否则旧对象静默保留，链接期才由 ROM 自检报出来。
+3. **不要在 `JVM::start()` 之前查询任何只在堆创建后才有意义的状态**。
+   `JVM_Initialize()` ≠ 建堆；建堆在 `Universe::initialize()`。
+4. 同一件事已经有了 `backed by VM memory` 这种**确定的日志证据**时，
+   不要再加一层预测式判断去替代它；预测只用于「决定要不要注入 `-int`」
+   这种**必须提前决定**的场合。
+
+
+## 2026-11-05 log185 贴图边缘「其他颜色」分析 + v04.30：Texture2D 过滤方式终于传到 GL
+
+**证据**
+- log185 = v04.28 真机，4 张截图（960x544）。我读不了图，只做了像素统计：3D 区域每张 816–1773 个边缘像素，
+  偏离「两侧邻居连线」的只有 0–1%（2/14/8/4 个，多为黑或深蓝）。数字上看不出杂色边，**像素层面没有证实异常**。
+- M3G 1.1 Javadoc（nikita36078.github.io/J2ME_Docs/docs/jsr184/）：`new Texture2D(Image2D)` 默认
+  WRAP_REPEAT、level FILTER_BASE_LEVEL、**image filter FILTER_NEAREST**、FUNC_MODULATE。
+- 反编译 BioMain：BioCtrl/BioCanvas 运行时 `new Texture2D(new Image2D(fmt, Image))`，**没调 setFiltering**。
+
+**错误（更正 v04.28 的结论）**
+- v04.28 写「36 个贴图全是 LINEAR，所以过滤不是原因」，依据只有**从文件读入的**贴图（文件里确实写 LINEAR）。
+  BioMain 的运行时贴图不在那份数据里，按规范应是 NEAREST。
+- 我们的实现双重不符：`Texture2D.imageFilter` 默认 LINEAR（规范是 NEAREST）；`vita_gl3d.c` 创建的贴图永远
+  GL_LINEAR，根本不看 Texture2D 的设置。图集（如 jil_all.png 128x128）上 LINEAR 会把相邻小块的颜色混进边缘。
+  这是**推断**，未经真机验证。
+
+**改动（v04.30）**
+- `Texture2D.java`：`imageFilter` 默认 FILTER_NEAREST（M3gReader 仍用文件值覆盖）。
+- `Renderer.java`：`draw()` 的 texture 参数 bit16 = NEAREST。
+- `m3g_native.c`：拆出 bit16，`v3d_texture_filter(g_texfix_on ? nearest : 0)`；`m3gtex=0` 即还原为全 LINEAR。
+- `vita_3d.c/.h`：`v3d_texture_filter`（仅硬件后端；软件光栅不变，Vita3K 不受影响）。
+- `vita_gl3d.c/.h`：`vita_gl3d_texture_filter`，按槽位缓存 `g_tex_nearest[]`，槽位被复用（texture_create）时复位为 0。
+
+**验证**
+- 宿主：`debug/tools/m3gprobe/FilterCheck.java`——默认 NEAREST、文件贴图 3 个保持 LINEAR、真实 draw 调用里 bit16
+  设/清正确、低 16 位句柄不变，PASSED；SkinHash 与基线一致。
+- 产物：`midp_vita_v04.30.vpk`；ELF 含 `v3d_texture_filter`、`vita_gl3d_texture_filter`（后者反汇编里 2 处
+  `glTexParameteri`）；`Texture2D.class`/`Renderer.class` 时间戳已更新。
+- **未经真机验证**：杂色边是否消失。若仍在，下一个嫌疑是 v04.28 的 alpha 渗色（`m3gtex=0` 会同时关掉两者做 A/B）。
+
+**本次踩到的构建坑（非代码）**
+- 测试陷阱：FilterCheck 一开始只切换 `appearances[0]` 的 Texture2D，而 `lastTexInfo` 是**最后一次** draw，
+  模型有 3 个 submesh、3 个不同的 Texture2D，必须全部切换，否则 bit16 看起来「没传」。是测试前提错，不是代码错。
+- `vita-port/build.sh midp` 一次链接失败：`_rom_methods_start` / `system_symbols` / `_rom_linkcheck_*` 未定义。
+  原因是 `phoneme-midp/build/vita_arm/ROMImage*.cpp` 全是 **0 字节**（17:38:30，疑为另一会话同时构建时被截断），
+  make 认为它们已最新，于是编出 712 字节的空 `ROMImage.o`。手工用完整 include 路径跑 romgen 能正常出
+  29937 对象，所以 romgen 本身没问题。处理：删除 0 字节的 `ROMImage*` 与 `obj/arm/ROMImage.o` 后重跑
+  `build.sh midp`（ROMImage.o 变为 2.1 MB，链接通过）。**以后看到 `_rom_*` 未定义，先 `ls -l build/vita_arm/ROMImage*.cpp`。**
+- `vita-port/CMakeLists.txt` 在我构建期间被另一会话重写，我的 `set(VITA_VERSION "04.30")` 丢了一次（VPK 变成
+  04.29 的名字）。**每次构建前后都要 grep `^set(VITA_VERSION`，产物名对不上就是被覆盖。**
+
+**待办（未做）**
+- `vita_gl3d_set_state` 仍忽略 alphaThreshold（vitaGL 有 `glAlphaFunc`/`GL_ALPHA_TEST`，文件里 67 个阈值全为 0）。
+- Texture2D wrap 仍未传给 GL（文件 36 个贴图全是 REPEAT；需要 CLAMP_TO_EDGE 的游戏才会暴露）。
+- log185 的 present 拆分计时（`[m3g] present split us/frame`）与 `api:`/`game=` 字段**还没分析**。
+
+## 2026-11-05 v04.32：兼容性第一批落地 —— 字符集（SJIS/EUC-JP/EUC-KR/GBK/Big5）、本地时区、挂起/恢复；ServerSocket 试开失败并回退
+
+> 依据：同日 v04.31 的差距分析（四层缺口：执行引擎 / 生态 API / 跑不对细节 / 产品化）。
+> 本轮只做"不碰 VM 深水区、可独立验证"的三项，另有一项（ServerSocket）试开后失败，已如实回退。
+
+### 1. 字符集：phoneME 在本平台**根本没有通用转换器**（最重要的一项）
+
+**症状**：`new InputStreamReader(in, "SJIS")`、`String.getBytes("GBK")`、EUC-KR/Big5 文本 →
+`UnsupportedEncodingException` 或乱码。中/日/韩游戏读资源、存高分时都会碰到。
+
+**根因（读代码即定案）**：MIDP 的 `com.sun.cldc.i18n.j2me.Gen_Reader/Gen_Writer` 把真正的转换
+/workspace/psvita/phoneme-vita `Conv.getHandler()` → native `conv.c` → `getLcGenConvMethods(encoding)`；
+                                                                                        `i18n_port/default/native/defaultGenConv.c` 是**返回 NULL 的桩**：
+```c
+LcConvMethods getLcGenConvMethods(char *encoding) { (void)encoding; return NULL; }
+```
+/workspace/psvita/phoneme-vita/ `ISO8859_1`、`UTF_8/16`，**其它编码一个都没有**。
+
+**第二个坑（不修就等于只支持一个编码）**：`conv.c` 的 handler 缓存在非日文配置下只有
+**1 个槽位**（`NUM_LCCONV 1`）。第一个编码占满后，`getLcConvMethodsIDByEncoding()` 的循环
+ `i == NUM_LCCONV` 退出 → 第二个编码永远返回 -1。
+
+**改动**：
+| 文件 | 内容 |
+|---|---|
+| `tools/charsetgen/gen_charmap.py` | **新增**：用宿主 Python codecs 生成 `vita_charmap.h`（单字节表 / lead 表 / 双字节块表 / 反向排序表）。反向表以**编码器**为准，解决 Big5 重复码位（U+5341 等 4 处）选错位置的问题 |
+| `phoneme-midp/src/i18n/i18n_port/vita/native/vita_charmap.h` | **新增（生成物，入库）**：1,680,643 B，SJIS 6879 / EUC-JP 6942 / EUC-KR 8225 / GBK 21791 / Big5 13710 个双字节映射 |
+| `phoneme-midp/src/i18n/i18n_port/vita/native/vitaGenConv.c` | **新增**：实现 `getLcGenConvMethods()` 与 6 个回调（byteMaxLen/byteLen/nativeToUnicode/unicodeToNative/sizeOfByteInUnicode/sizeOfUnicodeInByte），五套薄包装。语义严格按 `Gen_Reader.read()` 的契约（1/2=字符长度、0=非法、-1=需更多字节；非法字节输出 U+FFFD 并跳过 1 字节；不可映射字符输出 `?`） |
+| `phoneme-midp/src/i18n/i18n_port/vita/lib.gmk` | **新增**：`vpath` + `SUBSYSTEM_I18N_NATIVE_FILES += vitaGenConv.c` + `-I.../vita/native` |
+| `phoneme-midp/src/i18n/i18n_port/lib.gmk` | +6 行：`ifeq ($(USE_I18N_VITA), true)` → 编 vita 版，否则保持上游 default 桩 |
+| `phoneme-midp/src/i18n/i18n_main/reference/native/conv.c` | +13 行，`#if defined(__vita__)` 时 `NUM_LCCONV 8` 并补 7 个 NULL 槽位 |
+| `phoneme-midp/build/vita_arm/Settings.gmk` | +1 行 `USE_I18N_VITA=true` |
+| `phoneme-midp/build_vita.sh` | make 参数 +1 行 `USE_I18N_VITA=true` |
+
+**验证（宿主，全表，非抽样）**：`tools/charsetgen/verify_charsets.py`
+- 编译真实的 `vitaGenConv.c`（只把 `kni.h` 换成 `tools/charsetgen/hoststub/kni.h` 的 jchar 桩），
+  用 `tools/charsetgen/test_vitagenuconv.c` 做 dec/enc 驱动器，与 Python codecs 逐项比对。
+- 结果：
+```
+SJIS    decode  7069  encode  7069  OK
+EUC-JP  decode  7069  encode  7069  OK
+EUC-KR  decode  8352  encode  8352  OK
+GBK     decode 21918  encode 21918  OK
+Big5    decode 13837  encode 13833  OK
+```
+- 即**每个编码的全部单字节/双字节序列，解码与编码双向 0 不一致**。
+- 生成器可重复运行（幂等）：`python3 tools/charsetgen/gen_charmap.py`；
+  `--check` 只校验不入盘。换编码列表后必须重跑验证脚本。
+
+**未验证**：真机上从未跑过（表与状态机只在宿主验证）。上机验证方法：任选一个已知用
+SJIS/GBK 资源的 jar，看 `[ENCODING]` 相关日志不再出现 `UnsupportedEncodingException`；
+ `Hello.jar` 里 `new String(bytes,"GBK")` 打一行十六进制。
+
+### 2. 本地时区：`getenv("TZ")` 恒 NULL ⇒ 所有游戏都是 UTC
+
+**症状**：游戏内时钟/日历/倒计时/每日奖励全部按 GMT+00:00 走。
+
+**根因链**（两处都读过）：
+1. `midp_timezone_md.c`（posix 版，本平台实际编进去的就是它 —— `nm midp_timezone_md.o`
+   有 `U localtime` / `U gmtime`）用 `localtime() - gmtime()` 求偏移；
+2. 我们的 `getenv()` 是 `vita_pcsl.c` 里的强符号，**恒返回 NULL**（v04.04 的教训：
+   `getenv` 曾经是未解析的 vitalink import stub）。newlib 的 `_tzset` 因此读不到 `TZ`，
+   `localtime()` 等于 `gmtime()` ⇒ 偏移恒 0 ⇒ `GMT+00:00`。
+
+**改动**：
+| 文件 | 内容 |
+|---|---|
+| `vita-port/src/vita_timezone.c` / `.h` | **新增**：`vita_local_timezone()` 用 `sceRtcGetCurrentClockLocalTime()` 与 `sceRtcGetCurrentClock(&dt,0)` 两次采样 + `sceRtcGetTime_t` 求差，四舍五入到分钟，钳在 -12:00..+14:00，输出 `GMT±HH:MM`（≤11 字符），进程内缓存；失败回退 `GMT+00:00` 并打一行 stderr |
+| `phoneme-midp/src/core/timezone/posix/native/midp_timezone_md.c` | +17 行：`#if defined(__vita__)` 段声明 `extern const char *vita_local_timezone(void) __attribute__((weak));`，`getLocalTimeZone()` 里有弱符号就走它，否则保留原 libc 算法（构建期工具链不受影响） |
+| `vita-port/CMakeLists.txt` | 源列表 + `src/vita_timezone.c` |
+
+**日志**：每次进程一行 `[TZ] GMT+08:00 (local-UTC 28800 s)`（落在 vm_stderr.log）。
+**未验证**：真机。上机判据就是这行与主机系统设置是否一致。
+
+### 3. 挂起/恢复：后台回来后**音频永久静音**、时钟回落 333 MHz
+
+**症状（机制推演，未真机确认）**：
+1. `audio_out_open()` 只在 `g_audio_port < 0` 时开端口；Vita 挂起会作废 `SceAudioOut` 端口，
+   回来后 `sceAudioOutOutput()` 一直失败，但句柄非负 ⇒ **再也不会重开** ⇒ 本局永久无声。
+2. 开机时请求的 444/222 MHz 不保证跨挂起存活（v03.06 已证明内核可以"接受但忽略"）。
+
+**改动**：
+| 文件 | 内容 |
+|---|---|
+| `vita-port/src/vita_lifecycle.c` / `.h` | **新增**：一个 0x10000100 优先级线程阻塞在 `sceAppMgrReceiveSystemEvent()`；收到 `SCE_APPMGR_SYSTEMEVENT_ON_RESUME` → `vita_audio_after_resume()` + 重发 `vita_perf_clock_arm()/bus()` 的非零值 + 打日志。`vita_lifecycle_resumes()` 供诊断 |
+| `vita-port/src/vita_audio_javacall.c` | +22 行：`vita_audio_after_resume()` —— 丢掉旧端口（`g_audio_port=-1` + `sceAudioOutReleasePort`）再 `audio_out_open()`，成败都写 `alog` |
+| `vita-port/src/vita_main.c` | +6 行：`vita_perf_init()` 之后 `vita_lifecycle_init()`；+1 include |
+| `vita-port/CMakeLists.txt` | 源列表 + `src/vita_lifecycle.c` |
+
+**已知缺口（明确写清，不要误以为已实现）**：`MIDlet.pauseApp()` / `resumeApp()` **仍未调用**。
+AMS 里机制在（`MIDletStateHandler.java:534`），但从原生线程驱动它要走 AMS 状态机（`nams_javacall`
+ `javanotify_ams_midlet_pause` 是另一套构建），属于单独一轮的活。
+**未验证**：真机（需要 PS 键进出一次，看 `[LIFE] resume #N` 与 `resume: audio reopened`）。
+
+### 4. ServerSocket：试开即失败，已回退（留下结论，别重复踩）
+
+**设想**：`vita_net.c` 早已实现 `pcsl_server_socket_*`（577-660 行），而
+`USE_SERVER_SOCKET=false`，所以打开开关就是"低垂果实"。
+
+**实际**：`USE_SERVER_SOCKET=true` 后 `protocol/ssocket/reference/native/serverSocketProtocol.c`
+    d=open('/tmp/var%d.raw'%m,'rb').read(); n=len(d)//4
+```
+invalid use of incomplete typedef '_serversocketProtocol'
+  {aka 'struct Java_com_sun_midp_io_j2me_serversocket_Socket'}
+```
+   `build/vita_arm/ROMStructs.h` 里只有前置声明、没有结构体 —— **romgen 没把这个类放进 ROM**。
+
+**试过的还原手段（无效，记录以免重试）**：删掉 `ROMStructs.h` / `ROMImage.cpp` /
+`obj/arm/ROMImage.o` 后重建。结果：native 编译仍然先跑（`MIDP_DEPS` 里 native 对象在 ROM 生成之前），
+`ROMStructs.h` 也没有被重新生成（内容仍是旧的 484331 B，`grep serversocket` = 0 处）。
+
+**结论**：要开它必须先把 `com.sun.midp.io.j2me.serversocket.Socket` 纳入 ROM 配置
+    d=open('/tmp/var%d.raw'%m,'rb').read(); n=len(d)//`rom_configs.lst` / `rom.config` 的类列表），重新生成 `ROMStructs.h`，再翻转开关。
+    d=open('/tmp/var%d.raw'%m,'rb').read(); n=len(//4) ROM 产物已从
+`/tmp/rom_bak_0432/` 还原）。
+
+### 5. 本轮踩到的构建坑（新增）
+
+1. **`sceKernelCreateThread` 在 VitaSDK 是 7 参**：`(name, entry, prio, stack, attr, cpuAffinityMask, option)`。
+   项目里旧代码里能看到的 6 参写法编译不过（`vita_shot.c` 的调用是 6 参 + 宏？不同 SDK 版本差异，照 7 参写）。
+2. **1.68 MB 的生成头文件可以入库**，但每次改表都会让 `vitaGenConv.c` 重编；
+   `gen_charmap.py --check` 可以判断表是否与生成器一致（防止手改）。
+3. **`conv.c` 的 `NUM_LCCONV` 不是"缓存大小"这么简单**：它是"已请求编码数"的上限，
+   上游日文配置才给 3。任何"平台能支持多种编码"的移植都必须把它调大，否则只有第一个编码可用。
+4. **本仓库存在并发会话同时改 `vita-port/CMakeLists.txt`**（v04.30 记录过一次，本轮又发生：
+   上一轮写入的 `set(VITA_VERSION "04.31")` 在我改完源列表后消失，最后变成 04.30）。
+   **每次构建前后都要 `grep -n 'set(VITA_VERSION' | tail -2` 核对**。
+
+### 6. 状态与下一步
+
+5 种（宿主全表验证通过）
+- 本地时区（`[TZ]` 日志可判读）
+- 挂起/恢复（音频端口重开 + 时钟重发；`pauseApp/resumeApp` 未接）
+
+#    d=open('/tmp/var%d.raw'%m,'rb').read(); n=len(d)//4
+    d=open('/tmp/var%d.raw'%m,'rb').read(); n=len(
+1. JIT 结构性解锁（compiler area 独立 VM 块；当前只能 ≤15 MB 堆才可执行）
+2. 字体多档（SIZE_SMALL/LARGE/BOLD）
+3. 虚拟键盘字母页 / 自定义布局 / 长按重复
+4. 每游戏设置页 + `game.cfg` 全键（`jit`/`heap`/音量/VK 布局）
+5. ServerSocket（需 ROM 配置，见上）
+6. M3G 收尾（wrap/CLAMP、Fog、天空盒、多纹理、硬件 alpha test）
+7. Mascot Capsule V3 / v10 J3D / JSR-239（零行代码）
+
+### 7. 构建与产物验证（本轮实测，非"应该能过"）
+
+**产物**：`vita-port/out/vpk/midp_vita_v04.32.vpk` = **12,417,559 B**（v04.30 是 12,084,171 B，+333 KB），
+`midp_vita_v04.32.sym` = 11,378,820 B（+460 KB）。增量与 5 张表的 .rodata 体积一致，是"表确实进了 ELF"的第一层证据。
+
+**符号核对**（`arm-vita-eabi-nm midp_vita_v04.32.sym`）：
+```
+getLcGenConvMethods        1      <- 恰好一处：defaultGenConv.c 的桩已被替换
+vita_local_timezone        1
+vita_lifecycle_init        1
+vita_audio_after_resume    1
+813fadc0 r m_gbk_db               <- 表在 .rodata(r)
+81435778 r m_sjis_db
+813cba80 r vita_charmaps
+```
+`strings` 里 `[TZ] %s (local-UTC` / `[LIFE] resume #` / `resume: audio reopened` 各 1-2 处。
+
+**这一步踩到的三个顺序问题（已写进 BUILD_QUICKSTART 坑 17-19）**：
+1. `build.sh midp` 的 `all` 目标**不依赖** `libobj.a` ⇒ 新增的 `vitaGenConv.c` 第一次根本没编，
+   链接仍用旧的 `defaultGenConv.o`（返回 NULL 的桩），日志一切正常但功能等于没做。
+   必须显式 `MIDP_EXTRA_GOAL=<...>/obj/arm/libobj.a bash phoneme-midp/build_vita.sh`。
+2. 换成 `i18n_port/vita` 后 `default/lib.gmk` 不再被 include ⇒ `defaultLocale.c` 缺失 ⇒
+   `undefined reference to getLocaleInfo`。修法：`vita/lib.gmk` 里 vpath 同时指向
+   `default/native` 并把 `defaultLocale.c` 一起编（locale 不需要 Vita 特化）。
+3. `libobj.a` 成员来自**增量 ADD 列表**（`libobj.a-list`），`defaultLocale.o` 虽在 `obj/arm/` 却没入列，
+   必须 `rm` 掉强制重编才会被 ADD。
+
+**未做**：真机。本轮所有结论都是宿主 + ELF 静态核对，没有任何一条在 Vita 上跑过。
+
+## 2026-11-05 v04.33：ServerSocket 真正打开 + 虚拟键盘字母页/长按重复 + 每游戏 `jit=`
+
+### 1. ServerSocket：v04.32 判为"romgen 不收这个类"是**错的**，真正原因是构建顺序
+
+v04.32 的失败签名：
+```
+serverSocketProtocol.c:143:59: error: invalid use of incomplete typedef
+  '_serversocketProtocol' {aka 'struct Java_com_sun_midp_io_j2me_serversocket_Socket'}
+```
+当时我删掉 `ROMStructs.h`/`ROMImage.cpp`/`ROMImage.o` 重建仍复现，于是判定"romgen 不把该类放进 ROM"。
+**这个结论是错的**：那次构建传的是 `MIDP_EXTRA_GOAL=<...>/libobj.a`，而该目标**不依赖 `build_classes`**，
+所以 Java 编译**一步都没跑**（日志只有 4 行：`Running build...` + 错误）。`classes.zip` 里没有
+`com.sun.midp.io.j2me.serversocket`，romgen 自然生成不出结构体。
+
+**正确顺序（实测通过）**：
+```bash
+cd phoneme-midp
+find src/protocol/ssocket -name '*.java' -exec touch {} +   # 增量编译才会看到这些新类
+rm -f build/vita_arm/ROMStructs.h build/vita_arm/ROMImage.cpp build/vita_arm/obj/arm/ROMImage.o
+bash build_vita.sh                                          # 默认 all: 编 Java -> romgen -> 编 native
+MIDP_EXTRA_GOAL=$PWD/build/vita_arm/obj/arm/libobj.a bash build_vita.sh
+cd .. && vita-port/build.sh midp
+```
+第一次 `all` 的输出里有决定性证据：
+```
+Writing ROMStructs.h ...
+ROM image generated in 7.38 seconds     (25018 objects)
+ ... obj/arm/serverSocketProtocol.o      <- 编译通过（上一轮就是这一行报错）
+ ... obj/arm/ROMImage.o
+```
+
+**四处核对（全部通过）**：
+
+| 检查 | 结果 |
+|---|---|
+| `grep -c Java_com_sun_midp_io_j2me_serversocket_Socket build/vita_arm/ROMStructs.h` | 1（之前 0） |
+| `ls build/vita_arm/classes/com/sun/midp/io/j2me/` | 出现 `serversocket/` |
+| `ar t .../libobj.a \| grep serverSocketProtocol` | 1 个成员 |
+| ELF 符号 | `pcsl_server_socket_open_start`、`Java_..._Socket_open0/accept0` 各 1 处 |
+
+**代码改动只有一个开关**：`phoneme-midp/build_vita.sh` 的 `USE_SERVER_SOCKET=true`。
+`vita_net.c` 的 `pcsl_server_socket_*` 早就实现了，一行没动。教训写进 `BUILD_QUICKSTART.md` 坑 20。
+**未验证**：真机没起过 server socket（方法：probe MIDlet 里
+`(ServerSocketConnection)Connector.open("socket://:12345")`，PC 端 telnet）。
+
+
+### 2. 虚拟键盘字母页 + 长按重复（v04.33）
+
+**为什么**：自绘文本框的游戏（RPG 命名、存档名）要 `a`–`z`，而物理键全被方向/软键/A–D 占满，
+ IME（弹对话框，桌面式，不是手机式）。
+
+**关键前提（先查过才动手）**：`keymap_input.h` 里没有 `KEYMAP_KEY_A`，但**不需要**——MIDP 的
+`CHR` 直接吃字符码，所以字母按 ASCII `'a' + i`（97..122）注入，`Canvas.keyPressed()` 拿到的就是普通字母。
+
+**实现**（`vita-port/src/vita_vkey.c` / `.h`）
+| 点 | 做法 |
+|---|---|
+| 两页 | `static int page`：0 = 数字 3×4 + 底部 `abc`，1 = **4×7 字母 + `123`**（26 字母 + 切页，用 27 格） |
+| 切页 | `VKEY_KEY_PAGE (-200)`。`vita_vkey_hit()` 命中它就翻页 + `layout_valid=0` + 重建布局，然后 **return 0**（不产生按键事件）。`vita_input.c` 的 `!hit` 分支正好会释放按住的键，所以**下游一行没改** |
+| 字形 | 5×7 点阵表原来只有 `A B C D K O S L R` + 数字，补了 17 个字母凑满 A–Z（`glyph_find()` 本来就会把 a–z 折成大写） |
+| 容量 | `VKEY_MAX_BTN 24 → 48`：字母页 28 个按钮，原来的 24 会静默丢弃（`push_btn` 到上限直接 return） |
+| 尺寸 | 边栏模式按 `page_rows()/page_cols()` 算格子并按 544 高度上限压 `bh`；叠加模式用 while 循环把面板压进游戏矩形（字母页 28 格必须更小） |
+| 重复 | `vita_input.c` 新增 `VKEY_REPEAT_DELAY_US (450 ms)` / `VKEY_REPEAT_PERIOD_US (90 ms)`；同一按钮按住时发 `KEYMAP_STATE_REPEATED`（= `Canvas.keyRepeated()`，与 Clear 长按同一路径）；换键/抬手清零 |
+
+**未验证**：真机。判读：进一个需要命名的游戏，点 `abc` 页输入字母；日志 `[VKEY] touch phys=` 只是触点，
+#
+### 4. 构建与产物（本轮实测）
+
+```
+error: 0                        Build successful（两次：04.33 首链 + 含 game.cfg jit 改动后）
+midp_vita_v04.33.vpk = 12,424,403 B      midp_vita_v04.33.sym = 11,390,708 B
+pcsl_server_socket_open_start            1 处      <- vita_net.c 的实现真的被链进来了
+Java_com_sun_midp_io_j2me_serversocket_Socket_open0 / _accept0   各 1 处
+vita_vkey_page / vita_vkey_set_page      各 1 处
+libobj.a 成员 serverSocketProtocol.o     1 个
+ROMStructs.h 里的 serversocket 结构      1 处（v04.32 时为 0）
+```
+
+### 5. 教训（新增）
+
+1. **"删掉生成物也不会重新生成"这种结论，先确认目标依赖链再说。** v04.32 的误判就是因为
+   `MIDP_EXTRA_GOAL=libobj.a` 不依赖 `build_classes`，Java 编译与 romgen 都没跑；换成默认 `all`
+   一次就过。**结论写进记忆前，先问"我这条命令到底会跑哪些目标"。**
+2. **终端被后台构建占住时，不要反复重试同一条命令。** 用 `read_files`/`editor` 推进文档与代码，
+   等进程退出再回 shell。本轮因为"`cat >>` 实际执行了但 shell 没回显" + 随后又用 editor 插了一遍，
+   在 `PROJECT_MEMORY.md` 里留下了 45 行重复段落（已用 `head -n` 截断修复）。
+3. **虚拟键盘加页面不要动 `vita_input.c` 的按键路径**：把"切页"当成一次被吞掉的命中（`hit` 返回 0），
+   下游完全无感，这也是 `VKEY_MAX_BTN` 之外唯一需要小心的地方（索引会因重建而重排）。
+
+## 2026-11-05 v04.34：每游戏设置补齐 5 项（locale/虚拟键盘/振动/权限/JIT）+ 字体 size/style
+
+### 1. 每游戏设置：先查清"已经有什么"，只补缺的
+
+**发现**：vita_menu.c 的 `CROSS` 对话框（`mode==1`、`dlg_sel`、`DLG_*`）**早就存在**，
+tation / screen / scale / profile / MIDlet，并且每次改动都调 `save_cfg(g)` 写 `game.cfg`。
+**：locale、虚拟键盘、振动、权限、JIT。
+
+**改动（全部在 `vita-port/src/vita_menu.c`）**：
+| 点 | 内容 |
+|---|---|
+| `GameEntry` | 加 `vkey/vibrate/perms/jit`，**默认 -1 = 跟随全局**（此时不写键，未动过的 game.cfg 保持字节不变） |
+| `game_cfg_load` | 解析 `vkey=` / `vibrate=` / `perms=strict|relaxed` / `jit=0..2` |
+| `save_cfg` | 值为 -1 时省略对应键 |
+| `enum DLG_*` | 插在 `DLG_UNINSTALL` 之前：`DLG_LOCALE, DLG_VKEY, DLG_VIBRATE, DLG_PERMS, DLG_JIT`（`DLG_N` 9 → 13） |
+| 值循环 | `cycle_follow(v,max)`：-1 → 0 → … → max → -1；`follow_onoff`/`follow_label`/`jit_label_pergame`/`locale_label` 负责显示 |
+| 对话框布局 | 13 行塞不下 544 px，行距 40 → **34**，面板高 `70+DLG_N*34`，选中框 34 → 28 |
+
+**launcher 侧无需改动**：`vita_main.c` 的 `game_config_read()` 本来就认 `vkey/vibrate/perms/locale`，
+`jit=` 是 v04.33 加的。菜单写进去，下一轮启动即生效（`jit=` 的"本次会话第一轮"限制见 v04.33 记录）。
+
+### 2. 字体 size/style：单个字库按尺寸缩放
+
+**症状**：`gxjport_get_font_info(face, style, size, ...)`、`get_chars_width`、`draw_chars` 都收到了
+`size`/`style` 但**全部 `(void)` 掉**，于是 `Font.SIZE_LARGE` 画出的是中号字，而行盒也按中号报 ——
+ `Font.getHeight()` 算布局的游戏（标题/菜单）会挤在一起或溢出。
+
+**改动（`vita-port/src/vita_font.c`）**：
+- `font_scale(size)`：`SIZE_SMALL(8)→192`(0.75x)、`SIZE_MEDIUM(0)→256`(1.0x)、`SIZE_LARGE(16)→320`(1.25x)
+- 新增 `fb_blit565_scaled()`：最近邻缩放 blit（CJK 是 1bpp，本来没有灰度可插值）
+- `gxjport_get_font_info`：ascent/descent/leading 同比例缩放（**否则布局仍会撞**）
+- `gxjport_get_chars_width`：按 1/256 px 累加后一次取整，长串不漂移
+- `gxjport_draw_chars`：按 scale 绘制；`STYLE_BOLD` 额外向右 1 px 再画一遍（**不改 advance**，布局不破）；
+  `STYLE_UNDERLINED` 画下划线；**斜体明确不做**（1bpp 汉字剪切后是噪声，MIDP 允许替代样式）
+- 缺字 tofu 的边长也按 scale 缩放
+
+### 3. 构建与产物
+
+```
+error: 0        Build successful（vita_menu.c + vita_font.c + vita_main.c 一起重编）
+midp_vita_v04.34.vpk / .sym                 见 out/vpk/
+```
+
+### 4. 未验证 / 后续
+
+- **均未上真机**。
+- 菜单：13 行对话框在 544 px 下刚好放得下（70+13*34=512），但真机上要确认最后一行没有被
+  底部提示条压住；值文本用 scale 2，最长的是 `jit: on, first round only`（约 26 字符 ≈ 180 px，
+  面板宽 400 px，够）。
+- 字体：0.75x/1.25x 是最近邻，小字号下 1bpp 汉字可能偏"糙"；如果真机看着差，下一步不是加大缩放
+  算法，而是用 `vita-port/tools/fontgen.c` 烘焙第二档字库（J2FB v2 每个 section 已带 cell 尺寸与 bpp，
+  格式本身支持多档，只是 `vita_font.c` 现在只加载一个 bank）。
+- `Font.SIZE_LARGE` 的字号变化会改变 `Font.getHeight()`，**某些游戏的布局缓存可能只在启动时算一次**，
+  如果出现首屏正常、切屏后错位，先怀疑它而不是缩放算法。
+
+## 2026-11-05 v04.35：CMakeLists 精简 + M3G Texture2D wrap + 系统 UI 覆盖时静音
+
+### 1. CMakeLists 精简：7114 → 686 行，代码逐行未变
+
+**先量再动**：`wc -l` 7114 行里，非注释非空行只有 **530 行**，注释 6535 行；其中 **175 个**是重复的
+`set(VITA_VERSION ...)`（last-wins，只需要最后一个）。
+
+**脚本规则**（一次性，`/tmp/trim_cmake.py`，备份 `/tmp/CMakeLists.full.bak`）：
+- 保留**所有代码行**（只删掉除最后一个以外的 `set(VITA_VERSION`）；
+- 注释：保留"紧邻代码且 ≤4 行"的短注释、版本标题首行（`# 0X.YY ...` 截到 120 字符）、分隔线；
+  其余长篇论证删除（它们在 PROJECT_MEMORY / COMPATIBILITY_ROADMAP 里都有）；
+- 连续空行压成一个。
+
+**验证**：把所有非注释、非 `set(VITA_VERSION)` 行与备份做 `diff` → **CODE IDENTICAL**（353 行全等）。
+Configuration 块末尾写一次；
+#'EOF'
+
+
+### 2. 任务 3 第一块：M3G `Texture2D` wrap 传到后端（v04.31 的待办）
+
+**链路**：`Texture2D.wrapS/wrapT`(240=CLAMP, 241=REPEAT) → `Renderer` 打包进 texture 参数
+ bit17/bit18（bit16 已是 FILTER_NEAREST）→ `m3g_native.c` 解出 → `v3d_texture_wrap()` →
+.git .github .gitignore .gitmodules .instructions .vscode AGENTS.md BUILD.md BUILD_QUICKSTART.md COMPATIBILITY_ROADMAP.md DEVELOPMENT_PLAN.md FILE_LAYOUT.md PHASE2_MIDP_PORTING_PLAN.md PHASE2_SIMPLIFIED_PLAN.md PORTING.md PROJECT_MEMORY.md README.md UPSTREAM_SOURCES.md VM_BUILD.md build_env.sh debug jsr184 jsr75 patches phoneme-cldc phoneme-midp phoneme_source rebuild_vm.sh tools vita-port 
+
+| 文件 | 改动 |
+|---|---|
+| `Renderer.java` | `texWrap` 变量 + 两个 `wrapS/wrapT == WRAP_CLAMP` → bit1/bit2；`draw()` 传 `texWrap << 17` |
+| `m3g_native.c` | `extern void v3d_texture_wrap(int,int) M3G_WEAK;`、`texWrap = (texArg >> 17) & 3`、绑定后调用 |
+| `vita_3d.c/.h` | `v3d_texture_wrap()` 按后端转发 |
+| `vita_gl3d.c/.h` | `g_tex_clamp[]` 按槽位缓存；`glTexParameteri(WRAP_S/T, GL_CLAMP_TO_EDGE / GL_REPEAT)`；`texture_create` 时复位 |
+| `vita_sw3d.c/.h` | `swtex` 加 `clamp_s/clamp_t`；`texel()` 只在 REPEAT 时取小数部分（原来**无条件** `u -= floorf(u)`，所以 CLAMP 从未生效） |
+
+**为什么值得**：atlas 的 UV 略微超过 1.0 时，REPEAT 采样器会取到对侧边缘，这正是 v04.31 在
+`room_overlay` 上看到的紫红边线的成因之一。
+
+**构建注意**：JSR-184 的 **Java 类**改了（Renderer）→ 必须先重生成 ROM，再编 native：
+```bash
+rm -f build/vita_arm/ROMStructs.h build/vita_arm/ROMImage.cpp build/vita_arm/obj/arm/ROMImage.o
+bash build_vita.sh                                        # all: Java -> romgen -> native
+MIDP_EXTRA_GOAL=<...>/obj/arm/libobj.a bash build_vita.sh
+vita-port/build.sh midp
+```
+
+### 3. 任务 6 平台侧：系统 UI 覆盖时停止音频
+
+**先查清了做不到什么**：MIDP 的事件枚举里**没有 pause/resume 事件**
+with zipfile.ZipFile(out) as z: print('replaced', hit, 'entries', len(z.namelist()), 'testzip', z.testzip(), os.path.getsize(out), '`midpEvents.h` 只有 KEY/PEN/COMMAND/REPAINT/SCREEN_CHANGE/INVALIDATE/ITEM_CHANGED/PEER_CHANGED/
+CALL_SERIALLY/KILL_MIDLETS…）；`pauseApp()` 只能由 AMS 的 Java 状态机
+with zipfile.ZipFile(out) as z: print('replaced', hit, 'entries', len(z.namelist()), 'testzip', z.testzip(), os.path.getsize(out), '`MIDletStateHandler.java:534`）触发，从 native 打进 AMS 是另一件事。
+
+**平台侧能拿到的信号**：`_sceAppMgrGetAppState().isSystemUiOverlaid` —— 系统 UI（PS 键菜单/
+live area）覆盖本应用时为 1。这正是必须停音频的时刻。`SceAppMgrSystemEvent` 只有 `ON_RESUME`，
+"进入后台"事件，所以用轮询。
+
+**实现**：
+| 文件 | 改动 |
+|---|---|
+| `vita_lifecycle.c` | 抽出 `lifecycle_resume_now(why)`（重开音频 + 重设时钟 + 计数）；新增 `lifecycle_poll_thread`：每 200 ms `_sceAppMgrGetAppState`，`isSystemUiOverlaid` 0→1 **静音**、1→0 走 resume；`init` 启动第二个线程（失败只警告） |
+| `vita_audio_javacall.c` | `g_audio_suspended` + `vita_audio_set_suspended()`；渲染循环在提交前检查，命中就 `sceKernelDelayThread(10ms)` + `continue`（**曲目停在原位**，不是快进） |
+
+**仍未接线（明确）**：`MIDlet.pauseApp()` / `resumeApp()`。要做得从 native 调 AMS Java，
+/workspace/psvita/phoneme-vita `MIDletStateHandler` 加一个可被 KNI 调用的静态入口，并在 ROM 里暴露方法号；
+ AMS 改造，单独一轮。
+
+### 4. 任务 4 / 5：本轮**没有做**（如实说明，不是漏写）
+
+| 任务 | 内容 | 为什么本轮做不了 |
+|---|---|---|
+| 4 | Mascot Capsule V3 / v10 J3D / JSR-239 OpenGL ES | 三件都是"零行代码 → 完整 API 面 + 光栅/后端对接"，原估 4–8 周；v10 J3D 最小，可以单独开一轮先做 `Figure/FigureLayout/Effect3D/Graphics3D` 的 API 面 |
+| 5 | PIM / JSR-256 / 179 / 82 | 每个都要 Java 类 + native + ROM 注册 + 桩语义；建议按"最便宜的先做"：JSR-179（固定坐标）→ JSR-256（Vita 有六轴）→ JSR-82（loopback 桩）→ PIM（要自建存储） |
+
+wrap/lifecycle 混在一起会让"哪个改动导致回归"无法归因。
+
+### 5. 构建与产物（本轮实测）
+
+```
+error: 0            Build successful
+midp_vita_v04.35.vpk = 12,428,046 B      midp_vita_v04.35.sym = 11,393,728 B
+ 1 处：v3d_texture_wrap / vita_gl3d_texture_wrap / vita_sw3d_texture_wrap / vita_audio_set_suspended
+strings: "system UI overlaid -> audio muted" 1 处
+```
+
+**未验证**：真机。wrap 的效果看 v04.31 那条紫红边线是否消失（`m3gtex=0` 可做 A/B）；
+lifecycle 看 PS 键进出后 stderr 里 `[LIFE] system UI overlaid` 与 `resume #N (system UI gone)`。
+
+## 2026-11-05 v04.36：JSR-179（Location）最小实现 —— 任务 5 的第一件
+
+### 1. 为什么先做它
+
+ 5 里有 PIM / JSR-256 / 179 / 82，**179 最便宜**：纯 Java、不需要 native、不碰 VM。
+'EOF'"新增一个可选包 → 进 `midp_system.jar` → 游戏能找到类"这条链路，
+ JSR-256 / JSR-82 / v10 J3D 都要复用同一条路。
+
+### 2. 机制：复用 vendor 桩链路，不动 MIDP 的 makefile
+
+`vita-port/build_nokia_stubs.sh` 原本只做两件事：编 `nokia_src/**/*.java`、把 `com/*` 包装进
+`phoneme-midp/build/vita_arm/classes/`（再由 CMake 打进 `midp_system.jar`）。
+
+| 改动 | 内容 |
+|---|---|
+| 新输入目录 | `JSR_DIR=$SCRIPT_DIR/jsr_src`，`SOURCES` 同时扫 `nokia_src` 与 `jsr_src` |
+| 安装白名单 | `JSR_PKGS="location"`：先 `rm -rf $CLS/javax/microedition/<pkg>`，再复制、再列出来 |
+
+**为什么是白名单而不是整个 javax**：MIDP 自己的 `javax.microedition.{lcdui,media,io,rms,midlet,pki}`
+ **ROM 化**的，往 jar 里塞一份会遮盖 ROM 版本（而且这些包的 native 绑定在 ROM 里）。
+#.git .github .gitignore .gitmodules .instructions .vscode AGENTS.md BUILD.md BUILD_QUICKSTART.md COMPATIBILITY_ROADMAP.md DEVELOPMENT_PLAN.md FILE_LAYOUT.md PHASE2_MIDP_PORTING_PLAN.md PHASE2_SIMPLIFIED_PLAN.md PORTING.md PROJECT_MEMORY.md README.md UPSTREAM_SOURCES.md VM_BUILD.md build_env.sh debug jsr184 jsr75 patches phoneme-cldc phoneme-midp phoneme_source rebuild_vm.sh tools vita-port 
+.git .github .gitignore .gitmodules .instructions .vscode AGENTS.md BUILD.md BUILD_QUICKSTART.md COMPATIBILITY_ROADMAP.md DEVELOPMENT_PLAN.md FILE_LAYOUT.md PHASE2_MIDP_PORTING_PLAN.md PHASE2_SIMPLIFIED_PLAN.md PORTING.md PROJECT_MEMORY.md README.md UPSTREAM_SOURCES.md VM_BUILD.md build_env.sh debug jsr184 jsr75 patches phoneme-cldc phoneme-midp phoneme_source rebuild_vm.sh tools vita-port EOF
+
+### 3. 实现（`vita-port/jsr_src/javax/microedition/location/`，11 个类）
+
+| 类 | 说明 |
+|---|---|
+| `LocationProvider` | `getInstance()` 永远返回同一个 provider（忽略 Criteria） |
+| `VitaLocationProvider` | 固定坐标：**39.9042N / 116.4074E, alt 43 m, acc 30/50 m** |
+| `Location` | `vitaInit()`（包内）填充；`isValid()` 恒 true |
+| `Coordinates` / `QualifiedCoordinates` | 带范围校验；`distance()` 与 `azimuthTo()` |
+| `Criteria` | 所有 setter 接受并忽略（只有 getter 回读） |
+| `LocationListener` / `LocationException` | 接口/异常 |
+| `AddressInfo` + `VitaAddressInfo` | 单字段实现（`createField`） |
+| `Orientation` | 静止朝向 |
+
+**三个刻意的取舍（都写进源码注释了）**：
+1. **坐标不是一个"假"的 (0,0)**，而是北京：`0,0` 在几内亚湾，很多游戏把它当"无定位"；
+   给一个真实城市 + 小误差，距离/方位算出来才像回事。
+2. **`getLocation(timeout)` 立即返回**，不等 timeout。规范允许早于 timeout 返回；而游戏常传 60 秒，
+   真等下去就是把 MIDlet 事件线程冻结——恰好和这个桩的目的相反。
+3. **`setLocationListener()` 同步回调一次**（位置已知）。真实 provider 会稍后回调；
+   不回调的话，等第一次更新的游戏会永远等。
+
+**CLDC 1.1 的 `Math` 没有 `atan2`/`asin`/`toRadians`**（只有 sin/cos/tan/sqrt/abs/ceil/floor/round）。
+ `Coordinates` 里自己写了：
+- `atan2()`：`atan` 在 [0,1] 上的多项式近似（|误差| < 1e-4 rad），再折到四个象限；
+- `distance()`：等距圆柱近似（几公里内误差 < 0.1%），公式与理由都写在注释里。
+
+**未实现**：`Landmark` / `LandmarkStore` / `Geotagging`（要自建存储，游戏很少用）。
+'EOF' MIDlet 仍会 `NoClassDefFoundError`——和没有 JSR-179 时一样，只是范围小了。
+
+### 4. 验证（本轮实测，静态/产物级）
+
+```
+build_nokia_stubs.sh 输出：javax/microedition/location/*.class 共 11 个
+midp_system.jar          ：12 项（11 类 + 目录）
+VPK data/J2ME00001/midp_system.jar：同样 12 项    <- 端到端打通（python zipfile 读的嵌套 zip）
+error: 0 / Build successful
+midp_vita_v04.36.vpk = 12,434,942 B               <- 比 04.35 大 6.9 KB，与 11 个类吻合
+```
+
+### 5. 未验证 / 风险
+
+- **真机没跑过**。上机判据：一个探测 `Class.forName("javax.microedition.location.LocationProvider")`
+  的 MIDlet 不再抛 `ClassNotFoundException`；`getLocation(60)` 立即返回且 `isValid()==true`。
+- `Landmark`/`LandmarkStore` 缺失（见上）。
+- `getLocation()` 立即返回可能让"等 timeout 才有位置"的游戏觉得太快（应有正作用，但要注意日志）。
+- 坐标写死在北京：如果某个游戏按位置解锁内容，它会认为玩家在北京。
+
+## 2026-11-05 v04.37：JSR-256（Mobile Sensor API）最小实现 —— 任务 5 的第二件
+
+### 1. 先把规范核对清楚（这次有网）
+
+`nikita36078.github.io/J2ME_Docs/docs/jsr256/` 可用，逐页取了签名：`SensorManager`、`SensorInfo`、
+`ChannelInfo`、`Data`、`Unit`、`MeasurementRange`、`DataListener`、`SensorListener`；常量用
+`constant-values.html` 一次拿全：
+```
+ChannelInfo:      TYPE_DOUBLE=1 TYPE_INT=2 TYPE_OBJECT=4
+SensorConnection: STATE_OPENED=1 STATE_LISTENING=2 STATE_CLOSED=4
+SensorInfo:       CONN_EMBEDDED=1 CONN_REMOTE=2 CONN_SHORT_RANGE_WIRELESS=4 CONN_WIRED=8
+                  CONTEXT_TYPE_AMBIENT="ambient" DEVICE="device" USER="user" VEHICLE="vehicle"
+                  PROP_* = controllable/errorsReported/latitude/location/longitude/
+                           maxSamplingRate/permission/vendor/version
+```
+**最重要的发现**：`SensorManager` **没有** `openSensorConnection()`。JSR-256 打开传感器靠
+`Connector.open("sensor://acceleration;contextType=device;model=vita")`。这决定了实现方式。
+
+### 2. 因此必须做 Connector 协议处理器（本轮最花时间的一块）
+
+CLDC 的 `Connector` 这样找实现（`phoneme-cldc/.../Connector.java:308-313`）：
+```java
+Class clazz = Class.forName(classRoot + "." + platform + "." + protocol + ".Protocol");
+ConnectionBaseInterface uc = (ConnectionBaseInterface)clazz.newInstance();
+uc.openPrim(name, mode, timeouts);
+```
+而 `vita-port/config/system.config` 里是 `javax.microedition.io.Connector.protocolpath: com.sun.midp.io`
+和 `microedition.platform: j2me` ⇒ 需要的类名正是 **`com.sun.midp.io.j2me.sensor.Protocol`**。
+
+**两个坑**：
+1. 接口是 **`com.sun.cldc.io.ConnectionBaseInterface`**。我先写 `com.sun.midp.io.*`（不存在），
+   又试 `com.sun.j2me.io.*`（那是 MIDP abstractions 里的另一个），两次 `cannot find symbol`；
+   照 `jsr75/.../file/Protocol.java` 的 `import com.sun.cldc.io.ConnectionBaseInterface;` 才通过。
+2. `build_nokia_stubs.sh` 原本**拒绝一切 `com/sun`**（怕覆盖 MIDP 的 ROM 类）。改成
+   `SUN_ALLOW="com/sun/midp/io/j2me/sensor"` 白名单：我们的源码若在 `com/sun` 下产出**其它**类，
+   脚本仍报错退出。
+
+### 3. 实现（15 个类，`vita-port/jsr_src/`）
+
+| 文件 | 内容 |
+|---|---|
+| 接口 6 个 | `ChannelInfo` `SensorInfo` `SensorConnection`(extends Connection) `Data` `DataListener` `SensorListener`，常量取上表原值 |
+| `MeasurementRange` / `Unit` | `Unit.getUnit()` 按规范**缓存实例**（同一 symbol 返回同一对象，`==` 才成立） |
+| `SensorManager` | `findSensors(quantity,contextType)` / `findSensors(url)` / `addSensorListener`×2 / `removeSensorListener`；注册时立刻回调一次 `sensorAvailable`；另加 `openInternal()` 供协议处理器调用 |
+| `VitaSensor` | 传感器表 + URL 解析（`quantityOf`/`param`/`urlMatches`/`open`）+ **合成数据** |
+| `VitaSensorInfo`/`VitaChannelInfo` | acceleration(axis_x/y/z, m/s^2, ±19.62) 与 angular_velocity(rot_x/y/z, rad/s, ±34.91)；`getMaxBufferSize()=256` |
+| `VitaSensorConnection` | 同步 `getData()`；异步 `setDataListener()` 起**一个**泵线程（`bufferingPeriod` 或 `bufferSize*20ms`），`close()`/`removeDataListener()` 停它，监听器抛 Throwable 也自退 |
+| `VitaData` | 未请求的 timestamp/uncertainty/validity 抛 `IllegalStateException`（规范要求） |
+| `com/sun/midp/io/j2me/sensor/Protocol` | 实现 `ConnectionBaseInterface.openPrim()` → `SensorManager.openInternal(name)` |
+
+**数据是合成的**（`VitaSensor.value()`：0.9·sin / 0.9·cos / 9.81+0.15·sin；陀螺 0.35·…，50 Hz）。
+**真六轴（`sceMotion`）还没接**：需要一个小 native 桥，而且 jar 里的类（非 ROM 化）能不能解析 KNI
+符号要先验证，属单独一步。当前实现让游戏「不崩、数值在动」；摇手机不会有反应。
+
+### 4. 验证（本轮实测，产物级）
+
+```
+build_nokia_stubs.sh 输出：javax/microedition/sensor/*.class 共 15 个
+                            com/sun/midp/io/j2me/sensor/Protocol.class 1 个
+VPK data/J2ME00001/midp_system.jar：sensor 15 个类 + Protocol 1 个（python zipfile 读嵌套 zip）
+error: 0 / Build successful
+midp_vita_v04.37.vpk = 12,448,477 B      <- 比 04.36 大 13.5 KB，与 15 个类吻合
+```
+
+### 5. 未验证 / 风险（有两条是既存问题，不是本轮引入）
+
+1. **真机没跑过**。上机判据：`Class.forName("javax.microedition.sensor.SensorManager")` 通过；
+   `Connector.open("sensor://acceleration;contextType=device;model=vita")` 返回连接；
+   `getData(4)[0].getDoubleValues()` 长度 4 且数值随时间变化。
+2. **合成数据不等于真六轴**：数值在动，但与你摇不摇无关。体感玩法要等 `sceMotion` 桥。
+3. `javax.microedition.sensor.Condition` / `ConditionListener` 未实现（`OP_*` 常量、限值条件），
+   用到它们的 MIDlet 仍会 `NoClassDefFoundError`。
+4. **既存风险（值得单独确认）**：`Connector` 用 `microedition.platform` 拼协议类名。我们在
+   `system.config` 里写的是 `j2me`，所以一切正常；但**切换设备画像时会不会把这个属性改成
+   `Nokia6230` 之类**？如果会，`com.sun.midp.io.Nokia6230.socket.Protocol` 找不到，
+   `socket/http/sensor` 全部失效。这和 JSR-256 无关，是 profile 机制的潜在坑，下次动 profile 时先验。
+
+
+
+## 2026-11-05 v04.38：JSR-256 接真六轴（sceMotion → motion.bin → JSR-75 读回）
+
+### 1. 先排掉"在 jar 类里写 native 方法"这条路（有硬证据）
+
+原本的打算很直接：`VitaSensorConnection` 声明 `native`，C 侧用 `sceMotion` 实现。查了两处后否掉：
+
+- `phoneme-cldc/src/vm/os/vita/OS_vita.cpp:56-66`：
+  ```c
+  /* Dynamic library loading (disabled on Vita - all natives static) */
+  #if ENABLE_DYNAMIC_NATIVE_METHODS || ENABLE_JVMPI_PROFILE
+  void* Os::getSymbol(void* handle, const char* name) { return dlsym(handle, name); }
+  #endif
+  ```
+  动态 native 在本移植里**关着**（静态链接），`Natives::get_native_function_name` → `Os::getSymbol` 这条
+  查找链对**动态加载的类（jar 里的类）**不成立。
+- `jsr75/src/share/native/jsr75_file.c:35-38` 同时说明：ROM 化类的 native **可以**靠 KNI 命名约定在
+  链接期解析（romgen 会为解析不到的 native 合成 `Java_<class>_<method>`）。也就是说这条路只对
+  **ROM 化**的类成立，而 JSR-256 的类在 `midp_system.jar` 里。
+
+### 2. 选定方案：launcher 采样 + 24 字节文件 + Java 用 JSR-75 读回
+
+| 端 | 做什么 |
+|---|---|
+| `vita-port/src/vita_motion.c`（新增） | `sceMotionStartSampling()` + 一个 50 Hz 线程：`sceMotionGetSensorState(&st,1)` → 6 个 `float`（`ax ay az` 单位 g，`gx gy gz` 单位 rad/s）**一次性 24 字节写**到 `ux0:/data/J2ME00001/motion.bin`。**不 truncate**（Vita3K 忽略 `SCE_O_TRUNC` 的老坑，见 v01.16） |
+| `vita_main.c` | `vita_lifecycle_init()` 之后调 `vita_motion_start()` |
+| `VitaSensor.java` | 每 ≥20 ms 读一次文件（`Connector.open` + `DataInputStream.readFloat`×6），**4 个候选 URL**，第一个成功就记住；加速度 ×9.81（文件是 g，API 要 m/s²）；读不到 → 回落 v04.37 的合成倾斜 |
+
+为什么用文件而不是别的 IPC：Vita 上没有 Java 侧可达的共享内存，而 JSR-75 已经可用；
+代价是每 20 ms 一次 24 字节写 + 每帧最多一次小读，可忽略。
+
+### 3. 差点写错的地方：JSR-75 的 root
+
+候选 URL 一开始写的是 `file:///motion.bin`。查 `jsr75_file.c:26-33` 才确认：
+**JSR-75 的 root 是设备卷**（`ux0:/`、`imc0:/`…），launcher 的 `chdir` 目录只是 MIDlet store 的路径。
+所以第一个候选改成 **`file:///ux0/data/J2ME00001/motion.bin`**，其余三个留作兜底。
+
+### 4. 两个必须修的坑
+
+1. **链接失败**：`undefined reference to sceMotionGetSensorState / sceMotionStartSampling`
+   → `CMakeLists.txt` 的链接列表要加 **`SceMotion_stub`**（原来只有 SceDisplay/SceCtrl/…）。
+2. **Vita3K 会给出全 0**：它在文件里照样写、但 `sceMotion` 不产数据 ⇒ 加速度 (0,0,0) = 自由落体，
+   比合成数据更糟。所以读到后先判"三轴绝对值之和 < 0.05"就当作**文件不存在**，回落合成数据
+   （真机静置时总有一轴约 ±1 g）。
+
+### 5. 验证（本轮实测，产物级）
+
+```
+error: 0 / Build successful
+midp_vita_v04.38.vpk = 12,450,229 B
+nm: vita_motion_start            1 处
+ELF strings: motion.bin          1 处（launcher 的写路径）
+VPK 内 midp_system.jar 的 VitaSensor.class: "motion.bin" 出现 4 次（4 个候选 URL）
+```
+
+### 6. 未验证 / 风险
+
+- **真机没跑过**。上机判据：`vm_stderr.log` 有 `[MOTION] six-axis publishing to ...`；
+  倾斜主机时 `getData()` 的 axis_x/axis_y 跟着变（合成数据是缓慢正弦，真数据随你动作）。
+- **性能未知**：50 Hz 读文件在本机上没量过；若某游戏 `getData()` 调用极密，20 ms 的节流已经兜住
+  （最多 50 次/秒）。真的嫌慢就把 `refresh()` 的 20 改大。
+- **横竖屏/坐标系**：Vita 的轴定义是"z 垂直屏幕向外、x 平行上边缘"（`psp2/motion.h:78-84` 的说明），
+  与 JSR-256 推荐的"y 指向屏幕上方、z 指向用户"**不完全一致**；游戏若发现方向反了，需要在这里加
+  一次轴变换，改 `VitaSensor.value()` 即可，不用动 launcher。
+
+
+## 2026-11-05 v04.39：JSR-82（Bluetooth）最小实现 + `btspp:` 回环协议
+
+### 1. 先声明：这一件的 API 面**没有核过规范**
+
+镜像里 JSR-82 的 Javadoc **不存在**：`/docs/jsr82/`、`/docs/jsr082/`、`/docs/bluetooth/` 全 404，
+根索引页只给标题（fetch 把 href 剥掉了）。所以签名按公开资料/记忆写，源码注释里写明了这一点。
+**如果游戏报 `NoSuchMethodError`，先对 JSR-82 规范再改，不要照我的实现猜。**
+
+### 2. 设计：没有电台，就做回环
+
+| 类 | 行为 |
+|---|---|
+| `LocalDevice` | 固定身份 `001122334455` / `PS Vita`，`isPowerOn()` 恒 true、可发现；`getRecord/updateRecord` 只是本地登记（没有电台可以广播） |
+| `DiscoveryAgent` / `VitaDiscoveryAgent` | 查询**异步**回调（一次性线程）：`inquiryCompleted(INQUIRY_COMPLETED)`、`serviceSearchCompleted(trans, SERVICE_SEARCH_NO_RECORDS)`；`retrieveDevices()` 返回 null。**必须异步**——同步回调会把"发查询后阻塞等回调"的 MIDlet 死锁 |
+| `RemoteDevice` | 12 位十六进制地址校验；`authorize/encrypt` 返回 true（回环没有安全层） |
+| `ServiceRecord` / `VitaServiceRecord` | 本地属性表 + `getConnectionURL()`；`populateRecord()` 直接成功 |
+| `UUID` / `DeviceClass` / `DataElement` / 4 个异常 | 值类型；`DataElement` **故意不提供 `DataElement(int value)`**（规范里 int 构造是**类型**参数，两个 int 重载会让 `new DataElement(5)` 有歧义），整数值请用 `(long)` |
+| `com/sun/midp/io/j2me/btspp/Protocol` | `btspp://localhost:...` → `StreamConnectionNotifier`；`btspp://<addr>:<ch>` → `StreamConnection` |
+| `VitaBtBus` / `VitaBtConnection` | 所有 btspp 连接共享一个 **4 KB 环**：写进去的数据可以被**任一**连接读到（同机内两个连接能互通）；`acceptAndOpen()` **立即**返回连接，否则单人 MIDlet 会永远等对端 |
+
+**一个容易踩的点**：空总线上 `read()` 返回 **0 而不是 -1**。`-1` 是 EOF，游戏一看到就会
+永久停止收包循环；返回 0 让"没有数据"和"连接结束"可区分（游戏通常也会先看 `available()`）。
+
+### 3. 构建脚本两处改动（第一次跑就暴露了一个）
+
+1. `JSR_PKGS` 原来只写包名（`location sensor`），脚本拼成 `javax/microedition/<pkg>`。
+   **JSR-82 的包是 `javax/bluetooth`**，不在 `javax/microedition` 下 → 第一次跑 `javax/bluetooth`
+   一个类都没装上（btspp 装了 6 个，bluetooth 0 个）。改成**完整包路径**：
+   `JSR_PKGS="javax/microedition/location javax/microedition/sensor javax/bluetooth"`，三处使用点同步改成 `$pkg`。
+2. `SUN_ALLOW` 加上 `com/sun/midp/io/j2me/btspp`；白名单校验改用
+   `grep -vE '^com/sun/midp/io/j2me/(sensor|btspp)/'`（**加新的协议处理器时这三处要一起改**）。
+
+### 4. 验证（本轮实测，产物级）
+
+```
+build_nokia_stubs.sh: error 0；javax/bluetooth 16 个类 + com/sun/midp/io/j2me/btspp 6 个类
+error: 0 / Build successful
+midp_vita_v04.39.vpk = 12,463,740 B          <- 比 04.38 大 13.5 KB
+VPK 内 midp_system.jar: javax/bluetooth 16、btspp 6
+```
+
+### 5. 未验证 / 风险
+
+- **真机没跑过**。判据：`Connector.open("btspp://localhost:...")` 成功；`acceptAndOpen()` 立即返回；
+  写进去的字节能从同一连接读回。
+- **签名未核对**（见 §1）：`NoSuchMethodError` 优先怀疑这里。
+- **`javax.obex` 完全没有**（OBEX 对象交换是 JSR-82 的另一半，用来传文件/名片），
+  用它的 MIDlet 仍会 `NoClassDefFoundError`。
+- **多人对战仍然不能真联**：loopback 只在本机进程内，两台 Vita 之间没有数据通路。
+
+
+## 2026-11-05 v04.40：v10 J3D（`com.vodafone.v10.graphics.j3d`）API 面落地
+
+### 1. 这次规范查到了 —— 关键是镜像里的目录名
+
+`docs/Vodafone_API_2_0/` 只有 io/midlet/system/util；**J3D 在 `docs/Vodafone_API_1_0/`**（VSCL 1.0/1.1）。
+从那里逐页拿到了签名：
+
+| 类型 | 关键签名（已核） |
+|---|---|
+| `Graphics3D` | **接口，只有一个方法**：`drawFigure(Figure, int x, int y, FigureLayout, Effect3D)` |
+| `Figure` | `Figure(byte[])`、`Figure(String) throws IOException`、`setPosture(ActionTable,int,int)`、`setTexture(Texture)` |
+| `FigureLayout` | 两个构造 + `setAffineTrans/getAffineTrans`、`setScale(int,int)`（默认 512,512）、`setCenter(int,int)` |
+| `AffineTrans` | 公有字段 **m00..m23**；`set(int[][])`、`transPoint(Vector3D)`、`multiply(AffineTrans)`、`multiply(t1,t2)`、`rotationX/Y/Z(int)`、`rotationV(Vector3D,int)`、`setViewTrans(pos,look,up)` |
+| `Util3D` | `sin/cos(int a)`、`sqrt(int)` —— **角度 4096 段/圈** |
+| 其余 | `Effect3D`、`Light`、`Texture`、`ActionTable`、`Vector3D` |
+
+### 2. 两个硬限制（必须说在前面）
+
+1. **模型容器格式不公开**（Aplix "M3D"）。顶点/索引/动画表都读不出来，`Figure` 只能保存字节 →
+   **无法渲染真实模型**。
+2. **规范从没说 MIDlet 怎么拿到 `Graphics3D` 实例**：接口只有 `drawFigure`，j3d 目录的 javadoc 里
+   连实现类页都没有（厂商私有）。我提供现实实现里出现过的三种入口：
+   `Graphics3DImpl.getInstance()`、`getInstance(Graphics)`、`new Graphics3DImpl() + bindTarget(Graphics)`。
+   **如果某个游戏用的是第四种写法，它仍然拿不到实例**——这是本轮最大的不确定项。
+
+### 3. 实现（11 个类型，`vita-port/jsr_src/com/vodafone/v10/graphics/j3d/`）
+
+`Graphics3D`（接口）、`Graphics3DImpl`（实现 + 三种入口）、`Figure`、`FigureLayout`、`AffineTrans`、
+`Vector3D`、`Effect3D`、`Light`、`Texture`、`ActionTable`、`Util3D`。
+
+- 定点一律 **4096 = 1.0**；`AffineTrans` 的乘法/旋转用 `long` 中间量，`multiply(this, t)` 先缓存
+  `t1` 的 12 个元素（目标可能与源同对象）；
+- `rotationV` 用罗德里格斯公式；`setViewTrans` 用标准 look-at 并对平移取负；
+- `Figure(String)` / `ActionTable(String)` 通过 `Class.getResourceAsStream` 读 jar 内资源；
+- `Graphics3DImpl.drawFigure()` 在绑定的 `Graphics` 上按 `layout.getCenterX/Y()` 与
+  `getScaleX/Y()` 画一个**菱形占位**，并只打一次日志：
+  `[V10J3D] drawFigure: VSCL model format (Aplix M3D) is not supported; drawing a placeholder`。
+
+### 4. 验证（本轮实测）
+
+```
+build_nokia_stubs.sh: error 0，j3d 11 个类
+error: 0 / Build successful
+midp_vita_v04.40.vpk = 12,474,366 B            <- 比 04.39 大 10.6 KB
+VPK 内 midp_system.jar: v10/graphics/j3d 12 项；Graphics3DImpl.class 含 "[V10J3D]" 1 处
+```
+
+### 5. 未验证 / 风险
+
+- **真机没跑过**。判据：一个 import 了 j3d 的游戏能进 3D 场景不抛 `NoClassDefFoundError`，
+  `stdout` 出现一次 `[V10J3D]`，屏幕上有占位菱形在动。
+- **实际价值有限**：过关卡加载、不崩；**看不到真实模型**。这是格式不公开决定的，不是实现偷懒。
+- **`com.vodafone.v10.graphics.sprite` 未做**（VSCL 的 2D sprite 包，同一份 javadoc 里有）。
+- 若将来要真渲染 v10 3D，唯一现实路线是找到公开的 M3D 格式文档；在此之前的替代是引导玩家用
+  JSR-184 版本的游戏（我们的 M3G 已能渲染真实模型）。
+
+
+## 2026-11-05 v04.41：M3G Fog 落地（真渲染）—— 以及为什么放弃 VSCL sprite
+
+### 1. 先交代：为什么这一轮做的不是 sprite
+
+上一轮我说"VSCL sprite 是纯 Java、能真画"，**这个判断错了**。查了 javadoc 才发现：
+`sprite` 包只有一个 public 类 `SpriteCanvas`，而它是 **8×8 tile 的硬件精灵引擎** ——
+API 全是以 `short command` 位域为参数的（`createCharacterCommand(...)` / `drawSpriteChar` /
+`drawBackground`），sprite 数据是 Aplix 私有格式。也就是说：**做完也只能画占位**，与 v10 J3D 同病。
+
+雪上加霜的是 `createCharacterCommand` 的参数顺序/类型在抓取时被工具截断拿不到 ——
+猜错就是运行期 `NoSuchMethodError`，比不做更糟。**所以放弃，改做能真正改善画面的 Fog。**
+
+### 2. Fog 的四层链路
+
+| 层 | 改动 |
+|---|---|
+| `Renderer.java` | 每个 Appearance 读 `ap.getFog()`，算出 `fogMode/fogColor/fogNear256/fogFar256/fogDensity1000`，在 `setState` 之后调用 `NativeBridge.setFog(...)` |
+| `NativeBridge.java` | 新增 `static native void setFog(int,int,int,int,int)` |
+| `m3g_native.c` | 新增 `Java_com_sun_m3g_NativeBridge_setFog`，转发到弱符号 `v3d_fog` |
+| `vita_3d.c/.h` | `v3d_fog()` 按后端分发 |
+| `vita_gl3d.c` | **真 GLES1 雾**：`GL_FOG` + `glFogi(GL_FOG_MODE, GL_LINEAR/GL_EXP)` + `glFogfv(GL_FOG_COLOR)` + `glFogf(START/END/DENSITY)` |
+| `vita_sw3d.c` | 逐像素按视距混合：`dist = 1/iw`（`iw` 是插值出来的 1/w），LINEAR 用 `(far-dist)/(far-near)`，EXPONENTIAL 用 `expf(-density*dist)` |
+
+### 3. 三个设计决定
+
+1. **参数全部用 int**（near×256、far×256、density×1000）。理由：这套硬浮点 ABI 在 KNI 上踩过
+   大坑（v03.11 的 `vita_fp_overlay.S`、v04.01 的 KNI float 返回值），**参数和返回值都走整数最安全**。
+2. **GL 端按状态缓存**（`g_fog_last[5]`）：一个场景通常只有一个雾，逐 submesh 调用最终只产生
+   两次 GL 调用。
+3. **软件后端与 GL 用同两条曲线**，所以 `3d=sw` 与 `3d=hw` 的观感一致（这条在 v04.02 的混合方程上
+   也这么做过）。
+
+### 4. 构建顺序（改 ROM 化类的必经流程，本轮再次验证）
+
+`Renderer`/`NativeBridge` 都是**参与 ROM 化**的类，改了它们必须重生成 ROM：
+
+```bash
+rm -f phoneme-midp/build/vita_arm/{ROMStructs.h,ROMImage.cpp} \
+      phoneme-midp/build/vita_arm/obj/arm/ROMImage.o
+bash phoneme-midp/build_vita.sh                                   # all: Java + romgen + native
+MIDP_EXTRA_GOAL=<...>/obj/arm/libobj.a bash phoneme-midp/build_vita.sh
+vita-port/build.sh midp
+```
+
+**顺带验证了一条机制**：新增的 `NativeBridge.setFog` 不在 NativesTable 里，romgen 按
+`jsr75_file.c:35-38` 描述的方式合成了 `Java_com_sun_m3g_NativeBridge_setFog`，
+`nm` 在最终 ELF 里看到它恰好 1 处 → **给 ROM 化类新增 native 方法不需要改任何表**。
+
+### 5. 验证（本轮实测）
+
+```
+error: 0（三步链路 a/b 各 0 error；c 首轮 1 个编译错误已修） / Build successful
+midp_vita_v04.41.vpk = 12,504,522 B
+nm: v3d_fog / vita_gl3d_fog / vita_sw3d_fog / Java_com_sun_m3g_NativeBridge_setFog  各 1 处
+VPK 内 Renderer.class 含 "setFog" 1 处（ROM 已重建）
+```
+
+**修过的编译错误**：`vita_gl3d.c: GL_FOG_HINT 未定义`（vitaGL 的 GLES 头没有这个宏）→
+去掉那行 `glHint`，注释写明原因。
+
+### 6. 未验证 / 风险
+
+- **真机没跑过**。判据：带雾的场景远景变淡、近处清晰；`3d=sw` 与 `3d=hw` 观感一致。
+- **M3G 的 EXPONENTIAL** 我按 `GL_EXP`（`exp(-density*dist)`）实现；若某游戏期望 `GL_EXP2`
+  曲线，改 `vita_sw3d.c` / `vita_gl3d.c` 各一行即可。
+- `vitaGL` 若在某些版本里没实现 `glFogf/glFogfv`，链接期会报 undefined；那时把 GL 路径的 fog
+  退化成"只在软件后端生效"（改动只有一处 `#if`）。
+- 雾只作用于 **M3G 路径**；2D（Canvas/LCDUI）与 v10 J3D 的占位渲染不受影响。
+
+
+## 2026-11-05 v04.42：M3G 硬件 alpha test（纠正 v04.02 的误判）—— 附"天空盒"项作废
+
+### 1. 先更正我上一轮的说法：M3G 1.1 **没有**天空盒
+
+上一轮我说"下一件做 `Background.SPHERE/CUBE` 天空盒"。查代码后**这条不成立**：
+
+- `grep -rn 'SPHERE\|CUBE' jsr184/src/share/core/common/classes/` → **零结果**；
+- 我们的 `Background.java` 只有 `BORDER(32)` / `REPEAT(33)` 与 `TOP_LEFT..BOTTOM_RIGHT`；
+- M3G 1.1 的 `Background` 只有"2D 背景图 + crop + repeat"，而这已经由 **v03.53 的
+  `drawBackgroundImage()`** 实现了（全视口 quad，BioCtrl 的 bg*.png 就是靠它显示的）。
+
+**SPHERE/CUBE 是 M3G 2.0 的功能**，不在我们实现的 1.1 里。roadmap 里那一条是凭记忆写错的，已删除。
+
+### 2. 改做：硬件后端的 alpha test —— 一个真实存在的画面缺陷
+
+`vita_gl3d.c` 从 v04.02 起带着这段注释：
+
+> "alphaThreshold is recorded but NOT enforced here: **GLES1 has no alpha test**
+> and this backend has no fragment shader to discard in … use the software backend."
+
+**这是误判**。GLES1.0 规范本来就有 `glAlphaFunc` + `GL_ALPHA_TEST`，而且 vitaGL 三样都提供：
+
+```
+vitaGL.h:97   #define GL_GREATER     0x0204
+vitaGL.h:158  #define GL_ALPHA_TEST  0x0BC0
+vitaGL.h:681  void glAlphaFunc(GLenum func, GLfloat ref);
+libvitaGL.a   glAlphaFunc / glAlphaFuncx（各 1 个符号）
+```
+
+**后果**：默认后端是 GL，所以 `CompositingMode.setAlphaThreshold()` 一直被忽略 ——
+树叶 / 栅栏 / 铁网这类"镂空贴图"在硬件路径上被画成**实心四边形**，只有手动切到 `3d=sw` 才对。
+
+**改动**（`vita_gl3d.c`，两处，共 ~12 行）：
+
+```c
+if (alpha_threshold > 0.0f) {
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, alpha_threshold);
+} else {
+    glDisable(GL_ALPHA_TEST);
+}
+```
+- 阈值语义与软件后端一致：软件端"alpha < threshold 丢弃"，GL 的 `GL_GREATER` 是"alpha > ref 才保留"，
+  两者等价（包括 `alpha == threshold` 的情形）；
+- 删掉那条只打一次的 "cannot discard" CRUMB 警告；
+- 函数头注释改成纠正后的说明（保留"v04.02 曾写错"的痕迹，避免以后再抄错）。
+
+### 3. 验证（本轮实测）
+
+```
+error: 0 / Build successful
+midp_vita_v04.42.vpk = 12,504,617 B
+nm: glAlphaFunc 与 glAlphaFuncx 都是 T（已从 libvitaGL 链接进来，不是未解析引用）
+```
+
+### 4. 未验证 / 风险
+
+- **真机没跑过**。判据：同一场景在 `3d=hw` 下树叶/栅栏出现透空（此前是实心），
+  与 `3d=sw` 观感一致。
+- `GL_ALPHA_TEST` 是全局 GL 状态，我们在每次 `setState` 里显式 enable/disable，
+  所以不会污染其它 draw（2D HUD 走的是另一条绘制路径）。
+- 若某个游戏把阈值设成 0（= 禁用），行为与之前完全相同。
+
+
+## 2026-11-05 v04.43：M3G `MorphingMesh` 权重（顶点变形）—— 附 POINT/LINE 项作废
+
+### 1. 又一条凭记忆写错的项：`PolygonMode` POINT/LINE
+
+`PolygonMode.java` 里确实有 `POINT = 168` / `LINE = 169` / `FILL = 170`，但
+**整个类没有任何 `setFillMode()` / `getFillMode()`**（只有 setCulling / setWinding / setShading /
+setTwoSided…）。也就是说常量在那儿，**没有任何 API 能让游戏选中它们** —— M3G 1.1 没有 fill-mode 概念
+（同 v04.40 的 `Background.SPHERE/CUBE`、v04.42 的"多纹理"一样，属于我凭记忆写进 roadmap 的假项）。
+**该项作废，无法实现。**
+
+### 2. `MorphingMesh` 是真的，而且之前确实没做
+
+`MorphingMesh.java` 自己的文件头就写着"this port renders the base VertexBuffer only"。
+M3G 的规则是
+
+```
+v = base + Σ_i w_i · (target_i − base)
+```
+
+权重存在 `MorphingMesh.weights`（`setWeights()` 写进去，`getWeights()` 读出来）。
+
+**实现**（`Renderer.java`，新增 `applyMorph()` + 一处调用）：
+
+| 点 | 做法 |
+|---|---|
+| 调用位置 | 在 `decodeAttr(pos, …)` 之后、`SkinnedMesh.applySkin()` 之前 —— 与 skinning 同一条"顶点后处理"链 |
+| **base 快照** | 先 `System.arraycopy` 出原始位置数组。**这是本实现最容易写错的地方**：若就地累加，第二个目标会以"已混合后的 pos"为基准，`w2·(t2 − base)` 被污染成 `w2·(t2 − (base + w1·Δ1))` |
+| 顶点数不等 | 只混合 `min(base.numVertices, target.numVertices)`，其余保持 base |
+| 每个目标的 scale/bias | 用同一个 `decodeAttr()`（文件格式的 `value·scale + bias`），不假设目标与基准编码相同 |
+| 权重为 0 | 跳过（避免一次 `decodeAttr`） |
+
+### 3. 验证（本轮实测）
+
+（构建结果见下节；本轮按"改 ROM 化类"的完整链路重跑：删 ROMStructs.h/ROMImage.cpp/ROMImage.o →
+`all` → `libobj.a` → `build.sh midp`）
+
+### 4. 仍未做
+
+- **`Appearance.layer` 多 pass 排序**：`setLayer/getLayer` 存在（-1..15），`Renderer` 仍不读。
+  要做就得把 `for (s = 0; s < nSub; s++)` 改成"按 layer 稳定排序后的顺序"，并跳过 `layer == -1`
+  的 submesh。属于渲染顺序改造，单独一轮。
+- **软件后端没有对应改动**：MorphingMesh 的混合在 **Java 层**（顶点数组），所以两个后端自动都受益 ——
+  这是选择在 `Renderer` 而不是后端做混合的原因。
+
+
+## 2026-11-05 v04.44：M3G `Appearance.layer` 绘制顺序 —— **M3G 收尾关闭**
+
+### 1. 之前的状态
+
+`Appearance.setLayer()/getLayer()` 从 v04.22 起就是 public 且校验 `[-1, 15]`，但 **`Renderer` 从不读它**：
+submesh 一律按定义顺序绘制。后果是"分层贴图"的模型（身体上的贴花、房间前的玻璃）会画错顺序，
+且**规范里 `layer == -1` 的含义是"不渲染"**，这一点也被忽略。
+
+### 2. 实现（`Renderer.java`，3 处）
+
+| 点 | 内容 |
+|---|---|
+| `layerOf(mesh, s)` | 取某个 submesh 的 layer；`appearances` 缺失或该项为 null 时返回 **0**（M3G 默认值） |
+| 排序表 | 在 `for (s < nSub)` 之前构建 `order[]`：先**过滤掉 `layer < 0`**，再按 layer **升序稳定排序**（插入排序；`nSub` 是各位数） |
+| 主循环 | `for (int s = 0; s < nSub; s++)` → `for (int oi = 0; oi < nDraw; oi++) { int s = order[oi]; … }`，循环体一行没动 |
+
+**为什么强调"稳定"**：同 layer 的 submesh 必须保持模型里的定义顺序。不稳定排序会让共享 layer 的
+贴花/玻璃在不同帧之间互换顺序，表现为闪烁。
+
+### 3. 验证（本轮实测）
+
+```
+三步链路（删 ROM 产物 → all → libobj → build.sh midp）：全部 0 error
+midp_vita_v04.44.vpk = 12,505,936 B
+VPK 内 Renderer.class: "layerOf" 1 处、"getLayer" 1 处（ROM 已重建）
+```
+
+### 4. M3G 收尾清单（关闭）
+
+| 项 | 版本 |
+|---|---|
+| `Texture2D` wrap(CLAMP) | v04.35 |
+| `Fog`（GL + 软件两条后端） | v04.41 |
+| 硬件 alpha test（纠正 v04.02 误判） | v04.42 |
+| `MorphingMesh` 权重 | v04.43 |
+| `Appearance.layer` 顺序 + 跳过 -1 | **v04.44** |
+| `Background.SPHERE/CUBE`、多纹理、`PolygonMode` POINT/LINE | **作废**（M3G 1.1 无可用入口，v04.40/42/43 逐条查证） |
+
+### 5. 未验证 / 风险
+
+- **真机没跑过**。判据：带分层贴图的模型（如"身体+贴花"）不再出现贴花被身体遮挡；
+  某 submesh 的 layer 设为 -1 时它消失。
+- 排序是**每个 Mesh 内部**的；`Graphics3D.render(Node)` 之间的顺序仍由游戏的调用顺序决定（这是规范行为）。
+- 若某游戏依赖"定义顺序"而把 layer 全设 0，行为与之前**完全一致**（稳定排序 + 全 0 = 原顺序）。
+
+
+## 2026-11-05 v04.45：虚拟键下移 + 状态栏半透明 + OGG Vorbis（+ 修 MP3 32 位溢出）
+
+### 1. 虚拟键下移（`vita_vkey.c`）
+
+状态栏（诊断浮层）固定在左上角 (2,2)，bar 模式下软键行 y=8、动作 d-pad y=60 正好压在它下面。
+新增 `#define VKEY_Y_SHIFT 20`，加到三处：
+
+| 位置 | 改动 |
+|---|---|
+| 软键行（bar） | `ly = 8` → `8 + VKEY_Y_SHIFT` |
+| 数字面板（bar） | 居中后再 `+ VKEY_Y_SHIFT`，并**clamp** `y0 + total_h <= SCREEN_H - 4` |
+| 动作 d-pad（bar） | `y0 = 60` → `60 + VKEY_Y_SHIFT` |
+| overlay 模式 | **不动**（面板在游戏矩形内，永远到不了左上角） |
+
+### 2. 状态栏半透明（`vita_diag.c`）
+
+显示控制器忽略 alpha，所以"透明"只能在 CPU 侧做。`fill_box()` 加 `alpha` 参数：
+`alpha >= 255` 走原来的纯填充（零额外代价），否则逐像素 `dst = src*a/255 + dst*(1-a)/255`（A8B8G8R8，保留目标 alpha 字节）。
+诊断框用 **170/255（~67%）**。
+
+代价核算（旧注释曾写"绝对不能读 framebuffer"，这里推翻了它并写明依据）：
+框约 300×16 = 4800 像素 → 读+写 ≈ 38 KB/帧，而 blit 本身每帧搬 884 KB，占 **< 5%**。
+
+### 3. OGG Vorbis（`vita_ogg.c` + `stb_vorbis.c`，v1.22 public domain）
+
+- 与 MP3/AMR/AAC 同一套 `vita_pcm_dec` vtable，**新增一个文件**即可，播放线程/缓冲/音量全部复用。
+- **我校正了自己的一个错误猜测**：先按"有 `stb_vorbis_open_callbacks`"写了 read/seek 回调，`grep` 后发现 **v1.22 没有这个 API**（只有 `open_memory` / `open_filename` / `open_pushdata`）——那份代码根本编不过。
+  改用 `open_memory`：整文件读进 native 堆（`OGG_MAX_BYTES = 8 MB` 上限），`stb_vorbis_seek` 需要随机访问，只有 memory 版提供。文件头注释记下了这个坑。
+- `stb_vorbis.c` **不进 CMakeLists**：`vita_ogg.c` `#include` 它，单独编译会重复定义每个符号。
+- MIME：`audio/ogg` / `audio/x-ogg` / `audio/vorbis` / `application/ogg` / `application/x-ogg`。
+- 采样率换算与 MP3 **完全同路径**（最近邻源帧），两者不会在音高/时长上出现分歧。
+
+### 4. 顺手修掉一个既有真 bug：`t * rate` 32 位溢出（MP3 + OGG）
+
+`vita_mp3.c` 的 `mp3_read()` 里 `long need_src = (t * rate) / OUT_RATE;`，ARM 上 `long` 是 32 位，
+`t * rate` 在 **t ≈ 48700 输出帧（44.1 kHz，约 1 秒）** 就溢出。实测对照（`int32_t` 乘 vs `long long`）：
+
+```
+t=40000    32-bit 36750        64-bit 36750       ok
+t=48700    32-bit -44735       64-bit 44743       MISMATCH
+t=200000   32-bit 4793         64-bit 183750      MISMATCH   <- 读出 4793 = 回到开头附近
+t=8640000  32-bit -25585       64-bit 7938000     MISMATCH   <- 3 分钟 BGM
+```
+
+也就是说 **ARM 上 MP3/OGG 播过 1 秒后取源帧的索引就错了**（表现为 BGM 跳回开头/卡住，很容易被当成"游戏本身的效果"）。
+两处都改成 `(long)(((long long)t * (long long)rate) / (long long)OUT_RATE)`；`OUT_RATE` 是编译期常量，
+编译器把它变成乘+移位，**不会引入 libgcc 的 64 位除法**。
+
+### 5. 验证（本轮实测，非"编过了"）
+
+宿主端到端（`debug/tools/oggtest/ogg_test.c` + 维基百科 `Example.ogg`，104,793 B）：
+
+```
+open OK: 44100 Hz, 2 ch, 6104 ms, 104793 B     <- 该文件实际 6.1 s
+first 4800 frames: 4800 returned, rms 454.4    <- 非静音
+next 1 s: 48000 frames
+seek 5000 ms: OK, 4800 frames, rms 815.7        <- 跳到别处（RMS 不同）
+rewind: 4800 frames, rms 454.4                  <- 与开头逐帧一致
+drained: 288194 more frames                     <- 4800+288194 = 292,994 ≈ 6104 ms × 48 kHz
+```
+
+ARM 侧：`vita_ogg.c` 用 **vitasdk 的 gcc 单独编过 0 warning**（见下条坑）；全量 `build.sh midp` 0 error；
+VPK 12,542,478 B（比 v04.44 +36.5 KB ≈ stb_vorbis）；`.sym` 含 `vita_dec_ogg` + `stb_vorbis_open_memory`。
+
+### 6. 环境坑：这台机器上 `gcc` 是交叉编译器
+
+`which gcc` → `/usr/local/vitasdk/bin/gcc`，`gcc -dumpmachine` → **arm-vita-eabi**。
+所以"用 gcc 编一下试试"实际编的是 ARM 目标文件（好处：等于顺手做了 ARM 验证），
+但跑宿主测试必须 `/usr/bin/gcc -B/usr/bin`（`-B` 是必须的，否则它仍会用 vitasdk 的 `as`，报 `as: unrecognized option '--64'`）。
+
+### 7. 未做 / 风险
+
+- **真机没跑过**。判据：`alog` 出现 `pcm buffered: ogg 44100 Hz 2 ch …`；OGG BGM 播过 1 分钟不跳回开头；`3d`/诊断浮层下按键区不再压字。
+- OGG 占 native 内存 = 文件大小（≤ 8 MB），播完释放；同时开多个 OGG 播放器会叠加。
+- stb_vorbis 拒绝 floor 0（2004 年前的 OGG）与 chained stream，表现为"无法播放"而非杂音。
+- **`javax.obex` / JSR-256 `Condition` / PIM 本轮未做**（用户本轮一并提出，但四项各自都要规范核对 + 独立构建验证，本轮先把音频与 UI 两项做实）。
+
+
+## 2026-11-05 v04.46：JSR-256 条件监视（`Condition` / `Channel`）—— 补齐 v04.37 明确留下的缺口
+
+### 1. 缺口是什么
+
+v04.37 的记录里自己写了一行："`javax.microedition.sensor.Condition` / `ConditionListener` 未实现
+（`OP_*` 常量、限值条件），用到它们的 MIDlet 仍会 `NoClassDefFoundError`"。
+更关键的是**连 `Channel` 接口都没有**——而规范里 `addCondition` 是定义在 **`Channel`** 上的
+（`ConditionListener` 的 javadoc 原文："add Condition objects to Channel objects"），
+`SensorConnection` 只提供 `getChannel(ChannelInfo)`。所以不是"补两个接口"，而是要补一整条链。
+
+### 2. 规范核对（全部逐字取自 nikita36078 镜像 + constant-values 页）
+
+```
+Condition (接口)  OP_EQUALS="eq" OP_GREATER_THAN="gt" OP_GREATER_THAN_OR_EQUALS="ge"
+                  OP_LESS_THAN="lt" OP_LESS_THAN_OR_EQUALS="le"
+                  boolean isMet(double);  boolean isMet(Object)
+LimitCondition    (double limit, String op)   NPE=op null, IAE=op 不在上表
+                  isMet(Object) 恒 false
+RangeCondition    (lower, lowerOp, upper, upperOp)
+                  lowerOp ∈ {gt,ge}; upperOp ∈ {lt,le}
+                  IAE: lower>upper | lower==upper 但非(ge 且 le) | op 非法
+                  isMet(Object) 恒 false
+ObjectCondition   (Object limit)  NPE=limit null; isMet(Object)=limit.equals(v); isMet(double) 恒 false
+Channel           addCondition / getChannelInfo / getChannelUrl / getConditions
+                  removeAllConditions / removeCondition / removeConditionListener
+                  语义: 同一 (listener, condition) 对重复添加静默忽略;
+                        condition 命中后**立即从 Channel 移除**再通知（防刷屏）;
+                        removeCondition 用**实例相等**
+SensorConnection  Channel getChannel(ChannelInfo)  ← 参数也是**实例相等**
+                  （原文："is compared using instance equality and therefore needs to be
+                   instance previously returned from SensorInfo.getChannelInfos()"）
+```
+
+`getChannel(ChannelInfo)` 的签名一开始被 javadoc 页面截断，改用 `curl` 直接 grep HTML 源码
+才拿到（`<H3>getChannel</H3><PRE>Channel <B>getChannel</B>(ChannelInfo&nbsp;channelInfo)`）——
+fetch 工具对大页面会截掉中段，**签名类的东西要用 curl + grep**，这条已记进 BUILD_QUICKSTART 思路。
+
+### 3. 实现（7 个新文件 + 2 处改动）
+
+| 文件 | 内容 |
+|---|---|
+| `Condition.java` | 接口 + 5 个 `OP_*`（值是两字母串，因为同一批串也用于 sensor URL）；比较必须用 `equals` 而非 `==`（游戏可能传自己的 `new String("gt")`，测试里专门验了这条） |
+| `ConditionListener.java` | `conditionMet(SensorConnection, Data, Condition)` |
+| `LimitCondition.java` | 5 种算子 + 构造校验；`isMet(Object)` 恒 false（规范明确） |
+| `RangeCondition.java` | 4 种开闭形态 + 规范列出的**三条** IAE；相等限值仅在两端都闭时合法 |
+| `ObjectCondition.java` | 用 **limit 自己的 `equals()`** 比较 |
+| `Channel.java` | 接口；`getChannelUrl()` 的 `<channel>` grammar **未能逐字核对**（页面截断），实现为 `name=op:limit` 以 `&` 连接，并在注释里标注"本移植无 PushRegistry，此串仅作标识" |
+| `VitaChannel.java` | 两个平行 `Vector`（`listener[i]` 拥有 `condition[i]`），保住注册顺序=通知顺序与实例相等；`checkValue()` 在**锁内摘除、锁外通知**（监听器可以在 `conditionMet` 里回调 `addCondition`） |
+| `SensorConnection.java` | 加 `Channel getChannel(ChannelInfo)` |
+| `VitaSensorConnection.java` | `chans[]` 懒建并复用（保证 `getChannel` 多次返回同一 Channel）；`getChannel` 用 `==` 匹配，外来实例抛 IAE；**`collect()` 里每个值都调 `checkValue()`** ⇒ 同步 `getData()` 与异步泵线程**都**会触发条件 |
+
+`Condition` 命中后自动移除这点实现得很直白：先在锁内把 `(listener, condition)` 从两个 Vector 摘掉，
+再构造单值 `Data`（`validity` 恒 **true**，规范要求）并回调。所以一个值最多触发一次通知，不需要额外节流。
+
+### 4. 验证（本轮实测）
+
+**宿主端到端：62 项检查全部通过（`PASS=62 FAIL=0`）**，测试在
+`debug/tools/sensortest/javax/microedition/sensor/SensorConditionTest.java`（放在同包，才能直接
+`new VitaSensorConnection(...)`）。覆盖：5 种算子 × 边界、5 种异常类型（NPE/IAE/ISE 各就各位）、
+4 种 range 形态 + 3 条 IAE + "相等限值两端闭合法"、`getConditions` 计数、重复对忽略、
+`removeCondition` 实例相等、`conditionMet` 收到的是**注册的那个实例**且 `Data` 单值+validity、
+**命中后自动移除**（第二次 `getData` 不再触发）、`getChannel` 实例相等/外来实例 IAE、
+`getChannelUrl` 前缀与算子、关闭后 `addCondition`/`removeAllConditions` 抛 ISE。
+
+构建：`build.sh midp` **0 error，BUILD_EXIT=0**；
+`midp_vita_v04.46.vpk = 12,548,825 B`（较 v04.45 +6,347 B ≈ 7 个新类）。
+
+VPK 内 `data/J2ME00001/midp_system.jar` 逐类核对（脚本断言，非肉眼）：
+`Channel` `Condition` `ConditionListener` `LimitCondition` `ObjectCondition` `RangeCondition`
+`VitaChannel` **全部 OK**，sensor 包共 25 个条目。
+
+### 5. 未验证 / 风险
+
+1. **真机没跑过**。判据：`getChannel(conn.getSensorInfo().getChannelInfos()[0])` 返回非 null；
+   `addCondition(..., new LimitCondition(-1000,"gt"))` 后第一次 `getData(1)` 收到一次 `conditionMet`，
+   再 `getData(1)` **不再**收到。
+2. `getChannelUrl()` 格式未逐字核对（见上），不影响功能。
+3. 条件检查在 `collect()` 里**逐值**做，每值一次 `synchronized`（50 Hz × 3 轴 = 150 次/秒），
+   可忽略；但若某游戏注册了几十个条件，仍是线性扫描。
+4. 仍无 **object 类型 channel**（`VitaChannelInfo` 恒 `TYPE_DOUBLE`），所以
+   "numeric Condition 加到 object channel → IAE" 这条**代码里有、测试没覆盖**（造不出 object channel）。
+
+
+## 2026-11-05 v04.47：log187 "启动即闪退" 判读 —— JIT 的 icache flush 一直是空操作
+
+### 1. 现象与第一层证据（只有日志和 dump，没有源码改动可参考）
+
+log187 = v04.46，游戏 `com.app.filemanager.FileManagerMIDlet`。`vm_boot.log` 里 **VM 启动了两次**
+（+15.7 s 与 +80.7 s），两次都在 `[preload] done` 之后**没有下文**：
+
+```
+[preload] done defined=1091 entries=1165 fast=8
+[preload] phases2 sym_us=100500 verify_us=0 ...
+[jarmem] post ...
+（然后什么都没有）
+```
+
+`crumb.log` 里同一轮有 `vm UseCompiler(pre)=1 (jit policy=2)`，但**没有** `vm UseCompiler(post)=`
+和 `runMidlet returned` —— 这两行在 `vita_main.c` 里是 `runMidlet()` **返回之后**才打印的。
+⇒ 不是 Java 异常退出，是 `runMidlet()` 内部的**进程级崩溃**。
+
+### 2. dump 判读（psp2dmp）
+
+`base` 命令 FAIL（没有线程睡在 delay stub 里当锚点），按 SKILL 改用 `MODULE_INFO`/寄存器语义：
+
+```
+thr0 J2ME00001   tid=40010003  pc=868348ac  lr=868340f8  sp=81c3ec78
+thr2..thr8（lifecycle/lifeui/motion/shot/tone/watchdog/cldc_ticker）
+                 pc=811e7aa8  lr=81064c45   ← 全部睡在同一个 stub，正常
+thr1 SceCommonDialogWorker  pc=e0015a64 r12=0x65  ← 内核里阻塞，正常
+```
+
+**关键**：只有主线程的 pc 是"野"的，而且 `0x868348ac` 落在
+`0x85d00000 + 0xb348ac` —— 正是 crumb 里那一行：
+```
+[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: 0x85d00000, 15728640 bytes
+       => THE JAVA HEAP IS EXECUTABLE (compiler area included); JIT may run
+```
+也就是 **pc 在 Java 堆里**（JIT 的 compiler area，ObjectHeap 从托管堆里切出来的）。
+`mem 8683486c 96` 读不出指令（该页未进 dump，返回的是别的页/零）——**这条线索到此为止，
+不能靠反汇编 dump 定案**。
+
+**把 dump 挖到底之后能确认/不能确认的（v04.47 复盘，避免下次重复劳动）**：
+
+能确认：
+- 全部 15 个 PT_LOAD 故障页：`0x81481000`(.rodata 一页) + `0x81be1000` + `0x81c01000`(0x40000，线程栈)
+  + 12 个 `0xe0xxxxxx` 内核页。**没有一页来自 `0x85d00000` 的堆块** ⇒ JIT 生成的代码本身
+  不在 dump 里，所以**不可能**从这份 dump 反汇编出"出错的那条指令"。
+- 9 个线程逐一套出来（`_thread_regs` 的 `p += size` 变长条目）：只有 thr0 的条目尾部
+  `+0x170=0x000000f5`、`+0x174=0xe69248c4` 非零，其余 8 个线程这两处**都是 0**。
+  其他线程 pc 全部 `0x811e7aa8`（vitasdk 的 delay stub，无常规符号）、lr 全部 `0x81064c45`，
+  外加 thr1 阻塞在内核 `r12=0x65` —— 即"只有主线程发生了异常"。
+- `SUMMARY_INFO` 是线程状态表（17 个条目，`{status,size,size}`），`EVENT_LOG_INFO` 是内核模块
+  事件日志（`NPXS19999`/`TOOLBOX20`/`J2ME00001`），**两者都不含异常类型**。
+
+不能确认（不要再试）：
+- **fault 类型**：log174 的判据是 `+0x170=0x0d`(permission fault) 且 `+0x174==pc`，本次是
+  `0xf5` 且 `+0x174=0xe69248c4`（内核地址段，≠ pc）。没有 psp2core 结构文档，**不硬解读**。
+- **调用链**：sp(`0x81c3ec78`) 处的值混着数据和陈旧返回址（例如 `PoolThread_Spawn+0x18`、
+  `wma_put_string+0x1c` 都在里面，与 JIT 无关），JIT 代码不保证 ARM 标准帧指针链。
+- **用 `.sym` 符号化**：`midp_vita_v04.4x.sym` 是 **vita-elf-create 的二进制格式**，不是文本
+  `nm` 输出，grep/awk 读不了。
+- **用当前 ELF 比对**：`vita-port/build/cmake/midp_vita` 已被 v04.47 的重建覆盖，而 dump 是
+  v04.46；拿 dump 页 `0x81481000` 的内容去 v04.47 ELF 里搜只会得到假匹配
+  （我一度算出 `delta=0x10f80`，不是 0x1000 的倍数 ⇒ 假的，已丢弃）。
+  **教训：分析某次 dump 之前先确认本地 ELF 还是那个版本**，否则 `base` 失败后就无路可走。
+- **第二个 dump**（`...0x0000082a0b-eboot.bin.psp2dmp.tmp`）是**写了一半**的：
+  解压 2,414,592 B，而 note 解析需要 5,338,972 B ⇒ `psp2dmp.py` 直接 struct.error，不可用。
+
+⇒ 所以"崩在 JIT 代码"这个结论**不是**从 dump 的指令流得出的，而是"pc 落在堆块内 + 日志里
+`runMidlet()` 没返回"两条合起来的；而"为什么 JIT 代码会出错"是**反汇编 ELF**（`OsMisc_flush_icache`
+只有 2 条指令）加 `vita_jitmem.h` 的 v03.71 记录定案的。dump 在这里的作用是**排除法**：
+排除了解释器路径（其余线程正常）、排除了内核阻塞、排除了"代码页不可执行"能被直接观测。
+
+
+### 3. 为什么这一版才崩：JIT 第一次真的跑起来
+
+`runMidlet.c`（v04.29 "PREDICT, DO NOT QUERY"）的逻辑是**预测**而非查询：
+
+```
+heap_mb 由用户设置（设置→Java 堆）
+heap_mb > 0 && heap_mb <= 15  ⇒ 预测"堆会落在 VM block 里" ⇒ 保持 UseCompiler=1（JIT 开）
+否则                          ⇒ 注入 "-int" ⇒ JIT 关
+```
+
+- log187 的堆正是 **15 MiB**（15728640）⇒ 预测成立 ⇒ **JIT 开**；
+- log186 是 **v04.28**（不是我以为的 v04.45！先查了 `boot_log.txt` 的 version 才没搞错），
+  那一轮堆是 32 MB（`chunk0 needs 33554433 ... -> malloc`）⇒ 自动 `-int` ⇒
+  `vm UseCompiler(post)=0`、`jit: round 0 done: compile-requests=0 produced-code=0`。
+
+**所以 log186 从未跑过"可执行堆 + JIT 开"这个组合，log187 是第一次。**
+
+### 4. 根因：`OsMisc_flush_icache()` 在 Vita 上是空函数
+
+链路（每一环都有证据）：
+
+| 环 | 证据 |
+|---|---|
+| JIT 把代码写进堆里的 compiler area | crumb 的 `[heapmem] chunk0 BACKED ... compiler area included` |
+| 写完调 `JVMCompiledMethod::flush_icache()`（`USE_SINGLE_METHOD_FLUSHING=1`） | `BuildFlags.hpp:714`；`CompiledMethod_arm.cpp:157` |
+| 它是**尾调用** `OsMisc_flush_icache(code_start, size)` | 反汇编：`add r0,r0,#12` / `ubfx r1,r1,#0,#21` / `b OsMisc_flush_icache` |
+| 而 `OsMisc_flush_icache` 是**空的** | `OsMisc_vita.cpp` 用 `__builtin___clear_cache`；`vita_jitmem.h` 的 v03.71 记录写明 "VitaSDK GCC folds `__builtin___clear_cache()` to nothing (-O1 and above emit no code at all)"；v04.47 反汇编复核：该符号处**只有 2 条指令**，下一个函数紧接着开始 |
+
+`mcr p15` 也救不了：cache 维护在 ARMv7-A 是 **PL1**，应用跑在 PL0。
+唯一可用的是 `sceKernelSyncVMDomain`（JITPROBE 早就验证过它有效：
+`VM store survived` / `VM generated code returned 42`），但 `vita_jit_flush_icache()` 需要
+`g_area_base`，而 crumb 里**没有 `[JITAREA]`** ⇒ `vita_jit_code_area_acquire()` 从未被调用
+⇒ `g_area_base == NULL` ⇒ 那条路什么都不做。
+
+结论：**JIT 写了代码、icache 里还是旧内容、第一次 `bx` 进新方法就执行垃圾**。
+
+### 5. 次因：崩一次之后必然再也起不来（VM block 泄漏）
+
+```
+第一次：chunk0 BACKED BY VM-DOMAIN MEMORY (15728640)   ← 成功
+（崩）
+第二次：VM alloc of 16777216 bytes (MiB-aligned) FAILED: 0x80024b0b
+```
+崩溃路径不走 `[heapmem] freeing chunk0 (VM block uid=...)`（log186 正常退出时有这一行），
+所以第一次的 15 MiB 一直占着；第二次又要 16 MiB ⇒ `sceKernelAllocMemBlockForVM` 直接失败
+⇒ 连 Java 堆都拿不到。**用户看到的就是"点了就闪退，重进还是闪退"**。
+
+### 6. 修复（v04.47，两处，都带 `#if defined(VITA)` 上下文）
+
+| 文件 | 改动 |
+|---|---|
+| `phoneme-cldc/src/vm/share/runtime/OsMemory.cpp` | 新增 `extern "C" int vita_vm_flush_icache(void*, int)`：遍历 `chunks_vm[]`，对每个 VM block 调 `sceKernelSyncVMDomain(uid, start, size)`，成功即返回 1。放在 `vita_heap_executable()` 之后（`chunks_vm[]` 是该文件的私有表） |
+| `phoneme-cldc/src/vm/os/vita/OsMisc_vita.cpp` | `OsMisc_flush_icache()` 先调 `vita_vm_flush_icache()`，失败（地址不在任何 VM block）才退回 `__builtin___clear_cache` |
+
+**频率**：`USE_SINGLE_METHOD_FLUSHING=1` ⇒ 每个**编译完成的方法**一次 syscall（尾调用，整方法
+一次 flush），不是每条指令一次 —— 那个开销是不能接受的（`CompiledMethod_arm.cpp:151` 的
+per-4-byte 路径只在 `USE_SINGLE_METHOD_FLUSHING=0` 时才走）。
+
+### 7. 验证（本轮实测）
+
+```
+重建：./rebuild_vm.sh → VM_OK（libcldc_vm.a 14:43:30，含 OsMemory.o / OsMemory_vita.o / OsMisc_vita.o）
+      → build_vita.sh ×2 → MIDP_A_OK / MIDP_B_OK → vita-port/build.sh midp → CHAIN_DONE
+反汇编对照（同一符号，修复前后）：
+      修复前 0x8111f07c: 只有 2 条指令，下一个函数紧接着开始（= 空函数）
+      修复后 0x8111f0fc: push {r4,lr} / bl 8111ecd0 <vita_vm_flush_icache> / pop {r4,pc}
+.sym: 8111ecd0 T vita_vm_flush_icache   8111f0fc T OsMisc_flush_icache
+VPK:  midp_vita_v04.47.vpk = 12,549,094 B
+```
+
+`rebuild_vm.sh` 日志里那条 `collect2: error: ld returned 1 exit status` 是 **`cldc_vm_g`
+可执行文件**的链接失败，`VM_BUILD.md` 明确写着"vita-port 只需要 `dist/lib/libcldc_vm.a`，
+不需要 cldc_vm_g，忽略即可" —— 库本身是好的（ELF 里已能反汇编到新代码）。
+
+### 8. 未验证 / 上机判据 / 回退
+
+1. **真机没跑过**（这是本轮唯一没做到的事）。上机判据（按顺序）：
+   - crumb 出现 `[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY ... JIT may run`
+   - 出现 `*** runMidlet: JIT ENABLED - heap_mb=15 ...`（说明预测成立、JIT 真的开着）
+   - 游戏能进；退出时出现 `vm UseCompiler(post)=1` 和 `runMidlet returned 0`（v04.46 里这两行根本没有）
+   - 若仍崩：先看 pc 是否还在 `0x85d00000..0x86d00000`（堆内）。**还在** ⇒ 还有别的 flush 路径
+     （`arm_flush_icache` 是 TemplateTable 里的另一条），需要同样接上；**不在堆内** ⇒ 是另一个 bug。
+2. **回退方案（用户可立即自救）**：把 `设置 → Java 堆` 改回 **32 MB**（或 `jit=0`）。
+   两者都会让 `runMidlet.c` 注入 `-int`，JIT 关掉，游戏按 v04.28 的行为跑（那条路是稳的）。
+3. **VM block 泄漏未修**：崩溃后仍会占着 15 MiB 导致后续启动拿不到堆。本轮不改（flush 修好后
+   不该再走到那里），但要记住：**以后任何"第一次能跑、之后不行"的现象，先去 crumb 找
+   `[heapmem] freeing chunk0` 有没有出现**。
+4. **构建方式（重要，已记进 BUILD_QUICKSTART）**：改 `phoneme-cldc/src/vm/**` 之后**不能**直接
+   `cd phoneme-cldc/build/vita_arm && make` —— 缺 `JVMBuildSpace`/`JDK_DIR`/`TOOLS_DIR` 会让
+   `OUTDIR` 变成 `/build/vita_arm`，报 `mkdir: cannot create directory '/build': Permission denied`。
+   必须用 `./rebuild_vm.sh`（VM_BUILD.md 配套脚本），它自己 export 这些变量并只重打包库成员。
+
+
+## 2026-11-05 log188 分析（v04.47 真机）+ v04.48：15MB 堆是不可分配的，我 v04.29 的预测把崩溃引回来了
+
+**结论先说**：这次闪退是 **v04.29 我的判断错误**引入的，不是新问题。
+`pc == lr == 0x82dcf814`，在 Java 堆内部，故障状态 0x0d（取指权限）——
+与 log181 完全同一个签名，即 v03.75 本该已经关掉的那个。
+
+### 事实链（log188）
+
+启动正常，v04.29 的两处修复都生效了：
+```
+*** runMidlet: JIT ENABLED - heap_mb=15 will be placed in a VM-domain block
+*** runMidlet: midpInitialize OK
+*** runMidlet: heap_mb=15 applied -> Java heap 15728640 bytes
+```
+探针也通过（`VERDICT: VM DOMAIN WORKS. ... 1 MiB minimum block`）。
+
+然后堆的 VM 块分配失败：
+```
+[heapmem] OpenVMDomain rc=0x00000000
+[heapmem] VM alloc of 16777216 bytes (MiB-aligned) FAILED: 0x80024b0b -> malloc
+```
+`0x80024b0b` = `SCE_KERNEL_ERROR_MEMBLOCK_OVERFLOW`（`psp2/kernel/error.h:116`）。
+
+于是堆回退到普通 `malloc` —— **不可执行**。但 runMidlet.c 已经按预测
+打印了 `JIT ENABLED`，`UseCompiler` 保持 1，编译器区落在不可执行堆里。
+JIT 生成代码后首次调用 → 取指失败 → 闪退。
+
+### 我错在哪
+
+v04.29 我写的是：
+> 15 MiB -> 15736832 -> 取整 16777216 **FITS (exactly)**
+> 16 MiB -> 16785408 -> 取整 17825792 装不下
+
+**只算了取整边界，没验证 16 MiB 块本身能否分配。** 我依据的是
+「16 MiB 是 API 文档上限，所以必然可分配」。log186 其实已经测出反例，
+我当时没把它当回事：
+
+| log186 轮次 | 堆设置 | 请求 | 结果 |
+| --- | --- | --- | --- |
+| 第 2 轮 | 15 MB | `VM alloc of 16777216` | **FAILED 0x80024b0b** |
+| 第 3 轮 | 14 MB | `BACKED BY VM-DOMAIN MEMORY: 0x85c00000, 15728640` | **成功** |
+
+**真实上限是 15 MiB 块 = 14 MB 堆**，不是 16 MiB 块 = 15 MB 堆。
+这个证据在上一次分析里就摆在我面前，我却在「附带发现」里写
+「14MB 那个 0x80024b0b 未查，先别管」—— 结论就是从这里错的。
+
+### 修法（v04.48），按可信度从高到低
+
+1. **`OsMemory.cpp` 在堆块失败时强制关编译器**（最可靠，因为它是测出来的。
+   不是预测）。新增 `vita_heap_not_executable(i, why)`，在全部四条失败
+   路径调用：尺寸超范围、`AllocMemBlockForVM` 失败、拿不到 base、写不进去。
+   置 `UseCompiler = false`、`CompilerAreaPercentage = 0`、
+   `CompilerAreaSlack = 0`，并打一行说明是哪个失败触发的。
+   依据：`Compiler::compile()` 每个 tick 都检查 `!UseCompiler`
+   （`Compiler.cpp:235`），所以这能真正阻止生成代码。
+2. `runMidlet.c` 的 `JIT_MAX_HEAP_MB` 由 15 改为 **14**，对齐实测。
+3. 设置页「Java 堆」不再提供 15MB 选项：
+   `steps[] = { 0, 14, 12, 10, 8, 6 }`，提示条件改为 `<= 14`。
+
+### 与 log187 的关系
+
+log187（v04.46）崩在 `pc=0x868348ac`，是在 JIT 跑了一段时间之后；
+log188（v04.47）立刻就崩。差别是 v04.47 把
+`OsMisc_flush_icache()` 接到了 `sceKernelSyncVMDomain`—— 但那不是
+本次的原因，本次原因是堆压根没进 VM 块，JIT 代码落在不可执行内存。
+
+### 教训（重要）
+
+1. **API 文档写的上限不等于实际可分配的上限。** 遇到
+   `MEMBLOCK_OVERFLOW` 就是预算不够，要往小试，不要往「是不是尺寸非法」想
+   （那是 `ILLEGAL_MEMBLOCK_SIZE` = `0x80024b05`，本次不是它）。
+2. **同一份日志里已经有反例时，不要把它列成「未查」就跳过。**
+   log186 第 2 轮就是 15MB 失败的现场，我却把它写成待查项。
+3. **预测式判定必须配一个「事后兜底」**。凡是「提前决定、错了会崩溃」
+   的地方，都要在真实结果出来之后再检查一次并纠正。本次兜底在
+   `OsMemory.cpp`，位置比 `runMidlet.c` 更晚、信息更全。
+4. 先测量再写死上限：`log186` 的 14MB 成功 / 15MB 失败就是全部需要的实验，
+   不需要新增探针。
+
+## 2026-11-05 log189 分析（v04.48 真机）：**JIT 首次真正生效**
+
+### 结论
+
+**JIT 生效了。这是本项目第一次真机跑到 JIT 编译产物上执行。**
+
+第 3 轮（文件管理器，`heap_mb=14`）：
+```
+[heapmem] OpenVMDomain rc=0x00000000
+[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: 0x85d00000, 15728640 bytes
+          => THE JAVA HEAP IS EXECUTABLE (compiler area included); JIT may run
+vm UseCompiler(post)=1 <- actual round mode
+jit: round 0 done: UseCompiler=1 compile-requests=204 produced-code=204
+jit: compiler area size=2935580 used=95568
+jit: first code @0x868334e4 ...
+```
+**`compile-requests=204 produced-code=204` —— 204 个方法被编译并产出代码。**
+
+首个 JIT 代码地址 `0x868334e4` 落在 VM 块 `0x85d00000..0x86c00000` 内，
+偏移 `0xb334e4`（11.20 MiB），确认在可执行内存里。
+
+### v04.48 的三项修复全部验证通过
+
+| 修复 | 验证 |
+| --- | --- |
+| 上限 15→14 MB | 15MB 时打 `heap_mb=15 is above 14MB ... -> -int`，按预期退回解释器 |
+| 设置页去掉 15MB | 菜单可选到 14MB，生效 |
+| OsMemory 兜底 | 第 4 轮 VM 分配失败时打出 `forcing UseCompiler=0`，**没有闪退** |
+
+兜底那行是本次最有价值的输出：
+```
+[heapmem] VM alloc of 15728640 bytes (MiB-aligned) FAILED: 0x80024b0b -> malloc
+[heapmem] VM block allocation failed -> the Java heap is NOT executable; forcing
+ UseCompiler=0 (the JIT would fault on its first call, this is the log188 crash)
+```
+log188 的崩溃路径被真正切断了。
+
+### JIT 有效性数据（第 3 轮，文件管理器）
+
+- 编译请求 204，产出 204（100% 成功率）
+- 编译器区 `size=2935580`（2.80 MiB），`used=95568`（93 KB，3.3%）
+- 堆 15 MiB 块，首个代码偏移 11.20 MiB —— 编译器区在堆靠后位置，符合
+  `CompilerAreaPercentage=20` 的布局
+
+### 本次崩溃（第 4 轮，极品飞车）与 JIT **无关**
+
+崩溃点（coredump 符号化）：
+```
+pc = 0x8116d528  ->  _glTexImage2D_FlatIMPL  (vitaGL/source/textures.c:602)
+lr = 0x8116d4a8  ->  _glTexImage2D_FlatIMPL  (textures.c:770)
+```
+不是堆内地址，不是 JIT 代码地址，**是 vitaGL 的纹理上传**。
+
+而且该轮 JIT **已经被兜底关闭**（`forcing UseCompiler=0` 在前面就打出来了），
+崩溃时 `UseCompiler=0`，走的是解释器。
+
+**直接原因：内存耗尽/碎片**。观察 `arena` 逐轮变化：
+| 轮次 | arena | free | max |
+| --- | --- | --- | --- |
+| 0（未开JIT，32MB堆） | 22488K | 15900K | 13K |
+| 1（同上） | — | — | — |
+| 2（14MB堆 + JIT开） | 7084K | 496K | 11K |
+| 3（14MB堆，JIT被关） | 7076K | 488K | 3K |
+
+第 3 轮 `free=496K`，第 4 轮要 15 MiB 的 VM 块 → `0x80024b0b`
+（`SCE_KERNEL_ERROR_MEMBLOCK_OVERFLOW`，预算不够）。**JVVM 堆重复申请
+在进程内存碎片化的状态下拿不到连续 15 MiB**。
+
+注意 VM 块本身有释放（`[heapmem] freeing chunk0 (VM block uid=0x4004013d)`），
+所以不是块泄漏，而是 **malloc 侧 newlib arena 已被前面的轮次吃满**
+（前两轮 32MB 堆留下的碎片）。
+
+### 已知但未修的问题
+
+1. **连续启动游戏，第 4 个左右必然失败**（内存碎片）。
+   上一轮 32MB 堆的残留 + 本轮 15 MiB VM 块无法共存。
+   可能的方向：每轮结束强制 `malloc_trim`、或把堆块改成可复用
+   （保留 VM 块跨轮，只重置内容）、或第 N 轮后强制重启进程。
+2. `jit: first code @0x868334e4 block-info rc=0x80022007 access=0x0 base=0x0`
+   —— `sceKernelGetMemBlockInfoByRange` 返回 `0x80022007`（未知错误）且
+   base=0、size=0。这只是诊断查询失败，不影响执行（代码确实跑了）。
+   如果以后要靠这个 API 判断「某个地址是否可执行」，需要注意它对本
+   VM 块不工作。
+3. NFS 的 `ArithmeticException: singular transform`（`Transform.invert()`）
+   仍在，与 JIT 无关，是既有的 M3G 数学问题。
+4. `[gfx] fill trace budget exhausted (120)` —— 帧缓冲填充调试追踪超预算，
+   说明该轮触发了大量 `fillRect`。
+
+### 下一步（优先级）
+
+1. **先确认 JIT 的实际速度收益**：log189 第 3 轮是文件管理器（几乎无渲染），
+   不能体现 JIT 价值。需要一次**生化危机 / NFS 在 14MB 堆 + JIT 开启下完整跑起来**
+   的日志，对比解释器的帧时间。
+2. 修内存碎片（否则用户永远启动不了第 4 个游戏）。
+3. 不要在 15MB 上再纠结 —— 已由实测和兜底双重确认不可用。
+
+### 教训
+
+1. **兜底比预测可靠**。预测（runMidlet.c）会因信息不足而错，兜底
+   （OsMemory.cpp，在结果已知之后）不会。凡是「提前决定、错了会崩」的地方，
+   都必须配一个事后检查。
+2. **崩溃地址在代码段不等于「不是我们的问题」**，要符号化到具体函数。
+   本次 `pc` 落在 vitaGL 的 `_glTexImage2D_FlatIMPL`，与 JIT 完全没有关系。
+3. **同一进程内反复重启 VM，内存会碎片化**。`arena` 从 22488K 掉到 7084K
+   就是证据；这类问题不会在单轮测试里出现。
+
+## 2026-11-05 log189 的 coredump 重新判读（v04.48）：崩的是 BioMain，不是 NFS，也不是 vitaGL
+
+**更正上一节"log189 分析"**：那一节把 `pc=0x8116d528` 当成 ELF 地址（delta=0），符号化成
+`_glTexImage2D_FlatIMPL`，并说崩的是第 4 轮极品飞车。两点都不成立。
+- 基址：`MODULE_INFO` 段0 = `0x8105b000`，`pc0 0x8105d9d9 - e_entry 0x810029d9 = 0x5b000`。
+  delta=0x5b000 时 7 个休眠线程（pc=81231bd8, lr=810aec45）符号化为 `sceKernelDelayThread` /
+  `__wrap_sceKernelDelayThread`，自洽；delta=0 时落在 `.LANCHOR2` 和 `JVMInflater::read_completely()`，不自洽。
+- 按 delta=0x5b000：`pc=0x8116d528 -> 0x81112528 = remainder_pio2_kernel+0x310`，指令 `ldr r0,[r7,#4]!`，
+  `r7=0x3dbdf96a`（不是合法指针）。lr 也在同一函数内。`remainder_pio2_kernel` 是 `Math.sin/cos/tan` 对
+  |x| > 2^19·π/2 的大参数约化内核（`IEEE754_rem_pio2.cpp:183` 调用）。
+- 时间：dump = 15:27:05 UTC；BioMain 一轮的 ptime 在 15:26:30 / 15:27:03，crumb 第 129 行紧跟着 `launcher start`
+  （进程重启）。所以崩的是 **BioMain 这一轮**；NFS 那一轮是重启之后的事。
+
+**证据（dump）**：入口 `ldr r1,[sp,#696]` 说明 `prec`/`ipio2` 在 `[sp+696]`/`[sp+700]`。崩溃帧里这两个槽是
+`0x7ac809c3` / `0x3dbdf86a`，是 double 数据的字（0x3dxxxxxx 一串），不是 prec=2 和 `two_over_pi` 指针（`0x81461d98` 一带）。
+整段 `0x8157eae0..0x8157ebf0` 都是这种 double 数据，saved regs / 返回地址区被覆盖。
+**推断（未证实）**：kernel 的局部数组（`iq/f/fq/q[20]`）被写穿，覆盖了自己的栈参数。`jz` 在 `recompute` / `while(iq[jz]==0) jz--`
+里没有上界，输入或 FP 桩的任何偏差都可能让它越界。
+
+**没有定案的部分**：
+- 谁给 Math.sin/cos 传了大参数不知道。`jsr184` 里有 `Matrix4/Transform/AnimationTrack/Renderer` 调用 `Math.sin/cos/tan`；
+  BioMain 本体的 class 里没有直接引用（`javap` 扫 17 个类，0 处）。
+- fpmodel 在**保存下来的 v04.48 ELF** 上：`calibration 0 不一致`、`d2i/f2i 50/50` 通过，但 `mathfull.py sin/cos` 14 项里
+  6 错 2 中止——连 `sin(0.5)` 都返回 0.5，`cos(0.5)` 返回 1.0。v03.11 记录是 42/42。这可能是真回归，也可能是模型和 v04.4x
+  的某条指令不匹配（`ABORT unsupported 0xece31b02 @0x81112da4` 是模型缺指令，**不是通过也不是失败**），**我没有分清**。
+  `/tmp/bigarg.py`（1e6..1e300、inf、nan）的结果因此也不可信，别拿来当证据。
+- 这一轮 BioMain 的 crumb 只有 `VM alloc of 16777216 bytes FAILED -> malloc`，**没有**后面 NFS 那轮的
+  `forcing UseCompiler=0`、也没有 `UseCompiler(post)`。不能确认这一轮是解释器还是 JIT。若仍是 JIT 开着而堆不可执行，
+  就是 log188 的老路径；但崩溃 pc 在 C++ 内核里，不是堆地址，所以这条目前只是疑点。
+
+**注意**：`/tmp/fpmodel_elf.dis` 是 10-30 的旧文件；`armsim.py` 本身直接读 `FPELF`，不受它影响。
+
+**下一步**：
+1. 查 v03.11→v04.48 之间谁动了 `vita_fp_overlay.S` / `patch_interp.sh` / `Interpreter_arm.o`（`git log` 看不到，工作区未提交），
+   先用 v03.11 的 ELF 跑同一份 `mathfull.py` 对照，分清是模型问题还是回归。
+2. 补一个 `jsr184` 宿主侧检查：给 `Matrix4.rotate/Transform.setRotation` 的角度，看 BioMain 实际会传多大的值。
+3. BioMain 一轮的 `heap_mb` 与 `UseCompiler` 实际取值要在日志里打出来。
+**本次没有改任何代码。**
+
+## 2026-11-05 v04.49：修内存碎片 —— VM 块跨轮复用（log189 的直接后续）
+
+### 碎片到底是什么（先纠正我自己的说法）
+
+上一条记录我写的是「newlib arena 碎片导致 malloc 拿不到连续 15 MiB」。
+**这个说法是错的。** 重看 log189，失败的调用是 `sceKernelAllocMemBlockForVM`，
+不是 `malloc`：
+
+```
+round 0（文件管理器，heap_mb=14）
+  [heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: 0x85d00000, 15728640 bytes
+  [heapmem] freeing chunk0 (VM block uid=0x4004013d)
+round 1（极品飞车，heap_mb=14 —— 完全相同的请求）
+  [heapmem] VM alloc of 15728640 bytes (MiB-aligned) FAILED: 0x80024b0b
+```
+
+**同一个进程内，一个 15 MiB 的 VM 块刚被 `sceKernelFreeMemBlock` 释放，
+紧接着申请同样大小就失败（MEMBLOCK_OVERFLOW）。** 不是 arena 碎片，
+是 VM 块「还回去就再也拿不回来」。所以 `malloc_trim` 之类完全帮不上，
+上一版记录里的那个方向是错的。
+
+### 修法：块不还，跨轮复用
+
+`OsMemory.cpp` 新增三个静态量缓存堆块，`free_chunk` 时**不调用
+`sceKernelFreeMemBlock`**，`vita_try_vm_chunk` 在申请前先看缓存：
+
+```c
+static int    g_vm_keep_uid  = -1;
+static size_t g_vm_keep_size = 0;
+static void  *g_vm_keep_base = NULL;
+```
+
+- 复用前**先实测可写**（首尾各存一个 magic），因为「块还在不在」不能靠假设。
+  写不进去才丢弃并重新申请。
+- 缓存大小按 1 MiB 向上取整，所以后续略小的请求也能从同一块满足。
+- 复用保持**同一基址**，这对 JIT 有好处：生成代码的地址和
+  `vita_vm_flush_icache` 的 `chunks_vm[]` 查找都依赖它。
+- 也补了 `vita_vm_flush_icache`：块在两轮之间不在 `chunks_vm[]` 里，
+  但收尾阶段的 flush 仍可能指向它，所以加了按地址范围匹配的兜底。
+
+**复用的安全性**：`ObjectHeap::dispose()` 会把 `_heap_chunk` 置 NULL，
+下一轮 `create()` 走 `is_new_heap` 分支重建全部结构（含编译器区
+`used` 计数清零），所以读到上一轮残留数据的情况不存在。
+
+### 宿主验证（`/tmp/reusetest`，24 项断言全过）
+
+mock 内核**故意**复刻实测行为：一旦释放过 VM 块，后续申请一律返回
+`0x80024b0b`。这样才测得出复用是必要的。
+
+关键对照：
+```
+control: free-then-alloc (the v04.48 behaviour)
+  ok   control: first alloc succeeded
+  ok   control: re-alloc after free fails (this is log189)
+round 1 (the round that died in log189)
+  ok   round 1 gets a VM block
+  ok   round 1 did NOT call the kernel
+  ok   round 1 uses the same base
+```
+另外覆盖：缓存不释放（`no kernel free happened`）、缩小请求可复用、
+放大请求不用缓存且重新申请、32 MiB 默认堆在分配前就被拒。
+
+测试里修正过一个我自己的算术错误：14 MB 经调用点
+`vita_try_vm_chunk(i, max_size + alignment, alignment)` 传进来是
+`14680064 + 32 = 14680096`，取整 **15 MiB = 15728640** —— 正好是 log189
+打印的值。我一开始直接拿 14680064 算，以为是 14 MiB，断言写错。
+
+### 顺带修的构建缺陷（并行会话遗留）
+
+`vita_motion.c`（JSR-256 加速度计）已加入源码树，但
+`CMakeLists.txt` 的链接列表漏了 `SceMotion_stub`，导致
+`undefined reference to sceMotionGetSensorState`，整个构建卡住。
+已补在 `SceCtrl_stub`/`SceTouch_stub` 之后。
+
+### 还没解决的
+
+1. **第 4 个之后会不会仍然失败**没验证。复用只保证「同一尺寸反复用」不再
+   重新申请，但如果某轮堆尺寸**变大**（用户改了设置），仍会走新申请路径。
+   跨轮改尺寸的场景需要在真机上试。
+2. newlib arena 从 22488K 掉到 7084K 这件事本身没处理。它不一定有害
+   （`free=496K` 时 VM 块仍能分配成功，见 round 0），但连续多轮之后
+   普通 malloc 会不会也开始失败，未知。
+3. 真机未验证。
+
+### 教训
+
+1. **判错「失败发生在哪一层」会带偏整个修法**。上一版我把
+   `VM alloc FAILED` 读成 malloc 碎片，差点去接 `malloc_trim`。
+   错误码和函数名就在日志里，先看清是哪个 API 失败的。
+2. **宿主测试要复刻失败行为，而不只是复刻成功路径**。mock 内核如果
+   老老实实把块还回来，这个测试会全部通过却证明不了任何事。
+3. 复用外部资源时，**复用前要重新验证它仍然有效**（这里用首尾 magic 存储），
+   不能因为「上次是我的」就假设它没被回收。
+
+
+
+## 2026-11-05 v04.50：修掉 C++ 数学库的 double 字序错误（log189 崩溃的根因；此节被并发会话覆盖过一次，2026-11-06 按原内容补回）
+
+**产物**：`vita-port/out/vpk/midp_vita_v04.50.vpk`。log191 是它的真机日志：不再闪退。
+
+### 为什么会错（有证据）
+- 11-04 为让链接自检 `_rom_linkcheck_mffd_true` 通过，`rebuild_vm.sh` 给所有 VM 对象加了 `-DMSW_FIRST_FOR_DOUBLE=1`。
+  同一个宏还决定 `__JHI/__JLO`、`double_bits`、fabs/copysign、`jdouble_from_msw_lsw`，于是 C++ 浮点库把 C `double` 的低字当高字。
+- 同一段宏用 `arm-vita-eabi-g++` 单独编译：`=0` → `vmov r0,s1`，`=1` → `vmov r0,s0`。
+- 回归点：fpmodel 在 v04.28 上 mathfull 22/22，v04.29 上 5/22。v04.29–v04.49 六个版本都带着：`sqrt(1)=-1.49`、`floor(2.7)=1.6e-314`、`doubleToLongBits(1.0)=0x3ff00000`。
+- 当初我只想让两边"一致"，没问**哪一边对**；重建后也没重跑 fpmodel。
+
+### 改动（全在 phoneme-cldc；`build/share`、`phoneme_source` 未动）
+- `GlobalDefinitions.hpp`：新增 `JDOUBLE_MEM_HI_WORD/LO_WORD`（VITA 下取自 `__FLOAT_WORD_ORDER__`，未知则 `#error`）与 `jdouble_from_hi_lo_mem()`；
+  `double_bits/double_from_bits` 在 VITA 下改用它们。`WORD_FOR_*_IN_DOUBLE` 与链接自检宏**不动**。
+- `FloatNatives.hpp`（`__JHI/__JLO`）、`Stream.hpp::print_double`、`JFP_lib_fabs/copysign`，以及 8 处 `jdouble_from_msw_lsw`
+  （Cosine_kernel、FloatNatives、IEEE754_fmod ×2、rem_pio2、sqrt、ceil、floor、scalbn ×2）改用新宏/函数。ROM/常量池/`Oop.hpp` 的布局不动。
+- `./rebuild_vm.sh clean` 后重建（改宏必须清 target）。
+
+### 验证（最终 ELF，host 端 ARM 模型 `debug/tools/fpmodel`）
+- 校准 0 不一致；mathfull 42/42；bitsnat 42/42；d2ihf 50/50；fpreg 40/40。1e6 以内的 sin/cos、inf、nan 通过。
+- **没跑通**：`remainder_pio2_kernel`（|x| > 2^19·π/2）在模型里 1e7 以上全部 step limit，v04.28 的 ELF 同样如此，所以是模型局限，不是 v04.50 回归。
+  已让模型加载 `.rodata`（`init_jk`、`two_over_pi` 读对），仍不终止，原因未查清。"字序错 → 内核越界写栈 → 崩溃"仍是**推断**；
+  宿主上 ASan/UBSan 把同一份内核源码字序设反跑 20 万个随机参数，没复现越界。
+- log191（真机）：BioMain 不再在该函数崩溃。
+
+### 防复发
+- `vita-port/build.sh` Step 4b **FP 闸门**：链接后在刚出的 ELF 上跑 fpmodel 的校准 + mathfull + bitsnat + d2ihf（约 11 秒），
+  任何 WRONG/ABORT/Traceback 让构建失败；`FP_GATE=0` 可跳过；缺 python3 或缺 `debug/tools/fpmodel/` 是错误。
+  **限定：闸门只覆盖解释器和 C++ 库，不覆盖 JIT 生成的代码**（见 2026-11-06 log191 一节，JIT 路径仍有浮点错误）。
+  `debug/tools/fpmodel/` **v04.54 已入 git**：14 个文件入库（`*.py` / `README.md` / `run.sh` /
+  `soft_ref.c`），`soft_ref.o` 与 `__pycache__` 仍忽略；`armcal.py` 现在**自己编译** `soft_ref.o`
+  （此前是手工步骤，fresh clone 会让闸门 `FileNotFoundError` 直接失败），工具链路径改走
+  `VITASDK_BIN`（`build.sh` 从 `build_env.sh` 导出 `$VITASDK/bin`）。
+- `armsim3.py` 补 `vldm/vstm Rn`（只收 IA/DB，排除 `vmov Dm,Rt,Rt2`），补完立即重跑校准；`armsim.py` 现在连 `.rodata` 一起加载。
+  第一次补指令时匹配条件误吞了 vmov，所有 sin/cos 都 ABORT，靠重跑 mathfull 才发现。
+- `BUILD_QUICKSTART.md` 第 25 条。
+
+### 教训
+1. 一个宏同时承担"链接标签"和"内存字序"两个语义，是这次的根。改这类宏先 grep 全部使用点。
+2. 重建后必须跑行为回归，不能只看"链接过了"。
+3. 模型 ABORT / step limit 不是通过；要拿"已知好的旧 ELF"对照同一输入才能分清是模型局限还是新构建问题。
+4. 修改验证工具本身之后，立刻用已知结果重跑它。
+
+## 2026-11-06 log191 分析（v04.50 真机）：不闪退了；14MB 下建模错 + 卡 = JIT 开着，不是 14MB 本身
+
+**用户现象**：生化危机进游戏不再闪退；14MB 时建模不对、很卡；改 32MB 恢复正常。有截图（**我看不到图**，工具只返回 URI，下面全部靠日志数值）。
+
+### 证据（同一游戏 BioMain、同一批模型、同一版本 v04.50，只差 JIT）
+| | 轮 A：14MB，**JIT 开**（`compile-requests=1215 produced=819`） | 轮 B：32MB，JIT 被 OsMemory 兜底关掉（`UseCompiler(post)=0`） |
+|---|---|---|
+| `skin bind` 奇异骨骼数（hunter/zombie/nemesis/simin/jill_han） | 38 / 26 / 31 / 26 / 21 | **0 / 0 / 0 / 0 / 0** |
+| `drawMesh`（ms/帧） | 273–469 | 24–38 |
+| 帧总耗时 | 331–708 | 96–122 |
+- `skin bind` 是纯 Java（`SkinnedMesh.java:115-136` 里 `Matrix4.invert` 判奇异），数据相同，结果不同 ⇒ **JIT 编出的代码算错了浮点**。
+- 极品飞车那一轮（同样 JIT 开，复用同一个 14MB 块）：`Transform.rotation` 的 `rot#2 ang=0 axis=(0,-0.66,0) cos=0 sin=-0 ZERO`，
+  紧接着 `ArithmeticException: 104` 把定时任务取消。轴归一化后不是单位向量、`cos(0)=0`，同样是浮点算错。解释器那一轮同位置 `cos=3f800000`。
+- 排除堆压力：两轮 GC 相关行 20 vs 12，OOM 0。排除字序 bug：这是 v04.50（字序已修），FP 闸门全绿。
+- **我之前按行号 555 切日志，把极品飞车的 `proj m0=+Inf` 算到 BioMain 头上，是错的**；按 `startSuite` 重新分段后，BioMain 两轮的投影都是有限值。
+
+### 机制（静态证据 + 一致的运行证据；**没有在 JIT 机器码层面直接证实**）
+1. JIT 的 `CodeGenerator::vcall_simple_c_runtime`（`CodeGenerator_arm.cpp:2247`）按**整数协议**调 C 浮点辅助函数：参数放 r0–r3，
+   返回后用 `fmsr` / `fmdrr` 从 r0 / r0:r1 取结果。
+2. 它调用的是**无后缀**符号：`_MergedSrc002.o` 里对 `jvm_dadd/dsub/dmul/ddiv/d2i/d2f/f2d/f2i/i2d/i2f/fcmpl/fcmpg/dcmpl/dcmpg/l2d/l2f…` 全是未定义引用，无 `_isoft`。
+3. v03.11 之后无后缀符号是**硬浮点**版本（ELF 反汇编：`jvm_dadd = vadd.f64 d0,d0,d1`，`jvm_fcmpl = vcmpe.f32 s0,s1`，`jvm_f2i = vmov r0,s0; b jvm_f2i_isoft`）。
+4. v03.11 的 overlay（`patch_interp.sh`）只把**解释器** `Interpreter_arm.o` 的引用改成 `_isoft`；JIT 这条路径没人管。
+   原因：phoneme 原版在 GCC 下是 `-mfloat-abi=soft`，整数协议天然匹配；本项目是 `hard`。
+5. 结果：JIT 里每次 double 运算 / 浮点比较 / int↔float↔double 转换，参数在 r0..r3、被调函数却读 s0/d0（残留值），结果放 d0、JIT 却读 r0:r1。
+   `Transform.rotation` 里 `double rad = angle*(PI/180)`、`(float)Math.cos(rad)`、`Matrix4.compose` 里 `(float)Math.sqrt(..)` 都走这条路 ⇒ 旋转矩阵错 ⇒ 骨骼矩阵奇异。
+- float 的 + − × ÷ JIT 直接发 VFP 指令（`float_binary_do`，`ENABLE_ARM_VFP`），不经 C 函数，所以不在受影响之列（推理，未逐条验证）。
+- 这也解释了 `PROJECT_MEMORY` 16705 行早就写过的"JIT 生成代码里的 FP 路径未验证"——现在被证伪。
+
+### 没有确认的
+- **"很卡"是不是同一个原因没有证据**。drawMesh 里没有 double 运算，说不通；GC 也排除了。原因未知（候选：JIT 代码调 native `draw` 的路径、
+  JIT 编译 1215 个方法本身的开销、编译失败 396 个后回退）。
+- 14MB **解释器**（`jit=0`）是否正常，**没有单独测过**——用户的 A/B 同时改了堆大小和 JIT。
+- 截图内容我没看到。
+
+### 绕行（立即可用，不改代码）
+- 在 BioMain 的 `game.cfg` 写一行 `jit=0`（`vita_main.c:read_game_jit`，per-game 优先于 launch.cfg）。14MB + 解释器应恢复正常；
+  若仍卡，则说明 14MB 本身有问题，再另查。
+
+### 修法（未做，等确认；不是改名那么简单）
+- 同一个函数指针 `runtime_func` 在 `float_binary_do/double_binary_do` 里既被 C++ 直接调用做常量折叠（需要**硬浮点**），
+  又被 `(address)runtime_func` 交给 JIT 生成的代码调用（需要**整数协议**）。所以不能对 `_MergedSrc002.o` 整体 `--redefine-sym`。
+- 方向：在取地址的几处（`call_simple_c_runtime(…, (address)…)`，`CodeGenerator_arm.cpp` 约 2438–2716 与 1921/2026/2126/2237/2799）改传 `_isoft` 版本；
+  按 AGENTS.md 要求用 `#if defined(VITA)` 最小补丁。`jvm_sin/cos/sqrt` 等 NativeGenerator 路径要同样核对。
+- 验证只能是真机（JIT 机器码在 Vita 堆里，宿主跑不了）；可先在宿主上用 `skin bind` 的 `singular` 作为判据。
+
+### 教训
+1. **FP 闸门通过 ≠ JIT 正确**：闸门只跑解释器和 C++ 库，**不覆盖 JIT 生成的代码**。v04.50 的"防复发"说法需要加这个限定。
+2. **按行号给日志分段会出错**，用 `startSuite` 之类的真实边界。
+3. **A/B 只改一个变量**：这次用户同时改了堆大小和（间接）JIT，靠日志里的 `UseCompiler(post)` 才分开。
+
+
+## 2026-11-06 v04.53：JIT 浮点路径的两处确定缺陷 + JitSelfTest 诊断（**未证明能解决 log191 的症状**）
+
+**产物**：`vita-port/out/vpk/midp_vita_v04.53.vpk`。FP 闸门全绿（校准 0 不一致、mathfull 42/42、bitsnat 42/42、d2i/f2i 50/50）。**未在真机运行。**
+
+### 对上一节（log191 分析）的更正
+- 上一节写"JIT 里每次 double 运算/比较/转换都用错寄存器"——**不对**。`ENABLE_ARM_VFP` 开着时，JIT 对 float/double 的 + − × ÷、比较、
+  int/float/double 互转直接发 VFP 指令（`float_binary_do`、`double_binary_do`、`float_cmp`、`double_cmp`、`i2d/d2i/f2d/d2f…`），
+  `call_simple_c_runtime` 只在各函数的 `#else`（!VFP）死分支里。真正走 C 函数的只有 `frem/drem`、`l2f/l2d/f2l/d2l` 和 native 方法调用。
+- 因此我提的"把 JIT 取地址处改成 `_isoft`"**没有做**，而且不能这么做：`*_isoft` 适配器按**解释器**的字序（double = r0 高字、r1 低字）
+  取参数，而 JIT 的 `vsetup_c_args` 用 `lo_bits()/hi_bits()`（C 内存序，r0 低字）。只换符号会把高低字读反。
+- 另一会话的 04.52 块写"每轮 compile-requests=0"，那是 log191 末尾 32MB 几轮；BioMain 14MB 那一轮 `compile-requests=1215 produced=819`，JIT 确实在编译。
+  两者不冲突（04.52 讲的是后面的卡死，我讲的是前面的 14MB 建模错）。
+
+### 找到并修了的两处缺陷（都属"`MSW_FIRST_FOR_DOUBLE` 被当成内存字序"这一族）
+1. **JIT 的 `ldc2_w` 读 double 常量时高低字互换**。`Method::iterate_push_constant_2`（`Method.cpp`）经 `ConstantPool::double_at()` 取常量，
+   VITA 分支用 `jdouble_from_msw_lsw(slot0, slot1)`，宏被强制成 1 ⇒ `words[0]=msw`，小端 C double 把 `words[0]` 当低字。
+   宿主复现：π/180 的字（3F91DF46 / A2529D39）合成出 `-2.385e-143`，宏为 0 时是正确的 `0.017453292519943295`。
+   `Transform.rotation` 与 `Matrix4.compose` 的字节码里都有 `ldc2_w 0.017453292519943295d`（javap 核实）。
+   修法：新增 `ConstantPool::double_at_native()`（VITA 下用 `jdouble_from_hi_lo_mem`），只让 JIT 的 `push_double` 用。
+   **刻意不改 `double_at()`**：`InstanceClass.cpp:1040` 用它初始化 `static final double`，解释器读回时用的是自己的 MSW-first 布局，
+   两处可能互相抵消；我没核实，所以不动。
+2. **`CodeGenerator::double_constant_fold`（`CodeGenerator.cpp:558`）翻转的是低字的最高位，不是符号位**。`as_raw_long()` 读 C double 内存序，
+   符号位恒在 bit 63，而旧代码在宏=1、`MSW_FIRST_FOR_LONG=0` 时选了 `1<<31`。VITA 下固定 `1<<63`。新对象里能看到对高字的 `0x80000000` 操作。
+
+### 没有证明的（重要）
+- **这两处能不能解释 log191 的症状没有证据**。`rot#2 ang=0 → cos=0 sin=-0` 就对不上：`ang=0` 时即使常量读错，`rad` 也是 ±0，`cos(±0)=1`。
+  skin 奇异骨骼是否与 `ldc2_w` 有关也没验证（`Matrix4.compose` 里确有该常量，但奇异的直接原因没复现）。
+- 更大的风险点我只读了没验证：冻结解释器的 Java 栈上 double 是**高字在低地址**，JIT 用 `fldd/fstd` 整存整取（**低字在低地址**）。
+  若 JIT 与解释器之间（参数、返回值、native 入口 `native_math_*_entry` 的 `pop(A); pop(B)`）没有补偿，所有跨边界的 double 都会高低字互换。
+  这与"解释器对、JIT 错"吻合，但这是推测，不是证据。
+
+### 新诊断：`com.sun.m3g.JitSelfTest`（`jsr184/.../com/sun/m3g/JitSelfTest.java`，已加入 `subsystem.gmk`）
+- 第一次 `Graphics3D.getInstance()` 时跑一次（约 1 秒）。20 个探针，每个已知答案、只测一类操作：
+  `dconst`（ldc2_w+dmul）、`dcallarg`（double 过调用边界）、`cos0/sin90/sqrt`（native）、`f2d/d2f`、`dlocal`、`l2d/d2l`、`frem/drem`、
+  `darray/dstatic/dinst`、`dneg/dabs`、`i2d/d2i`、`dcmp`。输入来自非 final 静态字段，javac 折叠不掉。
+- 三轮：pass1（还没热，解释器）→ 循环约 0.7 秒让定时器驱动的 JIT 编译 → pass2、pass3。日志行 `[m3g] jitfp passN: ok=X/20 calls/s=... BAD: name=got(want …)`。
+- **怎么读**：pass1 对、之后某探针 BAD ⇒ 那一类操作是 JIT bug，下一步就修那一类。`calls/s` 在 pass3 没明显升高 ⇒ 探针没被编译，
+  全 OK **不能**证明 JIT 对。
+- 宿主验证：HotSpot `-Xint` 与默认 JIT 下都是 20/20（期望值本身无误）；`-source 1.3 -target 1.3` 可编译。
+- 确认已进镜像：ELF 里有 `com/sun/m3g/JitSelfTest` 与 UTF-16 的 `jitfp`；`.class` 时间戳是本次构建。**确认后要移除。**
+- 用 `jit=0`（game.cfg）对照：JIT 关时三轮应全 OK 且 calls/s 基本不变，这是对照组。
+
+### 下一步
+1. 装 v04.53，BioMain 用 14MB + JIT 开跑一次，取 `[m3g] jitfp` 三行，同时看 skin bind 的 `singular` 是否变化。
+2. 再用 `jit=0` 跑一次作对照。
+3. 按 `jitfp` 指出的操作类型修；若全 OK 且 calls/s 没升，要换办法让探针被编译。
+
+## 2026-11-06 v04.54：`debug/tools/fpmodel/` 入 git —— 顺带修掉两个会让 fresh clone 构建失败的问题
+
+**背景**：`vita-port/build.sh` 的 Step 4b FP 闸门（校准 + mathfull + bitsnat + d2ihf）依赖
+`debug/tools/fpmodel/`，而该目录一直是 **untracked**。所以 FP 闸门在一个干净 clone 上**根本跑不起来**，
+而它是唯一能挡住"数学库算错六个版本"那类回归的东西。
+
+### 不只是"忘了 add"：查下来有三个问题
+
+| # | 问题 | 后果 |
+|---|---|---|
+| 1 | 目录从未 `git add`（**不是被 .gitignore 挡**，`.gitignore` 只挡了 `__pycache__/`） | 干净 clone 没有这个目录 |
+| 2 | `armcal.py` 读 `soft_ref.o`（GCC 编的参考实现），**但没有任何步骤生成它** —— 只有 `run.sh` 里手工编一次 | 干净 clone 上 `armcal.py` 直接 `FileNotFoundError`，闸门 BUILD FAIL |
+| 3 | `armcal.py` / `armsim.py` / `overlay.py` / `run.sh` 四处**硬编码 `/usr/local/vitasdk/bin`** | vitasdk 装在别处（或另一个用户）时闸门失败 |
+
+### 改动
+
+1. **入库 14 个文件**：11 个 `*.py` + `README.md` + `run.sh` + `soft_ref.c`。
+   `soft_ref.o`（编译产物）和 `__pycache__/` 不入库 —— `.gitignore` 显式加了
+   `debug/tools/fpmodel/soft_ref.o`。
+2. **`armcal.py` 自己编译 `soft_ref.o`**（缺失或比 `soft_ref.c` 旧时），用
+   `-marm -march=armv7-a -mtune=cortex-a9 -mfloat-abi=hard -mfpu=vfpv3 -O2`
+   —— 和设备 ABI 一致，模型解释的是 ARM 代码。
+3. **工具链路径改走 `VITASDK_BIN`**：`os.environ.get('VITASDK_BIN', '/usr/local/vitasdk/bin')`，
+   默认值保持旧行为（手跑 `run.sh` 不受影响）；`build.sh` 从 `build_env.sh` 取到 `$VITASDK`
+   后 `export VITASDK_BIN="$VITASDK/bin"`。
+4. `build.sh` 里那句提示原来写 "it is untracked in git: copy it over or FP_GATE=0"，已改成
+   指向 `README.md`（不再是真的）。
+
+### 验证（两步，都不是"看代码觉得对"）
+
+**A. fresh clone 模拟** —— 把目录拷到 `/tmp/fpclone`，删掉 `soft_ref.o` 和 `__pycache__`
+（只剩入库的 14 个文件），然后跑闸门四项：
+
+```
+（软链/FPELF 指向本仓库的 ELF）
+calibration  CALIBRATION PASSED (0 mismatches)      ← soft_ref.o 由 armcal.py 自己编译出来
+mathfull     TOTAL 42: ok=42 wrong=0 abort=0
+bitsnat      TOTAL 42: ok=42 wrong=0 abort=0
+d2ihf        d2i/f2i hard-float: 50 cases, 0 bad
+```
+
+**B. 真实全量构建**（`./vita-port/build.sh midp`，改了 `build.sh` 就必须真跑一遍，
+否则 `$VITASDK` 若在该作用域不可用会 `export VITASDK_BIN="/bin"`，闸门反而全炸）：
+
+```
+==> FP gate (fpmodel) on midp_vita...
+  ok    calibration: CALIBRATION PASSED (0 mismatches)
+  ok    Math natives: TOTAL 42: ok=42 wrong=0 abort=0
+  ok    Double/Float bit natives: TOTAL 42: ok=42 wrong=0 abort=0
+  ok    hard-float d2i/f2i: d2i/f2i hard-float: 50 cases, 0 bad
+BUILD_EXIT=0
+```
+
+`bash -n vita-port/build.sh` 也过。
+
+### 状态
+
+- 14 个文件已 **`git add`（staged，未 commit）**。
+- 本次改动**不产生新的 VPK 语义**（闸门是构建期检查，不进 ELF）；构建产物版本号仍是 04.53。
+- 顺带把两处过时说法改掉：`PROJECT_MEMORY`（v04.50 节的"目前未入 git"）与
+  `BUILD_QUICKSTART.md` 第 25 条（"尚未入 git"）。
+
+### 下一个该做的（按之前的清单）
+
+1. **P0：JIT 浮点路径**（log191）。v04.53 已加 `JitSelfTest`（20 个探针，每局第一次
+   `Graphics3D.getInstance()` 时跑一次）。**上机时只需要三行日志**：
+   `[m3g] jitfp passN: ok=X/20 BAD: name=...`，再跑一次 `jit=0` 作对照。
+2. P1：VM 块复用第 4 轮之后的行为、newlib arena 22488K→7084K、`JitSelfTest` 用完移除。
 

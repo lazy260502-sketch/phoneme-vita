@@ -1,5 +1,9 @@
 # phoneME CLDC-HI JVM for PS Vita - Development Plan
 
+> **2026-10-23 更新**：本文（最后更新 2026-08-25）是早期规划，功能清单已过时。
+> 当前的对标差距分析与分阶段计划见 `COMPATIBILITY_ROADMAP.md`；开发记忆与踩坑见
+> `PROJECT_MEMORY.md`。
+
 ## Project Overview
 Porting Sun phoneME CLDC-HI JVM to PlayStation Vita with full J2ME game support.
 
