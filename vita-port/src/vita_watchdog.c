@@ -155,6 +155,88 @@ static void wd_dump_thread(const char *tag, SceUID tid) {
                      info.currentCpuId, info.lastExecutedCpuId,
                      info.threadPreemptCount);
     wd_log(buf, n);
+    /* v04.52: DECODE THE WAIT TARGET.
+     *
+     * log191's hang report ended at
+     *     vm 'J2ME00001' status=WAITING wait=other(0x100) wid=66751 cpu=-1
+     * and that wid is the whole investigation: 66751 == 0x104bf, which is NOT
+     * a thread UID (those all live in 0x4001xxxx). It is a kernel object -
+     * mutex / semaphore / event flag / LwMutex - and the interesting question
+     * is whether anything still owns it. Two 'cldc_ticker' threads in the same
+     * snapshot were already <gone>, so "the owner died" was a real possibility
+     * that nothing in the log could confirm or deny.
+     *
+     * Print the object's NAME next to the id. A name makes it obvious which
+     * subsystem owns it ("SceKernelMutex" vs "SceKernelLwMutexWork" vs an event
+     * flag), and an absent/unreadable name is itself information: the object is
+     * gone and the waiter can never be woken. That distinction is what decides
+     * "add a timeout" (recoverable) versus "fix the ordering that let the owner
+     * die while holding it" (the actual bug).
+     *
+     * sceKernelGetMutexInfo / GetLwMutexInfo / GetSemaInfo / GetEventFlagInfo
+     * are tried in turn: they all validate their argument, so the wrong one
+     * simply fails and the next is tried. Only the owner field of a genuine
+     * mutex is worth printing - it names the thread that must release it. */
+    /* Only a WAITING thread (status 8, see wd_status_name) has a waitId worth
+     * decoding; a running or ready thread reports a stale id. */
+    if ((info.status & 8) && info.waitId != 0 && info.waitId != -1) {
+        SceUID wid = info.waitId;
+        int printed = 0;
+        {
+            SceKernelMutexInfo mi;
+            memset(&mi, 0, sizeof(mi));
+            mi.size = sizeof(mi);
+            if (sceKernelGetMutexInfo(wid, &mi) >= 0) {
+                n = snprintf(buf, sizeof(buf),
+                             "[WD] %s waits on MUTEX 0x%x '%s' "
+                             "cur=%d owner=%d waiters=%d\n",
+                             tag, (unsigned)wid, mi.name,
+                             mi.currentCount, (int)mi.currentOwnerId,
+                             mi.numWaitThreads);
+                wd_log(buf, n);
+                printed = 1;
+            }
+        }
+        if (!printed) {
+            SceKernelSemaInfo si;
+            memset(&si, 0, sizeof(si));
+            si.size = sizeof(si);
+            if (sceKernelGetSemaInfo(wid, &si) >= 0) {
+                n = snprintf(buf, sizeof(buf),
+                             "[WD] %s waits on SEMA 0x%x '%s' "
+                             "cur=%d max=%d waiters=%d\n",
+                             tag, (unsigned)wid, si.name,
+                             si.currentCount, si.maxCount, si.numWaitThreads);
+                wd_log(buf, n);
+                printed = 1;
+            }
+        }
+        if (!printed) {
+            SceKernelEventFlagInfo ei;
+            memset(&ei, 0, sizeof(ei));
+            ei.size = sizeof(ei);
+            if (sceKernelGetEventFlagInfo(wid, &ei) >= 0) {
+                n = snprintf(buf, sizeof(buf),
+                             "[WD] %s waits on EVENTFLAG 0x%x '%s' "
+                             "bits=0x%x waiters=%d\n",
+                             tag, (unsigned)wid, ei.name,
+                             (unsigned)ei.currentPattern, ei.numWaitThreads);
+                wd_log(buf, n);
+                printed = 1;
+            }
+        }
+        if (!printed) {
+            /* Nothing owns that id any more. Say so EXPLICITLY: this is the
+             * "waiter can never be woken" case and it must not be mistaken
+             * for an ordinary wait. */
+            n = snprintf(buf, sizeof(buf),
+                         "[WD] %s waits on 0x%x which is NOT a live mutex / "
+                         "sema / eventflag -> owner is gone, the waiter "
+                         "cannot be woken\n",
+                         tag, (unsigned)wid);
+            wd_log(buf, n);
+        }
+    }
     /* v02.08: runClocks is the thread's accumulated CPU time. Sample
      * it twice, 500 ms apart, INSIDE the hang window: if the kernel
      * really has this thread on a core the counter must advance by

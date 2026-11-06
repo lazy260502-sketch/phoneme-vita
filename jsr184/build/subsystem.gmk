@@ -1,0 +1,76 @@
+#
+# JSR 184 (Mobile 3D Graphics, M3G) subsystem for the PS Vita port.
+#
+# Vita-local tree: no upstream phoneME M3G source exists (the archive has
+# no jsr184 directory), so the API surface and every implementation body
+# here are written for this port. Class/method signatures follow the
+# JSR 184 specification.
+#
+# Included by
+#     phoneme-midp/build/common/makefiles/Subsystems.gmk
+# when USE_JSR_184=true. The file lists are consumed by the
+# USE_JSR_184 block in SubsystemDefs.gmk (same shape as JSR 75).
+#
+# Source layout:
+#     src/share/core/common/classes/   Java: API + renderer
+#     src/share/native/                KNI natives (m3g_native.c)
+#
+# The renderer hands finished triangles to the Vita 3D backend
+# (vita-port/src/vita_3d.c), which picks the vitaGL or software path from
+# defaults.cfg "3d=auto|hw|sw".
+#
+
+SUBSYSTEM_JSR_184        = jsr184
+SUBSYSTEM_JSR_184_DIR    = $(JSR_184_DIR)
+
+JSR_184_CLASSES_DIR      = $(SUBSYSTEM_JSR_184_DIR)/src/share/core/common/classes
+JSR_184_NATIVE_DIR       = $(SUBSYSTEM_JSR_184_DIR)/src/share/native
+
+# Plain .java, not .jpp: this port's preprocess_jpp.py runs with an empty
+# DEFINES set, so an #ifdef guard would compile the sources away.
+SUBSYSTEM_JSR_184_JAVA_FILES = \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/AnimationController.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/AnimationTrack.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Appearance.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Background.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Camera.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/CompositingMode.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Fog.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Graphics3D.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Group.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Image2D.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/IndexBuffer.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/KeyframeSequence.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Light.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Loader.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/M3gReader.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Material.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Mesh.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/MorphingMesh.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Node.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Object3D.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/PolygonMode.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Renderer.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/SkinnedMesh.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Sprite3D.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Texture2D.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Transform.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/Transformable.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/TriangleStripArray.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/VertexArray.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/VertexBuffer.java \
+        $(JSR_184_CLASSES_DIR)/javax/microedition/m3g/World.java \
+        $(JSR_184_CLASSES_DIR)/com/sun/m3g/M3gFile.java \
+        $(JSR_184_CLASSES_DIR)/com/sun/m3g/M3gTrace.java \
+        $(JSR_184_CLASSES_DIR)/com/sun/m3g/JitSelfTest.java \
+        $(JSR_184_CLASSES_DIR)/com/sun/m3g/Matrix4.java \
+        $(JSR_184_CLASSES_DIR)/com/sun/m3g/NativeBridge.java \
+
+#
+# Natives are compiled by the MIDP makefile so they see the same KNI/PCSL
+# headers as the other subsystems; the object lands in libobj.a, which the
+# launcher links with --whole-archive, so romgen finds the Java_* entries.
+#
+vpath % $(JSR_184_NATIVE_DIR)
+SUBSYSTEM_JSR_184_NATIVE_FILES  = m3g_native.c
+SUBSYSTEM_JSR_184_EXTRA_INCLUDES =

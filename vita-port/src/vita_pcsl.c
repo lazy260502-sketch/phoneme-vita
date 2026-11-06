@@ -18,6 +18,8 @@
 #include <psp2/io/stat.h>
 #include <psp2/io/dirent.h>
 #include <psp2/appmgr.h>
+#include <psp2/kernel/threadmgr.h>   /* v04.00: sceKernelGetSystemTimeWide for
+                                      * JVM.monotonicTimeMillis (see below) */
 
 /* PCSL string headers */
 #include <pcsl_string.h>
@@ -208,17 +210,44 @@ pcsl_string_status pcsl_string_convert_from_utf8(const jbyte *buffer,
     while (buffer_length > 0 && buffer[buffer_length - 1] == 0) {
         buffer_length--;
     }
+    /* v02.75: decode real UTF-8. The old loop widened every byte to a
+     * jchar (Latin-1), so a path such as "games/魂斗罗4中文版/game.jar"
+     * reached Java as mojibake; pcsl_file_open then re-encoded the
+     * mojibake to UTF-8 and sceIoOpen found no such file (log116:
+     * "JAR not found" for every game whose directory name is non-ASCII).
+     * UTF-16 units never outnumber UTF-8 bytes, so buffer_length + 1
+     * jchars is always enough. A malformed sequence falls back to the
+     * old byte-per-jchar behaviour for that one byte. */
     jchar *data = (jchar *)malloc((buffer_length + 1) * sizeof(jchar));
     if (data == NULL) {
         return PCSL_STRING_ENOMEM;
     }
-    jsize i;
-    for (i = 0; i < buffer_length; i++) {
-        data[i] = (jchar)(buffer[i] & 0xFF);
+    jsize i = 0;
+    jsize o = 0;
+    while (i < buffer_length) {
+        unsigned char c = (unsigned char)buffer[i];
+        if (c < 0x80) {
+            data[o++] = c;
+            i++;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < buffer_length &&
+                   (buffer[i + 1] & 0xC0) == 0x80) {
+            data[o++] = (jchar)(((c & 0x1F) << 6) | (buffer[i + 1] & 0x3F));
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < buffer_length &&
+                   (buffer[i + 1] & 0xC0) == 0x80 &&
+                   (buffer[i + 2] & 0xC0) == 0x80) {
+            data[o++] = (jchar)(((c & 0x0F) << 12) |
+                                ((buffer[i + 1] & 0x3F) << 6) |
+                                (buffer[i + 2] & 0x3F));
+            i += 3;
+        } else {
+            data[o++] = c;
+            i++;
+        }
     }
-    data[buffer_length] = 0;
+    data[o] = 0;
     string->data = data;
-    string->length = buffer_length + 1;
+    string->length = o + 1;
     string->flags = PCSL_STRING_IN_HEAP;
     return PCSL_STRING_OK;
 }
@@ -567,72 +596,139 @@ pcsl_string_status pcsl_string_trim_from_end(const pcsl_string *str, pcsl_string
     return pcsl_string_dup(str, dst);
 }
 
+/* ---- v04.01: exact numeric conversions -------------------------------
+ *
+ * These four used to be shortcuts, and two of them were wrong:
+ *
+ *   convert_to_jint    did not accept a sign, so "-1" was EINVAL. Every
+ *                      caller that parses a signed value (RMS record ids,
+ *                      installer options, any Integer.parseInt stand-in)
+ *                      silently failed on negatives.
+ *   convert_to_jlong   delegated to convert_to_jint and cast, so any value
+ *                      outside 32 bits was truncated instead of reported
+ *                      as PCSL_STRING_OVERFLOW.
+ *   convert_from_jlong cast to jint first, so formatting a large value
+ *                      produced a different number than it was given.
+ *   convert_from_jint  was correct but swapped digits on INT_MIN.
+ *
+ * Rewritten to follow the upstream contract
+ * (phoneme_source/phoneME/pcsl/string/utf16/pcsl_string.c:1170-1300) line
+ * for line, so behaviour no longer depends on which platform the caller
+ * was written for: sign accepted, range checked, OVERFLOW returned rather
+ * than wrapped, and INT64_MIN handled without negating it.
+ *
+ * Nothing in this tree calls the two jlong functions today; the point is
+ * that whoever calls them next gets upstream semantics instead of a trap.
+ */
+/* Largest jlong / 10, spelled without writing a negative literal:
+ * 0x0CCCCCCC << 32 | 0x33333333 << 2 == 922337203685477580. */
+#define VITA_MAXINT_DIV_10 ((((jlong)0x0ccccccc) << 32) \
+                            | (((jlong)0x33333333) << 2))
+/* INT64_MIN without relying on signed-shift behaviour. */
+#define VITA_MIN_JLONG (-9223372036854775807LL - 1LL)
+
 pcsl_string_status pcsl_string_convert_to_jint(const pcsl_string *str, jint *value) {
     if (str == NULL || value == NULL || str->data == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    /* Simple ASCII atoi */
-    jint result = 0;
-    jsize i;
-    /* v01.55: parse the content only (terminator excluded). */
-    jsize len = pcsl_string_length(str);
-    for (i = 0; i < len; i++) {
-        if (str->data[i] >= '0' && str->data[i] <= '9') {
-            result = result * 10 + (str->data[i] - '0');
-        } else {
-            return PCSL_STRING_EINVAL;
+    /* Upstream parses into a jlong and narrows, so a value that does not
+     * fit is reported rather than truncated. */
+    {
+        jlong wide = 0;
+        pcsl_string_status s = pcsl_string_convert_to_jlong(str, &wide);
+        if (s != PCSL_STRING_OK) {
+            return s;
+        }
+        {
+            jint narrow = (jint)wide;
+            if ((jlong)narrow != wide) {
+                return PCSL_STRING_OVERFLOW;
+            }
+            *value = narrow;
         }
     }
-    *value = result;
     return PCSL_STRING_OK;
 }
 
 pcsl_string_status pcsl_string_convert_from_jint(jint value, pcsl_string *str) {
-    if (str == NULL) {
-        return PCSL_STRING_EINVAL;
-    }
-    jchar buf[16];
-    int len = 0;
-    if (value == 0) {
-        buf[len++] = '0';
-    } else {
-        jint v = value;
-        if (v < 0) {
-            v = -v;
-        }
-        while (v > 0) {
-            buf[len++] = '0' + (v % 10);
-            v /= 10;
-        }
-        if (value < 0) {
-            buf[len++] = '-';
-        }
-        /* Reverse */
-        int i;
-        for (i = 0; i < len / 2; i++) {
-            jchar tmp = buf[i];
-            buf[i] = buf[len - 1 - i];
-            buf[len - 1 - i] = tmp;
-        }
-    }
-    return pcsl_string_convert_from_utf16(buf, len, str);
+    return pcsl_string_convert_from_jlong((jlong)value, str);
 }
 
 pcsl_string_status pcsl_string_convert_to_jlong(const pcsl_string *str, jlong *value) {
-    if (str == NULL || value == NULL) {
+    jsize len;
+    jsize i;
+    jlong acc = 0;
+    int negative = 0;
+    const jchar *src;
+
+    if (str == NULL || str->data == NULL || value == NULL) {
         return PCSL_STRING_EINVAL;
     }
-    /* Stub: use jint conversion */
-    jint iv;
-    pcsl_string_status s = pcsl_string_convert_to_jint(str, &iv);
-    if (s == PCSL_STRING_OK) {
-        *value = (jlong)iv;
+    /* Content length only: ->length counts the terminating zero (v01.55). */
+    len = pcsl_string_length(str);
+    if (len == 0) {
+        return PCSL_STRING_EINVAL;
     }
-    return s;
+    src = str->data;
+
+    i = 0;
+    if (src[0] == '-' || src[0] == '+') {
+        negative = (src[0] == '-');
+        i = 1;
+        if (len == 1) {
+            return PCSL_STRING_EINVAL;   /* bare sign */
+        }
+    }
+    for (; i < len; i++) {
+        if (acc > VITA_MAXINT_DIV_10 || acc < 0) {
+            return PCSL_STRING_OVERFLOW;
+        }
+        if (src[i] < '0' || src[i] > '9') {
+            return PCSL_STRING_EINVAL;
+        }
+        acc = acc * 10 + (jlong)(src[i] - '0');
+        if (acc < 0 && acc != VITA_MIN_JLONG) {
+            return PCSL_STRING_OVERFLOW;
+        }
+    }
+    if (negative) {
+        acc = -acc;
+    } else if (acc == VITA_MIN_JLONG) {
+        return PCSL_STRING_OVERFLOW;
+    }
+    *value = acc;
+    return PCSL_STRING_OK;
 }
 
 pcsl_string_status pcsl_string_convert_from_jlong(jlong value, pcsl_string *str) {
-    return pcsl_string_convert_from_jint((jint)value, str);
+    jchar buf[21];
+    int pos = 20;
+    int negative = (value < 0);
+
+    if (str == NULL) {
+        return PCSL_STRING_EINVAL;
+    }
+    buf[pos] = 0;                       /* terminator, counted in ->length */
+    /* INT64_MIN has no positive counterpart, so it is copied verbatim
+     * instead of being negated (upstream does the same). */
+    if (negative && value == VITA_MIN_JLONG) {
+        static const jchar minbuf[21] = {
+            '-', '9', '2', '2', '3', '3', '7', '2', '0', '3', '6', '8',
+            '5', '4', '7', '7', '5', '8', '0', '8', 0
+        };
+        return pcsl_string_convert_from_utf16(minbuf, 21, str);
+    }
+    if (negative) {
+        value = -value;
+    }
+    do {
+        buf[--pos] = (jchar)('0' + (int)(value % 10));
+        value /= 10;
+    } while (value != 0);
+    if (negative) {
+        buf[--pos] = '-';
+    }
+    return pcsl_string_convert_from_utf16(&buf[pos], 21 - pos, str);
 }
 
 pcsl_string_status pcsl_string_free(pcsl_string *str) {
@@ -999,40 +1095,6 @@ int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
      * vita_resolve_path comment): raw sceIo* ignores the cwd. */
     char abs_path[600];
     vita_resolve_path(path_utf8, abs_path, sizeof(abs_path));
-
-    /* v01.55 diagnostic: one line per DISTINCT path+flags reaching the
-     * file layer. The v01.54 log proved every named record store
-     * (A/B/G2/P/CK/R/coreA) opened THE SAME 104-byte header and ran
-     * the same salvage - either they all resolve to one physical file
-     * (name lost in the path build) or every per-store file carries
-     * identical damage. This breadcrumb settles which one it is, and
-     * shows the exact file name each store maps to. rms/ paths only;
-     * 8 dedup slots keep the log bounded. */
-    if (strstr(abs_path, "/rms/") != NULL) {
-        static char seen[8][600];
-        static int seen_n = 0;
-        int i;
-        int dup = 0;
-        for (i = 0; i < seen_n; i++) {
-            if (strncmp(seen[i], abs_path, sizeof(seen[0]) - 1) == 0) {
-                dup = 1;
-                break;
-            }
-        }
-        if (!dup) {
-            SceIoStat probe;
-            long sz = -1;
-            if (sceIoGetstat(abs_path, &probe) >= 0) {
-                sz = (long)probe.st_size;
-            }
-            if (seen_n < 8) {
-                snprintf(seen[seen_n], sizeof(seen[0]), "%s", abs_path);
-                seen_n++;
-            }
-            fprintf(stderr, "[pcsl] open path=%s flags=0x%x size=%ld\n",
-                    abs_path, flags, sz);
-        }
-    }
 
     /* Convert PCSL flags to Vita/Unix flags - explicit mapping (bit values differ!) */
     int oflags = 0;
@@ -1439,9 +1501,28 @@ int pcsl_file_exist(const pcsl_string *fileName) {
     return 0;
 }
 
+/* pcsl_file_commitwrite - upstream contract: "Commits the pending writes
+ * to the file so that they are visible to other processes."
+ *
+ * v04.01: was `(void)handle; return 0;` - success reported without doing
+ * anything. Nothing in this tree broke visibly because the callers close
+ * the file before renaming it and sceIoClose() flushes, but the whole
+ * point of the commit step is the case where it DOESN'T close first: the
+ * suite store's write_file() is temp-write-commit-rename, and a rename
+ * that outruns the flush is the exact failure this project already paid
+ * for once (v01.24-style "save looks OK, next launch finds nothing").
+ * sceIoSyncByFd is the Vita primitive for it. Failure is not fatal here:
+ * the data is still in the handle, and pcsl_file_close() will flush. */
 int pcsl_file_commitwrite(void *handle) {
-    (void)handle;
-    return 0;
+    VitaFileHandle *vf;
+    if (handle == NULL) {
+        return 0;
+    }
+    vf = (VitaFileHandle *)handle;
+    if (vf->fd < 0) {
+        return -1;   /* dead handle - the caller must not think it synced */
+    }
+    return (sceIoSyncByFd(vf->fd, 0) < 0) ? -1 : 0;
 }
 
 /* Real rename via sceIoRename. The old stub always failed, breaking
@@ -1830,32 +1911,6 @@ long pcsl_file_getusedspace(const pcsl_string *dirName) {
     }
     sceIoDclose(dfd);
 
-    /* v01.53: one-shot breadcrumb when the used-space figure is big
-     * enough to zero out a suite's free space on its own. The MIDlet's
-     * "not enough space" only ever comes from this number, and after
-     * the v01.52 salvage incident a single leftover store could carry
-     * a multi-MB/Gb physical tail - so name the culprit directory and
-     * its (possibly inflated) total instead of leaving the next
-     * investigation to guess again. */
-    if (total > 1024 * 1024) {
-        static char reported[4][620];
-        static int reported_n = 0;
-        int i, seen = 0;
-        for (i = 0; i < reported_n; i++) {
-            if (strcmp(reported[i], abs_dir) == 0) {
-                seen = 1;
-                break;
-            }
-        }
-        if (!seen && reported_n < 4) {
-            snprintf(reported[reported_n], sizeof(reported[0]), "%s",
-                     abs_dir);
-            reported_n++;
-            fprintf(stderr, "[pcsl] getusedspace %s = %ld bytes\n",
-                    abs_dir, total);
-        }
-    }
-
     return total;
 }
 
@@ -2169,15 +2224,96 @@ void Java_com_sun_cldchi_jvm_JVM_flushJarCaches(void) {
     /* No-op stub */
 }
 
-/* Java_com_sun_cldchi_jvm_JVM_monotonicTimeMillis */
+/* Java_com_sun_cldchi_jvm_JVM_monotonicTimeMillis
+ *
+ * v04.00: THIS WAS THE BUG BEHIND "the panel never slides in".
+ *
+ * This stub used to `return 0`. java.util.TimerThread.mainLoop() decides
+ * whether a task is due with
+ *     taskFired = (task.nextExecutionTime <= Timer.monotonicTimeMillis())
+ * and Timer.monotonicTimeMillis() is JVM.monotonicTimeMillis() minus a fixed
+ * offset. With a constant clock the sequence is:
+ *     fire #1      (delay 0 -> due immediately, the only time it is ever due)
+ *     reschedule   nextExecutionTime = clock + 15
+ *     loop again   clock is unchanged  ->  clock + 15 <= clock is FALSE
+ *     ... forever
+ * which is exactly what the device showed: 极品飞车's 15 ms main-loop task fired
+ * ONCE and the loop then spun without ever firing again ([TIMER] loop #1..#50
+ * with a single fire). Every frame after the first was therefore never
+ * requested, so the IDIOMA panel stayed parked at its start offset (x = canvas
+ * width, 240) and the text rows never slid in - the whole "text is off to the
+ * right / only letters DI show" symptom.
+ *
+ * sceKernelGetSystemTimeWide() is monotonic and returns MICROSECONDS, so the
+ * millisecond value is that divided by 1000. `monotonicTimeMillis` really does
+ * mean milliseconds in this JVM.
+ *
+ * NOTE (v04.01): the only other two definitions of this symbol in the tree
+ * (phoneme-midp/src/vita_stubs.c and the CLDC fallback in
+ * phoneme-cldc/src/vm/share/runtime/jvmspi.cpp) are NOT part of any library
+ * that gets linked - `nm` on libobj.a and libcldc_vm.a shows no JVMSPI_*
+ * member from either file. So this is the live definition; the link's
+ * --allow-multiple-definition is not actually exercised for this symbol.
+ * Both other copies were updated anyway so that adding one of those files to
+ * a build cannot resurrect `return 0`. */
 jlong Java_com_sun_cldchi_jvm_JVM_monotonicTimeMillis(void) {
-    /* Return 0 as stub - should use sceKernelGetSystemTimeWide() */
-    return 0;
+    return (jlong)(sceKernelGetSystemTimeWide() / 1000);
 }
 
 /* ========================================================================
  * Misc stubs
  * ======================================================================== */
+
+/* getenv
+ *
+ * v04.04: THE CAUSE OF THE STARTUP CRASH ON REAL HARDWARE (log174).
+ *
+ * Both core dumps show the main thread at pc=0 with only two threads
+ * alive and a very shallow stack, and lr = (mapped to ELF) 0x8100266b -
+ * the instruction right after `blx getenv` inside
+ * _GLOBAL__sub_I__ZN9__gnu_cxx9__freeresEv, i.e. .init_array[6]: the C++
+ * static-initialisation pass that runs from _start before any of this
+ * port's code. r0 held the ".LC4" argument string, which is what made
+ * the identification unambiguous (0x811e32cc - 0x5000 = 0x811de2cc,
+ * exactly the movw/movt pair in front of the blx).
+ *
+ * Why that call jumps to address 0: newlib's getenv object
+ * (lib_a-getenv.o) is NOT in this image. _getenv_r (lib_a-getenvr.o)
+ * IS, which is why _getenv_r is real code at 0x811bd2fc while getenv was
+ * a 16-byte import stub at 0x811c3510 - inside
+ * .vitalink.fstubs.SceLibMonoBridge, because vita-elf-create drops every
+ * still-undefined symbol into a stub group. No Sce library exports
+ * getenv, so the stub's jump target resolved to 0 and the first call
+ * executed address 0 -> prefetch abort -> psp2core dump.
+ *
+ * This defect was latent in every earlier build too (the stub is present
+ * in v04.00/01/02 with the same call site); v04.03 is simply the first
+ * build ever run on real hardware instead of Vita3K, which does not fail
+ * the import the same way - which is why log173 (Vita3K, v04.01) ran
+ * four full rounds and log174 (hardware, v04.03) died before the first
+ * frame.
+ *
+ * Vita has no process environment, so "not found" is the correct answer
+ * and the libstdc++ callers all handle NULL (the static-init code braches
+ * on the return value before using it).
+ *
+ * DELIBERATELY does not read `environ`, and does not forward to
+ * _getenv_r:
+ *   - _REENT is not guaranteed to be valid this early in startup, and
+ *   - `environ` itself is not a reliable symbol in this image. The first
+ *     version of this fix walked it, and that single reference was enough
+ *     to change the link so lib_a-environ.o stopped being pulled in and
+ *     `environ` turned into... another vitalink import stub (T @
+ *     0x811c3590 instead of D in .data). Reading a stub as data yields a
+ *     garbage char** and the walk would fault - the same bug, one level
+ *     deeper. A fix for this crash must not introduce a new dependency on
+ *     an unverified symbol, so it returns NULL unconditionally.
+ * Reintroduce environ-based lookup only if a real need appears AND
+ * `nm` shows `D environ`, not `T environ`. */
+char *getenv(const char *name) {
+    (void)name;
+    return NULL;
+}
 
 /* getInternalPropertyInt - from properties_port.
  * JAVA_HEAP_SIZE: the default (1280KB) cannot hold the chameleon skin

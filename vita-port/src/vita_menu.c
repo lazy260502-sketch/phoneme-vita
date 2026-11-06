@@ -9,8 +9,15 @@
  *
  * Directory layout:
  *   ux0:/data/J2ME00001/games/<name>/game.jar    installed game
- *   ux0:/data/J2ME00001/games/<name>/game.cfg    line1=class ('-' = auto),
- *                                                line2=portrait|landscape
+ *   ux0:/data/J2ME00001/games/<name>/game.cfg    key=value (v02.83):
+ *                                                class=.. ('-' = auto),
+ *                                                orient=portrait|landscape,
+ *                                                width=/height= (0 = follow
+ *                                                the orientation),
+ *                                                scale=fit|stretch|integer
+ *                                                The legacy two-line form
+ *                                                (class, orientation) is
+ *                                                still read.
  *   ux0:/data/J2ME00001/games/<name>/cache.bin   scan cache (jar fp +
  *                                                name/class/icon metadata)
  *   ux0:/data/J2ME00001/inbox/*.jar              drop jars here, START
@@ -45,6 +52,8 @@
 #include "vita_version.h"
 #include "vita_fbmem.h"
 #include "vita_crumb.h"
+#include "vita_vkey.h"
+#include "vita_diag.h"  /* v03.79: 设置页驱动诊断浮层（不再改 diag.cfg） */
 
 /* from vita_font.c: menu-side UTF-8 rendering over the shared CJK bank */
 int vita_menu_font_gw(void);
@@ -319,7 +328,246 @@ typedef struct {
     char cls[128];
     char icon[128];   /* icon path inside the jar ("" = none) */
     int landscape;
+    /* v02.82: per-game virtual screen (game.cfg). width/height == 0 means
+     * "follow landscape"; scale_mode mirrors VITA_SCALE_* in
+     * vita_display.c (0 fit, 1 stretch, 2 integer). */
+    int width;
+    int height;
+    int scale_mode;
+    /* v02.84: device profile / locale / MIDlet selection. profile[] is
+     * "" for "generic" so an untouched game.cfg stays untouched;
+     * midlet_idx is 1-based (0 = leave the single detected class). */
+    char profile[24];
+    char locale[16];
+    int midlet_idx;
+    /* v04.34: per-game overrides for settings that used to be global-only.
+     * -1 = "follow defaults.cfg / the global setting", >= 0 = explicit.
+     * Written to game.cfg as vkey= / vibrate= / perms= / jit= (the launcher
+     * parses all four; jit= since v04.33). Keeping -1 as the default means an
+     * untouched game.cfg stays byte-identical to before. */
+    int vkey;
+    int vibrate;
+    int perms;
+    int jit;
 } GameEntry;
+
+/* v02.84: profile names must match vita_profiles[] in vita_main.c; the
+ * launcher is what actually applies them (it re-reads game.cfg). w/h is
+ * the same default size, duplicated here only so the menu can show the
+ * effective resolution and let "screen: auto" mean something concrete. */
+static const struct {
+    const char *name;
+    const char *label;
+    int w, h;
+} profile_choices[] = {
+    { "generic",      "generic",      240, 320 },
+    { "nokia6230",    "Nokia 6230",   128, 128 },
+    { "nokia_n95",    "Nokia N95",    240, 320 },
+    { "se_k800",      "SE K800i",     240, 320 },
+    { "samsung_e250", "Samsung E250", 128, 160 },
+    { "siemens_c65",  "Siemens C65",  130, 130 }
+};
+#define PROFILE_N (int)(sizeof(profile_choices) / sizeof(profile_choices[0]))
+
+/* defined later in this file (mini zip reader) */
+static unsigned char *zip_read_entry(const char *jarpath, const char *want,
+                                     long *out_size);
+
+static int profile_index(const GameEntry *g) {
+    int i;
+    for (i = 0; i < PROFILE_N; i++) {
+        if (strcmp(profile_choices[i].name, g->profile) == 0) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static const char *profile_label(const GameEntry *g) {
+    return profile_choices[profile_index(g)].label;
+}
+
+/* Effective virtual screen when game.cfg has no explicit width/height:
+ * the profile decides, and the orientation swaps the axes. */
+static void effective_size(const GameEntry *g, int *w, int *h) {
+    int i = profile_index(g);
+    if (g->width > 0 && g->height > 0) {
+        *w = g->width;
+        *h = g->height;
+        return;
+    }
+    if (g->landscape) {
+        *w = profile_choices[i].h;
+        *h = profile_choices[i].w;
+    } else {
+        *w = profile_choices[i].w;
+        *h = profile_choices[i].h;
+    }
+}
+
+/* ---- v02.84: MIDlet-1..N of the game currently shown in the dialog ---- */
+#define MAX_MIDLETS 8
+typedef struct {
+    char name[64];
+    char cls[128];
+} MidletInfo;
+
+static MidletInfo midlets[MAX_MIDLETS];
+static int midlet_count = 0;
+static char midlets_for[176];   /* jar the list was built from */
+
+static void midlet_add(const char *value, int len);
+
+/* Parse "Name, icon, class" (the MIDlet-N value). Tolerates missing icon
+ * and extra trailing fields; the class is what comes after the LAST
+ * comma, matching parse_manifest_class(). */
+static void midlet_add(const char *value, int len) {
+    int i, c1 = -1, c2 = -1;
+    int o;
+    MidletInfo *m;
+
+    if (midlet_count >= MAX_MIDLETS || len <= 0) {
+        return;
+    }
+    for (i = 0; i < len; i++) {
+        if (value[i] == ',') {
+            if (c1 < 0) {
+                c1 = i;
+            }
+            c2 = i;
+        }
+    }
+    if (c2 < 0) {
+        return; /* no commas: not a MIDlet-N line */
+    }
+    m = &midlets[midlet_count];
+    memset(m, 0, sizeof(*m));
+    /* name: first field, trimmed */
+    for (i = 0, o = 0; i < c1 && o < (int)sizeof(m->name) - 1; i++) {
+        unsigned char ch = (unsigned char)value[i];
+        if (ch >= 0x20) m->name[o++] = (char)ch;
+    }
+    while (o > 0 && m->name[o - 1] == ' ') o--;
+    m->name[o] = '\0';
+    /* class: last field, trimmed */
+    for (i = c2 + 1, o = 0; i < len && o < (int)sizeof(m->cls) - 1; i++) {
+        unsigned char ch = (unsigned char)value[i];
+        if (ch == ' ' && o == 0) continue;
+        if (ch >= 0x20) m->cls[o++] = (char)ch;
+    }
+    while (o > 0 && m->cls[o - 1] == ' ') o--;
+    m->cls[o] = '\0';
+    if (m->cls[0] == '\0') {
+        return;
+    }
+    if (m->name[0] == '\0') {
+        snprintf(m->name, sizeof(m->name), "%s", m->cls);
+    }
+    midlet_count++;
+}
+
+/* Scan MIDlet-N from a JAD (plain text) or MANIFEST.MF buffer. */
+static void midlets_scan_buffer(const unsigned char *buf, long n) {
+    long i = 0;
+    while (i < n) {
+        long ls = i, le, v;
+        int len;
+        le = ls;
+        while (le < n && buf[le] != '\n' && buf[le] != '\r') le++;
+        if (le - ls > 9 &&
+            (buf[ls] == 'M' || buf[ls] == 'm') &&
+            memcmp(buf + ls + 1, "IDlet-", 6) == 0 &&
+            buf[ls + 7] >= '1' && buf[ls + 7] <= '0' + MAX_MIDLETS &&
+            buf[ls + 8] == ':') {
+            v = ls + 9;
+            while (v < le && (buf[v] == ' ' || buf[v] == '\t')) v++;
+            len = (int)(le - v);
+            if (len > 0) {
+                /* NUL-safe: copy to a temp so midlet_add can treat it as
+                 * a C string region with an explicit length */
+                midlet_add((const char *)buf + v, len);
+            }
+        }
+        i = le;
+        while (i < n && (buf[i] == '\n' || buf[i] == '\r')) i++;
+    }
+}
+
+/* Build the MIDlet list for this jar. A JAD next to the jar wins over
+ * the manifest (same precedence as the launcher, which hands the JAD to
+ * runMidlet). Cached per jar so the dialog does not re-open the zip on
+ * every frame. */
+static void midlets_scan(const char *jarpath) {
+    char jad[300];
+    const char *slash;
+    const char *base, *dot;
+    SceUID fd;
+    unsigned char *buf;
+    long len = 0;
+
+    if (strcmp(midlets_for, jarpath) == 0) {
+        return;   /* already built for this jar */
+    }
+    snprintf(midlets_for, sizeof(midlets_for), "%s", jarpath);
+    midlet_count = 0;
+
+    /* 1) JAD */
+    jad[0] = '\0';
+    slash = strrchr(jarpath, '/');
+    if (slash != NULL) {
+        char dir[300];
+        size_t dn = (size_t)(slash - jarpath);
+        if (dn < sizeof(dir)) {
+            memcpy(dir, jarpath, dn);
+            dir[dn] = '\0';
+            snprintf(jad, sizeof(jad), "%s/game.jad", dir);
+            fd = sceIoOpen(jad, SCE_O_RDONLY, 0);
+            if (fd < 0) {
+                base = slash + 1;
+                dot = strrchr(base, '.');
+                if (dot != NULL && dot > base) {
+                    snprintf(jad, sizeof(jad), "%s/%.*s.jad", dir,
+                             (int)(dot - base), base);
+                    fd = sceIoOpen(jad, SCE_O_RDONLY, 0);
+                } else {
+                    jad[0] = '\0';
+                }
+            }
+            if (fd >= 0) {
+                buf = (unsigned char *)malloc(16 * 1024);
+                if (buf != NULL) {
+                    len = sceIoRead(fd, buf, 16 * 1024 - 1);
+                    sceIoClose(fd);
+                    if (len > 0) {
+                        midlets_scan_buffer(buf, len);
+                    }
+                    free(buf);
+                } else {
+                    sceIoClose(fd);
+                }
+            }
+        }
+    }
+
+    /* 2) MANIFEST.MF (only when the JAD had no MIDlet-N) */
+    if (midlet_count == 0) {
+        buf = zip_read_entry(jarpath, "META-INF/MANIFEST.MF", &len);
+        if (buf != NULL) {
+            if (len > 0) {
+                midlets_scan_buffer(buf, len);
+            }
+            free(buf);
+        }
+    }
+
+    /* 3) nothing parseable: fall back to the class the scan resolved */
+    if (midlet_count == 0) {
+        midlet_count = 0;
+    }
+    fprintf(stderr, "[menu] midlets: %d in %s\n", midlet_count, jarpath);
+    fflush(stderr);
+}
+
 
 static GameEntry games[MAX_GAMES];
 static int game_count = 0;
@@ -503,6 +751,40 @@ done:
     return result;
 }
 
+/* Drop an incomplete UTF-8 sequence at the end of s[0..len).
+ * Returns the new length, which is len unchanged for well-formed text.
+ * Used when a name is cut to fit a fixed buffer: a Chinese character is
+ * three bytes, so a plain byte limit can leave one or two of them
+ * behind. The renderer would then skip the broken glyph (or, worse,
+ * swallow the bytes that follow). */
+static int utf8_trim_partial(char *s, int len) {
+    int back = 0;
+    unsigned char lead;
+    int need;
+
+    while (back < len && back < 3 &&
+           ((unsigned char)s[len - back - 1] & 0xC0) == 0x80) {
+        back++;              /* count trailing continuation bytes */
+    }
+    if (back >= len) {
+        return 0;
+    }
+    lead = (unsigned char)s[len - back - 1];
+    if ((lead & 0xE0) == 0xC0) {
+        need = 2;
+    } else if ((lead & 0xF0) == 0xE0) {
+        need = 3;
+    } else if ((lead & 0xF8) == 0xF0) {
+        need = 4;
+    } else {
+        need = 1;            /* not a lead byte: nothing to trim */
+    }
+    if (need > back + 1) {
+        return len - back - 1;   /* lead byte's sequence is incomplete */
+    }
+    return len;
+}
+
 /* Find "Name: value" in a MANIFEST buffer. Handles the manifest line
  * continuation rule (a line starting with a single space continues the
  * previous attribute). Matching is case-insensitive per the MIDP spec.
@@ -559,10 +841,21 @@ static int manifest_get(const unsigned char *buf, long n,
             size_t o = 0;
             long q;
             for (q = vs; q < ve && o + 1 < outsz; q++) {
-                char ch = (char)buf[q];
-                if (ch >= 0x20) out[o++] = ch;
+                /* v01.81: keep the byte UNSIGNED. arm-vita-eabi-gcc's
+                 * plain char is signed, so the old `char ch = buf[q];
+                 * if (ch >= 0x20)` test threw away every byte >= 0x80 -
+                 * i.e. exactly the bytes of a UTF-8 Chinese name. The
+                 * name then kept only its ASCII fragments, which is how
+                 * a MIDlet called "泡泡龙4-豪华版" showed up as "4-". */
+                unsigned char ch = buf[q];
+                if (ch >= 0x20) out[o++] = (char)ch;
             }
             while (o > 0 && out[o - 1] == ' ') o--;
+            /* only when the buffer limit cut the value: never leave a
+             * half UTF-8 character at the end */
+            if (q < ve) {
+                o = (size_t)utf8_trim_partial(out, (int)o);
+            }
             out[o] = '\0';
             return (int)o;
         }
@@ -620,8 +913,9 @@ static int parse_manifest_icon(const char *jarpath, char *out, size_t outsz) {
                 while (s < e && buf[s] == ' ') s++;
                 while (e > s && buf[e - 1] == ' ') e--;
                 while (s < e && len + 1 < (int)outsz) {
-                    char ch = (char)buf[s++];
-                    if (ch >= 0x20) out[len++] = ch;
+                    /* v01.81: unsigned - see manifest_get() */
+                    unsigned char ch = buf[s++];
+                    if (ch >= 0x20) out[len++] = (char)ch;
                 }
                 out[len] = '\0';
             }
@@ -671,9 +965,10 @@ static void parse_manifest_class(const char *jarpath, char *out, size_t outsz) {
             p = last_comma + 1;
             while (p < line_end && buf[p] == ' ') p++;
             while (p < line_end && len < (int)sizeof(tmp) - 1) {
-                char ch = (char)buf[p++];
+                /* v01.81: unsigned - see manifest_get() */
+                unsigned char ch = buf[p++];
                 if (ch >= 0x20) {
-                    tmp[len++] = ch;
+                    tmp[len++] = (char)ch;
                 }
             }
             while (len > 0 && tmp[len - 1] == ' ') {
@@ -690,16 +985,182 @@ static void parse_manifest_class(const char *jarpath, char *out, size_t outsz) {
 
 static void save_cfg(const GameEntry *g) {
     char path[256];
+    char line[400];
+    int n;
     SceUID fd;
+
     snprintf(path, sizeof(path), "%s/" CFG_NAME, g->dir);
-    fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    n = snprintf(line, sizeof(line), "class=%s\norient=%s\n",
+                 g->cls[0] ? g->cls : "-",
+                 g->landscape ? "landscape" : "portrait");
+    /* v02.82: only persist an explicit screen size; 0/0 means "follow
+     * the orientation", which keeps the file identical to the legacy
+     * behaviour for games that never needed a custom size. */
+    if (g->width > 0 && g->height > 0 && n > 0 && n < (int)sizeof(line)) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n,
+                      "width=%d\nheight=%d\n", g->width, g->height);
+    }
+    if (n > 0 && n < (int)sizeof(line)) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "scale=%s\n",
+                      (g->scale_mode == 1) ? "stretch" :
+                      (g->scale_mode == 2) ? "integer" : "fit");
+    }
+    /* v02.84: identity / locale / MIDlet choice. Omitted when default so
+     * an untouched game keeps a minimal file. */
+    if (n > 0 && n < (int)sizeof(line) && g->profile[0] != '\0' &&
+        strcmp(g->profile, "generic") != 0) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "profile=%s\n",
+                      g->profile);
+    }
+    if (n > 0 && n < (int)sizeof(line) && g->locale[0] != '\0') {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "locale=%s\n",
+                      g->locale);
+    }
+    if (n > 0 && n < (int)sizeof(line) && g->midlet_idx > 1) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "midlet=%d\n",
+                      g->midlet_idx);
+    }
+    /* v04.34: per-game overrides. -1 means "follow the global setting", so
+     * the key is omitted and the file stays minimal. */
+    if (n > 0 && n < (int)sizeof(line) && g->vkey >= 0) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "vkey=%d\n",
+                      g->vkey ? 1 : 0);
+    }
+    if (n > 0 && n < (int)sizeof(line) && g->vibrate >= 0) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "vibrate=%d\n",
+                      g->vibrate ? 1 : 0);
+    }
+    if (n > 0 && n < (int)sizeof(line) && g->perms >= 0) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "perms=%s\n",
+                      g->perms ? "strict" : "relaxed");
+    }
+    if (n > 0 && n < (int)sizeof(line) && g->jit >= 0) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "jit=%d\n", g->jit);
+    }
+    if (n <= 0) {
+        return;
+    }
+    if (n > (int)sizeof(line)) {
+        n = (int)sizeof(line);
+    }
+    /* remove+create: Vita3K ignores SCE_O_TRUNC, and the new format is
+     * usually LONGER than the legacy two-line file (stale tail would
+     * confuse the parser). */
+    sceIoRemove(path);
+    fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT, 0777);
     if (fd >= 0) {
-        char line[160];
-        int n = snprintf(line, sizeof(line), "%s\n%s\n",
-                         g->cls[0] ? g->cls : "-",
-                         g->landscape ? "landscape" : "portrait");
-        sceIoWrite(fd, line, n);
+        sceIoWrite(fd, line, (SceSize)n);
         sceIoClose(fd);
+    }
+}
+
+/* v02.82: read game.cfg, accepting the new key=value form and the
+ * pre-02.82 positional form (line 1 class, line 2 portrait|landscape).
+ * Fields not present keep their defaults (landscape=0, size 0/0 =
+ * follow the orientation, fit). */
+static void game_cfg_load(GameEntry *g) {
+    char cfgpath[256];
+    char buf[512];
+    SceUID fd;
+    int n, positional = 0;
+    char *p;
+
+    g->landscape = 0;
+    g->width = 0;
+    g->height = 0;
+    g->scale_mode = 0;
+    g->profile[0] = '\0';
+    g->locale[0] = '\0';
+    g->midlet_idx = 0;
+    /* v04.34: -1 = follow the global setting (nothing written to game.cfg). */
+    g->vkey = -1;
+    g->vibrate = -1;
+    g->perms = -1;
+    g->jit = -1;
+
+    snprintf(cfgpath, sizeof(cfgpath), "%s/" CFG_NAME, g->dir);
+    fd = sceIoOpen(cfgpath, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return;
+    }
+    memset(buf, 0, sizeof(buf));
+    n = sceIoRead(fd, buf, sizeof(buf) - 1);
+    sceIoClose(fd);
+    if (n <= 0) {
+        return;
+    }
+    buf[n] = '\0';
+
+    for (p = buf; *p != '\0'; ) {
+        char *nl = strpbrk(p, "\r\n");
+        char *end = (nl != NULL) ? nl : p + strlen(p);
+        if (*end != '\0') {
+            *end = '\0';
+        }
+        if (p[0] != '\0' && p[0] != '#') {
+            char *eq = strchr(p, '=');
+            if (eq != NULL) {
+                char *k = p;
+                char *v = eq + 1;
+                char *ke = eq;
+                char *ve;
+                while (*k == ' ' || *k == '\t') k++;
+                while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
+                *ke = '\0';
+                while (*v == ' ' || *v == '\t') v++;
+                ve = v + strlen(v);
+                while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t')) {
+                    *--ve = '\0';
+                }
+                if (strcmp(k, "class") == 0) {
+                    if (strcmp(v, "-") != 0) {
+                        strncpy(g->cls, v, sizeof(g->cls) - 1);
+                        g->cls[sizeof(g->cls) - 1] = '\0';
+                    }
+                } else if (strcmp(k, "orient") == 0) {
+                    g->landscape = (strcmp(v, "landscape") == 0);
+                } else if (strcmp(k, "width") == 0) {
+                    int w = atoi(v);
+                    if (w > 0) g->width = w;
+                } else if (strcmp(k, "height") == 0) {
+                    int h = atoi(v);
+                    if (h > 0) g->height = h;
+                } else if (strcmp(k, "scale") == 0) {
+                    g->scale_mode = (strcmp(v, "stretch") == 0) ? 1 :
+                                    (strcmp(v, "integer") == 0) ? 2 : 0;
+                } else if (strcmp(k, "profile") == 0) {
+                    snprintf(g->profile, sizeof(g->profile), "%s", v);
+                } else if (strcmp(k, "locale") == 0) {
+                    snprintf(g->locale, sizeof(g->locale), "%s", v);
+                } else if (strcmp(k, "midlet") == 0) {
+                    int m = atoi(v);
+                    if (m > 0 && m <= MAX_MIDLETS) g->midlet_idx = m;
+                } else if (strcmp(k, "vkey") == 0) {
+                    g->vkey = (strcmp(v, "off") == 0 || v[0] == '0') ? 0 : 1;
+                } else if (strcmp(k, "vibrate") == 0) {
+                    g->vibrate = (strcmp(v, "off") == 0 || v[0] == '0') ? 0 : 1;
+                } else if (strcmp(k, "perms") == 0) {
+                    g->perms = (strcmp(v, "strict") == 0) ? 1 : 0;
+                } else if (strcmp(k, "jit") == 0) {
+                    if (v[0] >= '0' && v[0] <= '2') g->jit = v[0] - '0';
+                }
+            } else {
+                /* legacy positional lines */
+                if (positional == 0) {
+                    if (strcmp(p, "-") != 0) {
+                        strncpy(g->cls, p, sizeof(g->cls) - 1);
+                        g->cls[sizeof(g->cls) - 1] = '\0';
+                    }
+                } else if (positional == 1 && strncmp(p, "landscape", 9) == 0) {
+                    g->landscape = 1;
+                }
+                positional++;
+            }
+        }
+        if (nl == NULL) {
+            break;
+        }
+        p = nl + 1;
     }
 }
 
@@ -941,7 +1402,23 @@ static void validate_game_class(GameEntry *g, int allow_resave) {
 }
 
 static int dir_exists(const char *path) {
-    SceUID d = sceIoDopen(path);
+    char norm[256];
+    size_t n;
+    SceUID d;
+
+    /* v01.80: "ux0:" names a volume, not a directory path - real
+     * firmware refuses sceIoDopen() on it, only "ux0:/" works. Without
+     * the trailing separator every partition probe fails on hardware
+     * and the 文件 tab's root list falls back to its two hardcoded
+     * names. */
+    snprintf(norm, sizeof(norm), "%s", path);
+    n = strlen(norm);
+    if (n > 0 && norm[n - 1] == ':' && n + 1 < sizeof(norm)) {
+        norm[n] = '/';
+        norm[n + 1] = '\0';
+    }
+
+    d = sceIoDopen(norm);
     if (d < 0) {
         return 0;
     }
@@ -971,6 +1448,11 @@ static int dir_exists(const char *path) {
 
 #define CACHE_NAME "cache.bin"
 #define CACHE_MAGIC 0x4243324Au /* 'J2CB' */
+/* v2 (v01.81): v1 caches were written by the broken name parser, which
+ * dropped every UTF-8 byte and stored only the ASCII fragments ("4-"
+ * instead of a Chinese MIDlet-Name). Bumping the version makes every
+ * old cache.bin a miss, so the name is re-read from the jar once. */
+#define CACHE_VERSION 2u
 
 static int cache_valid(const GameEntry *g,
                        unsigned int jar_size, const SceDateTime *mtime) {
@@ -986,7 +1468,7 @@ static int cache_valid(const GameEntry *g,
         return 0;
     }
     if (sceIoRead(fd, hdr, sizeof(hdr)) == (int)sizeof(hdr) &&
-        hdr[0] == CACHE_MAGIC && hdr[1] == 1 &&
+        hdr[0] == CACHE_MAGIC && hdr[1] == CACHE_VERSION &&
         hdr[2] == jar_size &&
         sceRtcGetTick(mtime, &tick) >= 0 &&
         hdr[3] == (unsigned int)(tick.tick & 0xFFFFFFFFu) &&
@@ -1079,7 +1561,7 @@ static void cache_save(const GameEntry *g, const unsigned char *icon_png,
         return;
     }
     hdr[0] = CACHE_MAGIC;
-    hdr[1] = 1;
+    hdr[1] = CACHE_VERSION;
     hdr[2] = jar_size;
     if (sceRtcGetTick(mtime, &tick) >= 0) {
         hdr[3] = (unsigned int)(tick.tick & 0xFFFFFFFFu);
@@ -1224,6 +1706,10 @@ static void scan_games(void) {
     SceIoDirent ent;
     game_count = 0;
     memset(games, 0, sizeof(games));
+    /* v02.84: a rescan may follow an uninstall/reinstall of the same
+     * path, so drop the cached MIDlet list for the dialog too. */
+    midlets_for[0] = '\0';
+    midlet_count = 0;
     /* v01.78g: drop the previous scan's textures HERE. Freeing them on the
      * menu-exit path is what crashed; releasing them at scan start is
      * equivalent (every slot is about to be rewritten) and guarantees the
@@ -1243,8 +1729,6 @@ static void scan_games(void) {
             break;
         }
         GameEntry *g;
-        char cfgpath[256];
-        SceUID fd;
         SceDateTime mtime;
         unsigned int jar_size;
         unsigned char *icon_png = NULL;
@@ -1274,31 +1758,11 @@ static void scan_games(void) {
         if (cache_valid(g, jar_size, &mtime) &&
             cache_load(g, &icon_png, &icon_png_len_c)) {
             /* cache hit: no jar open at all. game.cfg may still carry a
-             * newer manual class override / orientation - refresh both. */
-            g->landscape = 0;
-            snprintf(cfgpath, sizeof(cfgpath), "%s/" CFG_NAME, g->dir);
-            fd = sceIoOpen(cfgpath, SCE_O_RDONLY, 0);
-            if (fd >= 0) {
-                char buf[256];
-                int n = sceIoRead(fd, buf, sizeof(buf) - 1);
-                sceIoClose(fd);
-                if (n > 0) {
-                    char *nl, *p2;
-                    buf[n] = '\0';
-                    nl = strpbrk(buf, "\r\n");
-                    if (nl != NULL) {
-                        *nl = '\0';
-                        p2 = nl + 1 + strspn(nl + 1, "\r\n");
-                        if (strncmp(p2, "landscape", 9) == 0) {
-                            g->landscape = 1;
-                        }
-                    }
-                    if (buf[0] != '\0' && strcmp(buf, "-") != 0) {
-                        strncpy(g->cls, buf, sizeof(g->cls) - 1);
-                        g->cls[sizeof(g->cls) - 1] = '\0';
-                    }
-                }
-            }
+             * newer manual class override / orientation / screen size.
+             * Do NOT clear cls here: cache_load() already restored it and
+             * game_cfg_load() only overwrites it when the file has a
+             * class entry. */
+            game_cfg_load(g);
             /* decode icon from the cached PNG bytes (cheap, no jar IO) */
             if (icon_png_len_c > 0 && icon_png != NULL) {
                 /* the slot is NULL here (icon_cache_clear() ran at scan
@@ -1322,30 +1786,9 @@ static void scan_games(void) {
                                 g->name, sizeof(g->name));
             parse_manifest_icon(g->jar, g->icon, sizeof(g->icon));
 
-            /* game.cfg: line1 class ('-' = auto), line2 orientation */
-            g->landscape = 0;
-            snprintf(cfgpath, sizeof(cfgpath), "%s/" CFG_NAME, g->dir);
-            fd = sceIoOpen(cfgpath, SCE_O_RDONLY, 0);
-            if (fd >= 0) {
-                char buf[256];
-                int n = sceIoRead(fd, buf, sizeof(buf) - 1);
-                sceIoClose(fd);
-                if (n > 0) {
-                    char *nl, *p2;
-                    buf[n] = '\0';
-                    nl = strpbrk(buf, "\r\n");
-                    if (nl != NULL) {
-                        *nl = '\0';
-                        p2 = nl + 1 + strspn(nl + 1, "\r\n");
-                        if (strncmp(p2, "landscape", 9) == 0) {
-                            g->landscape = 1;
-                        }
-                    }
-                    if (buf[0] != '\0' && strcmp(buf, "-") != 0) {
-                        strncpy(g->cls, buf, sizeof(g->cls) - 1);
-                    }
-                }
-            }
+            /* game.cfg: class override + orientation + screen size */
+            g->cls[0] = '\0';
+            game_cfg_load(g);
             if (g->cls[0] == '\0') {
                 parse_manifest_class(g->jar, g->cls, sizeof(g->cls));
             }
@@ -1458,7 +1901,116 @@ static void install_inbox(char *msg, size_t msg_sz) {
 /* Menu main loop                                                      */
 /* ------------------------------------------------------------------ */
 
-enum { DLG_LAUNCH = 0, DLG_ORIENT, DLG_UNINSTALL, DLG_BACK, DLG_N };
+enum { DLG_LAUNCH = 0, DLG_ORIENT, DLG_SCREEN, DLG_SCALE, DLG_PROFILE,
+       DLG_MIDLET, DLG_LOCALE, DLG_VKEY, DLG_VIBRATE, DLG_PERMS, DLG_JIT,
+       DLG_UNINSTALL, DLG_BACK, DLG_N };
+
+/* v04.34: per-game locale / keypad / rumble / permission / JIT rows. Each is
+ * a small cycle whose first stop is "follow the global setting" (-1), so a
+ * game.cfg written here never overrides more than the user asked for. */
+static const char *locale_choices[] = {
+    "", "zh-CN", "en-US", "ja-JP", "ko-KR", "zh-TW"
+};
+#define LOCALE_N (int)(sizeof(locale_choices) / sizeof(locale_choices[0]))
+
+static int locale_index(const GameEntry *g) {
+    int i;
+    for (i = 0; i < LOCALE_N; i++) {
+        if (strcmp(locale_choices[i], g->locale) == 0) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static const char *locale_label(const GameEntry *g) {
+    return (g->locale[0] != '\0') ? g->locale : "follow global";
+}
+
+/* -1 (follow) -> 0 -> 1 -> ... -> max -> -1 */
+static int cycle_follow(int v, int max) {
+    if (v < 0) {
+        return 0;
+    }
+    if (v >= max) {
+        return -1;
+    }
+    return v + 1;
+}
+
+static const char *follow_onoff(int v) {
+    return (v < 0) ? "follow global" : (v ? "on" : "off");
+}
+
+static const char *follow_label(int v, const char *a, const char *b) {
+    return (v < 0) ? "follow global" : (v ? a : b);
+}
+
+static const char *jit_label_pergame(int v) {
+    return (v < 0) ? "follow global" : (v == 0) ? "off (interpreter)"
+                            : (v == 1) ? "on, first round only"
+                                       : "on, every round";
+}
+
+/* v02.82: per-game virtual screen presets. index 0 = "follow the
+ * orientation" (no width/height written to game.cfg), which is the
+ * behaviour every pre-02.82 game had. */
+static const struct {
+    int w, h;
+    const char *label;
+} screen_presets[] = {
+    { 0,   0,   "auto (orientation)" },
+    { 128, 160, "128x160" },
+    { 176, 208, "176x208" },
+    { 176, 220, "176x220" },
+    { 240, 320, "240x320" },
+    { 320, 240, "320x240" },
+    { 360, 640, "360x640" },
+    { 480, 800, "480x800" }
+};
+#define SCREEN_PRESET_N (int)(sizeof(screen_presets) / sizeof(screen_presets[0]))
+
+static int screen_index(const GameEntry *g) {
+    int i;
+    if (g->width <= 0 || g->height <= 0) {
+        return 0;
+    }
+    for (i = 1; i < SCREEN_PRESET_N; i++) {
+        if (screen_presets[i].w == g->width &&
+            screen_presets[i].h == g->height) {
+            return i;
+        }
+    }
+    return -1; /* custom size from a hand-edited game.cfg */
+}
+
+static void screen_cycle(GameEntry *g) {
+    int i = screen_index(g);
+    i = (i + 1) % SCREEN_PRESET_N;   /* -1 (custom) wraps to 0 */
+    g->width = screen_presets[i].w;
+    g->height = screen_presets[i].h;
+}
+
+static const char *scale_name(int mode) {
+    return (mode == 1) ? "stretch" : (mode == 2) ? "integer" : "fit";
+}
+
+/* v02.84: pick MIDlet-N. Cycling sets the class the launcher runs, so
+ * a multi-MIDlet suite can start any of its entries. */
+static void midlet_cycle(GameEntry *g) {
+    if (midlet_count <= 0) {
+        return;
+    }
+    /* midlet_idx is 1-based; 0 means "whatever the scan resolved". The
+     * first press therefore lands on entry 1 (so explicitly choosing the
+     * default is possible), later presses wrap 1..N. */
+    if (g->midlet_idx < 1 || g->midlet_idx > midlet_count) {
+        g->midlet_idx = 1;
+    } else {
+        g->midlet_idx = (g->midlet_idx % midlet_count) + 1;
+    }
+    snprintf(g->cls, sizeof(g->cls), "%s", midlets[g->midlet_idx - 1].cls);
+}
 
 /* ==================================================================
  * v01.78: TV-style tab UI.
@@ -1509,7 +2061,22 @@ static const char *fe_devices[] = {
 /* ---- settings (menu.cfg + launch.cfg line 4) ---- */
 #define MENU_CFG DATA_ROOT "/menu.cfg"
 #define LAUNCH_CFG DATA_ROOT "/launch.cfg"
-enum { SET_VIEW = 0, SET_JIT, SET_KEYMAP, SET_N };
+/* v03.79: three on-screen-overlay rows live at the end, driven through
+ * vita_diag.h so the overlay itself holds the state (one source of truth,
+ * same as vkey). JITPROBE is a file-existence switch - the probe executes
+ * freshly written code, so it must stay an explicit opt-in, but making the
+ * user create a file by hand was the same mistake as diag.cfg. */
+/* v04.24: "Java 堆" sits right after "JIT 编译" ON PURPOSE. log183's user
+ * report was "there is nowhere to set the Java heap" - it existed, but as row
+ * 14 of a 10-row window that needs scrolling, and nobody looks for a JIT
+ * prerequisite three screens down from JIT. Related settings belong together. */
+/* v04.26: SET_JITPROBE removed together with the jitprobe.cfg gate in
+ * vita_jitmem.c - the probe now runs whenever the user asks for jit!=0, so
+ * there is nothing left to toggle here. */
+enum { SET_VIEW = 0, SET_PROFILE, SET_SCALE, SET_VKEY, SET_VIBRATE,
+       SET_KEYMAP, SET_PERMS, SET_JIT, SET_HEAPMB, SET_3D,
+       SET_DIAG, SET_DIAGPOS, SET_DIAGDETAIL,
+       SET_N };
 
 /* vita_input.c: user key remapping (keymap.cfg) */
 int vita_keymap_count(void);
@@ -1525,13 +2092,188 @@ static int km_top = 0;             /* first visible row */
 #define KM_LINES 13
 static int set_list_grid = 0;      /* 0 = list, 1 = grid */
 static int set_jit = 0;            /* 0/1/2, mirrors launch.cfg "jit=" */
+/* v02.85: virtual keypad. Kept in vkey.cfg (the launcher reads it before
+ * the VM starts), NOT in menu.cfg, so there is one source of truth. */
+static int set_vkey = 0;
+/* v02.86: global defaults written to defaults.cfg - the launcher reads
+ * this file before every round, and a per-game game.cfg overrides it.
+ * Not in menu.cfg because menu.cfg is UI state the launcher never sees. */
+static int set_profile = 0;        /* index into profile_choices[] */
+static int set_scale = 0;          /* 0 fit, 1 stretch, 2 integer */
+static int set_vibrate = 1;        /* 1 = allow Display.vibrate */
+/* v02.90: MIDP permission policy. 0 = relaxed (default, no prompts),
+ * 1 = strict (phoneME's own tables). Written to defaults.cfg as perms=,
+ * read by the launcher and again by the policy loader itself. */
+static int set_perms = 0;
+/* v03.04: 3D backend. 0 = auto (hardware, then software), 1 = hardware,
+ * 2 = software. Written to defaults.cfg as 3d=auto|hw|sw and read by
+ * vita_3d.c itself. */
+static int set_3d = 0;
+
+static const char *mode3d_name(int m) {
+    return (m == 1) ? "硬件" : (m == 2) ? "软件" : "自动";
+}
+
+#define DEFAULTS_CFG DATA_ROOT "/defaults.cfg"
+
+static void defaults_save(void) {
+    char buf[256];
+    int n;
+    SceUID fd;
+    n = snprintf(buf, sizeof(buf),
+                 "profile=%s\nscale=%s\nvkey=%d\nvibrate=%d\nperms=%s\n"
+                 "3d=%s\n",
+                 profile_choices[set_profile].name,
+                 (set_scale == 1) ? "stretch" :
+                 (set_scale == 2) ? "integer" : "fit",
+                 set_vkey ? 1 : 0, set_vibrate ? 1 : 0,
+                 set_perms ? "strict" : "relaxed",
+                 (set_3d == 1) ? "hw" : (set_3d == 2) ? "sw" : "auto");
+    if (n <= 0) {
+        return;
+    }
+    sceIoRemove(DEFAULTS_CFG);   /* Vita3K ignores SCE_O_TRUNC */
+    fd = sceIoOpen(DEFAULTS_CFG, SCE_O_WRONLY | SCE_O_CREAT, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, buf, (SceSize)n);
+        sceIoClose(fd);
+    }
+}
+
+static void defaults_load(void) {
+    char buf[256];
+    SceUID fd;
+    int n;
+    const char *p;
+
+    fd = sceIoOpen(DEFAULTS_CFG, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return;
+    }
+    memset(buf, 0, sizeof(buf));
+    n = sceIoRead(fd, buf, sizeof(buf) - 1);
+    sceIoClose(fd);
+    if (n <= 0) {
+        return;
+    }
+    buf[n] = '\0';
+    for (p = buf; *p != '\0'; ) {
+        const char *nl = strpbrk(p, "\r\n");
+        const char *end = (nl != NULL) ? nl : p + strlen(p);
+        int len = (int)(end - p);
+        char line[128];
+        if (len > 0 && len < (int)sizeof(line)) {
+            memcpy(line, p, (size_t)len);
+            line[len] = '\0';
+            if (line[0] != '#') {
+                char *eq = strchr(line, '=');
+                if (eq != NULL) {
+                    char *k = line, *v = eq + 1, *ke = eq, *ve;
+                    int i;
+                    while (*k == ' ' || *k == '\t') k++;
+                    while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
+                    *ke = '\0';
+                    while (*v == ' ' || *v == '\t') v++;
+                    ve = v + strlen(v);
+                    while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t'))
+                        *--ve = '\0';
+                    if (strcmp(k, "profile") == 0) {
+                        for (i = 0; i < PROFILE_N; i++)
+                            if (strcmp(profile_choices[i].name, v) == 0)
+                                set_profile = i;
+                    } else if (strcmp(k, "scale") == 0) {
+                        set_scale = (strcmp(v, "stretch") == 0) ? 1 :
+                                    (strcmp(v, "integer") == 0) ? 2 : 0;
+                    } else if (strcmp(k, "vkey") == 0) {
+                        set_vkey = (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+                    } else if (strcmp(k, "vibrate") == 0) {
+                        set_vibrate = !(v[0] == '0' || v[0] == 'n' ||
+                                        v[0] == 'N');
+                    } else if (strcmp(k, "perms") == 0) {
+                        set_perms = (strcmp(v, "strict") == 0) ? 1 : 0;
+                    } else if (strcmp(k, "3d") == 0) {
+                        set_3d = (strcmp(v, "hw") == 0) ? 1 :
+                                 (strcmp(v, "sw") == 0) ? 2 : 0;
+                    }
+                }
+            }
+        }
+        if (nl == NULL) break;
+        p = nl + 1;
+    }
+}
 
 static const char *jit_name(int j) {
     return (j == 0) ? "关闭" : (j == 1) ? "仅首轮" : "每轮";
 }
 
+/* v03.79: corner names for the diagnostics overlay, in pos= order. */
+static const char *diagpos_name(int p) {
+    return (p == 1) ? "左上" : (p == 2) ? "右下" :
+           (p == 3) ? "左下" : "右上";
+}
+
+/* v04.19: Java heap size override, in MiB, read by runMidlet.c before the VM
+ * starts. 0 / absent = platform default (32 MiB), which does NOT fit a VM
+ * domain block; <=15 lets the heap be executable and the JIT usable. */
+#define HEAPMB_CFG DATA_ROOT "/heap_mb"
+
+static int heapmb_get(void) {
+    SceUID fd = sceIoOpen(HEAPMB_CFG, SCE_O_RDONLY, 0);
+    char b[16];
+    int n, v = 0, k;
+
+    if (fd < 0) {
+        return 0;
+    }
+    n = (int)sceIoRead(fd, b, sizeof(b) - 1);
+    sceIoClose(fd);
+    if (n <= 0) {
+        return 0;
+    }
+    b[n] = '\0';
+    for (k = 0; k < n && b[k] >= '0' && b[k] <= '9'; k++) {
+        v = v * 10 + (b[k] - '0');
+    }
+    return (v >= 4 && v <= 64) ? v : 0;
+}
+
+static const char *heapmb_label(void) {
+    static char lb[16];
+    int mb = heapmb_get();
+
+    if (mb == 0) {
+        return "默认 32MB";
+    }
+    snprintf(lb, sizeof(lb), "%dMB", mb);
+    return lb;
+}
+
+static void heapmb_set(int mb) {
+    SceUID fd;
+    char b[16];
+    int n;
+
+    sceIoRemove(HEAPMB_CFG);
+    if (mb <= 0) {
+        return;                 /* 0 = no file = platform default */
+    }
+    n = snprintf(b, sizeof(b), "%d\n", mb);
+    fd = sceIoOpen(HEAPMB_CFG, SCE_O_WRONLY | SCE_O_CREAT, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, b, n);
+        sceIoClose(fd);
+    }
+}
+
+
 static void settings_load(void) {
     SceUID fd = sceIoOpen(MENU_CFG, SCE_O_RDONLY, 0);
+    /* v02.85/02.86: the keypad state lives in vkey.cfg (manual/legacy)
+     * and defaults.cfg (what this page writes). Read vkey.cfg first,
+     * then let defaults.cfg win when it has the key. */
+    set_vkey = vita_vkey_load(NULL);
+    defaults_load();
     if (fd >= 0) {
         char buf[64];
         int n = sceIoRead(fd, buf, sizeof(buf) - 1);
@@ -1624,10 +2366,88 @@ static void settings_toggle(int item, char *msg, size_t msg_sz) {
         settings_save();
         write_jit_to_launch_cfg(set_jit);
         snprintf(msg, msg_sz, "JIT: %s", jit_name(set_jit));
+    } else if (item == SET_VKEY) {
+        /* v02.85/02.86: toggle the on-screen keypad. Written to
+         * defaults.cfg because the launcher (not the menu) applies it;
+         * vkey.cfg stays readable for manual experiments. */
+        set_vkey = !set_vkey;
+        vita_vkey_set_enabled(set_vkey);
+        defaults_save();
+        snprintf(msg, msg_sz, "虚拟键盘: %s (需重启游戏)",
+                 set_vkey ? "开" : "关");
+    } else if (item == SET_PROFILE) {
+        set_profile = (set_profile + 1) % PROFILE_N;
+        defaults_save();
+        snprintf(msg, msg_sz, "默认机型: %s (需重启游戏)",
+                 profile_choices[set_profile].label);
+    } else if (item == SET_SCALE) {
+        set_scale = (set_scale + 1) % 3;
+        defaults_save();
+        snprintf(msg, msg_sz, "默认缩放: %s (需重启游戏)",
+                 scale_name(set_scale));
+    } else if (item == SET_VIBRATE) {
+        set_vibrate = !set_vibrate;
+        defaults_save();
+        snprintf(msg, msg_sz, "振动: %s", set_vibrate ? "开" : "关");
+    } else if (item == SET_PERMS) {
+        /* v02.90: relaxed = every permission allowed (no dialog, the
+         * default); strict = phoneME's own tables, where an unsigned jar
+         * can be prompted. Requires a restart because the policy tables
+         * are read once while the VM initialises. */
+        set_perms = !set_perms;
+        defaults_save();
+        snprintf(msg, msg_sz, "权限: %s (需重启游戏)",
+                 set_perms ? "严格" : "宽松");
+    } else if (item == SET_3D) {
+        set_3d = (set_3d + 1) % 3;
+        defaults_save();
+        snprintf(msg, msg_sz, "3D 模式: %s (需重启游戏)", mode3d_name(set_3d));
     } else if (item == SET_KEYMAP) {
         km_page = 1;
         km_sel = 0;
         km_top = 0;
+    } else if (item == SET_DIAG) {
+        /* v03.79: the overlay is the one thing a tester wants to flip mid-run,
+         * and until now the only way was editing diag.cfg on a PC. State lives
+         * in vita_diag.c; this writes it through and persists. */
+        vita_diag_set_visible(!vita_diag_visible());
+        vita_diag_save();
+        snprintf(msg, msg_sz, "帧率浮层: %s",                 vita_diag_visible() ? "开" : "关");
+    } else if (item == SET_DIAGPOS) {
+        vita_diag_set_pos((vita_diag_get_pos() + 1) % 4);
+        vita_diag_save();
+        snprintf(msg, msg_sz, "浮层位置: %s", diagpos_name(vita_diag_get_pos()));
+    } else if (item == SET_DIAGDETAIL) {
+        vita_diag_set_detail(!vita_diag_get_detail());
+        vita_diag_save();
+        snprintf(msg, msg_sz, "浮层详细: %s",
+                 vita_diag_get_detail() ? "开 (两行)" : "关 (一行)");
+    } else if (item == SET_HEAPMB) {
+        /* v04.48: the Java heap must fit ONE VM-domain block for the compiler
+         * area (and therefore JIT code) to be executable. Blocks are capped at
+         * 16 MiB by the API, but log186 measured that a 16 MiB request comes
+         * back 0x80024b0b (MEMBLOCK_OVERFLOW) while 15 MiB succeeds, so the
+         * usable maximum is a 15 MiB block = a 14 MB heap:
+         *     14 MB -> 14688256 -> rounds to 15728640 (15 MiB)  works
+         *     15 MB -> 15736832 -> rounds to 16777216 (16 MiB)  OVERFLOW
+         * 15 MB used to be offered here; selecting it produced the log188
+         * crash (JIT enabled, heap fell back to non-executable malloc).
+         * 0 = leave the platform default alone (32 MB, JIT unavailable). */
+        static const int steps[] = { 0, 14, 12, 10, 8, 6 };
+        int cur = heapmb_get();
+        int idx = 0, k;
+        for (k = 0; k < (int)(sizeof(steps) / sizeof(steps[0])); k++) {
+            if (steps[k] == cur) { idx = k; break; }
+        }
+        idx = (idx + 1) % (int)(sizeof(steps) / sizeof(steps[0]));
+        heapmb_set(steps[idx]);
+        if (steps[idx] == 0) {
+            snprintf(msg, msg_sz, "Java 堆: 默认(32MB)");
+        } else {
+            snprintf(msg, msg_sz, "Java 堆: %dMB%s (需重启游戏)",
+                     steps[idx],
+                     (steps[idx] <= 14) ? " 可启用JIT" : "");
+        }
     }
 }
 
@@ -1673,25 +2493,48 @@ static void fe_insert(const char *name, const char *full, int type) {
     fe_count++;
 }
 
-static void fe_scan(const char *path) {
+/* Scan `path` and replace the file-browser listing.
+ *
+ * Returns 1 when the listing was replaced, 0 when the directory could
+ * not be opened (the previous listing and fe_cwd are then untouched -
+ * a failed open must not look like an empty folder).
+ *
+ * v01.80 aliasing fix: callers pass fes[i].full, i.e. a pointer INTO
+ * the array this function rewrites. Using the argument directly meant
+ * the ".." entry (and later sorted inserts, which shift fes[]) overwrote
+ * the very string being scanned. sceIoDopen() then opened the wrong
+ * directory - or a bare entry name with no slash - and every full path
+ * built afterwards was garbage. Visible symptoms on hardware:
+ *   - opening a folder showed an empty list (Dopen on the clobbered
+ *     path failed), and
+ *   - listings showed names but selecting anything did nothing: the
+ *     entry's `full` did not point at the file at all.
+ * So the path is copied into a private buffer before any fes[] write. */
+static int fe_scan(const char *path) {
+    char target[256];
+    size_t tlen;
     SceUID d;
     SceIoDirent ent;
 
-    snprintf(fe_cwd, sizeof(fe_cwd), "%s", path);
-    fe_count = 0;
-    /* virtual ".." parent (except at the sandbox root) so up/down/tap
-     * all treat going up like opening any other directory */
-    if (strcmp(path, fe_root) != 0) {
-        char parent[256];
-        fe_parent(parent, sizeof(parent));
-        fe_insert("..", parent, FE_DIR);
+    if (path == NULL || path[0] == '\0') {
+        return 0;
     }
-    if (strcmp(path, "/") == 0) {
+    snprintf(target, sizeof(target), "%s", path);
+    tlen = strlen(target);
+    /* volume root needs the separator for sceIoDopen ("ux0:" -> "ux0:/") */
+    if (tlen > 0 && target[tlen - 1] == ':' && tlen + 1 < sizeof(target)) {
+        target[tlen] = '/';
+        target[tlen + 1] = '\0';
+    }
+
+    if (strcmp(target, "/") == 0) {
         /* Root: build the partition list by probing (see fe_devices),
          * then merge anything sceIoDopen("/") returns that we did not
          * already add. The old code early-returned when sceIoDopen
          * failed, which skipped the fallback and left the tab empty. */
         int i;
+        snprintf(fe_cwd, sizeof(fe_cwd), "%s", target);
+        fe_count = 0;
         for (i = 0; i < (int)(sizeof(fe_devices) / sizeof(fe_devices[0]));
              i++) {
             if (dir_exists(fe_devices[i])) {
@@ -1722,11 +2565,25 @@ static void fe_scan(const char *path) {
             fe_insert("ux0:", "ux0:", FE_DIR);
             fe_insert("ur0:", "ur0:", FE_DIR);
         }
-        return;
+        return 1;
     }
-    d = sceIoDopen(path);
+
+    /* open BEFORE clearing: on failure keep the current directory and
+     * listing instead of presenting an empty folder */
+    d = sceIoDopen(target);
     if (d < 0) {
-        return;
+        return 0;
+    }
+
+    snprintf(fe_cwd, sizeof(fe_cwd), "%s", target);
+    fe_count = 0;
+    /* virtual ".." parent (except at the sandbox root) so up/down/tap
+     * all treat going up like opening any other directory */
+    {
+        char parent[256];
+        if (fe_parent(parent, sizeof(parent))) {
+            fe_insert("..", parent, FE_DIR);
+        }
     }
     for (;;) {
         int type;
@@ -1739,8 +2596,10 @@ static void fe_scan(const char *path) {
             continue;
         }
         {
-            const char *sep = (path[strlen(path) - 1] == '/') ? "" : "/";
-            snprintf(full, sizeof(full), "%s%s%s", path, sep, ent.d_name);
+            /* build from `target`, never from `path`: fe_insert() below
+             * may overwrite the caller's buffer */
+            const char *sep = (target[strlen(target) - 1] == '/') ? "" : "/";
+            snprintf(full, sizeof(full), "%s%s%s", target, sep, ent.d_name);
         }
         if (SCE_S_ISDIR(ent.d_stat.st_mode)) {
             type = FE_DIR;
@@ -1750,10 +2609,14 @@ static void fe_scan(const char *path) {
         fe_insert(ent.d_name, full, type);
     }
     sceIoDclose(d);
+    return 1;
 }
 
 static int fe_parent(char *out, size_t outsz) {
     char *slash;
+    size_t n;
+    int dev_root;
+
     if (fe_cwd[0] == '\0' || strcmp(fe_cwd, "/") == 0) {
         return 0; /* Vita pseudo-root - no parent */
     }
@@ -1763,10 +2626,23 @@ static int fe_parent(char *out, size_t outsz) {
         snprintf(out, outsz, "/"); /* "ux0:" -> "/" */
         return 1;
     }
+    /* true when the separator being dropped is the last character, i.e.
+     * we go up from a volume root ("ux0:/"), not from a directory
+     * inside it ("ux0:/data") */
+    dev_root = (slash[1] == '\0');
     if (slash == out) {
         slash[1] = '\0'; /* "/ux0:" -> "/" */
     } else {
         *slash = '\0';
+    }
+    /* v01.80: fe_scan() stores volume roots with their separator
+     * ("ux0:/"), so going up trims them to "ux0:" - the volume itself,
+     * whose parent is the pseudo-root. Without this, O/CIRCLE from a
+     * volume root looped on the same directory. "ux0:/data" must still
+     * go up to the volume, not to "/". */
+    n = strlen(out);
+    if (dev_root && n > 0 && out[n - 1] == ':') {
+        snprintf(out, outsz, "/");
     }
     return 1;
 }
@@ -1847,6 +2723,48 @@ static int install_jar(const char *jarpath, char *msg, size_t msg_sz) {
     }
     snprintf(msg, msg_sz, "installed: %s", base);
     return 1;
+}
+
+/* Act on file-browser entry `idx`: enter a directory, or install a jar.
+ *
+ * The entry's path is copied out FIRST - fe_scan() and install_jar()
+ * both reuse/rewrite the fes[] slot it lives in, and the previous code
+ * passed &fes[idx].full straight through (see the fe_scan() comment).
+ *
+ * Returns 1 when the listing changed (folder entered / jar installed),
+ * 0 otherwise; msg always describes the result so a press never looks
+ * like it did nothing. */
+static int fe_activate(int idx, char *msg, size_t msg_sz) {
+    char sel[256];
+    char nm[64];
+    int type;
+
+    if (idx < 0 || idx >= fe_count) {
+        return 0;
+    }
+    snprintf(sel, sizeof(sel), "%s", fes[idx].full);
+    snprintf(nm, sizeof(nm), "%s", fes[idx].name);
+    type = fes[idx].type;
+
+    if (type == FE_DIR) {
+        if (!fe_scan(sel)) {
+            snprintf(msg, msg_sz, "无法打开: %.80s", nm);
+            return 0;
+        }
+        return 1;
+    }
+    if (type != FE_JAR) {
+        /* previously silent - the cursor sat on a non-jar entry and the
+         * X press appeared to be ignored */
+        snprintf(msg, msg_sz, "不是 .jar: %.80s", nm);
+        return 0;
+    }
+    if (install_jar(sel, msg, msg_sz)) {
+        scan_games();
+        fe_scan(fe_cwd);
+        return 1;
+    }
+    return 0;
 }
 
 /* inbox scan for the "未安装" tab: list .jar files in inbox/ */
@@ -1958,6 +2876,11 @@ int vita_menu_run(VitaGameSel *out) {
         int i;
         const int row_h = 30;
         const int lines = 13;
+        /* v03.79: visible rows in the 设置 tab. It is a single-column list with
+         * 30 px rows starting at y=64 plus a hint block and the storage figures
+         * underneath, so 10 rows is what fits in 544 px. Kept separate from
+         * `lines` because the list tabs are 2-line rows and must not shrink. */
+        const int SET_LINES = 10;
         const int cols = 4;
         const int cell_w = 170, cell_h = 150;
         const int grid_rows = 3;
@@ -2160,8 +3083,10 @@ int vita_menu_run(VitaGameSel *out) {
                     gtop = gsel / cols - grid_rows + 1;
                 }
             } else if (has_cursor) {
+                /* v03.79: the 设置 tab shows SET_LINES rows, not `lines`. */
+                int cap = (tab == 3) ? SET_LINES : lines;
                 if (*psel < *ptop) *ptop = *psel;
-                if (*psel >= *ptop + lines) *ptop = *psel - lines + 1;
+                if (*psel >= *ptop + cap) *ptop = *psel - cap + 1;
             }
 
             if (btn & SCE_CTRL_SELECT) {
@@ -2172,8 +3097,11 @@ int vita_menu_run(VitaGameSel *out) {
                              game_count);
                     msg_us = sceKernelGetProcessTimeWide();
                 } else if (tab == 2) {
-                    fe_scan(fe_cwd);
-                    snprintf(msg, sizeof(msg), "refreshed");
+                    if (fe_scan(fe_cwd)) {
+                        snprintf(msg, sizeof(msg), "refreshed");
+                    } else {
+                        snprintf(msg, sizeof(msg), "刷新失败: %.80s", fe_cwd);
+                    }
                     msg_us = sceKernelGetProcessTimeWide();
                 }
             }
@@ -2193,6 +3121,14 @@ int vita_menu_run(VitaGameSel *out) {
                     mode = 1;
                     dlg_sel = DLG_LAUNCH;
                     confirm_del = 0;
+                    /* v02.84: build MIDlet-1..N for this jar once, and
+                     * honour a saved choice (game.cfg midlet=N). */
+                    midlets_scan(games[sel].jar);
+                    if (games[sel].midlet_idx >= 1 &&
+                        games[sel].midlet_idx <= midlet_count) {
+                        snprintf(games[sel].cls, sizeof(games[sel].cls), "%s",
+                                 midlets[games[sel].midlet_idx - 1].cls);
+                    }
                 }
                 if ((btn & SCE_CTRL_CROSS) && game_count == 0) {
                     break; /* fall back to launch.cfg / Hello */
@@ -2208,6 +3144,13 @@ int vita_menu_run(VitaGameSel *out) {
                         mode = 1;
                         dlg_sel = DLG_LAUNCH;
                         confirm_del = 0;
+                        midlets_scan(games[sel].jar);
+                        if (games[sel].midlet_idx >= 1 &&
+                            games[sel].midlet_idx <= midlet_count) {
+                            snprintf(games[sel].cls,
+                                     sizeof(games[sel].cls), "%s",
+                                     midlets[games[sel].midlet_idx - 1].cls);
+                        }
                     }
                 }
                 if (btn & SCE_CTRL_TRIANGLE) {
@@ -2246,43 +3189,37 @@ int vita_menu_run(VitaGameSel *out) {
                 if (btn & SCE_CTRL_CIRCLE) {
                     char parent[256];
                     if (fe_parent(parent, sizeof(parent))) {
-                        fe_scan(parent);
-                        fsel = ftop = 0;
+                        if (fe_scan(parent)) {
+                            fsel = ftop = 0;
+                        } else {
+                            snprintf(msg, sizeof(msg), "无法打开: %.80s",
+                                     parent);
+                            msg_us = sceKernelGetProcessTimeWide();
+                        }
                     }
                 }
                 if (btn & SCE_CTRL_CROSS && fe_count > 0) {
-                    FileEntry *e = &fes[fsel];
-                    if (e->type == FE_DIR) {
-                        fe_scan(e->full);
-                        fsel = ftop = 0;
-                    } else if (e->type == FE_JAR) {
-                        if (install_jar(e->full, msg, sizeof(msg))) {
-                            msg_us = sceKernelGetProcessTimeWide();
-                            scan_games();
-                            fe_scan(fe_cwd);
-                            if (fsel >= fe_count) fsel = fe_count - 1;
-                            if (fsel < 0) fsel = 0;
-                        }
+                    if (fsel < 0) fsel = 0;
+                    if (fsel >= fe_count) fsel = fe_count - 1;
+                    if (fe_activate(fsel, msg, sizeof(msg))) {
+                        /* land on the first real entry, not on "..":
+                         * otherwise the first X press just walks up */
+                        fsel = (fe_count > 1) ? 1 : 0;
+                        ftop = 0;
                     }
+                    msg_us = sceKernelGetProcessTimeWide();
                 }
                 if (tapped && tap_x >= TABBAR_W && fe_count > 0) {
                     /* tab 2 content starts at y=80 (below the cwd line) */
                     int row = (tap_y - 80) / row_h;
                     int idx = ftop + row;
                     if (row >= 0 && idx >= 0 && idx < fe_count) {
-                        FileEntry *e = &fes[idx];
-                        if (e->type == FE_DIR) {
-                            fe_scan(e->full);
-                            fsel = ftop = 0;
-                        } else if (e->type == FE_JAR) {
-                            if (install_jar(e->full, msg, sizeof(msg))) {
-                                msg_us = sceKernelGetProcessTimeWide();
-                                scan_games();
-                                fe_scan(fe_cwd);
-                                if (fsel >= fe_count) fsel = fe_count - 1;
-                                if (fsel < 0) fsel = 0;
-                            }
+                        fsel = idx;
+                        if (fe_activate(idx, msg, sizeof(msg))) {
+                            fsel = (fe_count > 1) ? 1 : 0;
+                            ftop = 0;
                         }
+                        msg_us = sceKernelGetProcessTimeWide();
                     }
                 }
             } else if (tab == 3) { /* ---- 设置 ---- */
@@ -2292,8 +3229,13 @@ int vita_menu_run(VitaGameSel *out) {
                 }
                 if (tapped && tap_x >= TABBAR_W && tap_y >= 64) {
                     int row = (tap_y - 64) / row_h;
-                    if (row >= 0 && row < SET_N) {
-                        setsel = row;
+                    /* v03.79: the page scrolls, so the tapped row is an offset
+                     * into the visible window, not an item index. Without
+                     * settop here a tap on the first visible row of a scrolled
+                     * page would toggle the wrong option. */
+                    if (row >= 0 && row < SET_LINES &&
+                        settop + row < SET_N) {
+                        setsel = settop + row;
                         settings_toggle(setsel, msg, sizeof(msg));
                         msg_us = sceKernelGetProcessTimeWide();
                     }
@@ -2321,9 +3263,85 @@ int vita_menu_run(VitaGameSel *out) {
             if (btn & SCE_CTRL_CROSS) {
                 if (dlg_sel == DLG_ORIENT) {
                     g->landscape = !g->landscape;
+                    /* v02.82: an explicit screen size wins over the
+                     * orientation, so swap it too - otherwise flipping
+                     * this item would look like a no-op. */
+                    if (g->width > 0 && g->height > 0) {
+                        int t = g->width;
+                        g->width = g->height;
+                        g->height = t;
+                    }
                     save_cfg(g);
                     snprintf(msg, sizeof(msg), "%s: %s", g->name,
                              g->landscape ? "landscape" : "portrait");
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (dlg_sel == DLG_SCREEN) {
+                    screen_cycle(g);
+                    save_cfg(g);
+                    if (g->width > 0 && g->height > 0) {
+                        snprintf(msg, sizeof(msg), "screen: %dx%d",
+                                 g->width, g->height);
+                    } else {
+                        snprintf(msg, sizeof(msg), "screen: auto (%s)",
+                                 g->landscape ? "landscape" : "portrait");
+                    }
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (dlg_sel == DLG_SCALE) {
+                    g->scale_mode = (g->scale_mode + 1) % 3;
+                    save_cfg(g);
+                    snprintf(msg, sizeof(msg), "scale: %s",
+                             scale_name(g->scale_mode));
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (dlg_sel == DLG_PROFILE) {
+                    int i = (profile_index(g) + 1) % PROFILE_N;
+                    snprintf(g->profile, sizeof(g->profile), "%s",
+                             profile_choices[i].name);
+                    save_cfg(g);
+                    snprintf(msg, sizeof(msg), "profile: %s",
+                             profile_choices[i].label);
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (dlg_sel == DLG_MIDLET) {
+                    if (midlet_count <= 1) {
+                        snprintf(msg, sizeof(msg),
+                                 "only one MIDlet in this jar");
+                    } else {
+                        midlet_cycle(g);
+                        save_cfg(g);
+                        snprintf(msg, sizeof(msg), "midlet %d/%d: %.40s",
+                                 g->midlet_idx, midlet_count, g->cls);
+                    }
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (dlg_sel == DLG_LOCALE) {
+                    int i = (locale_index(g) + 1) % LOCALE_N;
+                    snprintf(g->locale, sizeof(g->locale), "%s",
+                             locale_choices[i]);
+                    save_cfg(g);
+                    snprintf(msg, sizeof(msg), "locale: %s",
+                             locale_label(g));
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (dlg_sel == DLG_VKEY) {
+                    g->vkey = cycle_follow(g->vkey, 1);
+                    save_cfg(g);
+                    snprintf(msg, sizeof(msg), "vkey: %s",
+                             follow_onoff(g->vkey));
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (dlg_sel == DLG_VIBRATE) {
+                    g->vibrate = cycle_follow(g->vibrate, 1);
+                    save_cfg(g);
+                    snprintf(msg, sizeof(msg), "vibrate: %s",
+                             follow_onoff(g->vibrate));
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (dlg_sel == DLG_PERMS) {
+                    g->perms = cycle_follow(g->perms, 1);
+                    save_cfg(g);
+                    snprintf(msg, sizeof(msg), "perms: %s",
+                             follow_label(g->perms, "strict", "relaxed"));
+                    msg_us = sceKernelGetProcessTimeWide();
+                } else if (dlg_sel == DLG_JIT) {
+                    g->jit = cycle_follow(g->jit, 2);
+                    save_cfg(g);
+                    snprintf(msg, sizeof(msg), "jit: %s",
+                             jit_label_pergame(g->jit));
                     msg_us = sceKernelGetProcessTimeWide();
                 } else if (dlg_sel == DLG_UNINSTALL) {
                     if (!confirm_del) {
@@ -2405,8 +3423,14 @@ int vita_menu_run(VitaGameSel *out) {
                 draw_icon_scaled(TABBAR_W + 20, y, &games[i], row_h - 8);
                 draw_text(TABBAR_W + 52, y, games[i].name, 2,
                           games[i].cls[0] ? C_FG : C_WARN);
-                draw_text(FB_W - 60, y, games[i].landscape ? "L" : "P",
-                          2, C_HINT);
+                /* v02.82: show the effective virtual screen instead of
+                 * the bare L/P marker - the size is now per game, and a
+                 * device profile changes the default. */
+                {
+                    int ew, eh;
+                    effective_size(&games[i], &ew, &eh);
+                    draw_textf(FB_W - 130, y, 2, C_HINT, "%dx%d", ew, eh);
+                }
                 y += row_h;
             }
             if (game_count == 0) {
@@ -2513,20 +3537,46 @@ int vita_menu_run(VitaGameSel *out) {
                       "左右/X 切换功能机按键  O 保存并返回", 1, C_HINT);
         } else if (tab == 3) {
             uint64_t maxb = 0, freeb = 0;
-            /* option rows: UP/DOWN move setsel, X cycles the value */
+            /* option rows: UP/DOWN move setsel, X cycles the value.
+             * v03.79: SET_N is now larger than the visible area, so the page
+             * scrolls by settop. It has to draw its own window (the list tabs
+             * use `lines`, which is what the shared clamp knows about), so the
+             * clamp below is told SET_LINES for this tab. */
             y = 64;
-            for (i = 0; i < SET_N; i++) {
-                const char *val = (i == SET_VIEW)
-                                      ? (set_list_grid ? "网格" : "列表")
-                                  : (i == SET_KEYMAP) ? "进入 >"
-                                      : jit_name(set_jit);
+            for (i = settop;
+                 i < SET_N && i < settop + SET_LINES; i++) {
+                const char *val =
+                      (i == SET_VIEW)    ? (set_list_grid ? "网格" : "列表")
+                    : (i == SET_PROFILE) ? profile_choices[set_profile].label
+                    : (i == SET_SCALE)   ? scale_name(set_scale)
+                    : (i == SET_VKEY)    ? (set_vkey ? "开" : "关")
+                    : (i == SET_VIBRATE) ? (set_vibrate ? "开" : "关")
+                    : (i == SET_PERMS)   ? (set_perms ? "严格" : "宽松")
+                    : (i == SET_KEYMAP)  ? "进入 >"
+                    : (i == SET_3D)      ? mode3d_name(set_3d)
+                    : (i == SET_DIAG)    ? (vita_diag_visible() ? "开" : "关")
+                    : (i == SET_DIAGPOS) ? diagpos_name(vita_diag_get_pos())
+                    : (i == SET_DIAGDETAIL) ? (vita_diag_get_detail() ? "开"
+                                                                     : "关")
+                    : (i == SET_HEAPMB)   ? (heapmb_label())
+                                         : jit_name(set_jit);
                 if (i == setsel) {
                     fill_rect(TABBAR_W + 8, y - 4, FB_W - TABBAR_W - 24,
                               row_h, (focus == 1) ? C_PANEL2 : C_SEL);
                 }
                 draw_text(TABBAR_W + 20, y,
-                          (i == SET_VIEW) ? "游戏视图" :
-                          (i == SET_KEYMAP) ? "按键映射" : "JIT 编译", 2,
+                          (i == SET_VIEW)    ? "游戏视图" :
+                          (i == SET_PROFILE) ? "默认机型" :
+                          (i == SET_SCALE)   ? "默认缩放" :
+                          (i == SET_VKEY)    ? "虚拟键盘" :
+                          (i == SET_VIBRATE) ? "振动" :
+                          (i == SET_PERMS)   ? "权限" :
+                          (i == SET_KEYMAP)  ? "按键映射" :
+                          (i == SET_3D)      ? "3D 模式" :
+                          (i == SET_DIAG)    ? "帧率浮层" :
+                          (i == SET_DIAGPOS) ? "浮层位置" :
+                          (i == SET_DIAGDETAIL) ? "浮层详细" :
+                                                  "Java 堆", 2,
                           C_FG);
                 draw_text(TABBAR_W + 260, y, val, 2, C_TITLE);
                 y += row_h;
@@ -2545,6 +3595,9 @@ int vita_menu_run(VitaGameSel *out) {
             y += 34;
             draw_text(TABBAR_W + 20, y,
                       "JIT 首轮后崩溃未解(v01.45), 慎开", 1, C_HINT);
+            y += 24;
+            draw_text(TABBAR_W + 20, y,
+                      "硬件3D需libshacccg, 且占用GXM(系统键盘不可用)", 1, C_HINT);
             y += 24;
             draw_text(TABBAR_W + 20, y,
                       "数据目录: ux0:/data/J2ME00001", 1, C_HINT);
@@ -2566,25 +3619,86 @@ int vita_menu_run(VitaGameSel *out) {
 
         if (mode == 1 && game_count > 0) {
             GameEntry *g = &games[sel];
-            fill_rect(280, 120, 400, 70 + DLG_N * 40, C_PANEL);
-            fill_rect(280, 120, 400, 3, C_TITLE);
-            draw_icon_scaled(300, 130, g, 44);
-            draw_text(354, 134, g->name, 2, C_TITLE);
+            char screen_label[48];
+            char scale_label[32];
+            char midlet_label[96];
+            char profile_label_buf[64];
+            const char *profile_label_str;
+            int ew, eh;
+            effective_size(g, &ew, &eh);
+            snprintf(profile_label_buf, sizeof(profile_label_buf),
+                     "profile: %s (%dx%d)", profile_label(g), ew, eh);
+            profile_label_str = profile_label_buf;
+            if (g->width > 0 && g->height > 0) {
+                snprintf(screen_label, sizeof(screen_label), "screen: %dx%d",
+                         g->width, g->height);
+            } else {
+                snprintf(screen_label, sizeof(screen_label),
+                         "screen: auto (%dx%d)", ew, eh);
+            }
+            snprintf(scale_label, sizeof(scale_label), "scale: %s",
+                     scale_name(g->scale_mode));
+            if (midlet_count > 1) {
+                snprintf(midlet_label, sizeof(midlet_label), "midlet: %d/%d",
+                         (g->midlet_idx >= 1 && g->midlet_idx <= midlet_count)
+                             ? g->midlet_idx : 1,
+                         midlet_count);
+            } else {
+                snprintf(midlet_label, sizeof(midlet_label),
+                         "midlet: %d in jar", midlet_count);
+            }
+            /* v04.34: 13 rows now. 28 px pitch starting at y=96 keeps the
+             * whole dialog inside the 544 px panel: 96 + 70 + 13*28 = 530. */
+            fill_rect(280, 96, 400, 70 + DLG_N * 28, C_PANEL);
+            fill_rect(280, 96, 400, 3, C_TITLE);
+            draw_icon_scaled(300, 106, g, 44);
+            draw_text(354, 110, g->name, 2, C_TITLE);
             for (i = 0; i < DLG_N; i++) {
-                int iy = 120 + 56 + i * 40;
+                int iy = 96 + 44 + i * 28;
                 const char *label;
+                char label_buf[96];
+
+                label_buf[0] = '\0';
                 if (i == DLG_LAUNCH) {
                     label = "launch game";
                 } else if (i == DLG_ORIENT) {
                     label = g->landscape ? "orientation: landscape"
                                          : "orientation: portrait";
+                } else if (i == DLG_SCREEN) {
+                    label = screen_label;
+                } else if (i == DLG_SCALE) {
+                    label = scale_label;
+                } else if (i == DLG_PROFILE) {
+                    label = profile_label_str;
+                } else if (i == DLG_MIDLET) {
+                    label = midlet_label;
+                } else if (i == DLG_LOCALE) {
+                    snprintf(label_buf, sizeof(label_buf), "locale: %s",
+                             locale_label(g));
+                    label = label_buf;
+                } else if (i == DLG_VKEY) {
+                    snprintf(label_buf, sizeof(label_buf), "keypad: %s",
+                             follow_onoff(g->vkey));
+                    label = label_buf;
+                } else if (i == DLG_VIBRATE) {
+                    snprintf(label_buf, sizeof(label_buf), "rumble: %s",
+                             follow_onoff(g->vibrate));
+                    label = label_buf;
+                } else if (i == DLG_PERMS) {
+                    snprintf(label_buf, sizeof(label_buf), "permissions: %s",
+                             follow_label(g->perms, "strict", "relaxed"));
+                    label = label_buf;
+                } else if (i == DLG_JIT) {
+                    snprintf(label_buf, sizeof(label_buf), "jit: %s",
+                             jit_label_pergame(g->jit));
+                    label = label_buf;
                 } else if (i == DLG_UNINSTALL) {
                     label = confirm_del ? "delete? press again" : "uninstall";
                 } else {
                     label = "back";
                 }
                 if (i == dlg_sel) {
-                    fill_rect(290, iy - 6, 380, 34, C_SEL);
+                    fill_rect(290, iy - 4, 380, 24, C_SEL);
                 }
                 draw_text(306, iy, label, 2, (i == dlg_sel) ? C_FG : C_HINT);
             }

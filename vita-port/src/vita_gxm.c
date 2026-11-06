@@ -10,6 +10,7 @@
 #include <psp2/kernel/processmgr.h>
 
 #include "vita_gxm.h"
+#include "vita_gl3d.h"
 
 /* Framebuffer geometry - must match vita_display.c's physical screen. */
 #define GXM_FB_W 960
@@ -36,6 +37,10 @@ unsigned vita_gxm_frame_count(void) {
     return g_dialog_frames_total;
 }
 
+int vita_gxm_is_initialized(void) {
+    return vita_gxm_ready;
+}
+
 /* Display-queue swap callback: runs on the GXM display-queue thread once the
  * GPU has finished rendering `fb` (signalled via the sync object). This is the
  * GXM path's equivalent of flip_to_display()'s sceDisplaySetFrameBuf. */
@@ -58,6 +63,10 @@ int vita_gxm_ensure_init(void) {
 
     if (vita_gxm_ready) {
         return 1;
+    }
+    if (vita_gl3d_active()) {
+        fprintf(stderr, "[GXM] owned by vitaGL, IME unavailable\n");
+        return 0;
     }
     memset(&gxm_params, 0, sizeof(gxm_params));
     gxm_params.flags = 0;

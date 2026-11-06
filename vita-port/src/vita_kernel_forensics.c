@@ -50,6 +50,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/io/stat.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/dirent.h>   /* v04.12: list the tai dirs in the [KB] report */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -678,6 +679,223 @@ const char *vita_kf_precheck(void)
             return "installed-NOT-visible";
     }
     return "ABSENT"; /* no plugin file: install it (or enum failed) */
+}
+
+/* ====================================================================
+ * v04.12: WHY THE "installed-NOT-visible" VERDICT WAS NOT ACTIONABLE
+ *
+ * The user reported "ur0:tai/kubridge.skprx has been in place all along", and
+ * that is exactly right - the verdict above only ever proved that the FILE
+ * exists. It never read config.txt and it never logged the clock value, so
+ * three completely different situations all produced the same string:
+ *
+ *   (a) file present, config.txt has no kubridge line      -> not loaded
+ *   (b) config.txt has the line, under the wrong section   -> not loaded
+ *   (c) config.txt has the line, plugin IS loaded, but our
+ *       weak `ku*` stub was never rebound to the real code  -> loaded, unusable
+ *
+ * This function separates them. It writes one [KB] block per boot with:
+ *   - the raw return of kuPowerGetSysClockFrequency() (0 means the weak stub
+ *     in libkubridge_stub.a was never replaced - the stub is literally
+ *     `movs r3,#0; mov r0,r3; bx lr`, verified by disassembling the archive)
+ *   - for ux0:tai/config.txt and ur0:tai/config.txt: exists?, line count, and
+ *     the 1-based line numbers mentioning kubridge, with the section they fall
+ *     under (*KERNEL / *main etc) tracked while scanning
+ *   - the directory listing of both tai folders, so a misplaced file is visible
+ *
+ * Deliberately does NOT call taiGetModuleInfo or any cross-domain taiHEN query:
+ * v02.26 cost two core dumps proving that class of syscall never returns on
+ * this console. File reads and one already-proven-safe kubridge call are enough
+ * to decide between (a), (b) and (c).
+ * ==================================================================== */
+static void kf_put_str(SceUID fd, const char *s)
+{
+    if (s != NULL && s[0] != '\0') {
+        sceIoWrite(fd, s, (SceSize)strlen(s));
+    }
+}
+
+/* Scan one config.txt, reporting every line that mentions "kubridge" together
+ * with the section it belongs to. Section state is carried line by line: taiHEN
+ * only loads entries under *KERNEL / *main / etc, so an entry before the first
+ * section header or under the wrong one is silently ignored - which looks
+ * exactly like "the file is there but nothing happens". */
+static void kf_scan_cfg(SceUID fd, const char *path)
+{
+    static char buf[4096];
+    SceUID cf;
+    int n, line_no = 0, hits = 0;
+    char cur[32];
+    char *p;
+
+    cur[0] = '\0';
+    kf_put_str(fd, "[KB] ");
+    kf_put_str(fd, path);
+    cf = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (cf < 0) {
+        kf_put_str(fd, ": absent\n");
+        return;
+    }
+    n = (int)sceIoRead(cf, buf, sizeof(buf) - 1);
+    sceIoClose(cf);
+    if (n <= 0) {
+        kf_put_str(fd, ": empty\n");
+        return;
+    }
+    buf[n] = '\0';
+
+    for (p = buf; p != NULL && *p != '\0'; ) {
+        char *nl = strpbrk(p, "\r\n");
+        char *end = (nl != NULL) ? nl : p + strlen(p);
+        int len = (int)(end - p);
+        char line[192];
+
+        line_no++;
+        if (len >= (int)sizeof(line)) {
+            len = (int)sizeof(line) - 1;
+        }
+        memcpy(line, p, (size_t)len);
+        line[len] = '\0';
+
+        if (len > 0 && line[0] == '*') {
+            /* Section headers are short; truncate explicitly rather than let
+             * snprintf copy a 191-byte line into a 32-byte buffer. */
+            snprintf(cur, sizeof(cur), "%.31s", line);
+        }
+        if (strstr(line, "kubridge") != NULL) {
+            hits++;
+            {
+                char out[256];
+                snprintf(out, sizeof(out), "  line %d [%s] %s\n", line_no,
+                         cur[0] ? cur : "NO SECTION", line);
+                kf_put_str(fd, out);
+            }
+        }
+        if (nl == NULL) {
+            break;
+        }
+        p = nl + 1;
+    }
+    {
+        char out[96];
+        snprintf(out, sizeof(out), "  -> %d line(s), %d kubridge hit(s)\n",
+                 line_no, hits);
+        kf_put_str(fd, out);
+    }
+}
+
+/* List a directory so a misplaced plugin file is visible in the log. */
+static void kf_list_dir(SceUID fd, const char *path)
+{
+    SceUID df;
+    SceIoDirent de;
+    int shown = 0;
+
+    kf_put_str(fd, "[KB] ");
+    kf_put_str(fd, path);
+    df = sceIoDopen(path);
+    if (df < 0) {
+        kf_put_str(fd, ": cannot open\n");
+        return;
+    }
+    kf_put_str(fd, ": ");
+    while (sceIoDread(df, &de) > 0 && shown < 24) {
+        if (strcmp(de.d_name, ".") == 0 || strcmp(de.d_name, "..") == 0) {
+            continue;
+        }
+        kf_put_str(fd, de.d_name);
+        kf_put_str(fd, " ");
+        shown++;
+    }
+    sceIoDclose(df);
+    kf_put_str(fd, "\n");
+}
+
+void vita_kf_kubridge_report(const char *path)
+{
+    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                          0777);
+    char out[192];
+    int clk;
+
+    if (fd < 0) {
+        return;
+    }
+    kf_put_str(fd, "\n===== v04.12 kubridge reachability =====\n");
+
+    /* v04.15: THE DECISIVE BYTE CHECK.
+     * VitaSDK's libkubridge_stub.a provides this symbol as a LOCAL weak
+     * function, not an import:
+     *     objdump -h libkubridge_stub.a -> only .text (0x28 bytes), NO
+     *     .vitalink.fstubs section, while libSceDisplay_stub.a does have one.
+     * Our ELF therefore contains real instructions at &kuPowerGetSysClock-
+     * Frequency:
+     *     b480 af00 2300 4618 46bd bc80 4770   (push {r7} / ... / bx lr)
+     * and calling it returns 0 no matter which plugins are resident.
+     * The only way a loaded kubridge could change that is by PATCHING our
+     * process memory at runtime. Reading the bytes back distinguishes the two
+     * explanations without any risk - a read cannot trap where a call might:
+     *   identical  -> nothing patched us; the call is a local no-op forever and
+     *                 the plugin's presence is simply irrelevant to this symbol
+     *   different  -> something (kubridge) rewrote our stub, and a call would
+     *                 reach real kernel code; then the 0 means the patch is
+     *                 wrong or offset, which is a different investigation
+     * This is what "why is the plugin not being used" actually reduces to. */
+    {
+        static const unsigned short expect[8] = {
+            0xB480, 0xAF00, 0x2300, 0x4618, 0x46BD, 0xBC80, 0x4770, 0x0000
+        };
+        const volatile unsigned short *p =
+            (const volatile unsigned short *)(void *)kuPowerGetSysClockFrequency;
+        int same = 1, i;
+        kf_put_str(fd, "[KB] stub bytes at &kuPowerGetSysClockFrequency:");
+        for (i = 0; i < 8; i++) {
+            snprintf(out, sizeof(out), " %04x", (unsigned int)p[i]);
+            kf_put_str(fd, out);
+            if (i < 7 && p[i] != expect[i]) {
+                same = 0;
+            }
+        }
+        kf_put_str(fd, same
+            ? "\n[KB]   -> IDENTICAL to the link-time weak stub: nothing patched "
+              "it, so this call is a local no-op regardless of plugins\n"
+            : "\n[KB]   -> DIFFERENT from the link-time stub: something patched "
+              "our code at runtime (kubridge did reach us)\n");
+    }
+
+    /* The decisive number. libkubridge_stub.a's weak implementations are
+     * `movs r3,#0 ; mov r0,r3 ; bx lr` (kuPower...) and `mov.w r3,#-1`
+     * (kuKernelCpuUnrestrictedMemcpy); 0 therefore means "never rebound".
+     * A real system clock is 111/166/222/333/444. */
+    clk = ku_clock_probe();
+    snprintf(out, sizeof(out),
+             "[KB] kuPowerGetSysClockFrequency() = %d %s\n", clk,
+             (clk >= 41) ? "(REAL - kubridge is callable)"
+                         : "(0/-1 = weak stub never rebound: NOT callable)");
+    kf_put_str(fd, out);
+    snprintf(out, sizeof(out), "[KB] module enum: rc=%d nmod=%u flag=0x%02x\n",
+             g_ku_enum_rc, g_ku_nmod, g_ku_flag);
+    kf_put_str(fd, out);
+    /* The bundled copy lives inside the VPK as app0:kubridge.skprx, so the
+     * config.txt line that points at it is valid; logging this stops the
+     * "the file is missing" reading of an empty result. */
+    {
+        SceIoStat st;
+        memset(&st, 0, sizeof(st));
+        snprintf(out, sizeof(out),
+                 "[KB] skprx: ur0:tai=%d ux0:tai=%d app0:=%d\n",
+                 sceIoGetstat("ur0:tai/kubridge.skprx", &st) >= 0,
+                 sceIoGetstat("ux0:tai/kubridge.skprx", &st) >= 0,
+                 sceIoGetstat("app0:kubridge.skprx", &st) >= 0);
+        kf_put_str(fd, out);
+    }
+
+    kf_scan_cfg(fd, "ux0:tai/config.txt");
+    kf_scan_cfg(fd, "ur0:tai/config.txt");
+    kf_list_dir(fd, "ux0:tai");
+    kf_list_dir(fd, "ur0:tai");
+    kf_put_str(fd, "===== end kubridge report =====\n");
+    sceIoClose(fd);
 }
 
 /* v02.22: dump the module table itself (first entries) so ONE boot log

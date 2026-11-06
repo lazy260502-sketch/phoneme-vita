@@ -54,6 +54,101 @@
 
 static tsf *g_tsf = NULL;
 
+/* v03.41: make GM program 80 ("Square Wave") a steady, single-layer square.
+ *
+ * Why (log139, user: the ring tone sounds "stretched / dragging"): Nokia ring tones are played on program 80
+ * (Sonivox: a flat square that stays at one level until note-off). TimGM6mb's preset 0:80 is not that. It stacks two
+ * layers per key range (regions 0-6 and 7-13) with tunings a few cents apart - they beat, so the level wobbles - and
+ * the layers differ in sustain level (0.977 vs 0.676) and carry a mod-envelope pitch/filter sweep. Measured on the host
+ * (TinySoundFont, the same code that runs on the device; device pcm_dump == host render sample for sample):
+ *   one 282 ms note, level 20 ms -> 260 ms:  unmodified -8.2 dB; pitch/filter env off -3.1 dB; + flat amp envelope
+ *   -2.6 dB (still beating); + one layer only -0.1 dB.
+ *   Per note, start-of-note vs end-of-note RMS over the real tunes (notes >= 150 ms):
+ *     D0 (22 notes)   median -10.4 dB -> 0.0 dB, worst -16.1 -> -1.3
+ *     D1 (181 notes)  median  -7.4 dB -> -1.2 dB, worst -18.0 -> -3.7 (key 65 / F5; a residual of the sample itself)
+ *     D2: all notes are 88 ms, too short for this measure.
+ * so the fix is: keep only the first layer (regions 0-6), zero its mod-envelope pitch/filter sweep and lowpass, make the
+ * amplitude envelope a flat sustain, and give back the 6 dB the removed layer contributed. Only preset 0:80 is touched;
+ * every other program (game BGM) is unchanged. Peaks of the patched render: 30 / 33 / 37 % FS, no clipping.
+ * This is measured, not heard: whether it sounds right is for the user's ears. */
+static void midi_patch_square_wave(tsf *t) {
+    int idx = tsf_get_presetindex(t, 0, 80);
+    struct tsf_preset *p;
+    struct tsf_region *donor = NULL;
+    int i, kept = 0, dropped = 0, remapped = 0;
+
+    if (idx < 0) {
+        return;
+    }
+    p = &t->presets[idx];
+    for (i = 0; i < p->regionNum; i++) {
+        struct tsf_region *r = &p->regions[i];
+        if (r->ampenv.sustain < 0.9f) {
+            /* second, detuned layer: remove it from every key */
+            r->lokey = 127;
+            r->hikey = 0;
+            dropped++;
+            continue;
+        }
+        r->ampenv.decay = 0.0f;
+        r->ampenv.sustain = 1.0f;
+        /* v03.42: TimGM6mb releases over 0.385 s (-23 dB still audible 120 ms after note-off), longer than a whole
+         * 88 ms ring-tone note, so every note smeared into the next ("stretched"). Sonivox's square stops at once. */
+        r->ampenv.release = 0.02f;
+        r->modEnvToPitch = 0;
+        r->modEnvToFilterFc = 0;
+        r->modLfoToPitch = 0;
+        r->vibLfoToPitch = 0;
+        r->modLfoToFilterFc = 0;
+        /* v03.61: 13500 was intended as "bypass", but TSF tests `f <= 13500` before building the biquad
+         * (tsf.h: tsf_voice_start__ and tsf_voice_render both use `<= 13500 ? cents2Hertz(...) : 1.0f`), so
+         * 13500 actually ENABLED a 19.9 kHz lowpass with QInv = 1 (region filterQ = 0 dB). Anything above
+         * 13500 is the real bypass. Measured on the host: < 1 dB difference on the square, so this is a
+         * correctness fix, not a sound change. */
+        r->initialFilterFc = 14000;
+        r->attenuation -= 6.0f;          /* dB: replace the level of the removed layer */
+        if (r->lokey == 0) {
+            /* the 336-sample single-period square, region keys 0-42: the only region in this preset whose
+             * loop is a whole number of periods AND long enough to survive interpolation. */
+            donor = r;
+        }
+        kept++;
+    }
+    /* v03.61: the two top regions are broken in TimGM6mb itself. Region keys 91-102 loops 12 samples
+     * (3675 Hz at 44.1 kHz) and 103-108 loops 9 samples (4900 Hz) - far too few to hold a square, so the
+     * waveform is mangled. Measured with the device's own tsf.h on the host (steady key, 0.39 volume, CC7 120):
+     *   original : pitch error +3.0..+6.5 cents, crest factor 1.42..1.55
+     *   donor C1 : pitch error -0.8..+2.0 cents, crest factor 1.26..1.44
+     *   donor C4 : pitch error +2.4..+5.2 cents, crest factor 1.48..1.90  (41-sample loop, worse)
+     * A ideal square has a crest factor near 1.0 (1.09 with Gibbs ringing), so the C1 donor is the closest to a
+     * real square while also being the most in tune. Nothing below key 91 is touched, so game BGM and the
+     * ring tones used by shipped titles (keys 55-78) are unaffected. */
+    if (donor != NULL) {
+        for (i = 0; i < p->regionNum; i++) {
+            struct tsf_region *r = &p->regions[i];
+            if (r->hikey < r->lokey) {   /* dropped layer */
+                continue;
+            }
+            if (r->lokey <= 90) {
+                continue;
+            }
+            r->sample_rate = donor->sample_rate;
+            r->offset = donor->offset;
+            r->end = donor->end;
+            r->loop_start = donor->loop_start;
+            r->loop_end = donor->loop_end;
+            r->loop_mode = donor->loop_mode;
+            r->pitch_keycenter = donor->pitch_keycenter;
+            r->tune = donor->tune;
+            r->transpose = donor->transpose;
+            remapped++;
+        }
+    }
+    fprintf(stderr, "[MIDI] preset 0:80 patched to a steady single layer: %d regions kept, %d dropped, "
+            "%d high regions remapped to the %u-sample donor\n",
+            kept, dropped, remapped, donor != NULL ? (donor->loop_end - donor->loop_start) : 0u);
+}
+
 int vita_midi_init(void) {
     static const char *paths[2] = {
         "ux0:/data/J2ME00001/TimGM6mb.sf2",
@@ -98,6 +193,7 @@ int vita_midi_init(void) {
                 fprintf(stderr, "[MIDI] tsf_set_max_voices(%d) FAILED\n",
                         MIDI_MAX_VOICES);
             }
+            midi_patch_square_wave(g_tsf);
             fprintf(stderr, "[MIDI] soundfont loaded: %d bytes, %d presets, "
                     "max %d voices\n",
                     size, tsf_get_presetcount(g_tsf), MIDI_MAX_VOICES);
@@ -259,6 +355,12 @@ int vita_midi_play(const uint8_t *midi_data, long midi_len, long volume,
     release_frames = (long)(MIDI_RELEASE_MS * (MIDI_SAMPLE_RATE / 1000.0));
     while (release_frames > 0) {
         if (stop != NULL && stop(ctx)) {
+            break;
+        }
+        /* v03.38 (log138): stop as soon as every voice has finished. The fixed 1500 ms tail was ~1200 ms of digital
+         * silence after a ring tone (device pcm_dump == host render, last 1.2 s all zero), which made each loop of a
+         * 9.0 s tune take 10.5 s. Voices still in their release phase keep the count above 0, so no decay is cut. */
+        if (tsf_active_voice_count(g_tsf) == 0) {
             break;
         }
         tsf_render_short(g_tsf, buf, MIDI_CHUNK_FRAMES, 0);

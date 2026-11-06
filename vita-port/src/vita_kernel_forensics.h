@@ -17,6 +17,14 @@ extern "C" {
 void vita_kf_dump(const char *path);
 const char *vita_kf_precheck(void); /* "present" / "ABSENT" / "err" */
 void vita_kf_list_modules(const char *path); /* v02.22: module table dump */
+/* v04.12: "installed-NOT-visible" only ever proved the .skprx FILE exists - it
+ * never read config.txt and never logged the clock return, so "plugin not
+ * loaded", "config line under the wrong section" and "loaded but our weak ku*
+ * stub was never rebound" all printed the same string. This writes one [KB]
+ * block per boot that separates them: the raw kuPowerGetSysClockFrequency()
+ * value, both config.txt files scanned for "kubridge" with the section each hit
+ * falls under, and both tai directory listings. */
+void vita_kf_kubridge_report(const char *path);
 void vita_kf_boot_resolve(void); /* v02.25: BOOT-time taiHEN resolve;
                                   * MUST run on the main thread before
                                   * the VM starts - the HANG path only

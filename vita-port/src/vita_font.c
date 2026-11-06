@@ -167,8 +167,10 @@ static void fb_load(const char *path) {
             advoff = rd32(rec + 24);
             if (sc->cnt == 0 || sc->gw == 0 || sc->gw > 64 ||
                 sc->gh == 0 || sc->gh > 64 ||
-                (sc->bpp != 1 && sc->bpp != 8) ||
-                sc->stride != (sc->bpp == 8 ? sc->gw : (sc->gw + 7) / 8)) {
+                (sc->bpp != 1 && sc->bpp != 4 && sc->bpp != 8) ||
+                sc->stride != (sc->bpp == 8 ? sc->gw :
+                               sc->bpp == 4 ? (sc->gw + 1) / 2 :
+                               (sc->gw + 7) / 8)) {
                 fb_fail(path, "bad v2 section");
                 return;
             }
@@ -259,6 +261,16 @@ static int fb_default_advance(unsigned int cp) {
     return fb_gw / 2;
 }
 
+/* Coverage 0..255 of pixel c in a glyph row; 1bpp yields 0 or 255 */
+static unsigned int fb_alpha(const unsigned char *row, int bpp, int c) {
+    if (bpp == 8) return row[c];
+    if (bpp == 4) {
+        unsigned int v = (c & 1) ? (row[c >> 1] & 0x0F) : (row[c >> 1] >> 4);
+        return v * 17u;
+    }
+    return (row[c >> 3] & (0x80 >> (c & 7))) ? 255u : 0u;
+}
+
 /* Blend `color` (RGB565) over `dest` with 0..255 coverage (8bpp glyphs) */
 static gxj_pixel_type fb_blend565(gxj_pixel_type color,
                                   gxj_pixel_type dest, unsigned int a) {
@@ -294,15 +306,72 @@ static int fb_blit565(gxj_screen_buffer *dest, const fb_glyph_t *gl,
             gxj_pixel_type *dst;
             if (px < clipX1 || px >= clipX2) continue;
             dst = &dest->pixelData[py * dest->width + px];
-            if (gl->bpp == 8) {
-                unsigned int a = row[c];
+            {
+                unsigned int a = fb_alpha(row, gl->bpp, c);
                 if (a == 0) continue;
                 *dst = (a == 255) ? color : fb_blend565(color, *dst, a);
-            } else if (row[c >> 3] & (0x80 >> (c & 7))) {
-                *dst = color;
-            } else {
-                continue;
             }
+            drawn++;
+        }
+    }
+    return drawn;
+}
+
+/* ------------------------------------------------------------------ */
+/* Size / style (v04.34)                                              */
+/*                                                                    */
+/* The bank is baked at ONE size (20 px cell, ascent 18). MIDP asks for */
+/* SIZE_SMALL / SIZE_MEDIUM / SIZE_LARGE (8 / 0 / 16) and for            */
+/* STYLE_BOLD / ITALIC / UNDERLINED, but this port ignored all of them:  */
+/* a game that builds its layout from Font.getHeight() and then draws a  */
+/* LARGE title got a medium-sized glyph inside a large line box (or the  */
+/* other way round) and overlapped its own UI. Scaling the baked glyphs  */
+/* keeps one bank - and one ROM/VPK - while making the sizes behave.     */
+/*                                                                      */
+/* 256 = 100%. Nearest-neighbour is deliberate: the CJK sections are     */
+/* 1bpp, so there is no grey to interpolate anyway, and the Latin sections */
+/* keep their anti-aliasing at 100%.                                     */
+static int font_scale(int size) {
+    if (size == 8) {        /* Font.SIZE_SMALL */
+        return 192;         /* 0.75 */
+    }
+    if (size == 16) {       /* Font.SIZE_LARGE */
+        return 320;         /* 1.25 */
+    }
+    return 256;             /* SIZE_MEDIUM (0) and anything unknown */
+}
+
+/* Scaled variant of fb_blit565: destination pixels sample the source with
+ * nearest-neighbour, so a 0.75x/1.25x glyph stays sharp. */
+static int fb_blit565_scaled(gxj_screen_buffer *dest, const fb_glyph_t *gl,
+                             int pen_x, int y, gxj_pixel_type color,
+                             int scale,
+                             int clipX1, int clipY1, int clipX2, int clipY2) {
+    int dw = (gl->gw * scale + 128) >> 8;
+    int dh = (gl->gh * scale + 128) >> 8;
+    int r, c, drawn = 0;
+
+    if (dw <= 0 || dh <= 0) {
+        return 0;
+    }
+    for (r = 0; r < dh; r++) {
+        int py = y + r;
+        int sy = (r << 8) / scale;
+        const unsigned char *row;
+        if (py < clipY1 || py >= clipY2) continue;
+        if (sy >= gl->gh) sy = gl->gh - 1;
+        row = gl->bits + (unsigned long)sy * gl->stride;
+        for (c = 0; c < dw; c++) {
+            int px = pen_x + c;
+            int sx = (c << 8) / scale;
+            gxj_pixel_type *dst;
+            unsigned int a;
+            if (px < clipX1 || px >= clipX2) continue;
+            if (sx >= gl->gw) sx = gl->gw - 1;
+            a = fb_alpha(row, gl->bpp, sx);
+            if (a == 0) continue;
+            dst = &dest->pixelData[py * dest->width + px];
+            *dst = (a == 255) ? color : fb_blend565(color, *dst, a);
             drawn++;
         }
     }
@@ -335,34 +404,43 @@ static int fb_tofu565(gxj_screen_buffer *dest, int pen_x, int y, int side,
 
 int gxjport_get_font_info(int face, int style, int size,
                           int *ascent, int *descent, int *leading) {
-    (void)face; (void)style; (void)size;
+    int scale;
+
+    (void)face; (void)style;
     fb_ensure();
     if (!fb_ready) {
         return KNI_FALSE;
     }
-    if (ascent)  *ascent  = fb_ascent;
-    if (descent) *descent = fb_descent;
-    if (leading) *leading = fb_leading;
+    /* v04.34: metrics follow the requested size, otherwise a LARGE line box
+     * would be reported as medium and the game's layout would overlap. */
+    scale = font_scale(size);
+    if (ascent)  *ascent  = (fb_ascent * scale + 128) >> 8;
+    if (descent) *descent = (fb_descent * scale + 128) >> 8;
+    if (leading) *leading = (fb_leading * scale + 128) >> 8;
     return KNI_TRUE;
 }
 
 int gxjport_get_chars_width(int face, int style, int size,
                             const jchar *charArray, int n) {
-    int i, w = 0;
+    int i, w = 0, acc = 0, scale;
     fb_glyph_t gl;
 
-    (void)face; (void)style; (void)size;
+    (void)face; (void)style;
     fb_ensure();
     if (!fb_ready) {
         return -1;
     }
+    scale = font_scale(size);
     /* Proportional: sum the bank's per-glyph advances instead of
-     * multiplying the cell width, so Latin text measures like Latin. */
+     * multiplying the cell width, so Latin text measures like Latin. The
+     * scaled advances are accumulated in 1/256 px and rounded once, so a
+     * long run does not drift the way per-glyph rounding would. */
     for (i = 0; i < n; i++) {
         unsigned int cp = (unsigned)charArray[i];
         fb_lookup(cp, &gl);
-        w += (gl.adv != 0) ? gl.adv : fb_default_advance(cp);
+        acc += ((gl.adv != 0) ? gl.adv : fb_default_advance(cp)) * scale;
     }
+    w = (acc + 128) >> 8;
     return w;
 }
 
@@ -371,12 +449,14 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
                        int x, int y, int anchor,
                        const jchar *chararray, int n) {
     gxj_screen_buffer *dest = (gxj_screen_buffer *)dst;
-    int i, pen_x;
+    int i, pen_x, scale;
+    int start_x;
     int clipX1, clipY1, clipX2, clipY2;
+    int bold, underline;
     gxj_pixel_type color = (gxj_pixel_type)pixel;
     fb_glyph_t gl;
 
-    (void)dotted; (void)face; (void)style; (void)size; (void)anchor;
+    (void)dotted; (void)face; (void)anchor;
 
     if (dest == NULL || dest->pixelData == NULL) {
         return KNI_FALSE;
@@ -387,19 +467,61 @@ int gxjport_draw_chars(int pixel, const jshort *clip, void *dst, int dotted,
     clipX1 = clip[0]; clipY1 = clip[1];
     clipX2 = clip[2]; clipY2 = clip[3];
 
+    /* v04.34: honour the requested size plus STYLE_BOLD / STYLE_UNDERLINED.
+     * Italic is not synthesised - a sheared 1bpp CJK bitmap looks like noise,
+     * and MIDP allows substituting a style, so it draws upright. */
+    scale = font_scale(size);
+    bold = (style & 1) ? 1 : 0;         /* STYLE_BOLD */
+    underline = (style & 4) ? 1 : 0;    /* STYLE_UNDERLINED */
+
     /* `y` is the top of the line box, the cell's top row is the pen row */
     pen_x = x;
+    start_x = x;
     for (i = 0; i < n; i++) {
         unsigned int cp = (unsigned)chararray[i];
+        int adv;
         fb_lookup(cp, &gl);
         if (gl.bits != NULL) {
-            fb_blit565(dest, &gl, pen_x, y, color,
-                       clipX1, clipY1, clipX2, clipY2);
+            if (scale == 256) {
+                fb_blit565(dest, &gl, pen_x, y, color,
+                           clipX1, clipY1, clipX2, clipY2);
+                if (bold) {
+                    fb_blit565(dest, &gl, pen_x + 1, y, color,
+                               clipX1, clipY1, clipX2, clipY2);
+                }
+            } else {
+                fb_blit565_scaled(dest, &gl, pen_x, y, color, scale,
+                                  clipX1, clipY1, clipX2, clipY2);
+                if (bold) {
+                    /* one extra pass 1 px to the right: synthetic bold that
+                     * does not change the advance, so layout stays intact */
+                    fb_blit565_scaled(dest, &gl, pen_x + 1, y, color, scale,
+                                      clipX1, clipY1, clipX2, clipY2);
+                }
+            }
         } else if (cp >= 0x2E80) {
-            fb_tofu565(dest, pen_x, y, fb_gw - 2, color,
+            int side = ((fb_gw - 2) * scale) >> 8;
+            if (side < 4) {
+                side = 4;
+            }
+            fb_tofu565(dest, pen_x, y, side, color,
                        clipX1, clipY1, clipX2, clipY2);
         }
-        pen_x += (gl.adv != 0) ? gl.adv : fb_default_advance(cp);
+        adv = (gl.adv != 0) ? gl.adv : fb_default_advance(cp);
+        pen_x += (adv * scale + 128) >> 8;
+    }
+
+    if (underline && pen_x > start_x &&
+        (fb_ascent * scale + 128) > 0) {
+        int uy = y + ((fb_ascent * scale + 128) >> 8) + 1;
+        if (uy >= clipY1 && uy < clipY2) {
+            int ux;
+            for (ux = start_x; ux < pen_x && ux < clipX2; ux++) {
+                if (ux >= clipX1) {
+                    dest->pixelData[uy * dest->width + ux] = color;
+                }
+            }
+        }
     }
 
     return KNI_TRUE;
@@ -463,12 +585,10 @@ static void fb_blit8888(uint32_t *fb, int w, int h, const fb_glyph_t *gl,
             uint32_t *dst;
             if (px < 0 || px >= w) continue;
             dst = &fb[py * w + px];
-            if (gl->bpp == 8) {
-                unsigned int a = row[c];
+            {
+                unsigned int a = fb_alpha(row, gl->bpp, c);
                 if (a == 0) continue;
                 *dst = (a == 255) ? color : fb_blend8888(color, *dst, a);
-            } else if (row[c >> 3] & (0x80 >> (c & 7))) {
-                *dst = color;
             }
         }
     }

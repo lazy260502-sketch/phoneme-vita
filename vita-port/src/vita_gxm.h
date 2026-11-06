@@ -18,8 +18,12 @@
 
 #include <stdint.h>
 
-/* Lazy, idempotent sceGxmInitialize. Returns non-zero once GXM is ready. */
+/* Lazy, idempotent sceGxmInitialize. Returns non-zero once GXM is ready.
+ * Returns 0 if vitaGL (vita_gl3d.h) already owns GXM. */
 int vita_gxm_ensure_init(void);
+
+/* Non-zero once the IME path has called sceGxmInitialize. */
+int vita_gxm_is_initialized(void);
 
 /* Render the system IME (CommonDialog) into fb, then submit it through the GXM
  * display queue. Called INSTEAD of sceDisplaySetFrameBuf while the IME is

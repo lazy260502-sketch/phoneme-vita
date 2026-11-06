@@ -250,7 +250,7 @@ int main(int argc, char **argv) {
     bmp_off = data_off;
     for (s = 0; s < NSEC; s++) {
         unsigned long gw = CW, gh = CH;
-        unsigned long stride = secs[s].latin ? gw : (gw + 7) / 8;
+        unsigned long stride = secs[s].latin ? gw : (gw + 1) / 2;
         sec_bmp_off[s] = bmp_off;
         bmp_off += (unsigned long)secs[s].count * stride * gh;
     }
@@ -276,10 +276,10 @@ int main(int argc, char **argv) {
 
     for (s = 0; s < NSEC; s++) {
         unsigned char *rec = bank + HDR_SIZE + SEC_SIZE * s;
-        unsigned long stride = secs[s].latin ? CW : (CW + 7) / 8;
+        unsigned long stride = secs[s].latin ? CW : (CW + 1) / 2;
         unsigned long adv_of_this_sec;
         const Face *f = secs[s].latin ? &latin : &cjk;
-        int bpp = secs[s].latin ? 8 : 1;
+        int bpp = secs[s].latin ? 8 : 4;
         int adv_min = 256, adv_max = 0, ink_lo = 99, ink_hi = -99;
 
         /* This section's advance table. */
@@ -344,9 +344,10 @@ int main(int argc, char **argv) {
                     if (px < 0 || px >= CW) { clipped_x++; continue; }
                     if (bpp == 8) {
                         dst[(unsigned long)py * (CW) + px] = a;
-                    } else if (a >= 128) {
-                        dst[(unsigned long)py * stride + (px >> 3)]
-                            |= (unsigned char)(0x80 >> (px & 7));
+                    } else {
+                        unsigned char q = (unsigned char)((a * 15 + 127) / 255);
+                        dst[(unsigned long)py * stride + (px >> 1)]
+                            |= (px & 1) ? q : (unsigned char)(q << 4);
                     }
                 }
             }
@@ -380,7 +381,7 @@ int main(int argc, char **argv) {
         }
         printf("  sec %2d: U+%04X..U+%04X %5u %-9s adv %d..%d ink cols %d..%d\n",
                s, secs[s].first, secs[s].first + secs[s].count - 1,
-               secs[s].count, bpp == 8 ? "8bpp" : "1bpp",
+               secs[s].count, bpp == 8 ? "8bpp" : "4bpp",
                adv_min, adv_max, ink_lo, ink_hi - 1);
     }
 

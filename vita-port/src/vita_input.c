@@ -47,6 +47,9 @@
 #include <keymap_input.h>
 #include <midp_mastermode_port.h> /* checkForSystemSignal contract */
 #include "vita_ime.h" /* v02.50: system keyboard bridge */
+#include "vita_vkey.h" /* v02.85: on-screen keypad */
+#include "vita_shot.h" /* v02.92: SELECT+START / tap camera = screenshot */
+#include "vita_diag.h"  /* v03.70: SELECT+L toggles the diagnostics overlay */
 
 #define VITA_INPUT_RING_SIZE 16
 
@@ -359,12 +362,53 @@ static void vita_input_poll(void) {
         return;
     }
 
+    /* v02.92: screenshot combo, SELECT + START held together.
+     * State is kept in the shot module because the poller thread uses the
+     * same flag to tell "combo in progress" from "ordinary key press".
+     * Both keys are swallowed while the combo is down (see the key loop
+     * below) - otherwise the game receives '#' and '*'. */
+    if (vita_shot_combo_enabled()) {
+        const unsigned int combo_mask = SCE_CTRL_SELECT | SCE_CTRL_START;
+        unsigned int combo_now = cur & combo_mask;
+        if (combo_now == combo_mask) {
+            if (!vita_shot_combo_held()) {
+                vita_shot_set_combo(1);
+                vita_shot_request("keys");
+            }
+        } else if (combo_now == 0) {
+            vita_shot_set_combo(0);
+        }
+    }
+
+    /* v03.70: diagnostics overlay, SELECT + L held together. Separate combo
+     * from the screenshot's SELECT+START, and not a single key: SELECT alone
+     * is '#' for the MIDlet and, with a text component focused, opens the
+     * system keyboard, so it cannot be repurposed. State is a module static
+     * here rather than in the overlay because the overlay has no polling
+     * thread - this is the only place that sees the raw pad. */
+    {
+        static int diag_combo_held = 0;
+        const unsigned int diag_mask = SCE_CTRL_SELECT | SCE_CTRL_LTRIGGER;
+        unsigned int diag_now = cur & diag_mask;
+        if (diag_now == diag_mask) {
+            if (!diag_combo_held) {
+                diag_combo_held = 1;
+                vita_diag_toggle();
+            }
+        } else if (diag_now == 0) {
+            diag_combo_held = 0;
+        }
+    }
+
     /* DEBUG: log every button change to verify the VM event pump is
      * still running (if the VM is frozen on a blocking native call,
      * checkForSystemSignal never fires and this log stays empty). */
     {
-        char dbg[64];
-        snprintf(dbg, sizeof(dbg), "[INPUT] buttons=0x%08X\n", pad.buttons);
+        char dbg[96];
+        struct timeval tvi;
+        gettimeofday(&tvi, NULL);
+        snprintf(dbg, sizeof(dbg), "[INPUT] buttons=0x%08X ms=%lld\n", pad.buttons,
+                 (long long)((jlong)tvi.tv_sec * 1000 + tvi.tv_usec / 1000));
         int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
                            SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
         if (fd >= 0) {
@@ -377,6 +421,17 @@ static void vita_input_poll(void) {
         unsigned int mask = key_map[i].vitaButton;
         if (changed & mask) {
             int pressed = (cur & mask) ? 1 : 0;
+            /* v02.92: while SELECT+START is held it owns both keys. Presses
+             * are dropped; a release is still delivered so a key whose press
+             * went out before the second one went down cannot stay stuck. */
+            if ((mask & (SCE_CTRL_SELECT | SCE_CTRL_START)) &&
+                vita_shot_combo_held()) {
+                if (!pressed && key_map[i].keymapKey != KEYMAP_KEY_INVALID) {
+                    emit_key_event(key_map[i].keymapKey,
+                                   KEYMAP_STATE_RELEASED);
+                }
+                continue;
+            }
             /* v02.50: SELECT opens the system IME instead of emitting
              * '#' - the port has no digit keys, so this is the only way
              * a MIDlet gets text input. MVP trigger; auto-pop on TextField
@@ -426,6 +481,188 @@ static void vita_input_poll(void) {
 static int touch_initialized = 0;
 static int touch_x = 0, touch_y = 0;      /* last virtual position */
 static int touch_down = 0;                /* finger currently down */
+/* v02.85: virtual keypad press state. Only one virtual button can be
+ * held at a time (the panel reports a single primary finger), so a
+ * single slot is enough. -1 = none. */
+static int vkey_down_btn = -1;
+static int vkey_down_key = 0;
+
+/* v03.80: one line per virtual-key edge with the same wall clock as [INPUT]/ptime, so the finger time can be
+ * compared with the game's ~0.8 s frame period. */
+static void vkey_edge_log(const char *what, int key, int btn, long long held_ms) {
+    struct timeval tv;
+    char line[112];
+    int fd;
+    int n;
+    gettimeofday(&tv, NULL);
+    n = snprintf(line, sizeof(line), "[VKEY] %s key=%d btn=%d ms=%lld", what, key, btn,
+                 (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000);
+    if (held_ms >= 0 && n > 0 && n < (int)sizeof(line)) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " held=%lld", held_ms);
+    }
+    if (n > 0 && n < (int)sizeof(line) - 1) {
+        line[n++] = '\n';
+        line[n] = '\0';
+    }
+    fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, line, strlen(line));
+        sceIoClose(fd);
+    }
+}
+
+/* v04.10: minimum time a virtual key stays down. log176/177: 33 of 34 and 37 of 54 taps lasted under 200 ms (median
+ * ~120 ms) while a slow game samples its key state once per frame, ~0.8 s, so most taps fell between two samples.
+ * A tap now lasts at least one frame period of the running game (smoothed time between finished frames, see
+ * vita_display_frame_period_ms; 0 for a menu that only repaints on input), capped at VKEY_HOLD_AUTO_MAX_MS.
+ * defaults.cfg: vkeyhold=0 turns it off, vkeyhold=<ms> forces a fixed time, anything else / absent = automatic. */
+#define VKEY_HOLD_AUTO_MAX_MS 1000
+#define VKEY_HOLD_FIXED_MAX_MS 2000
+extern unsigned int vita_display_frame_period_ms(void);
+
+static unsigned long long vkey_press_us = 0;
+static unsigned long long vkey_release_due_us = 0;   /* 0 = no release is waiting */
+/* v04.33: held virtual key repeats. Text fields (name entry) and list
+ * scrolling need it; 450 ms is the usual "this is a repeat, not a second
+ * tap" delay and 90 ms ≈ 11 chars/s afterwards. The event is
+ * KEYMAP_STATE_REPEATED, which MIDP delivers as Canvas.keyRepeated() - the
+ * same state the Clear long-press already uses. */
+#define VKEY_REPEAT_DELAY_US  (450ULL * 1000ULL)
+#define VKEY_REPEAT_PERIOD_US  (90ULL * 1000ULL)
+static unsigned long long vkey_repeat_next_us = 0;   /* 0 = no repeat armed */
+
+/* -2 not read yet, -1 automatic, >= 0 fixed milliseconds. */
+static int vkey_hold_cfg(void) {
+    static int cached = -2;
+    if (cached == -2) {
+        char buf[512];
+        SceUID fd = sceIoOpen("ux0:/data/J2ME00001/defaults.cfg", SCE_O_RDONLY, 0);
+        int n = 0;
+        cached = -1;
+        if (fd >= 0) {
+            n = sceIoRead(fd, buf, sizeof(buf) - 1);
+            sceIoClose(fd);
+        }
+        if (n > 0) {
+            const char *p;
+            buf[n] = '\0';
+            for (p = buf; (p = strstr(p, "vkeyhold=")) != NULL; p += 9) {
+                if (p == buf || p[-1] == '\n') {
+                    const char *v = p + 9;
+                    if (v[0] >= '0' && v[0] <= '9') {
+                        int ms = 0;
+                        while (*v >= '0' && *v <= '9' && ms < VKEY_HOLD_FIXED_MAX_MS) {
+                            ms = ms * 10 + (*v - '0');
+                            v++;
+                        }
+                        cached = ms > VKEY_HOLD_FIXED_MAX_MS ? VKEY_HOLD_FIXED_MAX_MS : ms;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return cached;
+}
+
+static unsigned long long vkey_min_hold_us(void) {
+    int cfg = vkey_hold_cfg();
+    unsigned int ms;
+    if (cfg >= 0) {
+        ms = (unsigned int)cfg;
+    } else {
+        ms = vita_display_frame_period_ms();
+        if (ms > VKEY_HOLD_AUTO_MAX_MS) {
+            ms = VKEY_HOLD_AUTO_MAX_MS;
+        }
+    }
+    return (unsigned long long)ms * 1000ULL;
+}
+
+/* Release whatever virtual button is held, now. Safe to call when none is. */
+static void vkey_release_now(void) {
+    if (vkey_down_btn >= 0) {
+        long long held = (long long)((sceKernelGetProcessTimeWide() - vkey_press_us) / 1000ULL);
+        vkey_edge_log("release", vkey_down_key, vkey_down_btn, held);
+        emit_key_event(vkey_down_key, KEYMAP_STATE_RELEASED);
+        vkey_down_btn = -1;
+        vkey_down_key = 0;
+        vkey_release_due_us = 0;
+        vkey_repeat_next_us = 0;
+        /* v02.89: clear the visual pressed state too. */
+        vita_vkey_set_pressed(-1);
+    }
+}
+
+/* The finger left the button: release it, but not before the minimum hold has passed. */
+static void vkey_release(void) {
+    unsigned long long now, need;
+    if (vkey_down_btn < 0 || vkey_release_due_us != 0) {
+        return;     /* nothing held, or its release is already scheduled */
+    }
+    need = vkey_min_hold_us();
+    now = sceKernelGetProcessTimeWide();
+    if (need == 0 || now - vkey_press_us >= need) {
+        vkey_release_now();
+        return;
+    }
+    vkey_release_due_us = vkey_press_us + need;
+}
+
+/* Called every poll: sends a release that was held back once its time has come. */
+static void vkey_hold_service(void) {
+    if (vkey_release_due_us != 0 && sceKernelGetProcessTimeWide() >= vkey_release_due_us) {
+        vkey_release_now();
+    }
+}
+
+/* Returns 1 when the touch was consumed by a virtual button. */
+static int vkey_touch(int px, int py) {
+    int key = 0, btn = -1;
+
+    if (!vita_vkey_enabled()) {
+        return 0;
+    }
+    if (!vita_vkey_hit(px, py, &key, &btn)) {
+        if (vkey_down_btn >= 0) {
+            /* slid off the button: release it and let the caller decide
+             * whether this position means a pointer press instead */
+            vkey_release();
+        }
+        return 0;
+    }
+    /* v04.21: the d-pad centre is FIRE. A finger already down on another key that slides across the centre on its way to
+     * the next direction must not fire it; a fresh touch (nothing held, or its release already scheduled) may. */
+    if (key == KEYMAP_KEY_SELECT && vkey_down_btn >= 0 && vkey_release_due_us == 0 && btn != vkey_down_btn) {
+        return 1;
+    }
+    if (btn == vkey_down_btn) {
+        unsigned long long now;
+
+        vkey_release_due_us = 0;    /* finger is back on a key whose release was held back: it stays down */
+        /* v04.33: a held key repeats (see VKEY_REPEAT_DELAY_US). Only the
+         * same button that is still down can repeat, so sliding onto
+         * another key never produces a repeat for the old one. */
+        if (vkey_repeat_next_us != 0) {
+            now = sceKernelGetProcessTimeWide();
+            if (now >= vkey_repeat_next_us) {
+                emit_key_event(vkey_down_key, KEYMAP_STATE_REPEATED);
+                vkey_repeat_next_us = now + VKEY_REPEAT_PERIOD_US;
+            }
+        }
+        return 1;   /* same button: no new press event */
+    }
+    vkey_release_now();
+    vkey_down_btn = btn;
+    vkey_down_key = key;
+    vkey_press_us = sceKernelGetProcessTimeWide();
+    vkey_repeat_next_us = vkey_press_us + VKEY_REPEAT_DELAY_US;
+    /* v02.89: highlight it until the finger lifts (see vita_vkey_draw). */
+    vita_vkey_set_pressed(btn);
+    vkey_edge_log("press", key, btn, -1);
+    emit_key_event(key, KEYMAP_STATE_PRESSED);
+    return 1;
+}
 /* Front panel report space: real HW reports in a 1920x1088 grid while
  * the display is 960x544 (the SDK touch sample uses "y >= 1000" as a
  * swipe threshold, proving the 2x scale). Read the active area from
@@ -489,6 +726,8 @@ static void vita_touch_poll(void) {
         vita_touch_init();
     }
 
+    vkey_hold_service();
+
     n = sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
     if (n < 0) {
         if (dbg_down != -2) {
@@ -535,6 +774,9 @@ static void vita_touch_poll(void) {
                 ring_push(&evt);
                 touch_down = 0;
             }
+            /* v02.85: a virtual button held when the dialog opened must
+             * not stay pressed in the MIDlet. */
+            vkey_release_now();
             return;
         }
         ime_was_active = 0;
@@ -542,6 +784,7 @@ static void vita_touch_poll(void) {
 
     if (touch.reportNum <= 0) {
         /* No finger on the panel. */
+        vkey_release();
         if (dbg_down != 0) {
             char dbg[48];
             snprintf(dbg, sizeof(dbg), "[TOUCH] up\n");
@@ -573,6 +816,70 @@ static void vita_touch_poll(void) {
      * space the display mapping expects. */
     px = touch.report[0].x * 960 / (touch_max_x + 1);
     py = touch.report[0].y * 544 / (touch_max_y + 1);
+
+    /* v02.92: the screenshot camera button. The shot poller thread does
+     * the actual hit test and capture (so it also works while the VM is
+     * frozen); here we only have to make sure the tap does not become a
+     * pointer event for the MIDlet. */
+    if (vita_shot_button_hit(px, py)) {
+        if (dbg_down != 4) {
+            char dbg[48];
+            snprintf(dbg, sizeof(dbg), "[SHOT] touch button\n");
+            int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
+                               SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                               0777);
+            if (fd >= 0) {
+                sceIoWrite(fd, dbg, strlen(dbg));
+                sceIoClose(fd);
+            }
+            dbg_down = 4;
+        }
+        if (touch_down) {
+            MidpEvent evt;
+            MIDP_EVENT_INITIALIZE(evt);
+            evt.type = MIDP_PEN_EVENT;
+            evt.ACTION = KEYMAP_STATE_RELEASED;
+            evt.X_POS = touch_x;
+            evt.Y_POS = touch_y;
+            ring_push(&evt);
+            touch_down = 0;
+        }
+        return;
+    }
+
+    /* v02.85: the keypad lives in the letterbox bars, i.e. OUTSIDE the
+     * game rectangle - so it has to be tested before the map_touch()
+     * rejection below. A hit consumes the touch: no pointer event is
+     * generated, otherwise games that handle pointerPressed would react
+     * to every virtual key press. */
+    if (vkey_touch(px, py)) {
+        if (dbg_down != 3) {
+            char dbg[80];
+            snprintf(dbg, sizeof(dbg), "[VKEY] touch phys=(%d,%d)\n", px, py);
+            int fd = sceIoOpen("ux0:/data/J2ME00001/input_debug.log",
+                               SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                               0777);
+            if (fd >= 0) {
+                sceIoWrite(fd, dbg, strlen(dbg));
+                sceIoClose(fd);
+            }
+            dbg_down = 3;
+        }
+        /* keep the pen state clean: a pointer press must not survive
+         * the finger wandering onto the keypad */
+        if (touch_down) {
+            MidpEvent evt;
+            MIDP_EVENT_INITIALIZE(evt);
+            evt.type = MIDP_PEN_EVENT;
+            evt.ACTION = KEYMAP_STATE_RELEASED;
+            evt.X_POS = touch_x;
+            evt.Y_POS = touch_y;
+            ring_push(&evt);
+            touch_down = 0;
+        }
+        return;
+    }
+
     if (vita_display_map_touch(px, py, &vx, &vy) != 0) {
         /* Finger on the panel but in the letterbox - log only the first
          * contact so a resting finger does not spam the log. */
@@ -707,6 +1014,15 @@ void checkForSystemSignal(MidpReentryData *pNewSignal,
     {
         extern void vita_display_ime_tick(void);
         vita_display_ime_tick();
+    }
+
+    /* v02.95: repaint while a virtual-keypad tap is still flashing, so the
+     * "pressed" highlight is visible even in a game that only repaints
+     * after it receives the key (see vita_display_vkey_tick). No-op when
+     * nothing was tapped. */
+    {
+        extern void vita_display_vkey_tick(void);
+        vita_display_vkey_tick();
     }
 
     /* v02.50: system IME result. Delivered straight into pNewMidpEvent

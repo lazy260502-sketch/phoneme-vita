@@ -26,7 +26,8 @@ javac -source 1.3 -target 1.3 \
     "$SRC_DIR/HelloMIDlet.java" \
     "$SRC_DIR/CanvasTest.java" \
     "$SRC_DIR/InputTest.java" \
-    "$SRC_DIR/ToneTest.java"
+    "$SRC_DIR/ToneTest.java" \
+    "$SRC_DIR/M3GTest.java"
 
 echo "Preverifying classes..."
 rm -rf "$BUILD_DIR/preverified"/*
