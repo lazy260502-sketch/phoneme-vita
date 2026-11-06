@@ -47,9 +47,17 @@ class ImageDataFactory implements AbstractImageDataFactory {
 
     /**
      * JPEG Header Data
+     *
+     * v02.89 (Vita port): upstream matched FF D8 FF E0, i.e. SOI followed
+     * by an APP0/JFIF marker. That rejects every JPEG whose first marker is
+     * something else - EXIF (FF E1), a plain DQT, ... - which is legal JPEG
+     * and which some games do ship. The JPEG spec only guarantees SOI, so
+     * match FF D8 FF (SOI + the start of ANY marker) instead; the SOF walk
+     * in decodeJPEG() then validates the rest. Without ENABLE_JPEG this
+     * change is inert: an unrecognised format still throws.
      */
     private static final byte[] jpegHeader = new byte[] {
-         (byte)0xff, (byte)0xd8, (byte)0xff, (byte)0xe0
+         (byte)0xff, (byte)0xd8, (byte)0xff
     };
 
     /**
@@ -159,8 +167,26 @@ class ImageDataFactory implements AbstractImageDataFactory {
          * proceed to load and create image normally.
          */
         if (!loadCachedImage(data, name)) {
-            createImageFromStream(data,
-                                  ImageData.class.getResourceAsStream(name));
+            /* v03.25 (Vita port): distinguish the two failure modes.
+             * log131 had "[img] load failed: '/effects.png'" with NO
+             * "resource NOT FOUND" line, which means getResourceAsStream()
+             * succeeded and the DECODE threw. That is the opposite of a
+             * missing resource and points at loadPNG()/imgdcd_decode_png()
+             * - both of which allocate, so heap exhaustion produces exactly
+             * this signature. Log which one happened. */
+            java.io.InputStream stream = ImageData.class.getResourceAsStream(name);
+            if (stream == null) {
+                System.out.println("[img] resource NOT FOUND: '" + name + "'");
+                createImageFromStream(data, stream);
+            } else {
+                try {
+                    createImageFromStream(data, stream);
+                } catch (java.io.IOException e) {
+                    System.out.println("[img] decode failed: '" + name + "' ("
+                                       + e + ")");
+                    throw e;
+                }
+            }
         }
 
         return data;
@@ -475,7 +501,12 @@ class ImageDataFactory implements AbstractImageDataFactory {
             try {
                 decode(data, buffer, 0, length);
             } catch (IllegalArgumentException e) {
-                throw new java.io.IOException();
+                /* v03.25 (Vita port): carry the byte count into the message.
+                 * A truncated stream and a genuine decode failure both arrive
+                 * here as a bare IllegalArgumentException; comparing this
+                 * length with the jar entry size separates them without another
+                 * build. */
+                throw new java.io.IOException("decode failed, len=" + length);
             }
         }
     }

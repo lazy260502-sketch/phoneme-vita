@@ -272,6 +272,27 @@ class AlertLFImpl extends ScreenLFImpl implements AlertLF {
         clipy = g.getClipY();
         clipw = g.getClipWidth();
         cliph = g.getClipHeight();
+
+        /* VITA v02.90: the user sees a garbled middle area + an OK soft key
+         * when UC shows its "clipboard is empty" Alert, and the cause could
+         * not be found by reading code. Print the geometry once per Alert
+         * so the next log shows whether clip / skin / layout are sane. */
+        if (!vitaPaintLogged) {
+            vitaPaintLogged = true;
+            System.out.println("[ALERT-PAINT] clip=" + clipx + "," + clipy
+                + " " + clipw + "x" + cliph
+                + " skin=" + AlertSkin.WIDTH + "x" + AlertSkin.HEIGHT
+                + " titleH=" + AlertSkin.TITLE_HEIGHT
+                + " margin=" + AlertSkin.MARGIN_H
+                + " viewable=" + viewable[X] + "," + viewable[Y] + " "
+                + viewable[WIDTH] + "x" + viewable[HEIGHT]
+                + " maxScroll=" + maxScroll
+                + " disp=" + getDisplayableWidth() + "x"
+                + getDisplayableHeight()
+                + " bgImg=" + (AlertSkin.IMAGE_BG == null ? "null"
+                               : String.valueOf(AlertSkin.IMAGE_BG.length))
+                + " bgColor=" + Integer.toHexString(AlertSkin.COLOR_BG));
+        }
         
         synchronized (Display.LCDUILock) {
             // titleHeight will be AlertSkin.TITLE_HEIGHT
@@ -479,6 +500,32 @@ class AlertLFImpl extends ScreenLFImpl implements AlertLF {
      * given Display and whether it needs to initialize its
      * highlight
      */
+    /* VITA: System.out drops non-ASCII (log118 showed "title=??"), so the
+     * [ALERT] line writes anything outside 0x20..0x7e as \\uXXXX. */
+    /* one [ALERT-PAINT] line per Alert instance (set in uCallPaint) */
+    private boolean vitaPaintLogged;
+
+    private static String vitaEsc(String s) {
+        if (s == null) {
+            return "null";
+        }
+        StringBuffer b = new StringBuffer();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= 0x20 && c < 0x7f) {
+                b.append(c);
+            } else {
+                String h = Integer.toHexString(c);
+                b.append("\\u");
+                for (int k = h.length(); k < 4; k++) {
+                    b.append('0');
+                }
+                b.append(h);
+            }
+        }
+        return b.toString();
+    }
+
     void lCallShow() {
         if (Logging.REPORT_LEVEL <= Logging.INFORMATION) {
             Logging.report(Logging.INFORMATION, 
@@ -487,6 +534,20 @@ class AlertLFImpl extends ScreenLFImpl implements AlertLF {
         }
 
         super.lCallShow();
+
+        /* VITA: Logging.* is compiled out, System.out is the only Java
+         * channel that reaches vm_output.log. Shows what an app's Alert says. */
+        System.out.println("[ALERT] title=" + vitaEsc(alert.getTitle())
+                           + " text=" + vitaEsc(alert.getString())
+                           + " type="
+                           + (alert.type == null ? "none"
+                              : alert.type == AlertType.INFO ? "INFO"
+                              : alert.type == AlertType.WARNING ? "WARNING"
+                              : alert.type == AlertType.ERROR ? "ERROR"
+                              : alert.type == AlertType.ALARM ? "ALARM"
+                              : alert.type == AlertType.CONFIRMATION
+                                  ? "CONFIRMATION" : "other")
+                           + " timeout=" + alert.getTimeout());
 
         if (alert.type != null) {
             currentDisplay.playAlertSound(alert.type);

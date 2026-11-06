@@ -405,7 +405,17 @@ static int gx_load_imagedata_from_raw_buffer(KNIDECLARGS jobject imageData,
             rawBuffer = (imgdcd_image_buffer_raw *)
                 (nativeBuffer + offset);
         }
-            memcpy(JavaByteArray(pixelData), rawBuffer->data, pixelSize);
+        /* v03.15 (Vita port): rawBuffer->data is a flexible array member
+         * declared as data[0], so with -O2 gcc reports "memcpy reading 2 or
+         * more bytes from a region of size 0" and the port builds with
+         * -Werror. The size is checked against the buffer length a few lines
+         * above ("Raw image is corrupted"), so this is a false positive. It
+         * only shows up when this file is recompiled, which is why a stale
+         * object file hid it until now. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overread"
+        memcpy(JavaByteArray(pixelData), rawBuffer->data, pixelSize);
+#pragma GCC diagnostic pop
 
         IMGAPI_GET_IMAGEDATA_PTR(imageData)->width =
             (jint)rawBuffer->width;
@@ -559,9 +569,18 @@ KNIDECL(javax_microedition_lcdui_ImageDataFactory_loadPNG) {
     /* assert
      * (imgPixelData != NULL && imgAlphaData != NULL)
      */
+    /* v03.15 (Vita port): the height argument was a copy of the width, so
+     * ANY non-square PNG failed to decode. Every 240x320 resource in the
+     * CAPCOM title (85 of its 89 PNGs are palette images at 240x320) threw
+     * IllegalArgumentException here, Image.createImage() turned it into an
+     * IOException, the title kept null images and then died in
+     * Graphics.drawImage() - the visible symptom was a black screen and a
+     * NullPointerException from BioCanvas.paintCapcomAdd().
+     * The sibling implementation img_gci passes height correctly; this was
+     * an upstream typo in the putpixel variant only. */
     status = imgdcd_decode_png((srcBuffer + offset), length,
                         midpImageData->width, 
-                        midpImageData->width,
+                        midpImageData->height,
                         (imgdcd_pixel_type *)imgPixelData,
                         (imgdcd_alpha_type *)imgAlphaData,
                         &creationError);

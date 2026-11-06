@@ -65,8 +65,10 @@ typedef enum {
 /** PNG file header */
 extern const unsigned char imgdcd_png_header[16];
 
-/** JPEG file header */
-extern const unsigned char imgdcd_jpeg_header[4];
+/** JPEG file header.
+ * v02.89 (Vita port): 3 bytes (SOI + start of the first marker), not the
+ * upstream 4-byte SOI+APP0/JFIF prefix - see the note in imgdcd_image.c. */
+extern const unsigned char imgdcd_jpeg_header[3];
 
 /** RAW platform dependent image file header */
 extern const unsigned char imgdcd_raw_header[4];
@@ -81,7 +83,9 @@ typedef struct {
 
 /** JPEG image buffer layout */
 typedef struct {
-    unsigned char header[4];  /**< Must equal imgdcd_jpeg_header */
+    /* Four bytes here describe the classic JFIF start (SOI + APP0); the
+     * accepted signature is only the 3-byte imgdcd_jpeg_header above. */
+    unsigned char header[4];
     /** Length of data (including these 2 bytes), big-endian. */
     unsigned char length[2];
     unsigned char id[5];      /**< 4A, 46, 49, 46, 00 ("JFIF" string) */

@@ -66,9 +66,33 @@ class DisplayableLFImpl implements DisplayableLF {
         // 'resetViewport()' below.
 
         resetViewport();
+        /* v03.72: log every DISTINCT width this displayable reports.
+         *
+         * 极品飞车 lays its IDIOMA screen out from Canvas.getWidth()/getHeight()
+         * at the moment its layout object is built (af.<init>(int,int)), and the
+         * resulting rows land at x=209..365 on what our logs say is a 240-pixel
+         * surface. Those numbers are produced by the title, not by us, and the
+         * coordinates in its own data files are 100..4650 - i.e. they must be
+         * scaled by a canvas size somewhere.
+         *
+         * If this ever returns a value other than 240 on the device (0 during
+         * early init, or a stale size from the launcher's menu canvas), the
+         * title computes its layout from the wrong width and every row is
+         * displaced by a constant - which is exactly the observed shape of the
+         * bug: the rows keep their spacing but all sit past the right edge.
+         * Cheap to print, and it cannot lie: the value is the one the app gets. */
+        if (dbgW != viewport[WIDTH] || dbgH != viewport[HEIGHT]) {
+            dbgW = viewport[WIDTH];
+            dbgH = viewport[HEIGHT];
+            System.out.println("[dim] getWidth=" + dbgW + " getHeight=" + dbgH
+                               + " lf=" + getClass().getName());
+        }
         return viewport[WIDTH];
     }
-    
+
+    private static int dbgW = -1;
+    private static int dbgH = -1;
+
     /**
      * Returns the height of the area available to the application.
      * @return height of the area available to the application

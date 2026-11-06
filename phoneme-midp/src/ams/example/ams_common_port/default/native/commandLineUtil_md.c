@@ -182,7 +182,10 @@ char* getApplicationDir(char *cmd) {
             strcat(appDirBuffer, APPDB_DIR);
         }
     } else {
-        getMidpHome(cmd, appDirBuffer);
+        /* VITA (v03.89): same NULL-BUFFER bug as getConfigurationDir below. */
+        if (getMidpHome(cmd, appDirBuffer) == NULL) {
+            return NULL;
+        }
         strcat(appDirBuffer, APPDB_DIR);
     }
 
@@ -210,7 +213,15 @@ char* getConfigurationDir(char *cmd) {
             strcat(confDirBuffer, CONFIG_DIR);
         }
     } else {
-        getMidpHome(cmd, confDirBuffer);
+        /* VITA (v03.89): getMidpHome() returns NULL after printing
+         * "Warning: cannot find appdb subdirectory." - and the original code
+         * went on to strcat(CONFIG_DIR) onto that failed buffer, yielding the
+         * nonsense relative path "./../../../appdblib". Do NOT append to a
+         * failed buffer; report the failure so the caller keeps whatever
+         * directory the launcher already set. */
+        if (getMidpHome(cmd, confDirBuffer) == NULL) {
+            return NULL;
+        }
         strcat(confDirBuffer, CONFIG_DIR);
     }
 

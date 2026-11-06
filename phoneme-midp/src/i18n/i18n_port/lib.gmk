@@ -42,6 +42,12 @@ SUBSYSTEM_I18N_EXTRA_INCLUDES += \
 # src/configuration/configuration_xml/share/l10n/en-US.xml, and append
 # its .c filename to SUBSYSTEM_I18N_NATIVE_FILES
 
+ifeq ($(USE_I18N_VITA), true)
+    # Vita: real byte<->Unicode converter instead of the NULL stub
+    # (SJIS / EUC-JP / EUC-KR / GBK / Big5), see i18n_port/vita/lib.gmk.
+    include $(SUBSYSTEM_I18N_DIR)/i18n_port/vita/lib.gmk
+else
 ifneq ($(USE_I18N_JAPANESE), true)
     include $(SUBSYSTEM_I18N_DIR)/i18n_port/default/lib.gmk
+endif
 endif

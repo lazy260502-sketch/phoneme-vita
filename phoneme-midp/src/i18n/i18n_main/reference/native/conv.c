@@ -47,9 +47,22 @@ static LcConvMethods lcConv[NUM_LCCONV] = {
 
 #else
 
+/* __vita__: the platform converter (i18n_port/vita/vitaGenConv.c) knows
+ * several encodings at once (SJIS / EUC-JP / EUC-KR / GBK / Big5).  The
+ * cache below holds one entry per encoding ever requested, so a single
+ * slot would make the second encoding fail with "unsupported" even
+ * though getLcGenConvMethods() can answer it.  Other platforms keep the
+ * upstream value. */
+#if defined(__vita__)
+#define NUM_LCCONV 8
+#else
 #define NUM_LCCONV 1
+#endif
 static LcConvMethods lcConv[NUM_LCCONV] = {
 /* 0 */    NULL, /* depositary for a platform general converter */
+#if defined(__vita__)
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+#endif
 };
 
 #endif /* ENABLE_I18N_JAPANESE */

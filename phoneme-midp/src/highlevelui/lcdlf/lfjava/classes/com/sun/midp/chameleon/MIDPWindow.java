@@ -725,7 +725,8 @@ public class MIDPWindow extends CWindow {
      */
     public static int getDefaultAlertWidth(int width, 
 					  boolean scrollBarIsVisible) {
-	int w = AlertSkin.WIDTH == -1 ? (int)(.95 * width) : AlertSkin.WIDTH;
+	/* v02.100: integer math, see AlertLayer.setAnchor (log122). */
+	int w = AlertSkin.WIDTH == -1 ? width * 95 / 100 : AlertSkin.WIDTH;
 	if (scrollBarIsVisible &&
 	    ScrollIndSkin.MODE == ScrollIndResourcesConstants.MODE_BAR) {
 	    w -= ScrollIndSkin.WIDTH;
@@ -740,7 +741,7 @@ public class MIDPWindow extends CWindow {
      * @return height of the paticular body layer
      */
     public static int getDefaultAlertHeight(int height) {
-	return AlertSkin.HEIGHT == -1 ? (int)(.75 * height) : AlertSkin.HEIGHT;
+	return AlertSkin.HEIGHT == -1 ? height * 75 / 100 : AlertSkin.HEIGHT;
     }
 
     /**

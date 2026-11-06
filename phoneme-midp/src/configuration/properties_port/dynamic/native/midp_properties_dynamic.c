@@ -35,6 +35,10 @@
 #include <gcf_export.h>
 #include <midp_logging.h>
 #include <midp_constants_data.h>
+#if defined(VITA)
+#include <stdio.h>   /* v03.88: the [cfg] breadcrumbs below go to stderr, which
+                      * the launcher has already pointed at midp_stderr.log. */
+#endif
 
 /**
  * @file
@@ -262,12 +266,59 @@ initProps(Property** props, const pcsl_string * name,
     pcsl_string pathname;
     int fd = -1 ;
     char * errStr;
+#if defined(VITA)
+    /* v03.88: log157 showed microedition.locale = 'en-US'; log161/162/163 show
+     * NULL for locale AND for every other application property, i.e. the whole
+     * set is empty, not just one key. The launcher side is proven correct by
+     * its own breadcrumb ("seed: system.config tmpl=1039 gfx=38 out=1145
+     * wr=1145" - template read, gfx.cfg merged, file written in full), so the
+     * failure has to be on THIS side and nothing here reported anything:
+     * REPORT_WARN2 compiles to nothing at the shipped REPORT_LEVEL, and the
+     * one call site that would have shown the path frees the string before
+     * anyone could print it.
+     *
+     * Two facts are needed and both fit on one line: the exact path pcsl is
+     * given, and whether the open succeeded. The path matters because a wrong
+     * or EMPTY configRoot turns "system.config" into a relative name, which is
+     * the difference between "file missing" and "looking in the wrong place".
+     * A property count closes the loop: open=OK with props=0 means the parse
+     * consumed nothing. */
+    char dbgPath[256];
+    jsize dbgLen = 0;
+    dbgPath[0] = '\0';
+#endif
 
     /* Property file can be relative or at midp_home variable */
     pcsl_string_cat(configRoot, name, &pathname);
 
+#if defined(VITA)
+    {
+        jbyte *b = (jbyte *)dbgPath;
+        jsize n = (jsize)(sizeof(dbgPath) - 1);
+        jsize conv = 0;
+        if (pcsl_string_convert_to_utf8(&pathname, b, n, &conv)
+                == PCSL_STRING_OK
+            && conv >= 0 && conv < (jsize)sizeof(dbgPath)) {
+            dbgPath[conv] = '\0';
+            dbgLen = conv;
+        } else {
+            jsize k;
+            for (k = 0; k < (jsize)n && k < (jsize)pathname.length; k++) {
+                dbgPath[k] = (char)(pathname.data[k] & 0xFF);
+            }
+            dbgPath[k] = '\0';
+            dbgLen = k;
+        }
+    }
+#endif
+
     fd = storage_open(&errStr, &pathname, OPEN_READ);
     pcsl_string_free(&pathname);
+#if defined(VITA)
+    /* printed BEFORE any early return, so a failed open is always visible */
+    fprintf(stderr, "[cfg] path='%s' len=%d rc=%d\n",
+            dbgPath, (int)dbgLen, (errStr != NULL) ? -1 : 0);
+#endif
     if (errStr != NULL) {
         REPORT_WARN2(LC_CORE,
              "Warning: could not open config file(%s): %s\n",
@@ -280,8 +331,23 @@ initProps(Property** props, const pcsl_string * name,
 
     /* Read through the file one line at a time */
     if (parseConfig(fd, props) != 0) {
+#if defined(VITA)
+        fprintf(stderr, "[cfg] parse FAILED for '%s'\n", dbgPath);
+#endif
         return -1;
     }
+
+#if defined(VITA)
+    {
+        /* Count what the parse actually produced. */
+        int dbgProps = 0;
+        Property *p;
+        for (p = *props; p != NULL; p = p->next) {
+            dbgProps++;
+        }
+        fprintf(stderr, "[cfg] parsed %d properties\n", dbgProps);
+    }
+#endif
 
     /* Close the storage handle */
     storageClose(&errStr, fd);

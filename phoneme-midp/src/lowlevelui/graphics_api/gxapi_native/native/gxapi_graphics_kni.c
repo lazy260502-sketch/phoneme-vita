@@ -39,6 +39,69 @@
 extern void fast_rect_8x8(void*first_pixel, int ypitch, int pixel);
 #endif
 
+#if defined(VITA)
+#include <stdio.h>
+
+/* v03.99: OFF BY DEFAULT, and this matters more than any trace content.
+ *
+ * The v03.92 version of this file called vita_gfx_fill_log() unconditionally -
+ * it never consulted the j2me.gfxdebug switch that the Java-side traces honour.
+ * log171 proves it: that run had NO gfx.cfg ("[prop] ask 'j2me.gfxdebug' ->
+ * null") yet midp_stderr.log still carried 10 "[gfx] fillRect" lines. Each line
+ * is a synchronous small write to ux0:, measured at ~13 ms by v02.48 - and
+ * fprintf here also reaches the tty - so every trace line costs ~26 ms of
+ * BLOCKING I/O on the thread that is drawing.
+ *
+ * That is not a neutral observation when the question is "why does the panel
+ * stay parked off-screen": the panel's x is an animation value advanced once per
+ * painted frame, so adding tens of milliseconds of blocking I/O to the paint
+ * path directly slows the very thing being measured. The evidence is in the
+ * logs: the panel's base x went 64 (v03.58-v03.67, panel fully visible) -> 169
+ * (v03.71) -> 240 (v03.89+), i.e. it progressed less and less across exactly the
+ * versions where the paint path accumulated probes.
+ *
+ * So this trace is now gated on a marker file, checked ONCE per process:
+ *     ux0:/data/J2ME00001/gfxtrace.on      (its mere existence enables it)
+ * Absent => no I/O at all in the render path, which is the shipping default and
+ * restores the v03.67 behaviour. A separate marker from gfx.cfg on purpose:
+ * gfx.cfg is a MIDlet property file consumed by the Java side, while this is C
+ * and cannot see the property set.
+ *
+ * Bounded: 120 lines total. */
+static int vita_fill_logged = 0;
+static int vita_fill_on = -1;   /* -1 unknown, 0 off, 1 on */
+
+static int vita_gfx_fill_enabled(void) {
+    if (vita_fill_on < 0) {
+        FILE *f = fopen("ux0:/data/J2ME00001/gfxtrace.on", "r");
+        vita_fill_on = (f != NULL) ? 1 : 0;
+        if (f != NULL) {
+            fclose(f);
+        }
+    }
+    return vita_fill_on == 1;
+}
+
+static void vita_gfx_fill_log(const char *what, int x, int y, int w, int h,
+                              const jshort *clip) {
+    if (vita_fill_on < 0 && !vita_gfx_fill_enabled()) {
+        return;
+    }
+    if (vita_fill_logged >= 120 + 1) {
+        return;
+    }
+    vita_fill_logged++;
+    if (vita_fill_logged <= 120) {
+        fprintf(stderr, "[gfx] %s d=%d,%d %dx%d clip=%d,%d %dx%d\n",
+                what, x, y, w, h,
+                (int)clip[0], (int)clip[1],
+                (int)(clip[2] - clip[0]), (int)(clip[3] - clip[1]));
+    } else {
+        fprintf(stderr, "[gfx] fill trace budget exhausted (120)\n");
+    }
+}
+#endif
+
 /**
  * Get a C structure representing the given <tt>ImageData</tt> class.
  */
@@ -216,6 +279,22 @@ KNIDECL(javax_microedition_lcdui_Graphics_fillRect) {
             TRANSLATE(thisObject, x, y);
 
             GET_CLIP(thisObject, clip);
+
+#if defined(VITA)
+            /* v03.92: fillRect was NEVER traced, and log165/166 showed a
+             * light-blue dithered panel on screen that no traced drawRegion
+             * call could account for (all 77 of them had x_dest >= 240 and were
+             * clipped to nothing). So the panel the user sees is very likely
+             * painted by a FILL, not by a drawRegion tile. Without this line
+             * the instrumentation covers only half of the drawing API, and
+             * "0 of 77 drawRegion calls land on the canvas" can be true while a
+             * large panel is plainly visible - exactly the kind of half-truth
+             * that has wasted several rounds here.
+             * x/y are POST-translate (TRANSLATE() ran above) and clip is the
+             * effective clip, so this is directly comparable with the existing
+             * drawRegion / drawImage lines. Self-bounded to 120 lines. */
+            vita_gfx_fill_log("fillRect", x, y, w, h, clip);
+#endif
 
             gx_fill_rect(GET_PIXEL(thisObject),
                          clip,
@@ -586,6 +665,16 @@ KNIDECL(javax_microedition_lcdui_Graphics_drawString) {
             jstr = GET_STRING_PTR(str);
         
             GET_CLIP(thisObject, clip);
+
+#if defined(VITA)
+            /* v03.92: text was not traced either. The user's screenshot shows
+             * exactly two glyphs - "DI" - at the right edge of the panel, i.e.
+             * the beginning of "IDIOMA" cut off by the canvas border. Whether
+             * those glyphs come through drawString/drawChar or through
+             * per-glyph drawRegion calls cannot be told from the earlier traces
+             * because text was invisible to them. x/y are POST-translate. */
+            vita_gfx_fill_log("drawString", x, y, strLen, 0, clip);
+#endif
 
             gx_draw_chars(GET_PIXEL(thisObject),
                           clip,

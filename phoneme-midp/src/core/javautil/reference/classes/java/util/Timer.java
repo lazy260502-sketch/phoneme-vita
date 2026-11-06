@@ -490,6 +490,8 @@ class TimerThread extends Thread {
 	     */
         } catch (Throwable t) {
             // Someone killed this Thread, behave as if Timer cancelled
+            // VITA v03.28: log it (was silent).
+            System.out.println("[TIMEREXC] timer thread died: " + t);
             synchronized (queue) {
                 queue.newTasksMayBeScheduled = false;
                 queue.clear();  // Eliminate obsolete references
@@ -556,7 +558,22 @@ class TimerThread extends Thread {
 			task.run();
 		    } catch (Exception e) {
 			// Cancel tasks that cause exceptions
+			// VITA v03.28: say so. A game whose main loop is a
+			// repeating TimerTask (Need for Speed: 15 ms) just
+			// stops here with no trace; System.out reaches
+			// vm_output.log.
+			System.out.println("[TIMEREXC] task " + task
+					   + " cancelled: " + e);
+			e.printStackTrace();
 			task.cancel();
+		    } catch (Error err) {
+			// VITA v03.28: an Error used to fall through to
+			// run()'s catch (Throwable) and silently kill the
+			// whole timer thread.
+			System.out.println("[TIMEREXC] task " + task
+					   + " Error: " + err);
+			err.printStackTrace();
+			throw err;
 		    }
 		}
             } catch (InterruptedException e) {

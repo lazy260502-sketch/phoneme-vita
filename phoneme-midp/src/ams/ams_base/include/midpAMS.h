@@ -182,6 +182,13 @@ const char* midpGetAppDir(void);
 void midpSetConfigDir(const char* dir);
 
 /**
+ * Gets the config directory for MIDP.
+ *
+ * @return config directory of MIDP, or NULL if none was set
+ */
+const char* midpGetConfigDir(void);
+
+/**
  * Runs the given MIDlet from the specified MIDlet suite with the
  * given arguments. Up to 3 arguments will be made available to
  * the MIDlet as properties <tt>arg-&lt;num&gt;</tt>, where

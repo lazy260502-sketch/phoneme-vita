@@ -46,6 +46,21 @@
 #include <midp_properties_port.h>
 #include <midpTimeZone.h>
 
+#if defined(__vita__)
+/*
+ * The PS Vita port cannot use the localtime()/gmtime() difference below:
+ * newlib has no TZ because this port's getenv() returns NULL for every
+ * name (vita_pcsl.c), so the difference is always zero and every MIDlet
+ * saw GMT+00:00.  The console knows the offset - ask it via
+ * vita-port/src/vita_timezone.c.
+ *
+ * Weak reference: the MIDP archive is also linked into build-time tools
+ * that never call getLocalTimeZone(); for those the symbol stays NULL and
+ * we fall back to the libc arithmetic.
+ */
+extern const char *vita_local_timezone(void) __attribute__((weak));
+#endif
+
 /**
  * Return local timezone ID string. This string is maintained by this 
  * function internally. Caller must NOT try to free it.
@@ -58,6 +73,11 @@
  *         format of GMT+/-??:??. For example, GMT-08:00 for PST.
  */
 char* getLocalTimeZone() {
+#if defined(__vita__)
+    if (vita_local_timezone != 0) {
+        return (char *)vita_local_timezone();
+    }
+#endif
     static char tz[16]; /* No longer than "GMT-10:00" */
     time_t ct;
     struct tm ltm, gtm;

@@ -97,12 +97,55 @@ public class AlertLayer extends BodyLayer {
     public void setAnchor() {
 	if (owner == null)
 	    return;
+	/* VITA v02.98 (HYPOTHESIS, not yet confirmed on device): the skin has
+	 * ALERT_WIDTH=-1 and this method resolves it ONCE by overwriting the
+	 * skin constant. log120 showed "skin=0x125" for both UC Alerts, i.e.
+	 * AlertSkin.WIDTH == 0 at paint time, which makes a zero-width box
+	 * while the wash layer still dims the page (checkerboard screenshot).
+	 * If this method ever runs while owner.bounds is still 0x0, 0.95 * 0
+	 * = 0 is written and sticks for the whole VM run. Guard against that,
+	 * and log what is seen so the next device log settles whether this is
+	 * the cause (if "[ALERT-LAYER]" never prints and skin is still 0, the
+	 * 0 comes from somewhere else - e.g. the loaded skin value). */
+	if (owner.bounds[W] <= 0 || owner.bounds[H] <= 0) {
+	    System.out.println("[ALERT-LAYER] owner has no size yet: "
+		+ owner.bounds[W] + "x" + owner.bounds[H]
+		+ " skin=" + AlertSkin.WIDTH + "x" + AlertSkin.HEIGHT);
+	    return;
+	}
+	if (AlertSkin.WIDTH == -1 || AlertSkin.HEIGHT == -1) {
+	    System.out.println("[ALERT-LAYER] resolve skin=" + AlertSkin.WIDTH
+		+ "x" + AlertSkin.HEIGHT + " owner=" + owner.bounds[W] + "x"
+		+ owner.bounds[H]);
+	}
+	/* v02.100 (log122): the line above printed "resolve skin=-1x125
+	 * owner=240x320" and the very next paint log said skin=0x125, i.e.
+	 * (int)(.95 * 240) evaluated to 0 instead of 228 (the owner size was
+	 * fine, so v02.98's "owner has no size" guess was wrong). Compute with
+	 * integer arithmetic, and print what the double expression gives so
+	 * the next log shows whether this VM's double -> int path is broken. */
+	if (AlertSkin.WIDTH == -1 || AlertSkin.HEIGHT == -1) {
+	    /* log123: (int)(.95*240)=228 but (int)(.95*owner)=0 - the first is
+	     * folded by javac (no VM arithmetic), the second runs on the VM's
+	     * i2d -> dmul -> d2i. Print each step so the next log shows which
+	     * bytecode loses the value. The long forms go through different
+	     * VM routines (l2d / d2l) and tell whether it is d2i only. */
+	    int w = owner.bounds[W];
+	    double dw = w;                   /* i2d */
+	    double dp = 0.95;                /* ldc2_w */
+	    double pr = dw * dp;             /* dmul */
+	    System.out.println("[ALERT-LAYER] fp i2d=" + (int) dw
+		+ " dmul*2=" + (int) (dw * 2.0) + " dadd=" + (int) (dw + 1.0)
+		+ " dmul.95=" + (int) pr + " d2l=" + (long) pr
+		+ " f=" + (int) ((float) w * 0.95f) + " cmp.95<w=" + (dp < dw)
+		+ " int-math=" + (w * 95 / 100));
+	}
 	if (AlertSkin.WIDTH == -1) {
-            AlertSkin.WIDTH = (int)(.95 * owner.bounds[W]);
+            AlertSkin.WIDTH = owner.bounds[W] * 95 / 100;
         }
 
         if (AlertSkin.HEIGHT == -1) {
-            AlertSkin.HEIGHT = (int)(.75 * owner.bounds[H]);
+            AlertSkin.HEIGHT = owner.bounds[H] * 75 / 100;
         }
 
         bounds[W] = AlertSkin.WIDTH;

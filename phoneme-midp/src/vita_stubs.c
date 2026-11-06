@@ -402,22 +402,23 @@ pcsl_string_status pcsl_string_trim_from_end(const pcsl_string *str, pcsl_string
     return pcsl_string_dup(str, dst);
 }
 
+/* VITA v04.01: this file is NOT part of the shipping image (see the note in
+ * phoneme-midp/build_vita.sh: its objects never enter libobj.a, so every
+ * symbol here stays unresolved and the real implementation in
+ * vita-port/src/vita_pcsl.c is the one that links).
+ *
+ * This function used to carry a hand-rolled atoi that walked str->length,
+ * i.e. the v01.55-BROKEN length convention (one past the content, so the
+ * terminating zero was parsed as a digit and every call returned EINVAL).
+ * Dead code that looks plausible is worse than dead code that obviously
+ * does nothing: if this file is ever added to a build, the failure below is
+ * immediate and self-explanatory instead of a silent wrong answer that gets
+ * blamed on the caller. The complete implementation (sign handling, 64-bit
+ * range checks, PCSL_STRING_OVERFLOW) lives in vita-port/src/vita_pcsl.c. */
 pcsl_string_status pcsl_string_convert_to_jint(const pcsl_string *str, jint *value) {
-    if (str == NULL || value == NULL || str->data == NULL) {
-        return PCSL_STRING_EINVAL;
-    }
-    /* Simple ASCII atoi */
-    jint result = 0;
-    jsize i;
-    for (i = 0; i < str->length; i++) {
-        if (str->data[i] >= '0' && str->data[i] <= '9') {
-            result = result * 10 + (str->data[i] - '0');
-        } else {
-            return PCSL_STRING_EINVAL;
-        }
-    }
-    *value = result;
-    return PCSL_STRING_OK;
+    (void)str;
+    (void)value;
+    return PCSL_STRING_EINVAL;
 }
 
 pcsl_string_status pcsl_string_convert_from_jint(jint value, pcsl_string *str) {

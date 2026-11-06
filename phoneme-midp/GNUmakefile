@@ -24,3 +24,9 @@ TARGET_DEVICE := vita
 
 # Include the phoneME build system
 include $(MIDP_DIR)/build/common/Top.gmk
+
+# v02.91: rules that need variables Top.gmk defines (OBJ_DIR and friends).
+# The variable-only overlay is loaded through MAKEFILES before this file;
+# anything that declares a *rule* has to come after, because make expands
+# its target immediately and $(OBJ_DIR) would still be empty.
+-include $(MIDP_DIR)/build/vita_arm/vita_overlay_rules.mk

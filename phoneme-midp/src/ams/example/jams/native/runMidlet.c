@@ -40,6 +40,21 @@
 #include <ams_params.h>
 #include <midp_properties_port.h>
 
+/* v04.29: the heap_mb override block used to sit here. It now runs right
+ * after JVM_Initialize(), because the JIT decision below reads HeapCapacity
+ * and used to run before it - see the log186 note at the top of this
+ * function. */
+
+#if defined(VITA)
+/* v04.19: minimal VitaSDK declarations for the heap_mb override. Kept local so
+ * this upstream file does not start depending on Vita headers. */
+typedef int VitaSceUID;
+extern VitaSceUID sceIoOpen(const char *path, int flags, int mode);
+extern int sceIoRead(VitaSceUID fd, void *buf, unsigned int n);
+extern int sceIoClose(VitaSceUID fd);
+#define VITA_SCE_O_RDONLY 0x0001
+#endif
+
 /** Maximum number of command line arguments. */
 #define RUNMIDLET_MAX_ARGS 32
 
@@ -60,6 +75,62 @@ static const char* const runUsageText __attribute__((unused)) =
 "  where <suite number> is the number of a suite as displayed by the\n"
 "  listMidlets command, and <suite ID> is the unique ID a suite is \n"
 "  referenced by\n\n";
+
+#if defined(VITA)
+/* v04.29: heap-size override, split into "read" and "apply".
+ *
+ * WHY SPLIT: the two halves must happen at different times.
+ *   - READ (and the JIT decision that uses the value) belongs right after
+ *     JVM_Initialize(), before anything has looked at HeapCapacity.
+ *   - APPLY must happen AFTER setHeapParameters(), because that upstream
+ *     function does JVM_SetConfig(JVM_CONFIG_HEAP_CAPACITY,
+ *     getHeapRequirement()) UNCONDITIONALLY and would silently overwrite us.
+ *     log186's rounds show exactly that: heap_mb=15 was logged and then the
+ *     heap still came up at 32 MiB.
+ *
+ * File: ux0:/data/J2ME00001/heap_mb, a single integer, megabytes.
+ * Range 4..64: below 4 the VM cannot bootstrap; above 64 is unreachable in
+ * this address-space budget anyway. */
+static int vita_read_heap_mb(void) {
+    VitaSceUID hf;
+    char hb[16];
+    int hn, mb = 0, k;
+
+    hf = sceIoOpen("ux0:/data/J2ME00001/heap_mb", VITA_SCE_O_RDONLY, 0);
+    if (hf < 0) {
+        return 0;                       /* absent = keep the platform default */
+    }
+    hn = (int)sceIoRead(hf, hb, sizeof(hb) - 1);
+    sceIoClose(hf);
+    if (hn <= 0) {
+        return 0;
+    }
+    hb[hn] = '\0';
+    for (k = 0; k < hn && hb[k] >= '0' && hb[k] <= '9'; k++) {
+        mb = mb * 10 + (hb[k] - '0');
+    }
+    if (mb < 4 || mb > 64) {
+        return 0;
+    }
+    return mb;
+}
+
+static void vita_apply_heap_mb(int mb) {
+    FILE *lf;
+
+    if (mb <= 0) {
+        return;
+    }
+    JVM_SetConfig(JVM_CONFIG_HEAP_CAPACITY, mb * 1024 * 1024);
+    JVM_SetConfig(JVM_CONFIG_HEAP_MINIMUM,  mb * 1024 * 1024);
+    lf = fopen("ux0:/data/runmidlet_debug.log", "a");
+    if (lf) {
+        fprintf(lf, "*** runMidlet: heap_mb=%d applied -> Java heap %d bytes\n",
+                mb, mb * 1024 * 1024);
+        fclose(lf);
+    }
+}
+#endif /* VITA */
 
 /**
  * Runs a MIDlet from an installed MIDlet suite. This is an example of
@@ -128,7 +199,35 @@ runMidlet(int argc, char** commandlineArgs) {
     if (_rf) { fprintf(_rf, __VA_ARGS__); fflush(_rf); } \
 } while(0)
 
+
     JVM_Initialize(); /* It's OK to call this more than once */
+
+#if defined(VITA)
+    /* v04.29: heap_mb IS READ HERE, BEFORE THE JIT DECISION.
+     *
+     * log186 proved the ordering was wrong. That log contains, in one boot:
+     *     *** runMidlet: JIT requested but the Java heap is not in executable
+     *         memory -> -int (interpreter)
+     *     *** runMidlet: midpInitialize OK
+     *     *** runMidlet: heap_mb=15 -> Java heap 15728640 bytes
+     * and, one round later, the heap block finally did land in a VM block:
+     *     [heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: 0x85c00000,
+     *              15728640 bytes => THE JAVA HEAP IS EXECUTABLE; JIT may run
+     * The heap was executable and the JIT was still disabled, because the
+     * decision ran before the heap size was known. 32 MiB is the default and
+     * cannot fit a 16 MiB VM block, so a size query could only ever say no.
+     *
+     * Ordering now: heap_mb -> JIT decision -> (later) midpInitialize builds
+     * the heap from these JVM_SetConfig values. Nothing between here and
+     * setHeapParameters() consumes HeapCapacity, so moving the read up is
+     * safe.
+     *
+     * Read ONCE and remember it: the value is needed by the JIT decision here
+     * and applied later, after setHeapParameters() - see vita_apply_heap_mb(). */
+    const int vita_heap_mb = vita_read_heap_mb();   /* 0 = use default 32 MiB */
+#else
+    const int vita_heap_mb = 0;
+#endif
 
     /* VITA: JIT mode is decided by the launcher (vita-port/vita_main.c)
      * through the weak symbol vita_jit_policy, set from launch.cfg line 4
@@ -151,9 +250,88 @@ runMidlet(int argc, char** commandlineArgs) {
      * "-int" behaviour. */
     {
         extern int vita_jit_policy __attribute__((weak));
+        /* v04.29: PREDICT, DO NOT QUERY. THE HEAP DOES NOT EXIST YET.
+         *
+         * History, so this is not "fixed" a fifth time in the wrong direction:
+         *   v04.18-v04.23 queried vita_heap_executable() in vita_main.c, BEFORE
+         *     runMidlet ran. Always 0 -> JIT never on.
+         *   v04.24 moved the query here, "after JVM_Initialize()". Still
+         *     always 0, which log186 proves: it printed
+         *         "JIT requested but the Java heap is not in executable memory"
+         *     and then, in the SAME round, the heap block did land in a VM
+         *     block ("[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY ...
+         *     THE JAVA HEAP IS EXECUTABLE; JIT may run"). JVM_Initialize()
+         *     only sets up tty and Argument parsing - it does NOT allocate the
+         *     heap. The heap is allocated by Universe::initialize() ->
+         *     ObjectHeap::create(), which is called from JVM::start(), i.e.
+         *     from midpRunVm - far below this line, and therefore AFTER the
+         *     only moment at which "-int" can still be injected.
+         *
+         * So no query can ever work here either. The honest predicate is a
+         * PREDICTION from the values we just set, and the prediction is exact
+         * because the size arithmetic is known (see OsMemory.cpp):
+         *     heap_chunk = HeapCapacity + 8192        (marking stack)
+         *     a VM block must be a 1 MiB multiple and <= 16 MiB
+         *     14 MiB -> 14688256 -> rounds to 15728640  (15 MiB) FITS
+         *     15 MiB -> 15736832 -> rounds to 16777216  (16 MiB) OVERFLOW
+         * Hence: HeapCapacity <= 14 MiB.
+         *
+         * v04.48 CORRECTION, from log188. v04.29 used 15 MiB here on the
+         * reasoning that a 16 MiB block is "the documented maximum" and
+         * therefore must be allocatable. It is not: log186 shows the 15 MB
+         * setting asking for exactly 16777216 bytes and getting
+         *     0x80024b0b = SCE_KERNEL_ERROR_MEMBLOCK_OVERFLOW
+         * while the SAME run's 14 MB setting asked for 15728640 and succeeded
+         *     [heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY: 0x85c00000,
+         *              15728640 bytes
+         * So the practically usable maximum is a 15 MiB block, i.e. a 14 MB
+         * heap. Feeding 15 MB to the old bound produced the worst possible
+         * outcome: this file said "JIT ENABLED", the heap fell back to
+         * non-executable malloc, and the process died on the first call into
+         * generated code (log188: pc == lr == 0x82dcf814 inside the heap).
+         * That is the log181 signature, recreated by trusting the datasheet
+         * over the measurement.
+         *
+         * The real outcome is still verified in the VM: ObjectHeap logs
+         * "[heapmem] chunk0 BACKED BY VM-DOMAIN MEMORY" on success and
+         * "[heapmem] ... FAILED ... -> malloc" on failure, and
+         * OsMemory now force-disables the compiler there, so a wrong
+         * prediction cannot reach the JIT. */
+        extern int vita_heap_executable(void) __attribute__((weak));
+
+        const int JIT_MAX_HEAP_MB = 14;   /* see the arithmetic above */
+        int heap_mb_override = vita_heap_mb;   /* read once, above */
+        int heap_will_be_code = 0;
+
+        if (heap_mb_override > 0 && heap_mb_override <= JIT_MAX_HEAP_MB) {
+            heap_will_be_code = 1;
+        }
+        /* Belt and braces: if an earlier round already placed the heap in a VM
+         * block, trust the measured fact over the prediction. */
+        if (!heap_will_be_code && &vita_heap_executable != NULL &&
+            vita_heap_executable() != 0) {
+            heap_will_be_code = 1;
+        }
+
         if (&vita_jit_policy == NULL || vita_jit_policy == 0) {
             char* vm_arg[] = { "-int" };
             JVM_ParseOneArg(1, vm_arg);
+        } else if (!heap_will_be_code) {
+            char* vm_arg[] = { "-int" };
+            JVM_ParseOneArg(1, vm_arg);
+            if (heap_mb_override == 0) {
+                RM_LOG("*** runMidlet: JIT requested but the Java heap is still "
+                       "the 32MB default (cannot fit a 16MB VM block) -> -int. "
+                       "Set 设置->Java 堆 to %dMB or less.\n",
+                       JIT_MAX_HEAP_MB);
+            } else {
+                RM_LOG("*** runMidlet: JIT requested but heap_mb=%d is above "
+                       "%dMB, which cannot fit a 16MB VM block -> -int\n",
+                       heap_mb_override, JIT_MAX_HEAP_MB);
+            }
+        } else {
+            RM_LOG("*** runMidlet: JIT ENABLED - heap_mb=%d will be placed in a "
+                   "VM-domain block, UseCompiler left on\n", heap_mb_override);
         }
     }
 
@@ -176,14 +354,38 @@ runMidlet(int argc, char** commandlineArgs) {
     }
 
     /* get midp configuration directory, set it */
-    confDir = getConfigurationDir(commandlineArgs[0]);
-    if (confDir == NULL) {
-        REPORT_ERROR(LC_AMS, "Failed to recieve midp configuration directory");
-        RM_LOG("*** runMidlet: FAIL getConfigurationDir -> return -1\n");
-        return -1;
+    /* VITA (v03.89): the same defect as the app directory above, but worse,
+     * because this one silently made every application property vanish.
+     * log163 finally showed the path:
+     *     [cfg] path='./../../../appdblib/internal.config' rc=-1
+     *     [cfg] path='./../../../appdblib/system.config' rc=-1
+     * Chain: getConfigurationDir() calls getenv("MIDP_HOME"); when that
+     * returns NULL it falls back to getMidpHome(), which cannot find an
+     * "appdb" subdirectory, prints
+     *     "Warning: cannot find appdb subdirectory."
+     * (that line IS in log162/163's midp_stderr.log) and returns NULL - and
+     * the caller then does strcat(confDirBuffer, "lib") on that bad buffer
+     * anyway, producing "./../../../appdblib". midpSetConfigDir() stores it,
+     * storageInitialize() makes it configRoot, and initializeConfig() then
+     * opens a nonexistent relative path for BOTH internal.config and
+     * system.config. initProps() treats "cannot open" as "empty file" and
+     * returns success, so the whole property set is empty with no error:
+     * microedition.locale, microedition.platform, j2me.gfxdebug - all NULL.
+     * That is exactly what log161/162/163 show, and why no [gfx] line could be
+     * printed no matter what the card contained.
+     * The launcher sets the right directory (ux0:/data/J2ME00001/lib) before
+     * runMidlet via midpSetConfigDir(); keep it, and only compute one when
+     * nobody has. */
+    if (midpGetConfigDir() == NULL) {
+        confDir = getConfigurationDir(commandlineArgs[0]);
+        if (confDir == NULL) {
+            REPORT_ERROR(LC_AMS, "Failed to recieve midp configuration directory");
+            RM_LOG("*** runMidlet: FAIL getConfigurationDir -> return -1\n");
+            return -1;
+        }
+
+        midpSetConfigDir(confDir);
     }
-    
-    midpSetConfigDir(confDir);
 
     if (midpInitialize() != 0) {
         REPORT_ERROR(LC_AMS, "Not enough memory");
@@ -194,6 +396,21 @@ runMidlet(int argc, char** commandlineArgs) {
 
     /* Set Java heap parameters now so they can been overridden from command line */
     setHeapParameters();
+
+#if defined(VITA)
+    /* v04.29: APPLY the heap_mb override HERE, after setHeapParameters().
+     *
+     * setHeapParameters() (ams_common/native/heap.c) does
+     *     JVM_SetConfig(JVM_CONFIG_HEAP_CAPACITY, getHeapRequirement());
+     * UNCONDITIONALLY. Setting HeapCapacity earlier therefore achieves
+     * nothing - which is exactly what log186 shows: "heap_mb=15 -> Java heap
+     * 15728640 bytes" was printed, and the heap still came up at 32 MiB
+     * because this function ran afterwards and overwrote it.
+     *
+     * The value itself was read near the top of this function, because the JIT
+     * decision needs it before the VM starts. */
+    vita_apply_heap_mb(vita_heap_mb);
+#endif
 
     /*
      * Check if there are some parameters passed to us from the platform

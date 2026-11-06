@@ -38,8 +38,13 @@ const unsigned char imgdcd_png_header[16] = {0x89, 'P', 'N', 'G',
 				      0x00, 0x00, 0x00, 0x0d,
 				      0x49, 0x48, 0x44, 0x52};
 
-/* JPEG file header */
-const unsigned char imgdcd_jpeg_header[4] = {0xff, 0xd8, 0xff, 0xe0};
+/* JPEG file header.
+ * v02.89 (Vita port): upstream required FF D8 FF E0 (SOI + APP0/JFIF),
+ * which rejects legal JPEGs whose first marker is EXIF (FF E1) or a bare
+ * DQT. Match SOI + any marker byte instead; the SOF walk below validates
+ * the stream, so a false positive costs one pass over the data. Keep this
+ * in sync with ImageDataFactory.java's jpegHeader. */
+const unsigned char imgdcd_jpeg_header[3] = {0xff, 0xd8, 0xff};
 
 /* RAW platform dependent image file header */
 const unsigned char imgdcd_raw_header[4] = {0x89, 'S', 'U', 'N'};
@@ -94,8 +99,8 @@ MIDP_ERROR imgdcd_image_get_info(unsigned char *imgBuf,
 
 	return MIDP_ERROR_NONE;
 
-    } else if ((length >= 4 + 8) &&
-               (memcmp(imgBuf, &imgdcd_jpeg_header, 4) == 0)) {
+    } else if ((length >= 3 + 8) &&
+               (memcmp(imgBuf, &imgdcd_jpeg_header, 3) == 0)) {
         unsigned int i, field_len;
 
 	*format = IMGDCD_IMAGE_FORMAT_JPEG;

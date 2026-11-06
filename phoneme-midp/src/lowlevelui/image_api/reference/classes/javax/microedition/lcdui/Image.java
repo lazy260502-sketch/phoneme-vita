@@ -352,8 +352,31 @@ public class Image {
      */
     public static Image createImage(java.lang.String name)
         throws java.io.IOException {
-        return new Image(ImageDataFactory.getImageDataFactory().
-                         createResourceImageData(name));
+        AbstractImageDataFactory factory = ImageDataFactory.getImageDataFactory();
+        try {
+            Image img = new Image(factory.createResourceImageData(name));
+            return img;
+        } catch (RuntimeException e) {
+            System.out.println("[img] load RT-fail: '" + name + "' (" + e + ")");
+            throw e;
+        } catch (Error e) {
+            System.out.println("[img] load ERR-fail: '" + name + "' (" + e + ")");
+            throw e;
+        } catch (java.io.IOException e) {
+            /* v03.16 (Vita port): diagnostics only - no behaviour change.
+             * A leading '/' is the normal absolute form (Class.resolveName
+             * strips it), so it is NOT a naming problem. The real chain is
+             * Class.getResourceAsStream -> ClassLoader.getSystemResource ->
+             * URL.openStream(), and when the URL is null that layer returns
+             * null SILENTLY: no IOException is thrown there, nothing reaches
+             * ResourceInputStream, so the "[res] open FAILED" log in
+             * Natives.cpp never sees it. log126's IOException bci=8 (the
+             * `stream == null` throw in createImageFromStream) therefore came
+             * from this silent null. Name the resource here so the next
+             * device log shows which lookup failed. */
+            System.out.println("[img] load failed: '" + name + "' (" + e + ")");
+            throw e;
+        }
     }
 
     /**

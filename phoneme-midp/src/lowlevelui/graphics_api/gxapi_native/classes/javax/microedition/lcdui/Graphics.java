@@ -570,6 +570,20 @@ public class Graphics {
      * @see #getTranslateY()
      */
     public synchronized void translate(int x, int y) {
+        /* v03.59: the coordinate space is the pivot of the log153 puzzle. The
+         * game's bitmap-font glyphs are passed to drawRegion at x=312..378 on a
+         * 240-wide surface (392..458 on a 320-wide one), i.e. 138 px past the
+         * right edge in BOTH orientations. getClipX() returns clipX1 - transX,
+         * so the clip and x_dest share one space and those glyphs really are
+         * clipped away - but a translate that moves the visible area would
+         * change that conclusion, and nothing in the log showed it. Trace it. */
+        if (DBG_GFX && dbgTransCalls < 40 && dbgOut()) {
+            dbgTransCalls++;
+            System.out.println("[gfx] translate " + x + "," + y
+                + " -> trans=" + (transX + x) + "," + (transY + y)
+                + " clip=" + (clipX1 - transX) + "," + (clipY1 - transY)
+                + " " + (clipX2 - clipX1) + "x" + (clipY2 - clipY1));
+        }
         transX += x;
         transY += y;
     }
@@ -958,6 +972,18 @@ public class Graphics {
         int translatedX1, translatedY1;
         int translatedX2, translatedY2;
 
+        /* v03.59: who sets the clip, and to what. log153 showed the NFS panel
+         * drawn under clip (64,90,176x117) and its bitmap-font text under
+         * (0,0,240x320), so something restores the full clip between the two;
+         * naming the call sites is the cheapest way to see the drawing order
+         * the game actually intends. */
+        if (DBG_GFX && dbgClipCalls < 40 && dbgOut()) {
+            dbgClipCalls++;
+            System.out.println("[gfx] setClip " + x + "," + y + " " + width
+                + "x" + height + " trans=" + transX + "," + transY
+                + " surf=" + maxWidth + "x" + maxHeight);
+        }
+
         // If width or height is zero or less then zero,
         // we do not preserve the current clipping and
         // set all clipping values to zero.
@@ -1340,10 +1366,118 @@ public class Graphics {
         if (image == null) {
             throw new NullPointerException();
         }
-
+        /* v03.59: bounded trace of the blit path. log153 (极品飞车) could be
+         * reproduced almost exactly on the host by replaying the traced
+         * drawRegion calls with the real assets, EXCEPT for one colour that
+         * shows through the dither's transparent half. Everything that could
+         * have painted underneath - drawImage here, plus fillRect/drawString -
+         * was invisible in the log, so the analysis ran out of evidence. This
+         * closes that gap without flooding the file (60 lines per run). */
+        /* v03.68: ALWAYS log a full-surface blit, even when the general
+         * drawImage budget is used up. log155's question was exactly "did the
+         * title ever present its frame?" - 极品飞车 stops after one panel and
+         * three text rows with no "drawImage 240x320 d=0,0" at all, which is
+         * the difference between "the frame is on screen" and "the screen still
+         * shows the splash logo that was blitted last". A bounded log can make
+         * that absence ambiguous, so the one call that matters is unconditional.
+         * It happens at most once per frame, so the volume is bounded by the
+         * frame count anyway. */
+        boolean fullBlit = (image.getWidth() == maxWidth
+                            && image.getHeight() == maxHeight);
+        /* v03.86: the full-surface blit stays OUTSIDE the budget. It is the one
+         * line that answers "is the title's frame actually on screen", it
+         * happens at most once per frame, and at this title's frame rate that
+         * is a couple of lines per second - negligible next to the 400 the
+         * budget already allows. Every other drawImage spends a slot. */
+        if (DBG_GFX && (fullBlit || (dbgImageCalls < 60 && dbgOut()))) {
+            if (!fullBlit) {
+                dbgImageCalls++;
+            }
+            System.out.println("[gfx] drawImage " + image.getWidth() + "x"
+                + image.getHeight() + " d=" + x + "," + y + " a=" + anchor
+                + " clip=" + getClipX() + "," + getClipY() + " "
+                + getClipWidth() + "x" + getClipHeight()
+                + " trans=" + getTranslateX() + "," + getTranslateY()
+                + (fullBlit ? "  <<FULLBLIT" : ""));
+        }
         if (!render(image, x, y, anchor)) {
             throw new IllegalArgumentException("");
         }
+    }
+
+    private static int dbgImageCalls = 0;
+    private static int dbgTransCalls = 0;
+    private static int dbgClipCalls = 0;
+
+    /* v03.72: the [gfx] traces above/below are OFF by default.
+     * Why: on the Vita every System.out line leaves the process TWICE
+     * (vm_output.log via crumb_append, vm_stderr.log via pcsl_print_chars)
+     * and each synchronous small write to ux0: costs ~13 ms, so one println
+     * is ~26 ms of blocking I/O on the VM thread. Measured in log156: this
+     * title emits 20-30 drawRegion calls per frame, i.e. 0.5-0.8 s of pure
+     * flash writes per frame, which is the whole reason it became unplayable
+     * (watchdog caught the VM thread inside sceIoWrite in 52 of 73 samples).
+     * The traces are kept because they are what found the NFS layout bugs;
+     * they just must not run by default.
+     * Enable with a MIDlet property: -Dj2me.gfxdebug=1 */
+    private static final boolean DBG_GFX = dbgGfxOn();
+
+    private static boolean dbgGfxOn() {
+        try {
+            return "1".equals(System.getProperty("j2me.gfxdebug"));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /* v03.86: a TOTAL line budget for every [gfx] trace in this class.
+     * Why a second switch: v03.72 turned the traces off because they cost
+     * ~26 ms each, but "off" left the next investigation with no evidence at
+     * all - log157 (v03.74) printed a single [gfx] Image.createImage line and
+     * nothing else, and "drawRegion=0" then reads as "the title never drew"
+     * when the truth is "the ruler is off". The useful thing to record is
+     * the FIRST frame or two after the screen appears, not the steady state.
+     *
+     * DBG_BUDGET caps the total across all trace sites (translate, setClip,
+     * drawImage, drawRegion) so the cost is bounded and predictable:
+     * default 900 lines ~= 23 s of one-time flash I/O, then complete silence.
+     * Override per run with the MIDlet property "j2me.gfxbudget" (e.g. 300
+     * for a 240-pixel title that emits 24+11 tiles + 25 glyphs per frame,
+     * or a larger number when a longer window is needed). The per-site caps
+     * below stay in place: they keep one chatty site from eating the whole
+     * budget before the interesting ones run.
+     *
+     * v03.90: the default went 400 -> 900 after log165 ("just a blue screen")
+     * consumed only 129 lines for ONE frame of 极品飞车, i.e. the 400-line
+     * budget covered barely two frames and could not show whether the menu
+     * panel's x coordinate moves over time. 900 covers ~11 frames of that
+     * title. The 1-in-100 clipped summary below deliberately does NOT spend
+     * the budget, so the x trend keeps being reported after the detail stops. */
+    private static final int DBG_BUDGET = dbgBudgetOn();
+    private static int dbgLinesOut = 0;
+
+    private static int dbgBudgetOn() {
+        try {
+            String s = System.getProperty("j2me.gfxbudget");
+            if (s != null) {
+                int v = Integer.parseInt(s.trim());
+                if (v >= 0) {
+                    return v;
+                }
+            }
+        } catch (Throwable t) {
+            /* malformed value: fall through to the default */
+        }
+        return 900;
+    }
+
+    /** True while one more [gfx] line may be printed. Consumes one slot. */
+    private static boolean dbgOut() {
+        if (dbgLinesOut >= DBG_BUDGET) {
+            return false;
+        }
+        dbgLinesOut++;
+        return true;
     }
 
     /**
@@ -1442,6 +1576,10 @@ public class Graphics {
      * @throws IllegalArgumentException if the region to be copied exceeds
      * the bounds of the source image
      */
+    private static int dbgRegionCalls = 0;
+    /** v03.61: how many drawRegion calls land entirely outside the clip. */
+    static int dbgRegionClipped = 0;
+
     public void drawRegion(Image src, 
                            int x_src, int y_src,
                            int width, int height, 
@@ -1451,8 +1589,61 @@ public class Graphics {
         if (src == null) {
             throw new NullPointerException();
         }
+        /* v03.68: 200 was too small to hold one full frame of this title
+         * (24+11 panel tiles + 25 glyphs per frame = 60 calls), so log155 ended
+         * mid-frame and looked like a crash. 1500 covers ~25 frames. */
+        if (DBG_GFX && dbgRegionCalls < 1500 && dbgOut()) {
+            dbgRegionCalls++;
+            /* v03.61: mark the calls that the clip throws away entirely.
+             * log153's NFS screen draws its bitmap-font menu rows at x=312..378
+             * on a 240-wide surface (and x=392..458 on the 320x240 run), i.e.
+             * W+72 in both orientations, while the panel lands at W-176. Those
+             * two formulas disagree about which coordinate space is in play, and
+             * the report is "only the first menu row appears, IDIOMA should be
+             * on the left, the OK/X buttons are missing". Counting how many of
+             * the game's own draw calls are clipped to nothing separates "the
+             * game lays out past the surface" from "we clip too much". */
+            {
+                int cx = getClipX();
+                int cy = getClipY();
+                int cw = getClipWidth();
+                int ch = getClipHeight();
+                boolean out = (cw <= 0 || ch <= 0
+                               || x_dest >= cx + cw || y_dest >= cy + ch
+                               || x_dest + width <= cx || y_dest + height <= cy);
+                System.out.println("[gfx] drawRegion src=" + src.getWidth() + "x"
+                    + src.getHeight() + " r=" + x_src + "," + y_src + " " + width
+                    + "x" + height + " t=" + transform + " d=" + x_dest + ","
+                    + y_dest + " a=" + anchor + " clip=" + cx + ","
+                    + cy + " " + cw + "x" + ch + (out ? "  <<CLIPPED" : ""));
+            }
+        } else if (DBG_GFX) {
+            /* count only, so the total is visible even past the line budget */
+            int cx = getClipX();
+            int cw = getClipWidth();
+            if (cw <= 0 || x_dest >= cx + cw || x_dest + width <= cx) {
+                dbgRegionClipped++;
+                /* v03.90: this summary does NOT spend the line budget.
+                 * log165 ran out of budget after ~1.8 frames and that made one
+                 * question unanswerable: is the IDIOMA panel's x a STATIC
+                 * misplacement (stuck at 240) or the FIRST FRAME of a slide-in
+                 * animation (240 is exactly the canvas width, i.e. just off the
+                 * right edge)? A 1-in-100 summary costs a handful of lines and
+                 * keeps reporting long after the detailed trace has gone quiet,
+                 * so the trend of x_dest over time survives a small budget. */
+                if (dbgRegionClipped % 100 == 0) {
+                    System.out.println("[gfx] drawRegion clipped total="
+                                       + dbgRegionClipped + " last d=" + x_dest
+                                       + "," + y_dest + " " + width + "x"
+                                       + height + " clip=" + cx + "," + getClipY()
+                                       + " " + cw + "x" + getClipHeight()
+                                       + " lines=" + dbgLinesOut);
+                }
+            }
+        }
         if (!renderRegion(src, x_src, y_src, width, height,
                           transform, x_dest, y_dest, anchor)) {
+            System.out.println("[gfx] drawRegion REJECTED");
             throw new IllegalArgumentException("");
         }
     }

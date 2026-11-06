@@ -1006,21 +1006,23 @@ public class Display {
      * @see #setCurrent
      */
     public Displayable getCurrent() {
+        Displayable r;
         synchronized (LCDUILock) {
             if (current == null) {
                 if (transitionCurrent == null) {
-                    return null;
+                    r = null;
                 } else {
-                    return transitionCurrent.lGetDisplayable();
+                    r = transitionCurrent.lGetDisplayable();
                 }
             } else {
                 if (current == initialDisplayable) {
-                    return null;
+                    r = null;
                 } else {
-                    return current.lGetDisplayable();
+                    r = current.lGetDisplayable();
                 }
             }
         }
+        return r;
     }
 
     /**
@@ -2119,7 +2121,20 @@ public class Display {
      * @return <code>true</code>, if sound was played.
      */
     boolean playAlertSound(AlertType t) {
-        
+
+        /* VITA v02.90: Alerts are silent. log119: UC's "clipboard is empty"
+         * and "copied" notices each fired a 1 s tone (note 72), which users
+         * read as an error beep. J2ME-Loader's AlertType.playSound() simply
+         * returns false for the same reason. Callers: AlertLFImpl.lCallShow,
+         * AlertType.playSound() (an app may call it directly; it now gets
+         * false = "no sound played", which the API allows) and
+         * TextFieldLFImpl:1243 (WARNING beep when a TextField rejects input,
+         * also silent now). Games' own sounds go through MMAPI and are
+         * unaffected. */
+        if (true) {
+            return false;
+        }
+
         if (!paintSuspended && hasForeground) {
             int note = 9 + 3 * t.getType();
             int duration = 1000;
@@ -2529,6 +2544,13 @@ public class Display {
         if (Logging.TRACE_ENABLED) {
             Logging.trace(t, "Exception caught in Display class");
         }
+        // v02.77: TRACE_ENABLED is a compile-time false, so an exception
+        // thrown by the app's paint()/keyPressed()/run() was swallowed
+        // without any trace (log117: four Nokia games drew nothing and no
+        // exception reached vm_output.log). System.out is the only Java-side
+        // channel that survives (-> JVMSPI_PrintRaw -> vm_output.log).
+        System.out.println("[APPEXC] " + t);
+        t.printStackTrace();
     }
 
 /*

@@ -1894,6 +1894,14 @@ public class RecordStoreImpl implements AbstractRecordStoreImpl {
                 dbIndex = new RecordStoreIndex(this, suiteId, recordStoreName);
 
             } catch (java.io.IOException ioe) {
+                /* v03.15 (Vita port): log126 showed 生化危机's
+                 * BioData.SaveGameData() failing with "error opening record
+                 * store file" for a NEW store, and the caught IOException was
+                 * swallowed, so the log said nothing about why. Print the
+                 * cause (bounded, this runs on every failing save). */
+                System.out.println("[rms] open FAILED name='" + recordStoreName
+                    + "' suite=" + suiteId + " exists=" + exists
+                    + " cause=" + ioe);
                 try {
                     if (dbFile != null) {
                         dbFile.close();

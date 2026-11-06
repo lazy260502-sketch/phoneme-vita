@@ -97,6 +97,18 @@ void midpSetConfigDir(const char* dir) {
     midpConfig = (char *)dir;
 }
 
+/*
+ * Returns the config directory set by midpSetConfigDir, or NULL if none
+ * was set. Symmetric with midpGetAppDir above; see the VITA note in
+ * runMidlet.c for why it is needed (v03.89).
+ *
+ * @return config directory of MIDP, or NULL if none was set
+ */
+const char* midpGetConfigDir(void) {
+
+    return midpConfig;
+}
+
 /**
  * The public MIDP initialization function. If not running for the MIDP
  * home directory, midpSetAppDir, midpSetConfigDir should the first calls 
