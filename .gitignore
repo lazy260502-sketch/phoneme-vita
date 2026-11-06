@@ -39,3 +39,6 @@ vita-port/nokia_classes/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# v04.54: fpmodel build product (armcal.py regenerates it from soft_ref.c)
+debug/tools/fpmodel/soft_ref.o
