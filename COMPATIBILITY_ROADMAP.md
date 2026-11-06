@@ -762,28 +762,32 @@ HTTPS 页面能打。
    AnimationTrack 采样、**CompositingMode 全部状态（v04.02）**、
    **调色板纹理（v04.06）/ 三遍对象排序（v04.08）/ 无 UV 时解除纹理（v04.12）/
    `PolygonMode` 全常量与 `Light.SPOT`（v04.17）**。
-   **仍缺**（按对真实游戏的影响排序）：
-   - `Graph` 加载契约（v04.27：`Loader.load()` 现保证**单根**文件的 `[0]` 就是根，
-     多根文件保持文件顺序；`find()` 因此只在调用方**自己的场景图内**作答，
-     `getTransformTo()` 不再返回"图外对象"）
-   - `Object3D.duplicate()` 对 **World** 的处理（v04.25：会走 Group 分支返回普通
-     `Group`，类型与 `activeCamera`/`background` 都丢失；样本集无标题用到）
-   - `Appearance.layer` 语义（v04.22：`setLayer` 已是 public 且校验 -1..15，
-     但 `Renderer` 从不读它 —— 既不按 layer 排序各 submesh，也不跳过
-     `layer == -1` 的"不绘制"）
+   **v04.41–04.44 补齐的**（本节此前一直写着"仍缺"，已过时）：`Fog` 真渲染（两条后端）、
+   **硬件路径 alpha test**（v04.42 纠正 v04.02 的误判：GLES1 本来就有 `glAlphaFunc`）、
+   `MorphingMesh` 权重（v04.43，Java 层实现，两后端共享）、`Appearance.layer` 绘制顺序 +
+   跳过 `layer == -1`（v04.44，稳定排序）。**M3G 1.1 的 API 面到此收尾。**
+   三条**作废**项（当时凭记忆写错，M3G 1.1 里没有入口）：`Background.SPHERE/CUBE`（属 2.0）、
+   多纹理（1.1 只允许 1 层）、`PolygonMode` 的 POINT/LINE（常量在，但没有 `setFillMode`）。
+   **仍然缺**（按对真实游戏的影响排序）：
+   - **头号阻塞不是 M3G，而是 JIT 的浮点路径**（2026-11-06 log191）：同一批模型、同一版本，
+     14 MB 堆（JIT 开）时 `skin bind` 报 38/26/31/26/21 根奇异骨骼、`drawMesh` 273–469 ms/帧；
+     32 MB（JIT 被关）时奇异数全 0、24–38 ms/帧。`skin bind` 是纯 Java（`Matrix4.invert`），
+     数据相同结果不同 ⇒ JIT 生成的代码算错浮点。v04.53 修了两处（`ldc2_w` 高低字、
+     `double_constant_fold` 符号位）但**未证明能解决**；`JitSelfTest` 的 20 个探针就是为定位它加的。
+     **在这一条解决前，"3D 做完了"不成立** —— 模型是对的，画出来是错的。
    - `Light.SPOT` 的**锥形衰减**（常量已有、`setMode` 已接受，着色暂按 OMNI）
-   - `Fog`（类与 `Appearance.setFog` 都在，`Renderer` 不读；远景无雾）
-   - `Background` 的 `SPHERE`/`CUBE`（天空盒；后端无 cubemap）
-   - `MorphingMesh` 权重（`weights` 存了但不参与顶点计算）
-   - `PolygonMode` 的 `POINT`/`LINE` 填充
-   - 多纹理（`Appearance` 目前硬限制为 1 层）
-   - 硬件路径的 alpha test（需 fragment shader discard）
-3. ⬜ **Mascot Capsule V3**（`com.mascotcapsule.micro3d`）：**代码零行**，日本游
-   戏常见。需先把 V3 的 API 面（`Figure`/`FigureLayout`/`Effect3D`/`Texture`/
-   `Graphics3D`）照 Javadoc 补齐，再接现有后端。
-4. ⬜ **v10 J3D**（`com.vodafone.v10.graphics.j3d`）：**代码零行**（v10 只有
-   sound/media/device 桩）。
+   - `Graph` 加载契约（v04.27 已保证单根文件 `[0]` 是根；多根文件按文件顺序）
+   - `Object3D.duplicate()` 对 **World** 的处理（v04.25：走 Group 分支，`activeCamera`/
+     `background` 丢失；样本集无标题用到）
+3. ⬜ **Mascot Capsule V3**（`com.mascotcapsule.micro3d`）：**代码零行**，日本游戏常见。
+   需先把 V3 的 API 面（`Figure`/`FigureLayout`/`Effect3D`/`Texture`/`Graphics3D`）照 Javadoc
+   补齐，再接现有后端。**这是 3D 剩余工作里最大的一块。**
+4. 🟡 **v10 J3D**（`com.vodafone.v10.graphics.j3d`）：v04.40 已落地 11 个类型（API 面完整），
+   但**模型格式（Aplix M3D）不公开 ⇒ 只画占位、不能渲真实模型**；规范也没公开"MIDlet 如何
+   获得 `Graphics3D`"，用其它获取方式的游戏仍拿不到实例。VSCL 的
+   `com.vodafone.v10.graphics.sprite` 同样未做（8×8 tile 硬件引擎 + 私有格式，刻意不做）。
 5. ⬜ JSR-239 OpenGL ES 1.x：Java 绑定映射到 vitaGL。
+
 6. ✅ 软件回退：`vita_sw3d.c`，含深度缓冲、五种混合方程、逐像素 alpha test。
 
 **验收**：至少 3 个 3D 游戏能进入并渲染；性能 ≥20fps（先求对，再求快）。
