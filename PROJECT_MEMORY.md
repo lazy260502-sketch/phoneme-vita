@@ -3221,6 +3221,78 @@ bash build_jar.sh
 
 ## 关键文件修改记录
 
+### 🔒 2026-11-06 log191/log192 分析（v04.52 + v04.55）：卡死是**等在 0x104bf 上**，建模错乱是相机矩阵的下游
+
+> 这两轮的说明原本写在 `vita-port/CMakeLists.txt` 里（该文件瘦身后只留标记，
+> 说明搬到这里）。
+
+#### 1. 先纠正我自己两个错误结论
+
+| 我说过 | 实际 | 证据 |
+| --- | --- | --- |
+| "JIT 在编译大方法导致卡死" | **JIT 一个字节都没编译** | `vm UseCompiler(post)=0`、`compile-requests=0`、`produced-code=0`，每一轮都是 |
+| "CPU 锁 333MHz 是主因" | 无关 | 卡死的线程 `cpu=-1`（不在任何核上），提频救不了 |
+
+`jit: round 0 policy 2 -> restored UseCompiler=1` 只是策略**要求**的，
+`(post)` 才是**实际运行**的。我读错了。相关改动已原样撤回。
+
+#### 2. 卡死（log191 & log192 同一个 ID）
+
+```
+[WD] HANG ce=14152 polls=12 tick=22495 clock d=100 kclock kd=100215us
+[WD] vm 'J2ME00001' status=WAITING wait=other(0x100) wid=66751 cpu=-1
+[WD] vm waits on 0x104bf ... 
+```
+
+- `0x104bf`（=66751）**不在 `0x4001xxxx` 线程段** → 是内核对象，不是线程
+- `cpu=-1`、`runClocks` 不增长 → 线程没在跑，在等
+- `tick` 冻结，`site_ring.log` 里两个 `cldc_ticker` 同一创建者
+  `0x8110a508`（`Os::start_ticks`），旧的已 `<gone>`
+- **log191 与 log192 是同一个 wid**，可复现
+
+#### 3. 建模错乱 = 相机矩阵退化的下游（不是独立 bug）
+
+```
+[m3g] Transform.invert: matrix is not invertible; left unchanged  (×12)
+[m3g] gmesh#6 world=(-9.43,-0.00,21.14) eye=(21.21,-2.43,2.22) w = -2.22
+[m3g] gmesh#8 world=(12.00, 0.00,-22.40) eye=(-22.49,1.31,-18.56) w = 18.56
+```
+
+同帧内 `gmesh#6` 的 **`w` 为负**（顶点在相机背后）。NDC 范围也印证：
+健康 mesh 是 `x[-21,291]`，异常的是 `x[-1315,6798]`、`x[-4202,19]`。
+
+来源：v04.49 的「求逆失败就沿用上一个好矩阵」——**单帧正确，连续帧会让相机
+与场景脱节**。根因仍是 log189 那条（游戏用两点算相机基，两点重合 → 除零）。
+
+⇒ **修相机源头即可，几何路径不需要单独修。**
+
+#### 4. 两次加的诊断
+
+| 版本 | 内容 |
+| --- | --- |
+| v04.52 | `vita_watchdog.c` 解码等待目标：依次试 `GetMutexInfo`/`GetSemaInfo`/`GetEventFlagInfo`，打印对象名 + owner |
+| v04.55 | 扩到 **5 类**（新增 `GetRWLockInfo`、`GetMsgPipeInfo`）；查不出时**明确说明歧义**而不是断言 |
+
+v04.52 初次写的是 "owner is gone"，**比证据更强**。真相：`LwMutex`/`LwCond`
+在这个 vitaSDK **没有 GetInfo API**，所以「等在 LwMutex 上」与「等在已销毁对象上」
+**无法区分**。v04.55 改成如实陈述这个歧义。
+
+#### 5. 未解决 / 下一步
+
+- 卡死仍未修复，只做到**可定位**。下次日志看 `[WD] vm waits on ...` 后面是
+  具体对象名还是 `cannot introspect`。
+- 若是 `cannot introspect` → 查 `Os::stop_ticks()`（用 `sceKernelDeleteThread`）
+  删除线程时有没有漏放锁。
+- 相机退化（log189 根因）未修，等卡死定位后一并处理。
+
+#### 6. CMakeLists 瘦身（教训）
+
+v04.54 的 `tools/slim_cmake.py` 把 CMakeLists 从 7256 行瘦到 1766 行。
+**我这几轮又往里加了 5550 行注释（未提交）**，涨回 7309 行。
+已再次瘦身。**规则：版本说明写进本文件，CMake 只留一行标记。**
+
+---
+
 ### ⬛ 2026-11-05 log189 分析（+ v04.49 修复）：相机两点重合 → 矩阵全 NaN → `Transform.invert()` 抛异常 → Timer 任务被取消 → **黑屏卡死**
 
 **用户报告**：分析log189, 极品飞车，黑屏卡在不动。
@@ -24892,4 +24964,281 @@ BUILD_EXIT=0
    `Graphics3D.getInstance()` 时跑一次）。**上机时只需要三行日志**：
    `[m3g] jitfp passN: ok=X/20 BAD: name=...`，再跑一次 `jit=0` 作对照。
 2. P1：VM 块复用第 4 轮之后的行为、newlib arena 22488K→7084K、`JitSelfTest` 用完移除。
+
+
+## 2026-11-06 log193 = 我要求的 A/B 结果：**14MB 堆不是慢的原因，JIT 本身慢 4-5 倍**
+
+### A/B 条件（用户按要求做的，条件干净）
+
+log193（v04.54）：三轮全部 `heap_mb=14 applied -> Java heap 14680064 bytes`，
+**完全没有 JIT 日志**（`jit=0` 走不打印的分支）。即 14MB + 解释器。
+
+### 三方对比（稳态 per-mesh `drawMesh`）
+
+| 堆 | 模式 | per-mesh drawMesh | 出处 |
+| --- | --- | --- | --- |
+| **14 MB** | **解释器** | **17 / 25 / 18 ms** | log193 |
+| 32 MB | 解释器 | 12 / 17 / 19 / 16 ms | log191 进程3 |
+| 14 MB | **JIT** | **92 / 94 / 91 / 92 ms** | log191 进程1 |
+
+（首帧 91ms 是加载/编译期，不计。log193 首帧 91.0 与 log191 JIT 稳态 92 恰好同值，
+是巧合，别混淆——log193 第 2 条起就掉到 17-25。）
+
+### 结论
+
+1. **14MB 堆不慢**。14MB 解释器 17-25ms vs 32MB 解释器 12-19ms，差 1.4 倍，
+   属正常范围（堆小 → GC 稍勤），远不足以解释"卡"。
+2. **慢的是 JIT 本身，4-5 倍**。同堆 14MB 下，JIT 92ms vs 解释器 18ms。
+3. 我上一轮说"无法区分 JIT 与 14MB"是对的，这次你的 A/B 把它定性了。
+   之前我一度错误地说"JIT 慢 5-7 倍"，靠的是跨堆对比（不成立）；
+   现在这个 5 倍结论**是同堆对比**得出的，成立。
+
+### 为什么 JIT 会慢（证据 + 待验证）
+
+**主嫌：`on_timer_tick` 在 VM 线程内同步编译，且没有 safepoint。**
+`Compiler.cpp:209` `void Compiler::on_timer_tick(bool is_real_time_tick JVM_TRAPS)`
+——注释本身就写着这是历史挂死问题的"prime suspect"（log9/10/35 的
+"VM thread frozen with CE/ttk stuck"）。它是**全同步编译**，没有中间 safepoint，
+所以编译期间 VM 线程完全不跑 Java。帧时间里每一帧都被切走一段。
+
+旁证：
+- log191 JIT 轮 `compile-requests=1215 produced-code=819`（文件管理器只有 204/204，
+  说明 BioMain 这种 3D 游戏会触发海量编译）。
+- `used=706272` / `size=2935580` —— 编译区用了 24%，还在持续增长，
+  说明整轮一直在编译，不是启动后收敛。
+- `flush_icache` 每编译一个方法一次 `sceKernelSyncVMDomain`（819 次 syscall），
+  但这是编译期一次性开销，只占小头。
+
+**已存在的调试开关（不用改代码，写文件即可）**：
+
+| 文件 | 内容 | 作用 |
+| --- | --- | --- |
+| `ux0:/data/J2ME00001/tick_compile.cfg` | `0` | 关闭 tick 驱动的编译（`vita_tick_compile_enabled()`，OS_vita.cpp:474） |
+| `ux0:/data/J2ME00001/tickgate` | — | ticker 陈旧时拒绝同步编译 |
+
+这两个是 v02.11/v02.17 就为同一个问题做好的，正好现在用。
+
+### 下一步 A/B（用户操作，仍不改代码）
+
+在 **14MB + `jit=2`** 下，依次试：
+
+1. `tick_compile.cfg` 写 `0` → 跑 BioMain。
+   - 如果恢复到 18ms 左右：确认是 tick 驱动同步编译把 VM 线程吃掉了。
+     修法方向：把编译搬到独立线程 / 降低编译优先级 / 只在 ticker 健康时编译。
+   - 如果仍然 90ms：说明慢在"执行已编译代码"本身，而非编译过程，
+     那是生成代码质量问题（phoneME ARM JIT 的代码质量本就一般），
+     这条路要重新评估是否值得。
+2. 顺带确认 JIT 是否真的有用过：`jit: first code` 之后有没有实际执行
+   编译方法（需要额外计数，暂无日志）。
+
+### 教训
+
+1. **跨变量对比得出的倍数是废的**。上一轮我拿 14MB+JIT 比 32MB+解释器，
+   两个变量同时变，结论不可用；这次同堆对比才站得住。
+2. **用户主动做的 A/B 比我猜两轮都有效**。我上一轮明确列出"两种结果各说明什么"，
+   这次一次实验就定性了。以后遇到多变量问题，先给可执行的实验设计。
+3. 项目里已有的调试开关（`tick_compile.cfg` / `tickgate`）要先查，
+   别急着写新代码——v02.11/v02.17 就为这个 exact 问题准备好了。
+
+
+## 2026-11-06 CMakeLists.txt 注释又变长：原因与防复发（用户第二次提这件事）
+
+**经过**：v04.35 精简到 686 行 → 被写回 7000+ 行 → v04.54 提交 `5da424e` 压到 1766 行 → 工作区又回到 7309 行（谁还原的我没查到证据）→
+`tools/slim_cmake.py` 压到 528 行（只剩一个 `set(VITA_VERSION "04.55")`，标记之后无注释）。排除 `set(VITA_VERSION` 后功能行 357 对 357 逐行一致；
+`cmake` 配置通过。**当前工作区是 528 行但未提交，HEAD 仍是 1766 行。**
+
+**我自己的责任**：我这次会话给 04.53 往 CMakeLists.txt 里写了 21 行说明 + 一个 `set(VITA_VERSION "04.53")`，正是 `BUILD_QUICKSTART.md` 第 2 节
+明令不许的做法（版本说明写 PROJECT_MEMORY.md）。那 21 行内容已在本文件 v04.53 一节，没有丢。
+
+**防复发**：`vita-port/build.sh` 在 cmake 之前检查：`set(VITA_VERSION` 多于一个，或最后一个之后仍有注释行 ⇒ 构建失败并提示。
+判据是症状而不是行数，不会误伤正常发版（只改那一行版本号）。演练：当前文件放行；精简前 7309 行版本拒绝（181 个 set、1234 行尾部注释）；
+精简后追加一行注释拒绝。
+
+**未处理**：`tools/slim_cmake.py` 的 `MARKER` 里版本号写死 `04.54`，当前是 04.55。下次有人写长后再跑它，版本号会被改回 04.54。
+该文件另一会话有未提交改动，我没碰；报告给用户。
+## 2026-11-07 v04.56：UC 卡初始化根因——签名校验是第一个 throw，把全部自愈逻辑挡在外面
+
+### 结论
+
+v01.50..v01.54 那一整套 RMS 自愈（`salvage (bad header)` / `salvage (bad chain)`
+/ `salvage (empty header, live blocks present)`）**全部位于签名校验之后**，而签名
+校验是 `if (dbHeaderData[i] != DB_SIGNATURE[i]) throw new RecordStoreException(
+"invalid record store contents")`。头部读不出来（最常见的一种损坏）恰好走不进任何
+修复分支，直接抛异常。UC 启动路径没 catch 它 → 线程静默死 → 卡在初始化。
+
+这就是"之前修好了、现在又出现"的真相：不是修复被回退，是**修复覆盖不到这种损坏
+形态**。
+
+### log193 事实
+
+**不是 coreA 一个库坏了，是所有 store 都一样**：
+
+```
+[rms] open name='0'     exists=1 next=0 live=0 ver=0 data=0 free=0
+[rms] open name='2'     exists=1 next=0 live=0 ver=0 data=0 free=0
+[rms] open name='coreA' exists=1 next=0 live=0 ver=0 data=0 free=0
+```
+
+`RecordStoreImpl.java:1776` 那行打印的是**读取后的原始头部**，五个字段全 0 =
+`dbFile.read(dbHeaderData)` 读回空，缓冲区保持初始化的零值。
+
+- BioMain / 文件管理器也报同样状态，但它们容错 → 照常跑；
+- UC 不容错 → `Calling midpRunVm` 之后再无任何输出，卡死。
+
+`suite=-1`（INTERNAL_SUITE_ID）说明走的是 suiteContainer 的路径基名，
+但**不是路径错**——路径错会导致 `exists=0` 走"新库"分支，而这里是 `exists=1`。
+
+### 改动（`RecordStoreImpl.java`，v04.56）
+
+签名不匹配不再 throw，改为当作"受损库"：
+
+1. `salvageStore(recordStoreName, dbHeaderData)` —— 它只读 `RS6_DATA_SIZE` 和
+   `dbFile`，**从不看签名**，所以拿垃圾头部调用是安全的；它从字节 40 扫到物理
+   EOF 找活块。
+2. 恢复签名 + 保证合法最小值（`next_id >= 1`、其余 `>= 0`）+ 更新
+   `last_modified`，写回头部。
+3. **一行都不抛**。原来没处理该异常的 MIDlet 现在看到的只是一个空库。
+
+清不掉的活块由 `salvageStore` 内部既有的 v01.54 保护处理（"no live block found
+→ 保留字节不动"），所以不会把 5 KB 的库物理抹掉。
+
+### 宿主验证（`/tmp/rmssig`，20 项断言全过）
+
+四次真实损坏形态 + 一次对照：
+
+| 场景 | 结果 |
+| --- | --- |
+| A 全零头 + 一个活块（log193 形态） | 不抛、签名恢复、块被救回、头部写回 |
+| B 全零头 + 只有 40 字节（无从救） | 重置为 pristine 空库（= 手动删 rms） |
+| C 签名垃圾但字段正常 | 签名修好、live 数保留 |
+| D 健康库 | 零写入、字节不变（回归守卫） |
+| **E 对照：旧代码** | **确实 throw（这就是 log193）** |
+
+### 产物验证（正确姿势）
+
+`strings <ELF> | grep 'salvage (bad signature)'` = **0**，这是**正常的** ——
+PROJECT_MEMORY 早有记载：ROM 化会去掉方法名/字符串常量，不能用它判"改动没进产物"。
+正确做法是查 `classes.zip` 里的 class 字节：
+
+```
+salvage (bad signature)        -> FOUND
+invalid record store contents  -> absent     (旧 throw 已彻底移除)
+```
+
+时间戳链也单调：`RecordStoreImpl.class 01:26:17 → classes.zip 01:26:18 →
+midp_vita 01:26:56`。
+
+### CMake 约定（遵守）
+
+`CMakeLists.txt` 已精简到 414 行，`set(VITA_VERSION "04.55")` 在第 38 行且是唯一
+一个。本次**只改这一行为 04.56**，没有加任何说明块——版本说明写在本文件。
+
+### 还没回答的
+
+**为什么头部读不出来**（`dbFile.read` 返回不足 40 字节或读失败）。本次修的是
+"读不出来也能启动"，不是"不再读不出来"。两种可能：
+
+1. 文件本身是 0 字节或不足 40 字节 → 写入侧（`midp_file_cache` flush/close）；
+2. 文件正常但读到错位置 → 悬空句柄家族（v01.48 修过一次，可能没修全，
+   `midp_file_cache_seek` 的 `position >= 0` 判断仍可疑）。
+
+要定位需要 `ux0:/data/J2ME00001/rms/appdb_1A35/` 的真实文件：
+- 文件大小（0 / 40 / 数千字节？）
+- 前 40 字节是否 `midp-rms`
+
+### 教训
+
+1. **新增自愈逻辑时，先确认它前面有没有 throw。** 本次四个 salvage 分支写得都对，
+   但全部在一个必抛的栅栏后面，等于没写。修复能力取决于**最早的那道门**。
+2. **"之前修好了现在又出现"要先怀疑覆盖范围，而不是回退。** 我一开始查 git
+   找 RMS 改动是错的方向——改动没被动过，是坏的形态变了。
+3. **日志打印要在修复之前、打印原始读到的值**（v01.54 加的那行 `[rms] open`
+   是关键证据，否则只知道"抛了异常"，不知道"读到了全零"）。
+4. 判"改动进产物"用 `classes.zip` 里的 class 字节，不要用 ELF 的 `strings`
+   （ROM 化会吃掉字符串）。
+
+## 2026-11-06 v04.55：Mascot Capsule V3 —— 阶段 A 第一步，MBAC 格式在宿主上跑通
+
+### 0. 为什么方向变了（先纠正上一轮的结论）
+
+上一轮我写"Mascot V3 做完也没法验证，因为规范找不到、本地 0 个游戏用它"。两点都错：
+
+1. **规范不用找**：`nikita36078/J2ME-Loader`（**Apache 2.0**，`(c) Yury Kharchenko`）里有完整实现
+   —— `ru/woesss/j2me/micro3d/` 约 168 KB / 5500–6000 行，其中 **`Loader.java`（30.8 KB / 958 行）
+   就是那个"不公开"的 MBAC 容器格式**。开源实现本身就是规范。
+2. **测试样本有**：`debug/3d_game2/fly_and_destroy_3d_176x220_188714.jar`
+   —— 引用 9 个 Mascot V3 类，带 **25 个真实 `.mbac`**（70 KB）。
+
+顺带确认：`khronos` 在 J2ME Loader 里 **0 命中** ⇒ **JSR-239 不做**（连最全的开源模拟器都不实现）。
+
+### 1. MBAC 容器格式（从 `Loader.loadMbacData` 反推 + 用真文件核对）
+
+```
+off  type  field
+ 0   'M','B'
+ 2   u8    version        2..5
+ 3   u8    0              must be 0
+ (version > 3 only)
+ 4   u8    vertexFormat   1=V1(fixed i16)  2=V2(bit stream)
+ 5   u8    normalFormat   0=none  1=V1  2=V2
+ 6   u8    polygonFormat  1/2/3；<3 表示"单纹理、无 C3/C4 计数"
+ 7   u8    boneFormat     must be 1
+ 8   u16   numVertices    <= 21845
+10   u16   numPolyT3 / 12 numPolyT4      三角形/四边形（带纹理）
+14   u16   numBones
+ (polygonFormat >= 3, from 16)
+16   u16   numPolyC3 / 18 numPolyC4      三角形/四边形（顶点色）
+20   u16   numTextures    <= 16
+22   u16   numPatterns    <= 33
+24   u16   numColors      <= 256
+ then, version == 5: numPatterns * (numTextures + 1) 组 u16 对
+```
+
+**顶点是位流压缩的**（`readVerticesV2`），位序 **LSB-first**——`readUBits` 用
+`cache |= byte << cached` 从低位累计，然后取低 `size` 位：
+
+```java
+int chunk = readUBits(8);
+int size  = SIZES[chunk >> 6];      // SIZES = {8, 10, 13, 16}
+int count = (chunk & 0x3F) + 1;     // 1..64 个顶点
+for (i < count) { x=readBits(size); y=readBits(size); z=readBits(size); }
+```
+
+法线更紧（`readNormalsV2`）：7+7+1 bit，`z = sqrt(4096² − x² − y²)`（源码里有 ±z 的符号位），
+另有 `POOL_NORMALS` 池（x == 64 时读 3 bit 索引 6 个轴向法线）。
+
+### 2. 本轮的产物：`tools/mbacinspect/mbacinspect.py`
+
+一个 Python 版的头部 + 顶点解码器，用来**在写任何 Java 之前**证明格式理解正确。
+用法：`python3 tools/mbacinspect/mbacinspect.py [--verts] <file.mbac|game.jar>`。
+
+### 3. 验证（用 `fly_and_destroy_3d` 的 25 个真模型）
+
+头部：**25/25 解析成功**，全部 `v5 / fmt=2/2/3 / tex=0`（这个游戏用顶点色，不用纹理
+—— 后面的渲染阶段可以省掉纹理路径）。
+
+顶点：**25/25 解码成功、0 失败**，而且坐标形状与模型名字对得上，这是"解析对了"的强证据：
+
+| 模型 | 顶点 | 位流结束 | 坐标范围 | 说明 |
+|---|---|---|---|---|
+| `m_wall_x` | 560 | 2256/4812 | x −10..10, **y −600..600**, z −10..10 | 墙：**薄而高** |
+| `m_ship_e_spitfire` | 584 | 1859/5063 | x **−169..169**, y −38..49, z −101..95 | 战斗机：x 跨 338 = 翼展 |
+| `m_ship_f_helicopter` | 921 | 2847/8004 | x −100..100, **y −1..175** | 机身在上方，y 不落到负 |
+| `m_fly_bomb` | 1964 | 5953/12851 | ±80 / ±103 / ±105 | 炸弹：接近立方 |
+| `m_fragment_a` | 6 | 49/122 | −50..50 / −14..65 / −100..127 | 最小碎片 |
+
+体积校核：文件大小与顶点数线性相关（约 6.5 B/顶点，位流 + 头部 + 面的平均值），
+位流结束后剩余字节占 53–65%，与"还有法线 + 面 + 骨骼"相符。
+
+### 4. 还没做（阶段 A 剩下的 + 阶段 B）
+
+1. **法线**（`readNormalsV2`）、**面**（`readPolyC` / `readPolyV3`，带颜色索引与顶点索引位宽）、
+   **骨骼**（`readBones`）—— 解析器还差这三块，`Loader.java` 里都有，逻辑同类。
+2. **API 壳**：`com.mascotcapsule.micro3d.v3` 的 11 个类，136 个 public 方法
+   （v10 J3D 只有 58 个，结构相同但签名要多一倍；`Util3D` 这个游戏没用到）。
+3. **渲染**（阶段 B）：`Render.java`（47.5 KB）+ `Program.java`（10.5 KB，GLSL）。
+   **vitaGL 支持 GLES2**（`glCreateShader` / `glUseProgram` / `glUniformMatrix4fv` 都在
+   `vitaGL.h` 里），所以可以移植而不是重写。
+4. **验证游戏**：`fly_and_destroy_3d` 本身。**注意 JIT 浮点仍未修**（log191），
+   跑它时必须先 `jit=0`，否则无法区分"Mascot 实现错"和"JIT 算错"。
 
